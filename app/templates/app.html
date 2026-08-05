@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PA Policy Forge</title>
+<link rel="stylesheet" href="{{url_for('static',filename='app.css')}}">
+</head>
+<body>
+<div class="app-shell">
+<aside class="sidebar">
+<a class="brand" href="/">
+<span class="brand-mark">PA</span>
+<span class="brand-copy">Policy Forge<small>Flow-driven policy</small>
+</span>
+</a>
+<nav class="nav">
+<button class="nav-link active" data-section="dashboard">
+<span class="nav-icon">◆</span>Dashboard</button>
+<button class="nav-link" data-section="profiles">
+<span class="nav-icon">▣</span>Firewalls & targets</button>
+<button class="nav-link" data-section="flows">
+<span class="nav-icon">⇄</span>Flows</button>
+<button class="nav-link" data-section="runs">
+<span class="nav-icon">⚒</span>Policy runs</button>
+<button class="nav-link" data-section="settings">
+<span class="nav-icon">⚙</span>Instellingen</button>
+</nav>
+<div class="sidebar-footer">
+<div>
+<span class="status-dot">
+</span>Collector actief</div>
+<div>UDP 514 · HTTPS only</div>
+</div>
+</aside>
+<main class="main">
+<header class="topbar">
+<div>
+<h2 class="topbar-title" data-page-title>Dashboard</h2>
+</div>
+<form class="topbar-actions" method="post" action="{{url_for('logout')}}">
+<input type="hidden" name="csrf" value="{{csrf_token()}}">
+<span class="topbar-meta">admin</span>
+<button class="btn btn-small" type="submit">Uitloggen</button>
+</form>
+</header>
+<div class="content">
+{% with messages=get_flashed_messages(with_categories=true) %}{% if messages %}<div class="flash-stack">{% for category,message in messages %}<div class="flash flash-{{category}}" data-auto-dismiss="9000">
+<div class="flash-body">{{message}}</div>
+<button class="flash-close" data-flash-close>×</button>
+</div>{% endfor %}</div>{% endif %}{% endwith %}
+<section id="dashboard" class="page-section" data-title="Dashboard">
+<div class="page-header">
+<div>
+<p class="eyebrow">Live overzicht</p>
+</div>
+</div>
+<div class="grid grid-4">
+<div class="card stat">
+<span class="stat-label">Geaggregeerde flows</span>
+<strong class="stat-value">{{stats.flow_count}}</strong>
+<span class="stat-trend">{{stats.total_sessions}} sessies</span>
+</div>
+<div class="card stat">
+<span class="stat-label">Firewalls gezien</span>
+<strong class="stat-value">{{stats.sources}}</strong>
+</div>
+<div class="card stat">
+<span class="stat-label">Policy runs</span>
+<strong class="stat-value">{{stats.runs}}</strong>
+<span class="muted">preview en candidate</span>
+</div>
+<div class="card stat">
+<span class="stat-label">Opslag</span>
+<strong class="stat-value">{{stats.storage_pct}}%</strong>
+<div class="progress">
+<div class="progress-bar" style="--progress:{{stats.storage_pct}}%">
+</div>
+</div>
+<span class="muted">limiet 50 GiB</span>
+</div>
+</div>
+<div class="grid" style="margin-top:18px">
+<div class="card">
+<div class="card-header">
+<div>
+<h2>Ontdekte firewalls</h2>
+</div>
+</div>{% if sources %}<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Serial</th>
+<th>Bron-IP</th>
+<th>Berichten</th>
+<th>Laatst</th>
+</tr>
+</thead>
+<tbody>{% for x in sources[:8] %}<tr>
+<td class="mono">{{x.serial or 'Onbekend'}}</td>
+<td class="mono">{{x.source_ip}}</td>
+<td>{{x.messages}}</td>
+<td>{{x.last_seen}}</td>
+</tr>{% endfor %}</tbody>
+</table>
+</div>{% else %}<div class="empty-state">
+<strong>Nog geen syslog ontvangen</strong>Stuur PAN-OS TRAFFIC-logs met action allow naar UDP 514.</div>{% endif %}</div>
+</div>
+</section>
+<section id="profiles" class="page-section" data-title="Firewalls & targets" hidden>
+<div class="page-header">
+<div>
+<h1>Profielen</h1>
+</div>
+</div>
+<div class="grid grid-2">
+<div class="card">
+<h2>Nieuw profiel</h2>
+<form method="post" action="{{url_for('profile_save')}}" class="form-grid">
+<input type="hidden" name="csrf" value="{{csrf_token()}}">
+<div class="field">
+<label>Naam</label>
+<input name="name" placeholder="Customer firewall" required>
+</div>
+<div class="field">
+<label>Firewallserial</label>
+<input name="serial" placeholder="0070..." required>
+</div>
+<div class="field">
+<label>Bron-IP (herkenning)</label>
+<input name="source_ip" placeholder="10.0.0.1">
+</div>
+<div class="field">
+<label>Target</label>
+<select name="target_type" data-target-select required>
+<option value="" selected disabled>Selecteer een target</option>
+<option value="scm">Strata Cloud Manager</option>
+<option value="panorama">Panorama</option>
+<option value="panos">Standalone PAN-OS</option>
+</select>
+</div>
+<div class="field full">
+<label>Zone mappings</label>
+<textarea name="zones" placeholder="L3-Clients = client&#10;L3-Servers = server&#10;Internet = internet" required>
+</textarea>
+</div>
+<div class="field">
+<label>Minimale sessies</label>
+<input type="number" name="min_sessions" min="1" value="3">
+</div>
+<div class="field">
+<label>Tags</label>
+<input name="tags" value="AI builder">
+</div>
+<div class="field full form-grid" data-targets="scm" hidden>
+<div class="field">
+<label>SCM scope</label>
+<select name="scm_scope_type" data-scm-scope-select>
+<option value="folder">Folder</option>
+<option value="snippet">Snippet</option>
+<option value="device">Device</option>
+</select>
+</div>
+<div class="field" data-scm-scope="folder">
+<label>SCM folder</label>
+<input name="folder" placeholder="Customer-Folder" required>
+</div>
+<div class="field" data-scm-scope="snippet" hidden>
+<label>SCM snippet</label>
+<input name="snippet" placeholder="Customer-Snippet" required>
+</div>
+<div class="field" data-scm-scope="device" hidden>
+<label>SCM device</label>
+<input name="device" placeholder="Device name" required>
+</div>
+<div class="field">
+<label>Rulebase</label>
+<select name="rulebase">
+<option value="pre">Pre</option>
+<option value="post">Post</option>
+</select>
+</div>
+<div class="field">
+<label>Log forwarding profile</label>
+<input name="log_profile">
+</div>
+<div class="field">
+<label>SCM client ID</label>
+<input name="client_id" autocomplete="off">
+</div>
+<div class="field">
+<label>SCM client secret</label>
+<input type="password" name="client_secret" autocomplete="new-password">
+</div>
+<div class="field">
+<label>SCM TSG ID</label>
+<input name="tsg_id" autocomplete="off">
+</div>
+</div>
+<div class="field full form-grid" data-targets="panorama" hidden>
+<div class="field">
+<label>Panorama endpoint</label>
+<input name="endpoint" placeholder="https://10.0.0.10" required>
+</div>
+<div class="field">
+<label>Device group</label>
+<input name="device_group" placeholder="Branches" required>
+</div>
+<div class="field">
+<label>Rulebase</label>
+<select name="rulebase">
+<option value="pre">Pre</option>
+<option value="post">Post</option>
+</select>
+</div>
+<div class="field">
+<label>Log forwarding profile</label>
+<input name="log_profile">
+</div>
+<div class="field">
+<label>Username</label>
+<input name="username" autocomplete="off">
+</div>
+<div class="field">
+<label>Password</label>
+<input type="password" name="password" autocomplete="new-password">
+</div>
+</div>
+<div class="field full form-grid" data-targets="panos" hidden>
+<div class="field">
+<label>Firewall endpoint</label>
+<input name="endpoint" placeholder="https://10.0.0.10" required>
+</div>
+<div class="field">
+<label>VSYS</label>
+<input name="vsys" value="vsys1">
+</div>
+<div class="field">
+<label>Log forwarding profile</label>
+<input name="log_profile">
+</div>
+<div class="field">
+<label>Username</label>
+<input name="username" autocomplete="off">
+</div>
+<div class="field">
+<label>Password</label>
+<input type="password" name="password" autocomplete="new-password">
+</div>
+</div>
+<div class="field full cluster">
+<label class="checkbox">
+<input type="checkbox" name="enabled" checked> Actief</label>
+<label class="checkbox">
+<input type="checkbox" name="disabled"> Gegenereerde regels disabled</label>
+<label class="checkbox">
+<input type="checkbox" name="global_ping" checked> Globale ping/traceroute</label>
+<label class="checkbox">
+<input type="checkbox" name="global_dns" checked> Globale DNS</label>
+</div>
+<div class="field full">
+<button class="btn btn-primary" type="submit">Profiel veilig opslaan</button>
+</div>
+</form>
+</div>
+<div class="stack">{% for p in profiles %}<article class="card">
+<div class="card-header">
+<div>
+<h2>{{p.name}}</h2>
+<p class="mono muted">{{p.serial}}</p>
+</div>
+<span class="badge badge-orange">{{p.target_type|upper}}</span>
+</div>
+<div class="cluster">
+<form method="post" action="{{url_for('build',profile_id=p.id)}}">
+<input type="hidden" name="csrf" value="{{csrf_token()}}">
+<input type="hidden" name="mode" value="preview">
+<button class="btn" type="submit">Preview bouwen</button>
+</form>
+<form method="post" action="{{url_for('build',profile_id=p.id)}}" data-confirm="Schrijf objecten en regels naar candidate configuration? Er wordt niet gecommit of gedeployed.">
+<input type="hidden" name="csrf" value="{{csrf_token()}}">
+<input type="hidden" name="mode" value="push">
+<button class="btn btn-primary" type="submit">Naar candidate schrijven</button>
+</form>
+<form method="post" action="{{url_for('profile_delete',profile_id=p.id)}}" data-confirm="Profiel verwijderen? Flows en runs blijven bewaard.">
+<input type="hidden" name="csrf" value="{{csrf_token()}}">
+<button class="btn btn-danger" type="submit">Verwijderen</button>
+</form>
+</div>
+</article>{% else %}<div class="empty-state">
+<strong>Nog geen profiel</strong>Maak links het eerste firewallprofiel.</div>{% endfor %}</div>
+</div>
+</section>
+<section id="flows" class="page-section" data-title="Flows" hidden>
+<div class="page-header">
+<div>
+<h1>Flows</h1>
+</div>
+<input class="search" data-table-filter="#flow-table" placeholder="Filter flows...">
+</div>
+<div class="table-wrap">
+<table id="flow-table">
+<thead>
+<tr>
+<th>Serial</th>
+<th>Van</th>
+<th>Naar</th>
+<th>Zones</th>
+<th>App</th>
+<th>Service</th>
+<th>Sessies</th>
+<th>Laatst</th>
+</tr>
+</thead>
+<tbody>{% for f in flows %}<tr>
+<td class="mono">{{f.serial}}</td>
+<td class="mono">{{f.src}}</td>
+<td class="mono">{{f.dst}}</td>
+<td>{{f.src_zone}} → {{f.dst_zone}}</td>
+<td>{{f.app}}</td>
+<td>{{f.proto}}/{{f.dport}}</td>
+<td>{{f.repeat}}</td>
+<td>{{f.last_seen}}</td>
+</tr>{% endfor %}</tbody>
+</table>
+</div>
+</section>
+<section id="runs" class="page-section" data-title="Policy runs" hidden>
+<div class="page-header">
+<div>
+<p class="eyebrow">Auditbaar</p>
+<h1>Runhistoriek</h1>
+</div>
+</div>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Profiel</th>
+<th>Mode</th>
+<th>Status</th>
+<th>Regels</th>
+<th>Gestart</th>
+<th>
+</th>
+</tr>
+</thead>
+<tbody>{% for r in runs %}<tr>
+<td>#{{r.id}}</td>
+<td>{{r.profile_name}}</td>
+<td>{{r.mode}}</td>
+<td>
+<span class="badge badge-{{'success' if r.status=='complete' else 'danger' if r.status=='failed' else 'warning'}}">{{r.status}}</span>
+</td>
+<td>{{r.rule_count}}</td>
+<td>{{r.started_at}}</td>
+<td>
+<a class="btn btn-small" href="{{url_for('run_detail',run_id=r.id)}}">Open</a>
+</td>
+</tr>{% else %}<tr>
+<td colspan="7">Nog geen runs.</td>
+</tr>{% endfor %}</tbody>
+</table>
+</div>
+</section>
+<section id="settings" class="page-section" data-title="Instellingen" hidden>
+<div class="page-header">
+<div>
+<p class="eyebrow">Appliance</p>
+<h1>Systeeminstellingen</h1>
+</div>
+</div>
+<div class="grid grid-2">
+<div class="card">
+<h2>Netwerk & certificaat</h2>
+<div class="stack">
+<div class="metric-row">
+<span>FQDN</span>
+<code>{{request.host.split(':')[0]}}</code>
+</div>
+<div class="metric-row">
+<span>Web</span>
+<span class="badge badge-success">HTTPS 443</span>
+</div>
+<div class="metric-row">
+<span>Syslog</span>
+<span class="badge badge-success">UDP 514</span>
+</div>
+<div class="metric-row">
+<span>HTTP</span>
+<span class="badge">Niet actief</span>
+</div>
+</div>
+</div>
+<div class="card">
+<h2>Auditlog</h2>
+<div class="timeline">{% for a in audits %}<div class="timeline-item">
+<span class="timeline-dot">
+</span>
+<strong>{{a.action}}</strong>
+<div class="muted">{{a.created_at}} · {{a.username}}</div>
+<small>{{a.detail}}</small>
+</div>{% endfor %}</div>
+</div>
+</div>
+</section>
+</div>
+</main>
+</div>
+<script src="{{url_for('static',filename='app.js')}}">
+</script>
+</body>
+</html>

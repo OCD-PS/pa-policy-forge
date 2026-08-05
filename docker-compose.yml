@@ -1,0 +1,30 @@
+services:
+  pa-policy-forge:
+    build: .
+    image: pa-policy-forge:local
+    container_name: pa-policy-forge
+    restart: unless-stopped
+    ports:
+      - "443:8443/tcp"
+      - "514:5514/udp"
+    environment:
+      PPF_DATA_DIR: /data
+      PPF_SYSLOG_PORT: "5514"
+      PPF_MAX_GIB: "50"
+      PPF_BOOTSTRAP_PASSWORD: "OCD1234!"
+    volumes:
+      - /var/lib/pa-policy-forge:/data
+      - /opt/pa-policy-forge/certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import ssl,urllib.request; urllib.request.urlopen('https://127.0.0.1:8443/healthz',context=ssl._create_unverified_context(),timeout=5)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
