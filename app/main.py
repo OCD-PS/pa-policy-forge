@@ -478,6 +478,22 @@ def fetch_panos_objects(profile, object_type: str) -> list[dict]:
     return collected
 
 
+def refresh_catalog_async(profile, kind: str, cache_path: Path) -> None:
+    key = (int(profile["id"]), kind)
+    with _catalog_refresh_lock:
+        if key in _catalog_refreshing: return
+        _catalog_refreshing.add(key)
+    def refresh():
+        try:
+            fresh = fetch_scm_objects(profile, kind)
+            cache_path.write_text(json.dumps(fresh)); cache_path.chmod(0o600)
+        except Exception:
+            app.logger.exception("catalog refresh failed for profile=%s kind=%s", profile["id"], kind)
+        finally:
+            with _catalog_refresh_lock: _catalog_refreshing.discard(key)
+    threading.Thread(target=refresh, name=f"catalog-{profile['id']}-{kind}", daemon=True).start()
+
+
 def fetch_object_catalog(profile, object_type: str) -> list[dict]:
     related = {"addresses": ("tags",), "services": ("tags",), "address-groups": ("addresses", "address-groups", "tags"), "service-groups": ("services", "service-groups", "tags"), "application-groups": ("applications", "application-groups", "tags"), "zones": ("zones",), "policy-picker": ("zones", "addresses", "address-groups", "applications", "application-groups", "application-filters", "services", "service-groups", "tags")}.get(object_type, ())
     catalog = []
@@ -489,17 +505,7 @@ def fetch_object_catalog(profile, object_type: str) -> list[dict]:
             except (OSError, json.JSONDecodeError): cached = None
         stale = not cache_path.exists() or time.time() - cache_path.stat().st_mtime >= 1800
         if kind == "applications" and stale:
-            key = (int(profile["id"]), kind)
-            with _catalog_refresh_lock:
-                if key not in _catalog_refreshing:
-                    _catalog_refreshing.add(key)
-                    def refresh_catalog(profile=profile, kind=kind, cache_path=cache_path, key=key):
-                        try:
-                            fresh = fetch_scm_objects(profile, kind)
-                            cache_path.write_text(json.dumps(fresh)); cache_path.chmod(0o600)
-                        finally:
-                            with _catalog_refresh_lock: _catalog_refreshing.discard(key)
-                    threading.Thread(target=refresh_catalog, name=f"catalog-{profile['id']}-{kind}", daemon=True).start()
+            refresh_catalog_async(profile, kind, cache_path)
         elif cached is None or stale:
             try:
                 cached = fetch_scm_objects(profile, kind)
@@ -509,6 +515,21 @@ def fetch_object_catalog(profile, object_type: str) -> list[dict]:
         cached = cached or []
         catalog.extend({"name": item.get("name", ""), "kind": kind} for item in cached if item.get("name"))
     return sorted(catalog, key=lambda item: (item["name"].lower(), item["kind"]))
+
+
+@app.get("/profiles/<int:profile_id>/catalog/applications")
+@login_required
+def application_catalog(profile_id):
+    with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+    if not profile: return {"ready": False, "items": []}, 404
+    cache_path = OBJECT_CACHE / f"{profile_id}-applications.json"
+    items = []
+    if cache_path.exists():
+        try: items = json.loads(cache_path.read_text())
+        except (OSError, json.JSONDecodeError): items = []
+    stale = not cache_path.exists() or time.time() - cache_path.stat().st_mtime >= 1800
+    if stale: refresh_catalog_async(profile, "applications", cache_path)
+    return {"ready": bool(items), "refreshing": (profile_id, "applications") in _catalog_refreshing, "items": [{"name": item.get("name", ""), "kind": "applications"} for item in items if item.get("name")]}
 
 
 def scm_object_payload(object_type: str, form, container: dict) -> dict:

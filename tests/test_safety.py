@@ -48,6 +48,10 @@ class SafetyTests(unittest.TestCase):
         self.assertIn('scm_client_secret = ""', text)
         self.assertIn('PPF_SCM_CLIENT_SECRET', text)
 
+    def test_policy_picker_is_moved_into_active_dialog(self):
+        script = (ROOT / "app/static/app.js").read_text()
+        self.assertIn('activeDialog.appendChild(valuePicker)', script)
+
     def test_panos_12_versioned_traffic_log_is_parsed(self):
         line = (
             '<14>Aug  5 12:49:02 PA-VM '
