@@ -10,4 +10,4 @@ COPY vendor ./vendor
 RUN mkdir -p /data /certs && chown -R forge:forge /data /app
 USER forge
 EXPOSE 8443/tcp 5514/udp
-CMD ["gunicorn","--workers","1","--threads","8","--timeout","1800","--keep-alive","5","--limit-request-fields","50","--limit-request-field_size","8190","--ciphers","ECDHE+AESGCM:ECDHE+CHACHA20","--bind","0.0.0.0:8443","--certfile","/certs/tls.crt","--keyfile","/certs/tls.key","app.main:app"]
+CMD ["gunicorn","--workers","1","--threads","8","--timeout","1800","--keep-alive","5","--limit-request-fields","50","--limit-request-field_size","8190","--ciphers","ECDHE+AESGCM:ECDHE+CHACHA20","--no-control-socket","--bind","0.0.0.0:8443","--certfile","/certs/tls.crt","--keyfile","/certs/tls.key","app.main:app"]
