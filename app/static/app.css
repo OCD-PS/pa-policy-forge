@@ -171,6 +171,14 @@ tbody tr:hover { background: rgba(255,255,255,.02); }
 .bulk-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px; margin-top: 18px; }
 .bulk-field { display: grid; gap: 7px; padding: 13px; border: 1px solid var(--line); border-radius: 7px; background: #111; }
 .bulk-field strong { color: var(--orange-2); }
+.policy-value-editor { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 7px; min-height: 54px; padding: 9px; border: 1px solid #393939; border-radius: 6px; background: #181818; }
+.policy-value-chip { display: inline-flex; align-items: center; overflow: hidden; height: 28px; border: 1px solid #555; border-radius: 4px; background: #292929; color: #eee; }
+.policy-value-chip > span { padding: 0 8px; }
+.policy-value-chip button { align-self: stretch; min-width: 28px; border: 0; border-left: 1px solid #555; background: #202020; color: var(--orange-2); cursor: pointer; font-size: 18px; line-height: 1; }
+.policy-value-chip button:hover { background: var(--orange); color: #111; }
+.policy-value-chip.is-removed { border-color: #754343; opacity: .55; text-decoration: line-through; }
+.policy-value-entry { display: grid; grid-template-columns: 1fr auto; gap: 7px; }
+.policy-value-entry .btn { min-width: 42px; padding-inline: 12px; font-size: 18px; }
 .bulk-dialog-actions { justify-content: flex-end; margin-top: 18px; }
 .timeline { display: grid; gap: 0; }
 .timeline-item { position: relative; padding: 0 0 22px 28px; border-left: 1px solid #3c3c3c; }

@@ -238,7 +238,7 @@
         if (!dataField) throw new Error("Onbekend veld: " + field);
         expected = expected.toLocaleLowerCase();
         return function (row) {
-          var values = (row.dataset[dataField] || "").split("|||");
+          var values = (row.dataset[dataField] || "").split("|||").map(function (item) { return item.toLocaleLowerCase(); });
           var match = operator === "contains" ? values.some(function (item) { return item.includes(expected); }) : values.some(function (item) { return item === expected; });
           return operator === "neq" ? !match : match;
         };
@@ -296,11 +296,51 @@
 
     var dialog = document.querySelector("[data-policy-bulk-dialog]");
     var opener = document.querySelector("[data-open-policy-bulk]");
+    function selectedRows() { return rows.filter(function (row) { return row.querySelector("[data-policy-select]").checked; }); }
+    function splitEntry(value) { return value.split(",").map(function (item) { return item.trim(); }).filter(Boolean); }
+    function renderBulkField(fieldNode, values, removed) {
+      var container = fieldNode.querySelector("[data-bulk-values]"); container.innerHTML = "";
+      values.forEach(function (value) {
+        var chip = document.createElement("span"); chip.className = "policy-value-chip" + (removed.has(value) ? " is-removed" : "");
+        var label = document.createElement("span"); label.textContent = value; chip.appendChild(label);
+        var button = document.createElement("button"); button.type = "button"; button.textContent = removed.has(value) ? "+" : "−";
+        button.title = removed.has(value) ? "Verwijdering ongedaan maken" : "Uit geselecteerde policies verwijderen";
+        button.addEventListener("click", function () {
+          if (removed.has(value)) removed.delete(value); else removed.add(value);
+          fieldNode.querySelector("[data-bulk-remove]").value = Array.from(removed).join(",");
+          renderBulkField(fieldNode, values, removed);
+        });
+        chip.appendChild(button); container.appendChild(chip);
+      });
+      if (!values.length) { var empty = document.createElement("span"); empty.className = "muted small"; empty.textContent = "Geen bestaande waarden"; container.appendChild(empty); }
+    }
+    function prepareBulkFields() {
+      var selected = selectedRows();
+      all("[data-bulk-field]", dialog).forEach(function (fieldNode) {
+        var field = fieldNode.dataset.bulkField; var values = []; var seen = new Set();
+        selected.forEach(function (row) { (row.dataset[field] || "").split("|||").filter(Boolean).forEach(function (value) { if (!seen.has(value)) { seen.add(value); values.push(value); } }); });
+        var removed = new Set(); fieldNode._removedValues = removed;
+        fieldNode.querySelector("[data-bulk-remove]").value = ""; fieldNode.querySelector("[data-bulk-add]").value = ""; fieldNode.querySelector("[data-bulk-add]").dataset.values = "";
+        renderBulkField(fieldNode, values, removed);
+      });
+    }
     if (dialog && opener) opener.addEventListener("click", function () {
       var count = all("[data-policy-select]:checked").length;
       if (!count) { window.alert("Selecteer minstens één security policy."); return; }
       dialog.querySelector("[data-policy-selected-count]").textContent = count;
+      prepareBulkFields();
       dialog.showModal();
+    });
+    all("[data-bulk-field]", dialog).forEach(function (fieldNode) {
+      var input = fieldNode.querySelector("[data-bulk-add]"); var button = fieldNode.querySelector("[data-bulk-add-button]");
+      function addValue() {
+        var additions = splitEntry(input.value); if (!additions.length) return;
+        var current = splitEntry(input.dataset.values || "");
+        additions.forEach(function (value) { if (!current.includes(value)) current.push(value); });
+        input.dataset.values = current.join(","); input.value = current.join(", ");
+      }
+      button.addEventListener("click", addValue);
+      input.addEventListener("keydown", function (event) { if (event.key === "Enter") { event.preventDefault(); addValue(); } });
     });
     var cancel = document.querySelector("[data-policy-bulk-cancel]");
     if (cancel) cancel.addEventListener("click", function () { dialog.close(); });
