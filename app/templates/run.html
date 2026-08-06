@@ -15,7 +15,7 @@
 <p class="lede">{{run.started_at}} — {{run.finished_at or 'bezig'}}</p>
 </div>
 <div class="cluster">
-<a class="btn" href="{{url_for('index')}}#runs">Terug</a>
+<a class="btn" href="{{url_for('index',run_profile=run.profile_id)}}#runs">Terug</a>
 {% if run.status=='complete' %}
 <a class="btn" href="{{url_for('run_download',run_id=run.id,kind='csv')}}">Review CSV</a>
 <a class="btn" href="{{url_for('run_download',run_id=run.id,kind='xml')}}">Policy XML</a>

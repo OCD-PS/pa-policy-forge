@@ -36,6 +36,15 @@ class SafetyTests(unittest.TestCase):
         config_block = app_text[app_text.index("def write_config"):app_text.index("def export_profile_flows")]
         self.assertNotIn("PPF_SCM_DEPLOY_DEVICES", config_block)
 
+    def test_run_history_is_profile_scoped_and_success_limited(self):
+        app_text=(ROOT/"app/main.py").read_text()
+        template=(ROOT/"app/templates/app.html").read_text()
+        self.assertIn('request.args.get("run_profile", type=int)', app_text)
+        self.assertIn("status='complete' ORDER BY id DESC LIMIT 5", app_text)
+        self.assertIn("status='complete' \"\n            \"ORDER BY id DESC LIMIT -1 OFFSET ?", app_text)
+        self.assertIn("run_profile=p.id", template)
+        self.assertIn("selected_run_profile", template)
+
     @patch("vendor.bdnd_panos_policy_builder.get_scm_token", return_value="test-token")
     @patch("vendor.bdnd_panos_policy_builder.scm_http_request")
     def test_scm_deploy_waits_for_both_device_jobs(self, request, _token):

@@ -344,18 +344,30 @@
 {% else %}<div class="empty-state"><strong>Nog geen firewallprofiel</strong>Maak eerst een profiel onder Firewalls &amp; targets.</div>{% endif %}
 </section>
 <section id="runs" class="page-section" data-title="Policy runs" hidden>
+{% if profiles and not selected_run_profile %}
 <div class="page-header">
 <div>
-<p class="eyebrow">Auditbaar</p>
 <h1>Runhistoriek</h1>
 </div>
+</div>
+<div class="grid device-selector-grid">
+{% for p in profiles %}<a class="card" href="{{url_for('index',run_profile=p.id)}}#runs" style="text-decoration:none;color:inherit">
+<h2>{{p.name}}</h2>
+</a>{% endfor %}
+</div>
+{% elif selected_run_profile %}
+<div class="page-header">
+<div>
+<p class="eyebrow">{{selected_run_profile.target_type|upper}}</p>
+<h1>{{selected_run_profile.name}}</h1>
+</div>
+<div class="cluster"><a class="btn" href="{{url_for('index')}}#runs">Terug naar devices</a></div>
 </div>
 <div class="table-wrap">
 <table>
 <thead>
 <tr>
 <th>ID</th>
-<th>Profiel</th>
 <th>Mode</th>
 <th>Status</th>
 <th>Regels</th>
@@ -366,7 +378,6 @@
 </thead>
 <tbody>{% for r in runs %}<tr>
 <td>#{{r.id}}</td>
-<td>{{r.profile_name}}</td>
 <td>{{r.mode}}</td>
 <td>
 <span class="badge badge-{{'success' if r.status=='complete' else 'danger' if r.status=='failed' else 'warning'}}">{{r.status}}</span>
@@ -383,10 +394,11 @@
 </div>
 </td>
 </tr>{% else %}<tr>
-<td colspan="7">Nog geen runs.</td>
+<td colspan="6">Nog geen runs voor dit profiel.</td>
 </tr>{% endfor %}</tbody>
 </table>
 </div>
+{% else %}<div class="empty-state"><strong>Nog geen firewallprofiel</strong>Maak eerst een profiel onder Firewalls &amp; targets.</div>{% endif %}
 </section>
 <section id="policy-management" class="page-section" data-title="Policybeheer" hidden>
 {% if not policy_profile %}

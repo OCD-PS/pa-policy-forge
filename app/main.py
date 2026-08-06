@@ -905,7 +905,6 @@ def index():
     with db() as conn:
         profile_rows = conn.execute("SELECT * FROM profiles ORDER BY name").fetchall()
         sources = conn.execute("SELECT * FROM sources ORDER BY last_seen DESC LIMIT 100").fetchall()
-        runs = conn.execute("SELECT runs.*,profiles.name profile_name FROM runs JOIN profiles ON profiles.id=runs.profile_id ORDER BY runs.id DESC LIMIT 50").fetchall()
         audits = conn.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 20").fetchall()
     profiles = []
     with flow_store._connect() as conn:
@@ -920,6 +919,20 @@ def index():
             profile["scm_scope_type"] = "snippet" if settings.get("snippet") else "device" if settings.get("device") else "folder"
             profile["flow_count"] = sum(counts.get(serial, 0) for serial in profile_serials(row))
             profiles.append(profile)
+        run_profile_id = request.args.get("run_profile", type=int)
+        selected_run_profile = next((profile for profile in profiles if profile["id"] == run_profile_id), None)
+        runs = []
+        if selected_run_profile:
+            with db() as run_conn:
+                runs = run_conn.execute(
+                    "SELECT runs.*,profiles.name profile_name FROM runs "
+                    "JOIN profiles ON profiles.id=runs.profile_id "
+                    "WHERE runs.profile_id=? AND runs.mode!='prepared' "
+                    "AND (runs.status!='complete' OR runs.id IN ("
+                    "SELECT id FROM runs WHERE profile_id=? AND mode!='prepared' AND status='complete' ORDER BY id DESC LIMIT 5"
+                    ")) ORDER BY runs.id DESC",
+                    (selected_run_profile["id"], selected_run_profile["id"]),
+                ).fetchall()
         editing_id = request.args.get("edit_profile", type=int)
         editing_profile = next((profile for profile in profiles if profile["id"] == editing_id), None)
         selected_id = request.args.get("flow_profile", type=int)
@@ -951,7 +964,7 @@ def index():
                     policies = fetch_scm_policy_type(policy_profile, policy_kind)
                     policy_catalog = fetch_object_catalog(policy_profile, "policy-picker")
             except Exception as exc: policy_error = str(exc)
-    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, policy_profile=policy_profile, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
+    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
 
 
 def parse_zones(text: str) -> dict[str, str]:
@@ -1331,6 +1344,37 @@ def build_fingerprint(profile, include_flows: bool = True) -> str:
     return hashlib.sha256(json.dumps(state, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def remove_run_artifacts(run) -> None:
+    runs_root = RUNS.resolve()
+    run_path = Path(run["run_dir"]).resolve()
+    try:
+        run_path.relative_to(runs_root)
+    except ValueError as exc:
+        raise RuntimeError(f"Refused to delete run outside runs root: {run_path}") from exc
+    if run_path == runs_root:
+        raise RuntimeError("Refused to delete runs root")
+    if run_path.exists():
+        if not run_path.is_dir():
+            raise RuntimeError(f"Run artifact path is not a directory: {run_path}")
+        shutil.rmtree(run_path)
+
+
+def prune_successful_run_history(profile_id: int, keep: int = 5) -> int:
+    with db() as conn:
+        old_runs = conn.execute(
+            "SELECT * FROM runs WHERE profile_id=? AND mode!='prepared' AND status='complete' "
+            "ORDER BY id DESC LIMIT -1 OFFSET ?",
+            (profile_id, keep),
+        ).fetchall()
+    removed = 0
+    for old_run in old_runs:
+        remove_run_artifacts(old_run)
+        with db() as conn:
+            conn.execute("DELETE FROM runs WHERE id=? AND status='complete'", (old_run["id"],))
+        removed += 1
+    return removed
+
+
 def execute_run(profile, mode: str, disabled_override: bool | None = None, prepared=None) -> int:
     push = mode == "push"
     run_dir = RUNS / (datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{profile['id']}-{secrets.token_hex(3)}")
@@ -1371,6 +1415,13 @@ def execute_run(profile, mode: str, disabled_override: bool | None = None, prepa
             "prepared_at": int(time.time()),
         }))
         with db() as conn: conn.execute("UPDATE runs SET status='complete',finished_at=?,rule_count=?,output=? WHERE id=?", (now(), rules, output, run_id))
+        if mode != "prepared":
+            try:
+                removed = prune_successful_run_history(profile["id"])
+                if removed:
+                    audit("policy-run-retention", f"profile={profile['name']} removed={removed} kept=5")
+            except Exception:
+                app.logger.exception("policy-run retention cleanup failed for profile %s", profile["id"])
         audit("policy-prepared" if mode == "prepared" else "candidate-written" if push else "policy-preview", f"profile={profile['name']} run={run_id} rules={rules} reused={bool(prepared)} disabled={disabled_override if push else 'profile-default'}")
         return run_id
     except Exception as exc:
@@ -1483,7 +1534,7 @@ def run_delete(run_id):
         return "Not found", 404
     if run["status"] == "running":
         flash("Een actieve policy-run kan niet worden verwijderd.", "error")
-        return redirect(url_for("index") + "#runs")
+        return redirect(url_for("index", run_profile=run["profile_id"]) + "#runs")
 
     runs_root = RUNS.resolve()
     run_path = Path(run["run_dir"]).resolve()
@@ -1492,20 +1543,20 @@ def run_delete(run_id):
     except ValueError:
         app.logger.error("Refused to delete run outside runs root: %s", run_path)
         flash("Run niet verwijderd: ongeldig artifactpad.", "error")
-        return redirect(url_for("index") + "#runs")
+        return redirect(url_for("index", run_profile=run["profile_id"]) + "#runs")
     if run_path == runs_root:
         flash("Run niet verwijderd: ongeldig artifactpad.", "error")
-        return redirect(url_for("index") + "#runs")
+        return redirect(url_for("index", run_profile=run["profile_id"]) + "#runs")
     if run_path.exists():
         if not run_path.is_dir():
             flash("Run niet verwijderd: artifactpad is geen map.", "error")
-            return redirect(url_for("index") + "#runs")
+            return redirect(url_for("index", run_profile=run["profile_id"]) + "#runs")
         shutil.rmtree(run_path)
     with db() as conn:
         conn.execute("DELETE FROM runs WHERE id=?", (run_id,))
     audit("policy-run-deleted", f"run={run_id} profile={run['profile_name']}")
     flash(f"Policy-run #{run_id} en bijhorende artifacts verwijderd.", "success")
-    return redirect(url_for("index") + "#runs")
+    return redirect(url_for("index", run_profile=run["profile_id"]) + "#runs")
 
 
 @app.get("/runs/<int:run_id>/<kind>")
