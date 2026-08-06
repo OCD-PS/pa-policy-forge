@@ -11,10 +11,14 @@ import secrets
 import shutil
 import socketserver
 import sqlite3
+import ssl
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from functools import wraps
 
@@ -59,6 +63,12 @@ SCM_POLICY_TYPES = {
     "sdwan": ("network", "sdwan-rules", "SD-WAN"),
 }
 SCM_UNAVAILABLE_POLICY_TYPES = {"tunnel-inspection", "dos", "sdwan"}
+PANOS_POLICY_NODES = {
+    "security": "security", "nat": "nat", "qos": "qos", "pbf": "pbf",
+    "decryption": "decryption", "application-override": "application-override",
+    "authentication": "authentication", "tunnel-inspection": "tunnel-inspect",
+    "dos": "dos", "sdwan": "sdwan",
+}
 
 SCM_OBJECT_TYPES = {
     "addresses": {"label": "Addresses", "creatable": True},
@@ -293,33 +303,155 @@ def normalize_scm_policy(rule: dict) -> dict:
     return normalized
 
 
+def normalize_policy(rule: dict, policy_kind: str) -> dict:
+    """Expose one stable UI model while retaining the complete target payload."""
+    if policy_kind == "security":
+        normalized = normalize_scm_policy(rule)
+    else:
+        normalized = {
+            "id": str(rule.get("id", "")), "name": str(rule.get("name", "")),
+            "action": str(rule.get("action", "") or ""), "disabled": bool(rule.get("disabled", False)),
+            "description": str(rule.get("description", "") or ""),
+            "log_setting": str(rule.get("log_setting", "") or ""),
+            "profile_group": "", "source_user": list(rule.get("source_user", []) or ["any"]),
+            "destination_user": list(rule.get("destination_user", []) or ["any"]),
+            "source_hip": list(rule.get("source_hip", []) or ["any"]),
+            "destination_hip": list(rule.get("destination_hip", []) or ["any"]),
+            "category": list(rule.get("category", []) or ["any"]),
+            "negate_source": bool(rule.get("negate_source", False)),
+            "negate_destination": bool(rule.get("negate_destination", False)),
+            "schedule": str(rule.get("schedule", "") or ""), "log_start": rule.get("log_start"),
+            "log_end": rule.get("log_end"), "rule_type": str(rule.get("rule_type", "") or ""),
+        }
+        for field in POLICY_LIST_FIELDS:
+            value = rule.get(field, []) or []
+            normalized[field] = [str(item) for item in (value if isinstance(value, list) else [value])]
+    normalized["_raw"] = rule
+    normalized["_policy_kind"] = policy_kind
+    return normalized
+
+
+def xml_value(node: ET.Element):
+    children = list(node)
+    if not children:
+        return node.text or ""
+    if all(child.tag == "member" for child in children):
+        return [child.text or "" for child in children]
+    result = {}
+    for child in children:
+        value = xml_value(child)
+        if child.tag in result:
+            result[child.tag] = result[child.tag] if isinstance(result[child.tag], list) else [result[child.tag]]
+            result[child.tag].append(value)
+        else:
+            result[child.tag] = value
+    return result
+
+
+def xml_entry_to_policy(entry: ET.Element, policy_kind: str) -> dict:
+    raw = {child.tag.replace("-", "_"): xml_value(child) for child in entry}
+    raw.update({"id": entry.attrib.get("uuid") or entry.attrib.get("name", ""), "name": entry.attrib.get("name", "")})
+    for key in ("disabled", "negate_source", "negate_destination", "log_start", "log_end"):
+        if key in raw: raw[key] = str(raw[key]).lower() == "yes"
+    normalized = normalize_policy(raw, policy_kind)
+    normalized["_xml"] = ET.tostring(entry, encoding="unicode")
+    return normalized
+
+
+def panos_profile_context(profile):
+    settings = json.loads(profile["settings_json"] or "{}")
+    secret = json.loads(fernet.decrypt(profile["secret_blob"]).decode()) if profile["secret_blob"] else {}
+    endpoint = settings.get("endpoint", "").rstrip("/")
+    if not endpoint: raise ValueError("PAN-OS/Panorama endpoint ontbreekt")
+    ctx = ssl._create_unverified_context()
+    key_root = policy_api.require_success(policy_api.api_get(endpoint, {"type": "keygen", "user": secret.get("username", ""), "password": secret.get("password", "")}, ctx), "keygen")
+    key = key_root.findtext(".//key")
+    if not key: raise RuntimeError("API key generation gaf geen sleutel terug")
+    return settings, endpoint, key, ctx
+
+
+def panos_api_post(endpoint: str, params: dict, ctx: ssl.SSLContext) -> str:
+    request_body = urllib.parse.urlencode(params).encode()
+    api_request = urllib.request.Request(endpoint.rstrip("/") + "/api/", data=request_body, headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+    with urllib.request.urlopen(api_request, context=ctx, timeout=120) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def panos_policy_xpath(profile, policy_kind: str) -> str:
+    settings = json.loads(profile["settings_json"] or "{}")
+    node = PANOS_POLICY_NODES[policy_kind]
+    device = policy_api.xpath_literal("localhost.localdomain")
+    if profile["target_type"] == "panorama":
+        group = policy_api.xpath_literal(settings.get("device_group", ""))
+        position = settings.get("rulebase", "pre")
+        return f"/config/devices/entry[@name={device}]/device-group/entry[@name={group}]/{position}-rulebase/{node}/rules"
+    vsys = policy_api.xpath_literal(settings.get("vsys", "vsys1"))
+    return f"/config/devices/entry[@name={device}]/vsys/entry[@name={vsys}]/rulebase/{node}/rules"
+
+
+def fetch_panos_policies(profile, policy_kind: str) -> list[dict]:
+    _, endpoint, key, ctx = panos_profile_context(profile)
+    root = policy_api.require_success(policy_api.api_get(endpoint, {"type": "config", "action": "get", "xpath": panos_policy_xpath(profile, policy_kind), "key": key}, ctx), f"fetch {policy_kind} rules")
+    return [xml_entry_to_policy(entry, policy_kind) for entry in root.findall(".//entry")]
+
+
 def fetch_security_policies(profile) -> list[dict]:
-    if profile["target_type"] != "scm":
-        raise ValueError("Policybeheer is in deze eerste testversie beschikbaar voor SCM; Panorama en standalone volgen via dezelfde interface.")
+    if profile["target_type"] != "scm": return fetch_panos_policies(profile, "security")
     scm, token, endpoint, container = scm_client(profile)
-    return [normalize_scm_policy(rule) for rule in policy_api.scm_fetch_rules(endpoint, token, container, scm.scm_rulebase)]
+    return [normalize_policy(rule, "security") for rule in policy_api.scm_fetch_rules(endpoint, token, container, scm.scm_rulebase)]
 
 
 def fetch_scm_policy_type(profile, policy_kind: str) -> list[dict]:
     if policy_kind not in SCM_POLICY_TYPES: raise ValueError("Onbekend policytype")
-    if profile["target_type"] == "scm" and policy_kind in SCM_UNAVAILABLE_POLICY_TYPES: return []
+    if profile["target_type"] != "scm": return fetch_panos_policies(profile, policy_kind)
+    if policy_kind in SCM_UNAVAILABLE_POLICY_TYPES: return []
     if policy_kind == "security": return fetch_security_policies(profile)
-    if profile["target_type"] != "scm": raise ValueError("Deze policycategorie wordt eerst via SCM gevalideerd.")
     service, endpoint_name, _ = SCM_POLICY_TYPES[policy_kind]
     scm, token, _, container = scm_client(profile)
     endpoint = policy_api.scm_api_root(scm.scm_api_base) + f"/config/{service}/v1/{endpoint_name}"
-    return policy_api.scm_fetch_all(endpoint, token, {**container, "position": scm.scm_rulebase})
+    return [normalize_policy(rule, policy_kind) for rule in policy_api.scm_fetch_all(endpoint, token, {**container, "position": scm.scm_rulebase})]
 
 
 def fetch_scm_objects(profile, object_type: str) -> list[dict]:
     if object_type not in SCM_OBJECT_TYPES:
         raise ValueError("Onbekend objecttype")
-    if profile["target_type"] != "scm":
-        raise ValueError("Objectbeheer wordt eerst veilig getest met SCM; Panorama en standalone volgen via dezelfde interface.")
+    if profile["target_type"] != "scm": return fetch_panos_objects(profile, object_type)
     scm, token, _, _ = scm_client(profile)
     root = policy_api.scm_api_root(scm.scm_api_base) + "/config/objects/v1"
     container = policy_api.scm_container(folder=scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
     return policy_api.scm_fetch_all(f"{root}/{object_type}", token, container)
+
+
+PANOS_OBJECT_NODES = {"addresses": "address", "address-groups": "address-group", "applications": "application", "application-groups": "application-group", "application-filters": "application-filter", "services": "service", "service-groups": "service-group", "tags": "tag"}
+
+
+def panos_object_bases(profile, object_type: str) -> list[str]:
+    settings = json.loads(profile["settings_json"] or "{}")
+    if object_type == "applications": return ["/config/predefined"]
+    device = policy_api.xpath_literal("localhost.localdomain")
+    if profile["target_type"] == "panorama":
+        group = policy_api.xpath_literal(settings.get("device_group", ""))
+        return ["/config/shared", f"/config/devices/entry[@name={device}]/device-group/entry[@name={group}]"]
+    vsys = policy_api.xpath_literal(settings.get("vsys", "vsys1"))
+    return [f"/config/devices/entry[@name={device}]/vsys/entry[@name={vsys}]"]
+
+
+def xml_object_to_dict(entry: ET.Element, object_type: str, base: str) -> dict:
+    item = {"id": entry.attrib.get("uuid") or entry.attrib.get("name", ""), "name": entry.attrib.get("name", ""), "_xml": ET.tostring(entry, encoding="unicode"), "_scope_xpath": base}
+    children = {child.tag.replace("-", "_"): xml_value(child) for child in entry}
+    item.update(children)
+    if object_type == "address-groups" and isinstance(item.get("dynamic"), dict): item["dynamic"] = item["dynamic"].get("filter", "")
+    return item
+
+
+def fetch_panos_objects(profile, object_type: str) -> list[dict]:
+    _, endpoint, key, ctx = panos_profile_context(profile)
+    node = PANOS_OBJECT_NODES[object_type]
+    collected = []
+    for base in panos_object_bases(profile, object_type):
+        response = policy_api.require_success(policy_api.api_get(endpoint, {"type": "config", "action": "get", "xpath": f"{base}/{node}", "key": key}, ctx), f"fetch {object_type}")
+        collected.extend(xml_object_to_dict(entry, object_type, base) for entry in response.findall(".//entry"))
+    return collected
 
 
 def fetch_object_catalog(profile, object_type: str) -> list[dict]:
@@ -415,6 +547,45 @@ def object_fingerprint(value: dict) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def object_payload_xml(payload: dict) -> str:
+    entry = ET.Element("entry", {"name": payload["name"]})
+    for key, value in payload.items():
+        if key in {"name", "folder", "snippet", "device"} or value in (None, "", []): continue
+        tag = key.replace("_", "-")
+        node = ET.SubElement(entry, tag)
+        if isinstance(value, list):
+            for member in value: ET.SubElement(node, "member").text = str(member)
+        elif isinstance(value, dict):
+            for child_key, child_value in value.items():
+                child = ET.SubElement(node, child_key.replace("_", "-"))
+                if isinstance(child_value, dict):
+                    for detail_key, detail_value in child_value.items(): ET.SubElement(child, detail_key.replace("_", "-")).text = "yes" if detail_value is True else str(detail_value)
+                elif isinstance(child_value, list):
+                    for member in child_value: ET.SubElement(child, "member").text = str(member)
+                else: child.text = str(child_value)
+        else: node.text = str(value)
+    return ET.tostring(entry, encoding="unicode")
+
+
+def write_panos_object_draft(profile, draft: dict) -> None:
+    _, endpoint, key, ctx = panos_profile_context(profile)
+    object_type = draft["object_type"]; node = PANOS_OBJECT_NODES[object_type]; operation = draft["operation"]
+    if operation == "create":
+        base = "/config/shared" if profile["target_type"] == "panorama" else panos_object_bases(profile, object_type)[0]
+        params = {"type": "config", "action": "set", "xpath": f"{base}/{node}", "element": object_payload_xml(draft["payload"]), "key": key}
+        policy_api.require_success(panos_api_post(endpoint, params, ctx), f"create {object_type}")
+    elif operation == "update":
+        before = draft["before"]; base = before.get("_scope_xpath") or ("/config/shared" if profile["target_type"] == "panorama" else panos_object_bases(profile, object_type)[0])
+        xpath = f"{base}/{node}/entry[@name={policy_api.xpath_literal(before['name'])}]"
+        params = {"type": "config", "action": "edit", "xpath": xpath, "element": object_payload_xml(draft["payload"]), "key": key}
+        policy_api.require_success(panos_api_post(endpoint, params, ctx), f"update {object_type}")
+    else:
+        for wrapped in draft["objects"]:
+            item = wrapped["value"]; base = item.get("_scope_xpath") or ("/config/shared" if profile["target_type"] == "panorama" else panos_object_bases(profile, object_type)[0])
+            xpath = f"{base}/{node}/entry[@name={policy_api.xpath_literal(item['name'])}]"
+            policy_api.require_success(panos_api_post(endpoint, {"type": "config", "action": "delete", "xpath": xpath, "key": key}, ctx), f"delete {object_type}")
+
+
 def validate_object_payload(payload: dict, object_type: str, existing: list[dict], own_id: str = "") -> None:
     others = [item for item in existing if str(item.get("id", "")) != own_id]
     same_name = next((item for item in others if item.get("name") == payload["name"]), None)
@@ -457,6 +628,59 @@ def scm_policy_payload(policy: dict, container: dict) -> dict:
         if policy.get(field) is not None: payload[field] = policy[field]
     if policy.get("profile_group"): payload["profile_setting"] = {"group": split_values(policy["profile_group"])}
     return payload
+
+
+def target_policy_payload(policy: dict, container: dict, policy_kind: str) -> dict:
+    if policy_kind == "security": return scm_policy_payload(policy, container)
+    payload = json.loads(json.dumps(policy.get("_raw") or {}))
+    for internal in ("id", "_xml", "_raw", "_policy_kind"): payload.pop(internal, None)
+    payload["name"] = policy["name"]
+    for field in POLICY_LIST_FIELDS:
+        if field in policy and (field in payload or policy.get(field) not in ([], ["any"])):
+            payload[field] = policy[field]
+    for field in ("action", "disabled", "description", "log_setting", "schedule", "negate_source", "negate_destination", "log_start", "log_end"):
+        if field in policy and (field in payload or policy.get(field) not in (None, "")): payload[field] = policy[field]
+    payload.update(container)
+    return payload
+
+
+def update_xml_policy(policy: dict) -> str:
+    entry = ET.fromstring(policy["_xml"])
+    list_fields = set(POLICY_LIST_FIELDS)
+    for field in list_fields:
+        if field not in policy: continue
+        tag = field.replace("_", "-")
+        node = entry.find(f"./{tag}")
+        if node is None and policy[field] in ([], ["any"]): continue
+        if node is None: node = ET.SubElement(entry, tag)
+        node.clear()
+        for value in policy[field]: ET.SubElement(node, "member").text = str(value)
+    for field in ("action", "description", "log_setting", "schedule"):
+        if field not in policy: continue
+        tag = field.replace("_", "-")
+        node = entry.find(f"./{tag}")
+        if node is None and not policy[field]: continue
+        if node is None: node = ET.SubElement(entry, tag)
+        node.text = str(policy[field])
+    for field in ("disabled", "negate_source", "negate_destination", "log_start", "log_end"):
+        if field not in policy or policy[field] is None: continue
+        tag = field.replace("_", "-")
+        node = entry.find(f"./{tag}")
+        if node is None: node = ET.SubElement(entry, tag)
+        node.text = "yes" if policy[field] else "no"
+    return ET.tostring(entry, encoding="unicode")
+
+
+def write_target_policy(profile, policy_kind: str, policy: dict) -> None:
+    if profile["target_type"] == "scm":
+        scm, token, _, container = scm_client(profile)
+        service, endpoint_name, _ = SCM_POLICY_TYPES[policy_kind]
+        endpoint = policy_api.scm_api_root(scm.scm_api_base) + f"/config/{service}/v1/{endpoint_name}"
+        policy_api.scm_http_request("PUT", f"{endpoint}/{policy['id']}", token, payload=target_policy_payload(policy, container, policy_kind), params={"position": scm.scm_rulebase})
+        return
+    _, endpoint, key, ctx = panos_profile_context(profile)
+    xpath = f"{panos_policy_xpath(profile, policy_kind)}/entry[@name={policy_api.xpath_literal(policy['name'])}]"
+    policy_api.require_success(panos_api_post(endpoint, {"type": "config", "action": "edit", "xpath": xpath, "element": update_xml_policy(policy), "key": key}, ctx), f"edit {policy_kind} rule {policy['name']}")
 
 
 @app.get("/")
@@ -653,9 +877,11 @@ def policy_bulk_preview(profile_id):
     with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
     if not profile: return "Not found", 404
     selected_ids = set(request.form.getlist("policy_id"))
+    policy_kind = request.form.get("policy_kind", "security")
+    if policy_kind not in SCM_POLICY_TYPES or (profile["target_type"] == "scm" and policy_kind in SCM_UNAVAILABLE_POLICY_TYPES): return "Not found", 404
     if not selected_ids:
-        flash("Selecteer minstens één security policy.", "error")
-        return redirect(url_for("index", policy_profile=profile_id) + "#policy-management")
+        flash("Selecteer minstens één policy.", "error")
+        return redirect(url_for("index", policy_profile=profile_id, policy_kind=policy_kind) + "#policy-management")
     operations = {}
     for field in POLICY_LIST_FIELDS:
         operations[field] = {"add": split_values(request.form.get(f"{field}_add", "")), "remove": split_values(request.form.get(f"{field}_remove", ""))}
@@ -665,7 +891,7 @@ def policy_bulk_preview(profile_id):
     disabled = request.form.get("disabled", "")
     operations["disabled"] = disabled == "true" if disabled in {"true", "false"} else None
     try:
-        current = fetch_security_policies(profile)
+        current = fetch_scm_policy_type(profile, policy_kind)
         selected = [policy for policy in current if policy["id"] in selected_ids]
         if len(selected) != len(selected_ids): raise ValueError("Niet alle geselecteerde policies bestaan nog. Vernieuw de rulebase.")
         changes = []
@@ -675,13 +901,13 @@ def policy_bulk_preview(profile_id):
                 changes.append({"before": policy, "after": updated, "fingerprint": policy_fingerprint(policy)})
         if not changes: raise ValueError("De gekozen bulkbewerking veroorzaakt geen wijzigingen.")
         draft_id = secrets.token_urlsafe(18)
-        draft = {"profile_id": profile_id, "created_at": now(), "changes": changes}
+        draft = {"profile_id": profile_id, "policy_kind": policy_kind, "created_at": now(), "changes": changes}
         path = POLICY_DRAFTS / f"{draft_id}.json"; path.write_text(json.dumps(draft)); path.chmod(0o600)
         audit("policy-bulk-preview", f"profile={profile['name']} rules={len(changes)}")
-        return render_template("policy_preview.html", profile=profile, changes=changes, draft_id=draft_id)
+        return render_template("policy_preview.html", profile=profile, changes=changes, draft_id=draft_id, policy_kind=policy_kind, policy_label=SCM_POLICY_TYPES[policy_kind][2])
     except Exception as exc:
         flash(f"Bulk-preview mislukt: {exc}", "error")
-        return redirect(url_for("index", policy_profile=profile_id) + "#policy-management")
+        return redirect(url_for("index", policy_profile=profile_id, policy_kind=policy_kind) + "#policy-management")
 
 
 @app.post("/objects/<int:profile_id>/<object_type>/preview")
@@ -691,8 +917,10 @@ def object_preview(profile_id, object_type):
     with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
     if not profile: return "Not found", 404
     try:
-        scm, _, _, _ = scm_client(profile)
-        container = policy_api.scm_container(folder=scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
+        container = {}
+        if profile["target_type"] == "scm":
+            scm, _, _, _ = scm_client(profile)
+            container = policy_api.scm_container(folder=scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
         payload = scm_object_payload(object_type, request.form, container)
         existing = fetch_scm_objects(profile, object_type)
         object_id = request.form.get("object_id", "").strip()
@@ -700,7 +928,7 @@ def object_preview(profile_id, object_type):
         if object_id and not before: raise ValueError("Het object bestaat niet meer. Vernieuw de lijst.")
         validate_object_payload(payload, object_type, existing, object_id)
         draft_id = secrets.token_urlsafe(18)
-        draft = {"profile_id": profile_id, "created_at": now(), "object_type": object_type, "operation": "update" if before else "create", "payload": payload, "before": before, "fingerprint": object_fingerprint(before) if before else ""}
+        draft = {"profile_id": profile_id, "created_at": now(), "object_type": object_type, "operation": "update" if before else "create", "payload": payload, "before": before, "fingerprint": object_fingerprint(before) if before else "", "scope_xpath": before.get("_scope_xpath", "") if before else ""}
         path = OBJECT_DRAFTS / f"{draft_id}.json"; path.write_text(json.dumps(draft)); path.chmod(0o600)
         audit("object-preview", f"profile={profile['name']} operation={draft['operation']} type={object_type} name={payload['name']}")
         return render_template("object_preview.html", profile=profile, object_type=object_type, object_label=SCM_OBJECT_TYPES[object_type]["label"], payload=payload, before=before, operation=draft["operation"], draft_id=draft_id)
@@ -741,31 +969,34 @@ def object_push(draft_id):
     with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (draft["profile_id"],)).fetchone()
     if not profile: return "Not found", 404
     try:
-        scm, token, _, _ = scm_client(profile)
         object_type = draft["object_type"]
-        root = policy_api.scm_api_root(scm.scm_api_base) + "/config/objects/v1"
-        container = policy_api.scm_container(folder=scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
         current = fetch_scm_objects(profile, object_type)
         operation = draft.get("operation", "create")
         if operation == "create":
             validate_object_payload(draft["payload"], object_type, current)
-            policy_api.scm_http_request("POST", f"{root}/{object_type}", token, payload=draft["payload"])
         elif operation == "update":
             before = draft["before"]; live = next((item for item in current if str(item.get("id", "")) == str(before.get("id", ""))), None)
             if not live or object_fingerprint(live) != draft["fingerprint"]: raise RuntimeError(f"Object {before['name']} is intussen gewijzigd; Push gestopt.")
             validate_object_payload(draft["payload"], object_type, current, str(before["id"]))
-            policy_api.scm_http_request("PUT", f"{root}/{object_type}/{before['id']}", token, payload=draft["payload"])
         elif operation == "delete":
             for entry in draft["objects"]:
                 before = entry["value"]; live = next((item for item in current if str(item.get("id", "")) == str(before.get("id", ""))), None)
                 if not live or object_fingerprint(live) != entry["fingerprint"]: raise RuntimeError(f"Object {before['name']} is intussen gewijzigd; Delete gestopt.")
-            for entry in draft["objects"]:
-                policy_api.scm_http_request("DELETE", f"{root}/{object_type}/{entry['value']['id']}", token, params=container)
         else: raise RuntimeError("Onbekende objectbewerking")
+        if profile["target_type"] == "scm":
+            scm, token, _, _ = scm_client(profile)
+            root = policy_api.scm_api_root(scm.scm_api_base) + "/config/objects/v1"
+            container = policy_api.scm_container(folder=scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
+            if operation == "create": policy_api.scm_http_request("POST", f"{root}/{object_type}", token, payload=draft["payload"])
+            elif operation == "update": policy_api.scm_http_request("PUT", f"{root}/{object_type}/{draft['before']['id']}", token, payload=draft["payload"])
+            else:
+                for entry in draft["objects"]: policy_api.scm_http_request("DELETE", f"{root}/{object_type}/{entry['value']['id']}", token, params=container)
+        else:
+            write_panos_object_draft(profile, draft)
         path.unlink()
         count = len(draft.get("objects", [])) or 1
         audit("object-candidate", f"profile={profile['name']} operation={operation} type={object_type} count={count}")
-        flash(f"Objectbewerking ({operation}) geschreven naar SCM candidate.", "success")
+        flash(f"Objectbewerking ({operation}) geschreven naar {profile['target_type'].upper()} candidate.", "success")
     except Exception as exc:
         flash(f"Object-Push gestopt: {exc}", "error")
     return redirect(url_for("index", policy_profile=profile["id"], policy_view="objects", object_type=draft["object_type"]) + "#policy-management")
@@ -781,21 +1012,21 @@ def policy_bulk_push(draft_id):
     with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (draft["profile_id"],)).fetchone()
     if not profile: return "Not found", 404
     try:
-        current = {policy["id"]: policy for policy in fetch_security_policies(profile)}
+        policy_kind = draft.get("policy_kind", "security")
+        current = {policy["id"]: policy for policy in fetch_scm_policy_type(profile, policy_kind)}
         for change in draft["changes"]:
             live = current.get(change["before"]["id"])
             if not live or policy_fingerprint(live) != change["fingerprint"]:
                 raise RuntimeError(f"Policy {change['before']['name']} is intussen gewijzigd; Push gestopt.")
-        scm, token, endpoint, container = scm_client(profile)
         for change in draft["changes"]:
-            policy_api.scm_http_request("PUT", f"{endpoint}/{change['after']['id']}", token, payload=scm_policy_payload(change["after"], container), params={"position": scm.scm_rulebase})
+            write_target_policy(profile, policy_kind, change["after"])
         path.unlink()
         audit("policy-bulk-candidate", f"profile={profile['name']} rules={len(draft['changes'])}")
-        flash(f"{len(draft['changes'])} security policies bijgewerkt in SCM candidate.", "success")
-        return redirect(url_for("index", policy_profile=profile["id"]) + "#policy-management")
+        flash(f"{len(draft['changes'])} {SCM_POLICY_TYPES[policy_kind][2]} policies bijgewerkt in {profile['target_type'].upper()} candidate.", "success")
+        return redirect(url_for("index", policy_profile=profile["id"], policy_kind=policy_kind) + "#policy-management")
     except Exception as exc:
         flash(f"Bulk-Push gestopt: {exc}", "error")
-        return redirect(url_for("index", policy_profile=profile["id"]) + "#policy-management")
+        return redirect(url_for("index", policy_profile=profile["id"], policy_kind=draft.get("policy_kind", "security")) + "#policy-management")
 
 
 def build_fingerprint(profile, include_flows: bool = True) -> str:

@@ -342,7 +342,7 @@
     }
     if (dialog && opener) opener.addEventListener("click", function () {
       var count = all("[data-policy-select]:checked").length;
-      if (!count) { window.alert("Selecteer minstens één security policy."); return; }
+      if (!count) { window.alert("Selecteer minstens één policy."); return; }
       dialog.querySelector("[data-policy-selected-count]").textContent = count;
       prepareBulkFields();
       dialog.showModal();

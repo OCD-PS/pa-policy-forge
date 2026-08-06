@@ -1,9 +1,15 @@
 import unittest
 
-from app.policy_bulk import apply_bulk_operations
+from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations
 
 
 class PolicyBulkTests(unittest.TestCase):
+    def test_empty_operations_do_not_invent_fields_for_nat(self):
+        policy = {"id": "n1", "name": "NAT-1", "from": ["Trust"], "source_translation": {"dynamic": "interface-address"}}
+        operations = {field: {"add": [], "remove": []} for field in POLICY_LIST_FIELDS}
+        changed = apply_bulk_operations(policy, operations)
+        self.assertEqual(changed, policy)
+
     def test_remove_preserves_other_values_and_fields(self):
         policy = {
             "from": ["Trust", "DMZ"], "to": ["Internet"], "source": ["any"], "destination": ["any"],

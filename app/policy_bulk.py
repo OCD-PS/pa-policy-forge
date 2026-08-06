@@ -10,9 +10,12 @@ POLICY_LIST_FIELDS = (
 def apply_bulk_operations(policy: dict, operations: dict) -> dict:
     changed = json.loads(json.dumps(policy))
     for field in POLICY_LIST_FIELDS:
+        operation = operations.get(field, {})
+        if not operation.get("remove") and not operation.get("add"):
+            continue
         current = list(changed.get(field, []))
-        remove = operations.get(field, {}).get("remove", [])
-        add = operations.get(field, {}).get("add", [])
+        remove = operation.get("remove", [])
+        add = operation.get("add", [])
         current = [value for value in current if value not in remove]
         for value in add:
             if value not in current:

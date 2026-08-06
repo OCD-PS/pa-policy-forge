@@ -6,9 +6,9 @@
 <link rel="stylesheet" href="{{url_for('static',filename='app.css')}}">
 </head>
 <body><main class="content" style="margin:auto">
-<div class="page-header"><div><p class="eyebrow">Policybeheer</p><h1>Bulk-preview · {{profile.name}}</h1></div>
-<div class="cluster"><a class="btn" href="{{url_for('index',policy_profile=profile.id)}}#policy-management">Annuleren</a>
-<form method="post" action="{{url_for('policy_bulk_push',draft_id=draft_id)}}" data-confirm="Deze wijzigingen naar SCM candidate schrijven?">
+<div class="page-header"><div><p class="eyebrow">{{policy_label}} · {{profile.target_type|upper}}</p><h1>Bulk-preview · {{profile.name}}</h1></div>
+<div class="cluster"><a class="btn" href="{{url_for('index',policy_profile=profile.id,policy_kind=policy_kind)}}#policy-management">Annuleren</a>
+<form method="post" action="{{url_for('policy_bulk_push',draft_id=draft_id)}}" data-confirm="Deze wijzigingen naar {{profile.target_type|upper}} candidate schrijven?">
 <input type="hidden" name="csrf" value="{{csrf_token()}}"><button class="btn btn-primary" type="submit">Push</button></form></div></div>
 <div class="table-wrap"><table><thead><tr><th>Policy</th><th>Veld</th><th>Voor</th><th>Na</th></tr></thead><tbody>
 {% for change in changes %}{% for field in change.before.keys() if change.before[field] != change.after[field] %}
