@@ -9,6 +9,7 @@
 <body>
 <div class="app-shell">
 <aside class="sidebar">
+<button class="sidebar-collapse" type="button" data-sidebar-collapse aria-label="Navigatie inklappen" title="Navigatie inklappen">‹</button>
 <a class="brand" href="/">
 <span class="brand-mark">PA</span>
 <span class="brand-copy">Policy Forge<small>Flow-driven policy</small>
@@ -122,26 +123,11 @@
 <form method="post" action="{{url_for('profile_save')}}" class="form-grid">
 <input type="hidden" name="csrf" value="{{csrf_token()}}">
 <input type="hidden" name="id" value="{{ep.id if ep else ''}}">
-<div class="field">
+<div class="field full">
 <label>Naam</label>
 <input name="name" value="{{ep.name if ep else ''}}" placeholder="Customer firewall" required>
 </div>
-<div class="field">
-<label>Actieve firewallserial</label>
-<input name="serial" value="{{ep.serial if ep else ''}}" placeholder="0070..." required>
-</div>
-<div class="field">
-<label>Passieve firewallserial (optioneel)</label>
-<input name="passive_serial" value="{{ep.passive_serial if ep else ''}}" placeholder="0070...">
-</div>
-<div class="field">
-<label>Actieve bron-IP (herkenning)</label>
-<input name="source_ip" value="{{ep.source_ip if ep else ''}}" placeholder="10.0.0.1">
-</div>
-<div class="field">
-<label>Passieve bron-IP (herkenning)</label>
-<input name="passive_source_ip" value="{{ep.passive_source_ip if ep else ''}}" placeholder="10.0.0.2">
-</div>
+<fieldset class="field full ha-settings"><legend>Firewallcluster en logherkenning</legend><div class="ha-columns"><div class="ha-node"><strong>Actieve firewall</strong><div class="field"><label>Serienummer</label><input name="serial" value="{{ep.serial if ep else ''}}" placeholder="0070..." required></div><div class="field"><label>Bron-IP herkenning</label><input name="source_ip" value="{{ep.source_ip if ep else ''}}" placeholder="10.0.0.1"></div></div><div class="ha-node"><strong>Passieve firewall</strong><div class="field"><label>Serienummer (optioneel)</label><input name="passive_serial" value="{{ep.passive_serial if ep else ''}}" placeholder="0070..."></div><div class="field"><label>Bron-IP herkenning</label><input name="passive_source_ip" value="{{ep.passive_source_ip if ep else ''}}" placeholder="10.0.0.2"></div></div></div></fieldset>
 <div class="field">
 <label>Target</label>
 <select name="target_type" data-target-select required>
@@ -407,7 +393,14 @@
 <div class="grid grid-2">{% for p in profiles %}<a class="card" href="{{url_for('index',policy_profile=p.id)}}#policy-management" style="text-decoration:none;color:inherit"><h2>{{p.name}}</h2></a>{% endfor %}</div>
 {% else %}
 <div class="page-header"><div><p class="eyebrow">{{policy_profile.target_type|upper}}</p><h1>{{policy_profile.name}}</h1></div><div class="cluster"><a class="btn" href="{{url_for('index')}}#policy-management">Terug naar devices</a></div></div>
-{% if policy_error %}<div class="callout"><strong>Rulebase niet geladen</strong><br>{{policy_error}}</div>{% elif policies %}
+<nav class="workspace-nav"><a class="{{'active' if policy_view=='policies' else ''}}" href="{{url_for('index',policy_profile=policy_profile.id,policy_view='policies')}}#policy-management">Policies</a><a class="{{'active' if policy_view=='objects' else ''}}" href="{{url_for('index',policy_profile=policy_profile.id,policy_view='objects')}}#policy-management">Objects</a></nav>
+{% if policy_view=='policies' %}<nav class="workspace-subnav">{% for kind,label in [('security','Security'),('nat','NAT'),('qos','QoS'),('pbf','Policy Based Forwarding'),('decryption','Decryption'),('tunnel-inspection','Tunnel Inspection'),('application-override','Application Override'),('authentication','Authentication'),('dos','DoS Protection'),('sdwan','SD-WAN')] %}<a class="{{'active' if policy_kind==kind else ''}}" href="{{url_for('index',policy_profile=policy_profile.id,policy_view='policies',policy_kind=kind)}}#policy-management">{{label}}</a>{% endfor %}</nav>{% else %}<nav class="workspace-subnav object-subnav">{% for slug,meta in object_types.items() %}<a class="{{'active' if object_type==slug else ''}}" href="{{url_for('index',policy_profile=policy_profile.id,policy_view='objects',object_type=slug)}}#policy-management">{{meta.label}}</a>{% endfor %}</nav>{% endif %}
+{% if policy_error %}<div class="callout"><strong>Configuratie niet geladen</strong><br>{{policy_error}}</div>
+{% elif policy_view=='objects' %}
+<div class="objects-layout"><div class="card object-list"><div class="card-header"><div><h2>{{object_types[object_type].label}}</h2><p class="muted">{{policy_objects|length}} objecten in de geconfigureerde scope</p></div></div><div class="policy-filterbar"><input class="search" data-table-filter="#object-table" placeholder="Filter objecten..."></div><div class="table-wrap"><table id="object-table"><thead><tr><th>Naam</th><th>Waarde / members</th><th>Description</th></tr></thead><tbody>{% for item in policy_objects %}<tr><td>{{item.name}}</td><td class="mono">{{item.ip_netmask or item.ip_range or item.ip_wildcard or item.fqdn or item.static|default([])|join(', ') or item.members|default([])|join(', ') or item.protocol|default({})}}</td><td>{{item.description or ''}}</td></tr>{% else %}<tr><td colspan="3">Geen objecten gevonden.</td></tr>{% endfor %}</tbody></table></div></div>
+{% if object_types[object_type].creatable %}<div class="card object-create"><h2>Nieuw {{object_types[object_type].label}}</h2><form method="post" action="{{url_for('object_preview',profile_id=policy_profile.id,object_type=object_type)}}" class="stack"><input type="hidden" name="csrf" value="{{csrf_token()}}"><div class="field"><label>Naam</label><input name="name" required></div>{% if object_type=='addresses' %}<div class="field"><label>Type</label><select name="value_type"><option value="ip_netmask">IP Netmask</option><option value="ip_range">IP Range</option><option value="ip_wildcard">IP Wildcard</option><option value="fqdn">FQDN</option></select></div><div class="field"><label>Waarde</label><input name="value" required></div>{% elif object_type in ['address-groups','application-groups','service-groups'] %}<div class="field"><label>Members</label><textarea name="members" placeholder="Eén per regel of komma-gescheiden" required></textarea></div>{% elif object_type=='services' %}<div class="field"><label>Protocol</label><select name="protocol"><option value="tcp">TCP</option><option value="udp">UDP</option></select></div><div class="field"><label>Poort</label><input name="port" placeholder="443 of 8000-8010" required></div>{% elif object_type=='tags' %}<div class="field"><label>Kleur (optioneel)</label><input name="color" placeholder="Red"></div>{% endif %}<div class="field"><label>Description</label><textarea name="description"></textarea></div><button class="btn btn-primary" type="submit">Preview object</button></form></div>{% endif %}</div>
+{% elif policy_kind!='security' %}<div class="empty-state"><strong>{{policy_kind|replace('-',' ')|title}}</strong>Deze policycategorie is zichtbaar in de nieuwe workspace en wordt na de SCM Security-test aangesloten.</div>
+{% elif policies %}
 <div class="policy-filterbar"><input class="search" data-policy-expression placeholder="Bijv. (from/member eq 'Trust') and ((application/member eq 'ssl') or (service/member eq 'HTTPS'))"><span class="filter-status" data-policy-filter-status></span></div>
 <form method="post" action="{{url_for('policy_bulk_preview',profile_id=policy_profile.id)}}" data-policy-bulk-form>
 <input type="hidden" name="csrf" value="{{csrf_token()}}">
@@ -417,7 +410,7 @@
 </tbody></table></div>
 <dialog class="bulk-dialog" data-policy-bulk-dialog><div class="push-dialog-brand">OCD</div><div class="bulk-dialog-body"><div class="card-header"><div><h2>Security Policy Bulk Edit</h2><p class="muted"><span data-policy-selected-count>0</span> policies geselecteerd</p></div></div>
 <div class="policy-tabs" role="tablist">{% for tab,label in [('general','General'),('source','Source'),('destination','Destination'),('application','Application'),('service','Service/URL Category'),('actions','Actions')] %}<button type="button" role="tab" data-policy-tab="{{tab}}" class="{{'is-active' if loop.first else ''}}">{{label}}</button>{% endfor %}</div>
-{% macro value_editor(field,label) %}<div class="bulk-field" data-bulk-field="{{field}}"><strong>{{label}}</strong><div class="policy-value-editor" data-bulk-values></div><div class="policy-value-entry"><input name="{{field}}_add" placeholder="Waarde toevoegen" autocomplete="off" data-bulk-add><button class="btn" type="button" data-bulk-add-button>+</button></div><input type="hidden" name="{{field}}_remove" data-bulk-remove></div>{% endmacro %}
+{% macro value_editor(field,label) %}<div class="bulk-field" data-bulk-field="{{field}}"><strong>{{label}}</strong><div class="policy-value-editor" data-bulk-values></div><div class="policy-value-entry"><input placeholder="Waarde toevoegen" autocomplete="off" data-bulk-entry><button class="btn" type="button" data-bulk-add-button>+</button></div><input type="hidden" name="{{field}}_add" data-bulk-add><input type="hidden" name="{{field}}_remove" data-bulk-remove></div>{% endmacro %}
 <div class="policy-tab-panel is-active" data-policy-panel="general"><div class="policy-form-row"><label>Description toevoegen</label><textarea name="description_append" rows="3" placeholder="Leeg laten om descriptions te behouden"></textarea><small>Ingevulde tekst wordt achter de bestaande description gezet.</small></div>{{value_editor('tag','Tags')}}</div>
 <div class="policy-tab-panel" data-policy-panel="source"><div class="bulk-grid">{{value_editor('from','Source Zone')}}{{value_editor('source','Source Address')}}{{value_editor('source_user','Source User')}}{{value_editor('source_hip','Source HIP Profile')}}</div></div>
 <div class="policy-tab-panel" data-policy-panel="destination"><div class="bulk-grid">{{value_editor('to','Destination Zone')}}{{value_editor('destination','Destination Address')}}{{value_editor('destination_user','Destination User')}}{{value_editor('destination_hip','Destination HIP Profile')}}</div></div>

@@ -31,6 +31,7 @@ FLOW_DB = DATA / "flows.sqlite3"
 RUNS = DATA / "runs"
 SECRETS = DATA / "secrets"
 POLICY_DRAFTS = DATA / "policy-drafts"
+OBJECT_DRAFTS = DATA / "object-drafts"
 MAX_BYTES = int(float(os.getenv("PPF_MAX_GIB", "50")) * 1024**3)
 PREPARE_INTERVAL = max(300, int(os.getenv("PPF_PREPARE_INTERVAL", "1800")))
 PREPARE_INITIAL_DELAY = max(30, int(os.getenv("PPF_PREPARE_INITIAL_DELAY", "60")))
@@ -41,6 +42,18 @@ DATA.mkdir(parents=True, exist_ok=True)
 RUNS.mkdir(parents=True, exist_ok=True)
 SECRETS.mkdir(parents=True, exist_ok=True)
 POLICY_DRAFTS.mkdir(parents=True, exist_ok=True)
+OBJECT_DRAFTS.mkdir(parents=True, exist_ok=True)
+
+SCM_OBJECT_TYPES = {
+    "addresses": {"label": "Addresses", "creatable": True},
+    "address-groups": {"label": "Address Groups", "creatable": True},
+    "applications": {"label": "Applications", "creatable": False},
+    "application-groups": {"label": "Application Groups", "creatable": True},
+    "application-filters": {"label": "Application Filters", "creatable": False},
+    "services": {"label": "Services", "creatable": True},
+    "service-groups": {"label": "Service Groups", "creatable": True},
+    "tags": {"label": "Tags", "creatable": True},
+}
 
 
 def secret_file(name: str, generator) -> bytes:
@@ -269,6 +282,70 @@ def fetch_security_policies(profile) -> list[dict]:
     return [normalize_scm_policy(rule) for rule in policy_api.scm_fetch_rules(endpoint, token, container, scm.scm_rulebase)]
 
 
+def fetch_scm_objects(profile, object_type: str) -> list[dict]:
+    if object_type not in SCM_OBJECT_TYPES:
+        raise ValueError("Onbekend objecttype")
+    if profile["target_type"] != "scm":
+        raise ValueError("Objectbeheer wordt eerst veilig getest met SCM; Panorama en standalone volgen via dezelfde interface.")
+    scm, token, _, _ = scm_client(profile)
+    root = policy_api.scm_api_root(scm.scm_api_base) + "/config/objects/v1"
+    container = policy_api.scm_container(folder=scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
+    return policy_api.scm_fetch_all(f"{root}/{object_type}", token, container)
+
+
+def scm_object_payload(object_type: str, form, container: dict) -> dict:
+    name = form.get("name", "").strip()
+    if not name:
+        raise ValueError("Naam is verplicht")
+    payload = {"name": name, **container}
+    description = form.get("description", "").strip()
+    if description:
+        payload["description"] = description
+    if object_type == "addresses":
+        value_type = form.get("value_type", "ip_netmask")
+        if value_type not in {"ip_netmask", "ip_range", "ip_wildcard", "fqdn"}:
+            raise ValueError("Ongeldig adrestype")
+        value = form.get("value", "").strip()
+        if not value:
+            raise ValueError("Adreswaarde is verplicht")
+        payload[value_type] = value
+    elif object_type in {"address-groups", "application-groups", "service-groups"}:
+        members = split_values(form.get("members", ""))
+        if not members:
+            raise ValueError("Voeg minstens één member toe")
+        payload["static" if object_type == "address-groups" else "members"] = members
+    elif object_type == "services":
+        protocol = form.get("protocol", "tcp").lower()
+        if protocol not in {"tcp", "udp"}:
+            raise ValueError("Protocol moet TCP of UDP zijn")
+        port = form.get("port", "").strip()
+        if not port:
+            raise ValueError("Poort is verplicht")
+        payload["protocol"] = {protocol: {"port": port}}
+    elif object_type == "tags":
+        color = form.get("color", "").strip()
+        if color:
+            payload["color"] = color
+    else:
+        raise ValueError("Dit objecttype is momenteel alleen-lezen")
+    return payload
+
+
+def validate_new_object(payload: dict, object_type: str, existing: list[dict]) -> None:
+    same_name = next((item for item in existing if item.get("name") == payload["name"]), None)
+    if same_name:
+        raise ValueError(f"Object {payload['name']} bestaat al; gebruik het bestaande object.")
+    comparable_keys = {
+        "addresses": ("ip_netmask", "ip_range", "ip_wildcard", "fqdn"),
+        "address-groups": ("static",), "application-groups": ("members",),
+        "services": ("protocol",), "service-groups": ("members",), "tags": ("color",),
+    }[object_type]
+    wanted = {key: payload.get(key) for key in comparable_keys if payload.get(key) is not None}
+    equivalent = next((item for item in existing if {key: item.get(key) for key in comparable_keys if item.get(key) is not None} == wanted), None)
+    if equivalent:
+        raise ValueError(f"Een equivalent object bestaat al als {equivalent['name']}; gebruik dat bestaande object.")
+
+
 def policy_fingerprint(policy: dict) -> str:
     return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -329,14 +406,21 @@ def index():
             if serials:
                 placeholders = ",".join("?" for _ in serials)
                 flows = conn.execute(f"SELECT * FROM flows WHERE serial IN ({placeholders}) ORDER BY last_seen DESC LIMIT 100", serials).fetchall()
-    policy_profile = None; policies = []; policy_error = ""
+    policy_profile = None; policies = []; policy_error = ""; policy_objects = []
+    policy_view = request.args.get("policy_view", "policies")
+    if policy_view not in {"policies", "objects"}: policy_view = "policies"
+    policy_kind = request.args.get("policy_kind", "security")
+    object_type = request.args.get("object_type", "addresses")
+    if object_type not in SCM_OBJECT_TYPES: object_type = "addresses"
     policy_profile_id = request.args.get("policy_profile", type=int)
     if policy_profile_id:
         policy_profile = next((profile for profile in profiles if profile["id"] == policy_profile_id), None)
         if policy_profile:
-            try: policies = fetch_security_policies(policy_profile)
+            try:
+                if policy_view == "objects": policy_objects = fetch_scm_objects(policy_profile, object_type)
+                elif policy_kind == "security": policies = fetch_security_policies(policy_profile)
             except Exception as exc: policy_error = str(exc)
-    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, policy_profile=policy_profile, policies=policies, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
+    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, policy_profile=policy_profile, policies=policies, policy_objects=policy_objects, policy_view=policy_view, policy_kind=policy_kind, object_type=object_type, object_types=SCM_OBJECT_TYPES, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
 
 
 def parse_zones(text: str) -> dict[str, str]:
@@ -510,6 +594,52 @@ def policy_bulk_preview(profile_id):
     except Exception as exc:
         flash(f"Bulk-preview mislukt: {exc}", "error")
         return redirect(url_for("index", policy_profile=profile_id) + "#policy-management")
+
+
+@app.post("/objects/<int:profile_id>/<object_type>/preview")
+@login_required
+def object_preview(profile_id, object_type):
+    if object_type not in SCM_OBJECT_TYPES or not SCM_OBJECT_TYPES[object_type]["creatable"]: return "Not found", 404
+    with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+    if not profile: return "Not found", 404
+    try:
+        scm, _, _, _ = scm_client(profile)
+        container = policy_api.scm_container(folder=scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
+        payload = scm_object_payload(object_type, request.form, container)
+        existing = fetch_scm_objects(profile, object_type)
+        validate_new_object(payload, object_type, existing)
+        draft_id = secrets.token_urlsafe(18)
+        draft = {"profile_id": profile_id, "created_at": now(), "object_type": object_type, "payload": payload}
+        path = OBJECT_DRAFTS / f"{draft_id}.json"; path.write_text(json.dumps(draft)); path.chmod(0o600)
+        audit("object-preview", f"profile={profile['name']} type={object_type} name={payload['name']}")
+        return render_template("object_preview.html", profile=profile, object_type=object_type, object_label=SCM_OBJECT_TYPES[object_type]["label"], payload=payload, draft_id=draft_id)
+    except Exception as exc:
+        flash(f"Object-preview mislukt: {exc}", "error")
+        return redirect(url_for("index", policy_profile=profile_id, policy_view="objects", object_type=object_type) + "#policy-management")
+
+
+@app.post("/objects/drafts/<draft_id>/push")
+@login_required
+def object_push(draft_id):
+    if not draft_id or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in draft_id): return "Not found", 404
+    path = OBJECT_DRAFTS / f"{draft_id}.json"
+    if not path.exists(): return "Not found", 404
+    draft = json.loads(path.read_text())
+    with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (draft["profile_id"],)).fetchone()
+    if not profile: return "Not found", 404
+    try:
+        scm, token, _, _ = scm_client(profile)
+        object_type = draft["object_type"]
+        validate_new_object(draft["payload"], object_type, fetch_scm_objects(profile, object_type))
+        root = policy_api.scm_api_root(scm.scm_api_base) + "/config/objects/v1"
+        container = policy_api.scm_container(folder=scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
+        policy_api.scm_upsert(f"{root}/{object_type}", token, draft["payload"], container)
+        path.unlink()
+        audit("object-candidate", f"profile={profile['name']} type={object_type} name={draft['payload']['name']}")
+        flash(f"Object {draft['payload']['name']} geschreven naar SCM candidate.", "success")
+    except Exception as exc:
+        flash(f"Object-Push gestopt: {exc}", "error")
+    return redirect(url_for("index", policy_profile=profile["id"], policy_view="objects", object_type=draft["object_type"]) + "#policy-management")
 
 
 @app.post("/policies/drafts/<draft_id>/push")

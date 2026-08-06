@@ -75,6 +75,13 @@ and nested parentheses. Click a row and Ctrl- or Shift-click another row to
 select the continuous range. The selected-rule count and **Bulk edit** action
 remain available in the fixed bottom action bar. Bulk list changes are explicit
 add/remove operations:
+
+The workspace has separate **Policies** and **Objects** navigation. SCM object
+inventory is read from the configured object scope. Addresses, address groups,
+application groups, services, service groups, and tags can be prepared through
+a preview and then written to SCM candidate. Creation is stopped when the name
+or equivalent object already exists. Object creation never commits or pushes the
+SCM candidate configuration automatically.
 removing one zone or object never removes the other existing members. A preview
 shows every changed value before a separate candidate write. The candidate
 write re-fetches the live rules and stops on concurrent changes. SCM is the

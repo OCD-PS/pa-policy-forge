@@ -44,6 +44,15 @@
 
   }
 
+  function setupSidebarCollapse() {
+    var button = document.querySelector("[data-sidebar-collapse]");
+    if (!button) return;
+    var collapsed = window.localStorage.getItem("ppf-sidebar-collapsed") === "true";
+    function apply() { document.body.classList.toggle("sidebar-collapsed", collapsed); button.textContent = collapsed ? "›" : "‹"; button.title = collapsed ? "Navigatie uitklappen" : "Navigatie inklappen"; }
+    button.addEventListener("click", function () { collapsed = !collapsed; window.localStorage.setItem("ppf-sidebar-collapsed", String(collapsed)); apply(); });
+    apply();
+  }
+
   function setupPasswords() {
     all("[data-password-toggle]").forEach(function (button) {
       var explicitId = button.getAttribute("data-password-toggle");
@@ -298,7 +307,7 @@
     var opener = document.querySelector("[data-open-policy-bulk]");
     function selectedRows() { return rows.filter(function (row) { return row.querySelector("[data-policy-select]").checked; }); }
     function splitEntry(value) { return value.split(",").map(function (item) { return item.trim(); }).filter(Boolean); }
-    function renderBulkField(fieldNode, values, removed) {
+    function renderBulkField(fieldNode, values, removed, added) {
       var container = fieldNode.querySelector("[data-bulk-values]"); container.innerHTML = "";
       values.forEach(function (value) {
         var chip = document.createElement("span"); chip.className = "policy-value-chip" + (removed.has(value) ? " is-removed" : "");
@@ -308,20 +317,27 @@
         button.addEventListener("click", function () {
           if (removed.has(value)) removed.delete(value); else removed.add(value);
           fieldNode.querySelector("[data-bulk-remove]").value = Array.from(removed).join(",");
-          renderBulkField(fieldNode, values, removed);
+          renderBulkField(fieldNode, values, removed, added);
         });
         chip.appendChild(button); container.appendChild(chip);
       });
-      if (!values.length) { var empty = document.createElement("span"); empty.className = "muted small"; empty.textContent = "Geen bestaande waarden"; container.appendChild(empty); }
+      added.forEach(function (value) {
+        var chip = document.createElement("span"); chip.className = "policy-value-chip is-added";
+        var label = document.createElement("span"); label.textContent = value; chip.appendChild(label);
+        var button = document.createElement("button"); button.type = "button"; button.textContent = "×"; button.title = "Toevoeging verwijderen";
+        button.addEventListener("click", function () { added.delete(value); fieldNode.querySelector("[data-bulk-add]").value = Array.from(added).join(","); renderBulkField(fieldNode, values, removed, added); });
+        chip.appendChild(button); container.appendChild(chip);
+      });
+      if (!values.length && !added.size) { var empty = document.createElement("span"); empty.className = "muted small"; empty.textContent = "Geen bestaande waarden"; container.appendChild(empty); }
     }
     function prepareBulkFields() {
       var selected = selectedRows(); var datasetKeys = {source_user: "sourceUser", destination_user: "destinationUser", source_hip: "sourceHip", destination_hip: "destinationHip"};
       all("[data-bulk-field]", dialog).forEach(function (fieldNode) {
         var field = fieldNode.dataset.bulkField; var dataKey = datasetKeys[field] || field; var values = []; var seen = new Set();
         selected.forEach(function (row) { (row.dataset[dataKey] || "").split("|||").filter(Boolean).forEach(function (value) { if (!seen.has(value)) { seen.add(value); values.push(value); } }); });
-        var removed = new Set(); fieldNode._removedValues = removed;
-        fieldNode.querySelector("[data-bulk-remove]").value = ""; fieldNode.querySelector("[data-bulk-add]").value = ""; fieldNode.querySelector("[data-bulk-add]").dataset.values = "";
-        renderBulkField(fieldNode, values, removed);
+        var removed = new Set(); var added = new Set(); fieldNode._removedValues = removed; fieldNode._addedValues = added; fieldNode._currentValues = values;
+        fieldNode.querySelector("[data-bulk-remove]").value = ""; fieldNode.querySelector("[data-bulk-add]").value = ""; fieldNode.querySelector("[data-bulk-entry]").value = "";
+        renderBulkField(fieldNode, values, removed, added);
       });
     }
     if (dialog && opener) opener.addEventListener("click", function () {
@@ -332,12 +348,12 @@
       dialog.showModal();
     });
     all("[data-bulk-field]", dialog).forEach(function (fieldNode) {
-      var input = fieldNode.querySelector("[data-bulk-add]"); var button = fieldNode.querySelector("[data-bulk-add-button]");
+      var input = fieldNode.querySelector("[data-bulk-entry]"); var hidden = fieldNode.querySelector("[data-bulk-add]"); var button = fieldNode.querySelector("[data-bulk-add-button]");
       function addValue() {
         var additions = splitEntry(input.value); if (!additions.length) return;
-        var current = splitEntry(input.dataset.values || "");
-        additions.forEach(function (value) { if (!current.includes(value)) current.push(value); });
-        input.dataset.values = current.join(","); input.value = current.join(", ");
+        additions.forEach(function (value) { fieldNode._addedValues.add(value); });
+        hidden.value = Array.from(fieldNode._addedValues).join(","); input.value = "";
+        renderBulkField(fieldNode, fieldNode._currentValues, fieldNode._removedValues, fieldNode._addedValues);
       }
       button.addEventListener("click", addValue);
       input.addEventListener("keydown", function (event) { if (event.key === "Enter") { event.preventDefault(); addValue(); } });
@@ -355,6 +371,7 @@
 
   document.addEventListener("DOMContentLoaded", function () {
     setupNavigation();
+    setupSidebarCollapse();
     setupPasswords();
     setupConfirmations();
     setupFlashes();
