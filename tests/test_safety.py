@@ -29,6 +29,35 @@ class SafetyTests(unittest.TestCase):
         text=(ROOT/"docker-compose.yml").read_text()
         self.assertNotIn('"80:', text)
 
+    def test_distribution_has_no_default_bootstrap_password(self):
+        compose=(ROOT/"docker-compose.yml").read_text()
+        installer=(ROOT/"install.sh").read_text()
+        self.assertNotIn("OCD1234!", compose)
+        self.assertIn("openssl rand", installer)
+
+    def test_untrusted_api_xml_uses_defusedxml(self):
+        text=(ROOT/"vendor/bdnd_panos_policy_builder.py").read_text()
+        self.assertIn("SafeET.fromstring(xml_text)", text)
+
+    def test_panos_keygen_credentials_are_never_sent_in_url(self):
+        app_text=(ROOT/"app/main.py").read_text()
+        builder_text=(ROOT/"vendor/bdnd_panos_policy_builder.py").read_text()
+        self.assertIn("panos_api_post(endpoint, {\"type\": \"keygen\"", app_text)
+        self.assertIn("api_post_form(deployment.panos_endpoint, {\"type\": \"keygen\"", builder_text)
+        self.assertNotIn("api_get(deployment.panos_endpoint, {\"type\": \"keygen\"", builder_text)
+
+    def test_panos_api_keys_use_header_not_query_string(self):
+        app_text=(ROOT/"app/main.py").read_text()
+        builder_text=(ROOT/"vendor/bdnd_panos_policy_builder.py").read_text()
+        self.assertIn('headers["X-PAN-KEY"] = api_key', app_text)
+        self.assertIn('{"X-PAN-KEY": api_key}', builder_text)
+        self.assertIn('request_params.pop("key", "")', builder_text)
+
+    def test_sha1_is_explicitly_non_security_naming_only(self):
+        text=(ROOT/"vendor/bdnd_panos_policy_builder.py").read_text()
+        for line in text.splitlines():
+            if "hashlib.sha1(" in line: self.assertIn("usedforsecurity=False", line)
+
     def test_runtime_secrets_ignored(self):
         text=(ROOT/".gitignore").read_text()
         self.assertIn("*.key",text)

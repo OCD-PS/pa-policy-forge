@@ -4,6 +4,7 @@ import csv
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -19,10 +20,12 @@ import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 from cryptography.fernet import Fernet
+from defusedxml import ElementTree as SafeET
 from flask import Flask, Response, flash, has_request_context, redirect, render_template, request, send_file, session, url_for
 
 from vendor.paloalto_light_syslog import FlowStore, parse_panos_syslog
@@ -41,6 +44,9 @@ MAX_BYTES = int(float(os.getenv("PPF_MAX_GIB", "50")) * 1024**3)
 PREPARE_INTERVAL = max(300, int(os.getenv("PPF_PREPARE_INTERVAL", "1800")))
 PREPARE_INITIAL_DELAY = max(30, int(os.getenv("PPF_PREPARE_INITIAL_DELAY", "60")))
 PREPARE_MAX_AGE = PREPARE_INTERVAL + 300
+LOGIN_WINDOW_SECONDS = 900
+LOGIN_MAX_FAILURES = 10
+BLOCKED_PASSWORD_SHA256 = {"421d2f00ccdd4ccccf0455cdd0557d5af23dc70b06c83b94cf210ba9d4f3bf58"}
 
 app = Flask(__name__)
 DATA.mkdir(parents=True, exist_ok=True)
@@ -63,6 +69,7 @@ SCM_POLICY_TYPES = {
     "sdwan": ("network", "sdwan-rules", "SD-WAN"),
 }
 SCM_UNAVAILABLE_POLICY_TYPES = {"tunnel-inspection", "dos", "sdwan"}
+TARGET_TYPES = {"scm", "panorama", "panos"}
 PANOS_POLICY_NODES = {
     "security": "security", "nat": "nat", "qos": "qos", "pbf": "pbf",
     "decryption": "decryption", "application-override": "application-override",
@@ -98,8 +105,23 @@ def secret_file(name: str, generator) -> bytes:
 
 
 app.secret_key = secret_file("session.key", lambda: secrets.token_bytes(64))
+app.config.update(
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Strict",
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
+    MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+    MAX_FORM_MEMORY_SIZE=512 * 1024,
+    MAX_FORM_PARTS=200,
+)
+trusted_hosts = [value.strip() for value in os.getenv("PPF_TRUSTED_HOSTS", "").split(",") if value.strip()]
+if trusted_hosts: app.config["TRUSTED_HOSTS"] = trusted_hosts
 fernet = Fernet(secret_file("encryption.key", Fernet.generate_key))
 flow_store = FlowStore(FLOW_DB, retention_days=0)
+_login_failures: dict[tuple[str, str], deque[float]] = defaultdict(deque)
+_login_failures_lock = threading.Lock()
+_syslog_source_policy: dict[str, set[str] | None] = {}
+_syslog_source_policy_lock = threading.Lock()
 sys.path.insert(0, str(BASE / "vendor"))
 from vendor import bdnd_panos_policy_builder as policy_api
 
@@ -125,6 +147,10 @@ def password_ok(value: str, stored: str) -> bool:
         return hmac.compare_digest(actual, expected)
     except Exception:
         return False
+
+
+def password_is_blocked(value: str) -> bool:
+    return hashlib.sha256(value.encode()).hexdigest() in BLOCKED_PASSWORD_SHA256
 
 
 def init_db() -> None:
@@ -157,11 +183,15 @@ def init_db() -> None:
         );
         """)
         if not conn.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
+            bootstrap_password = os.getenv("PPF_BOOTSTRAP_PASSWORD", "")
+            if len(bootstrap_password) < 12 or password_is_blocked(bootstrap_password):
+                raise RuntimeError("Set a unique PPF_BOOTSTRAP_PASSWORD of at least 12 characters before first start")
             conn.execute("INSERT INTO users(username,password_hash,must_change) VALUES(?,?,1)",
-                         ("admin", password_hash(os.getenv("PPF_BOOTSTRAP_PASSWORD", "OCD1234!"))))
+                         ("admin", password_hash(bootstrap_password)))
 
 
 init_db()
+_dummy_password_hash = password_hash(secrets.token_urlsafe(32))
 
 
 def now() -> str:
@@ -189,6 +219,44 @@ def protect_csrf():
         return "Invalid CSRF token", 400
 
 
+@app.after_request
+def security_headers(response):
+    response.headers["Strict-Transport-Security"] = "max-age=31536000"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "same-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    response.headers["X-Permitted-Cross-Domain-Policies"] = "none"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; "
+        "form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; connect-src 'self'"
+    )
+    if request.endpoint != "static": response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def login_rate_limited(client: str, username: str, record_failure: bool = False) -> bool:
+    keys = ((client, "*"), (client, username.casefold()))
+    cutoff = time.monotonic() - LOGIN_WINDOW_SECONDS
+    with _login_failures_lock:
+        blocked = False
+        for key in keys:
+            failures = _login_failures[key]
+            while failures and failures[0] < cutoff: failures.popleft()
+            if record_failure: failures.append(time.monotonic())
+            blocked = blocked or len(failures) >= LOGIN_MAX_FAILURES
+            if not failures: _login_failures.pop(key, None)
+        return blocked
+
+
+def clear_login_failures(client: str, username: str) -> None:
+    with _login_failures_lock:
+        _login_failures.pop((client, "*"), None)
+        _login_failures.pop((client, username.casefold()), None)
+
+
 def login_required(fn):
     @wraps(fn)
     def inner(*args, **kwargs):
@@ -208,12 +276,20 @@ def healthz():
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
+        username = request.form.get("username", "")
+        client = request.remote_addr or "unknown"
+        if login_rate_limited(client, username):
+            flash("Te veel mislukte pogingen. Probeer later opnieuw.", "error")
+            return render_template("login.html"), 429
         with db() as conn:
-            user = conn.execute("SELECT * FROM users WHERE username=?", (request.form.get("username", ""),)).fetchone()
-        if user and password_ok(request.form.get("password", ""), user["password_hash"]):
-            session.clear(); session["user_id"] = user["id"]; session["username"] = user["username"]; session["must_change"] = bool(user["must_change"]); csrf()
+            user = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        password_valid = password_ok(request.form.get("password", ""), user["password_hash"] if user else _dummy_password_hash)
+        if user and password_valid:
+            clear_login_failures(client, username)
+            session.clear(); session.permanent = True; session["user_id"] = user["id"]; session["username"] = user["username"]; session["must_change"] = bool(user["must_change"]); csrf()
             audit("login")
             return redirect(url_for("change_password" if user["must_change"] else "index"))
+        login_rate_limited(client, username, record_failure=True)
         flash("Ongeldige gebruikersnaam of wachtwoord.", "error")
     return render_template("login.html")
 
@@ -229,7 +305,7 @@ def logout():
 def change_password():
     if request.method == "POST":
         value = request.form.get("password", "")
-        if len(value) < 12 or value == "OCD1234!":
+        if len(value) < 12 or password_is_blocked(value):
             flash("Gebruik minimaal 12 tekens en niet het standaardwachtwoord.", "error")
         elif value != request.form.get("confirm"):
             flash("De wachtwoorden komen niet overeen.", "error")
@@ -266,6 +342,47 @@ def profile_serials(profile) -> list[str]:
         for value in (profile["serial"], settings.get("passive_serial", ""))
         if value and value.strip()
     ))
+
+
+def refresh_syslog_source_policy() -> None:
+    configured_serials: set[str] = set()
+    allowed_sources: dict[str, set[str]] = defaultdict(set)
+    with db() as conn: profiles = conn.execute("SELECT serial,source_ip,settings_json FROM profiles").fetchall()
+    for profile in profiles:
+        settings = profile_settings(profile)
+        pairs = ((profile["serial"], profile["source_ip"]), (settings.get("passive_serial", ""), settings.get("passive_source_ip", "")))
+        for serial, source_ip in pairs:
+            serial = str(serial or "").strip(); source_ip = str(source_ip or "").strip()
+            if not serial: continue
+            configured_serials.add(serial)
+            if source_ip: allowed_sources[serial].add(source_ip)
+    policy = {serial: (allowed_sources[serial] or None) for serial in configured_serials}
+    with _syslog_source_policy_lock:
+        _syslog_source_policy.clear(); _syslog_source_policy.update(policy)
+
+
+def syslog_source_allowed(serial: str, source_ip: str) -> bool:
+    with _syslog_source_policy_lock:
+        if serial not in _syslog_source_policy: return True
+        allowed = _syslog_source_policy[serial]
+        return allowed is None or source_ip in allowed
+
+
+def validate_panos_endpoint(value: str) -> str:
+    endpoint = value.strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(endpoint)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
+        raise ValueError("PAN-OS/Panorama endpoint moet een HTTPS-origin zonder pad, credentials, query of fragment zijn")
+    try: parsed.port
+    except ValueError as exc: raise ValueError("Ongeldige PAN-OS/Panorama endpointpoort") from exc
+    return endpoint
+
+
+def optional_ip_address(value: str) -> str:
+    value = value.strip()
+    if not value: return ""
+    try: return str(ipaddress.ip_address(value))
+    except ValueError as exc: raise ValueError(f"Ongeldig herkennings-IP: {value}") from exc
 
 
 def scm_client(profile):
@@ -366,7 +483,7 @@ def xml_entry_to_policy(entry: ET.Element, policy_kind: str) -> dict:
 def panos_profile_context(profile):
     settings = json.loads(profile["settings_json"] or "{}")
     secret = json.loads(fernet.decrypt(profile["secret_blob"]).decode()) if profile["secret_blob"] else {}
-    endpoint = settings.get("endpoint", "").rstrip("/")
+    endpoint = validate_panos_endpoint(settings.get("endpoint", ""))
     if not endpoint: raise ValueError("PAN-OS/Panorama endpoint ontbreekt")
     profile_id = int(profile["id"]) if "id" in profile.keys() else 0
     profile_version = str(profile["updated_at"]) if "updated_at" in profile.keys() else ""
@@ -376,7 +493,7 @@ def panos_profile_context(profile):
             cached = _panos_key_cache.get(profile_id)
             if cached and cached[0] == profile_version and cached[1] == endpoint and cached[3] > time.time():
                 return settings, endpoint, cached[2], ctx
-    key_root = policy_api.require_success(policy_api.api_get(endpoint, {"type": "keygen", "user": secret.get("username", ""), "password": secret.get("password", "")}, ctx), "keygen")
+    key_root = policy_api.require_success(panos_api_post(endpoint, {"type": "keygen", "user": secret.get("username", ""), "password": secret.get("password", "")}, ctx), "keygen")
     key = key_root.findtext(".//key")
     if not key: raise RuntimeError("API key generation gaf geen sleutel terug")
     if profile_id:
@@ -397,8 +514,12 @@ def invalidate_profile_caches(profile_id: int) -> None:
 
 
 def panos_api_post(endpoint: str, params: dict, ctx: ssl.SSLContext) -> str:
-    request_body = urllib.parse.urlencode(params).encode()
-    api_request = urllib.request.Request(endpoint.rstrip("/") + "/api/", data=request_body, headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+    request_params = dict(params)
+    api_key = request_params.pop("key", "")
+    request_body = urllib.parse.urlencode(request_params).encode()
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    if api_key: headers["X-PAN-KEY"] = api_key
+    api_request = urllib.request.Request(endpoint.rstrip("/") + "/api/", data=request_body, headers=headers, method="POST")
     with urllib.request.urlopen(api_request, context=ctx, timeout=120) as response:
         return response.read().decode("utf-8", errors="replace")
 
@@ -737,7 +858,7 @@ def target_policy_payload(policy: dict, container: dict, policy_kind: str) -> di
 
 
 def update_xml_policy(policy: dict) -> str:
-    entry = ET.fromstring(policy["_xml"])
+    entry = SafeET.fromstring(policy["_xml"])
     list_fields = set(POLICY_LIST_FIELDS)
     for field in list_fields:
         if field not in policy: continue
@@ -847,6 +968,10 @@ def parse_zones(text: str) -> dict[str, str]:
 def profile_save():
     try:
         profile_id = int(request.form.get("id") or 0)
+        target_type = request.form.get("target_type", "")
+        if target_type not in TARGET_TYPES: raise ValueError("Onbekend targettype")
+        rulebase = request.form.get("rulebase", "pre")
+        if rulebase not in {"pre", "post"}: raise ValueError("Rulebase moet pre of post zijn")
         active_serial = request.form.get("serial", "").strip()
         passive_serial = request.form.get("passive_serial", "").strip()
         if passive_serial and passive_serial == active_serial:
@@ -858,24 +983,24 @@ def profile_save():
             "tags": [x.strip() for x in request.form.get("tags", "AI builder").split(",") if x.strip()],
             "global_ping": request.form.get("global_ping") == "on",
             "global_dns": request.form.get("global_dns") == "on",
-            "endpoint": request.form.get("endpoint", "").strip(),
+            "endpoint": validate_panos_endpoint(request.form.get("endpoint", "")) if request.form.get("target_type") in {"panorama", "panos"} else "",
             "vsys": request.form.get("vsys", "vsys1").strip(),
             "device_group": request.form.get("device_group", "").strip(),
-            "rulebase": request.form.get("rulebase", "pre"),
+            "rulebase": rulebase,
             "folder": request.form.get("folder", "").strip(),
             "snippet": request.form.get("snippet", "").strip(),
             "device": request.form.get("device", "").strip(),
             "object_folder": request.form.get("object_folder", "").strip(),
             "log_profile": request.form.get("log_profile", "").strip(),
             "passive_serial": passive_serial,
-            "passive_source_ip": request.form.get("passive_source_ip", "").strip(),
+            "passive_source_ip": optional_ip_address(request.form.get("passive_source_ip", "")),
         }
         supplied = {k: request.form.get(k, "") for k in ("username", "password", "client_id", "client_secret", "tsg_id")}
-        if request.form["target_type"] in {"panorama", "panos"} and not settings["endpoint"]:
+        if target_type in {"panorama", "panos"} and not settings["endpoint"]:
             raise ValueError("Endpoint is verplicht voor Panorama en standalone PAN-OS")
-        if request.form["target_type"] == "panorama" and not settings["device_group"]:
+        if target_type == "panorama" and not settings["device_group"]:
             raise ValueError("Device group is verplicht voor Panorama")
-        if request.form["target_type"] == "scm" and sum(bool(settings[k]) for k in ("folder", "snippet", "device")) != 1:
+        if target_type == "scm" and sum(bool(settings[k]) for k in ("folder", "snippet", "device")) != 1:
             raise ValueError("Selecteer exact één SCM-scope: folder, snippet of device")
         with db() as conn:
             existing = conn.execute("SELECT secret_blob FROM profiles WHERE id=?", (profile_id,)).fetchone() if profile_id else None
@@ -886,13 +1011,14 @@ def profile_save():
                 blob = existing["secret_blob"]
             else:
                 blob = fernet.encrypt(json.dumps(merged).encode()) if merged else b""
-            values = (request.form["name"].strip(), request.form.get("enabled") == "on", active_serial, request.form.get("source_ip", "").strip(), request.form["target_type"], json.dumps(settings), blob, now())
+            values = (request.form["name"].strip(), request.form.get("enabled") == "on", active_serial, optional_ip_address(request.form.get("source_ip", "")), target_type, json.dumps(settings), blob, now())
             if profile_id:
                 conn.execute("UPDATE profiles SET name=?,enabled=?,serial=?,source_ip=?,target_type=?,settings_json=?,secret_blob=?,updated_at=? WHERE id=?", (*values, profile_id))
             else:
                 cursor = conn.execute("INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (*values, now()))
                 profile_id = int(cursor.lastrowid)
         invalidate_profile_caches(profile_id)
+        refresh_syslog_source_policy()
         audit("profile-saved", request.form["name"]); flash("Firewallprofiel opgeslagen.", "success")
     except Exception as exc:
         flash(f"Profiel niet opgeslagen: {exc}", "error")
@@ -911,6 +1037,7 @@ def profile_delete(profile_id):
             conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
             deleted_name = row["name"]
         invalidate_profile_caches(profile_id)
+        refresh_syslog_source_policy()
         audit("profile-deleted", deleted_name)
         flash("Profiel verwijderd.", "success")
     except Exception as exc:
@@ -942,6 +1069,8 @@ def toml_string(value) -> str:
 def write_config(profile, run_dir: Path, push: bool, disabled_override: bool | None = None) -> dict:
     s = json.loads(profile["settings_json"]); secret = json.loads(fernet.decrypt(profile["secret_blob"]).decode()) if profile["secret_blob"] else {}
     target = profile["target_type"]
+    if target not in TARGET_TYPES: raise ValueError("Onbekend targettype")
+    if target in {"panorama", "panos"}: s["endpoint"] = validate_panos_endpoint(s.get("endpoint", ""))
     generated_disabled = s.get("disabled") if disabled_override is None else disabled_override
     lines = [
         "[deployment]", f"panorama = {'true' if target == 'panorama' else 'false'}", f"scm = {'true' if target == 'scm' else 'false'}", "",
@@ -975,6 +1104,13 @@ def export_profile_flows(profile, path: Path) -> int:
     with path.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields); writer.writeheader(); writer.writerows(dict(r) for r in rows)
     return len(rows)
+
+
+def spreadsheet_safe(value: str) -> str:
+    text = str(value)
+    if text.lstrip().startswith(("=", "+", "-", "@")) or text.startswith(("\t", "\r")):
+        return "'" + text
+    return text
 
 
 @app.post("/policies/<int:profile_id>/preview")
@@ -1220,7 +1356,7 @@ def execute_run(profile, mode: str, disabled_override: bool | None = None, prepa
             "PPF_SCM_CLIENT_ID": run_secret.get("client_id", ""), "PPF_SCM_CLIENT_SECRET": run_secret.get("client_secret", ""),
             "PPF_SCM_TSG_ID": run_secret.get("tsg_id", "")}
         if prepared: run_env["PPF_PUSH_PREBUILT"] = "1"
-        result = subprocess.run(["python3", "bdnd_panos_policy_builder.py"], cwd=run_dir, env=run_env, capture_output=True, text=True, timeout=1800)
+        result = subprocess.run([sys.executable, "bdnd_panos_policy_builder.py"], cwd=run_dir, env=run_env, capture_output=True, text=True, timeout=1800)
         run_secret = {}; run_env = {}
         output = (result.stdout + "\n" + result.stderr)[-12000:]
         if result.returncode: raise RuntimeError(output)
@@ -1376,6 +1512,15 @@ def run_download(run_id, kind):
     names={"csv":"review.csv","xml":"policy.xml"}; name=names.get(kind)
     if not name: return "Not found",404
     path=Path(run["run_dir"])/name
+    if kind == "csv":
+        if not path.exists(): return "Not found", 404
+        output = io.StringIO()
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            writer = csv.DictWriter(output, fieldnames=reader.fieldnames or [], lineterminator="\n")
+            writer.writeheader()
+            for row in reader: writer.writerow({key: spreadsheet_safe(value) for key, value in row.items()})
+        return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f'attachment; filename="pa-policy-forge-run-{run_id}-{name}"'})
     return send_file(path, as_attachment=True, download_name=f"pa-policy-forge-run-{run_id}-{name}")
 
 
@@ -1384,12 +1529,15 @@ def udp_loop():
         def handle(self):
             flow=parse_panos_syslog(self.request[0].decode("utf-8",errors="replace"))
             if not flow: return
-            flow_store.add_flow(flow); source=self.client_address[0]; timestamp=now()
+            source=self.client_address[0]
+            if not syslog_source_allowed(flow.serial, source): return
+            flow_store.add_flow(flow); timestamp=now()
             with db() as conn:
                 conn.execute("INSERT INTO sources(serial,source_ip,first_seen,last_seen,messages) VALUES(?,?,?,?,1) ON CONFLICT(serial,source_ip) DO UPDATE SET last_seen=excluded.last_seen,messages=messages+1", (flow.serial,source,timestamp,timestamp))
     server=socketserver.ThreadingUDPServer(("0.0.0.0", int(os.getenv("PPF_SYSLOG_PORT","514"))),Handler); server.daemon_threads=True; server.serve_forever()
 
 
+refresh_syslog_source_policy()
 threading.Thread(target=udp_loop,daemon=True,name="syslog-udp").start()
 threading.Thread(target=quota_loop,daemon=True,name="storage-quota").start()
 threading.Thread(target=prepare_loop,daemon=True,name="policy-prepare").start()

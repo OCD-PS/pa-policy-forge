@@ -42,7 +42,16 @@ Ports:
 - `443/tcp`: HTTPS GUI
 - `514/udp`: PAN-OS syslog
 
-Initial local login is `admin` / `OCD1234!`; PA Policy Forge forces a password change before any other page is accessible.
+The installer generates a unique bootstrap password in the root-only
+`/opt/pa-policy-forge/.env` file. The initial username is `admin`; PA Policy
+Forge forces a password change before any other page is accessible. Direct
+Docker Compose deployments must provide `PPF_BOOTSTRAP_PASSWORD` before the
+first start.
+
+The installer also pins the published container ports to the appliance's
+primary address through `PPF_BIND_ADDRESS`. Override `PPF_BIND_ADDRESS` and
+`PPF_TRUSTED_HOSTS` in `/opt/pa-policy-forge/.env` when the appliance uses a
+different management address or additional DNS aliases.
 
 The installer creates a self-signed certificate for the server IP and exposes no HTTP listener. To use a trusted certificate, replace `/opt/pa-policy-forge/certs/tls.crt` and `/opt/pa-policy-forge/certs/tls.key` with your certificate and private key, then run `docker compose restart` from `/opt/pa-policy-forge`.
 

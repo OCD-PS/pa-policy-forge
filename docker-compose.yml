@@ -5,13 +5,14 @@ services:
     container_name: pa-policy-forge
     restart: unless-stopped
     ports:
-      - "443:8443/tcp"
-      - "514:5514/udp"
+      - "${PPF_BIND_ADDRESS:-0.0.0.0}:443:8443/tcp"
+      - "${PPF_BIND_ADDRESS:-0.0.0.0}:514:5514/udp"
     environment:
       PPF_DATA_DIR: /data
       PPF_SYSLOG_PORT: "5514"
       PPF_MAX_GIB: "50"
-      PPF_BOOTSTRAP_PASSWORD: "OCD1234!"
+      PPF_BOOTSTRAP_PASSWORD: ${PPF_BOOTSTRAP_PASSWORD:-}
+      PPF_TRUSTED_HOSTS: ${PPF_TRUSTED_HOSTS:-}
     volumes:
       - /var/lib/pa-policy-forge:/data
       - /opt/pa-policy-forge/certs:/certs:ro

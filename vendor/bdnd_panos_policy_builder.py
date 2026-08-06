@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from defusedxml import ElementTree as SafeET
+
 from bdnd_bpa_policy_builder import (
     GENERATED_FILE_PATTERNS,
     aggregate_log_paths,
@@ -71,7 +73,7 @@ def compact_name(prefix: str, value: str, max_len: int = 32) -> str:
     normalized = safe_name(f"{prefix}-{value}", max_len=128)
     if len(normalized) <= max_len:
         return normalized
-    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:7]
+    digest = hashlib.sha1(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()[:7]
     return f"{normalized[: max_len - 8]}-{digest}"
 
 
@@ -79,7 +81,7 @@ def suffix_name(value: str, suffix: str, max_len: int = 32) -> str:
     normalized = safe_name(f"{value}-{suffix}", max_len=128)
     if len(normalized) <= max_len:
         return normalized
-    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:7]
+    digest = hashlib.sha1(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()[:7]
     return f"{normalized[: max_len - 8]}-{digest}"
 
 
@@ -102,7 +104,7 @@ def unique_rule_name(base_name: str, used: set[str], max_len: int = 32) -> str:
         used.add(candidate)
         return candidate
 
-    digest = hashlib.sha1(base_name.encode("utf-8")).hexdigest()[:7]
+    digest = hashlib.sha1(base_name.encode("utf-8"), usedforsecurity=False).hexdigest()[:7]
     candidate = f"{candidate[: max_len - 8].rstrip('-')}-{digest}"
     if candidate not in used:
         used.add(candidate)
@@ -908,21 +910,42 @@ def import_name_for_path(path: Path, max_len: int = 32) -> str:
     stem = safe_name(path.stem, max_len=128)
     if len(stem) <= stem_max:
         return f"{stem}{suffix}"
-    digest = hashlib.sha1(path.name.encode("utf-8")).hexdigest()[:7]
+    digest = hashlib.sha1(path.name.encode("utf-8"), usedforsecurity=False).hexdigest()[:7]
     trimmed = stem[: stem_max - 8].rstrip("-") or "import"
     return f"{trimmed}-{digest}{suffix}"
 
 
 def api_get(endpoint: str, params: dict[str, str], ctx: ssl.SSLContext) -> str:
-    url = endpoint.rstrip("/") + "/api?" + urllib.parse.urlencode(params)
-    with urllib.request.urlopen(url, context=ctx, timeout=120) as response:
+    request_params = dict(params)
+    api_key = request_params.pop("key", "")
+    url = endpoint.rstrip("/") + "/api?" + urllib.parse.urlencode(request_params)
+    headers = {"X-PAN-KEY": api_key} if api_key else {}
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, context=ctx, timeout=120) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def api_post_form(endpoint: str, params: dict[str, str], ctx: ssl.SSLContext) -> str:
+    request_params = dict(params)
+    api_key = request_params.pop("key", "")
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    if api_key: headers["X-PAN-KEY"] = api_key
+    request = urllib.request.Request(
+        endpoint.rstrip("/") + "/api/",
+        data=urllib.parse.urlencode(request_params).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(request, context=ctx, timeout=120) as response:
         return response.read().decode("utf-8", errors="replace")
 
 
 def api_post_multipart(endpoint: str, params: dict[str, str], file_path: Path, ctx: ssl.SSLContext) -> str:
+    request_params = dict(params)
+    api_key = request_params.pop("key", "")
     boundary = "----bdndPanosBoundary"
     body: list[bytes] = []
-    for key, value in params.items():
+    for key, value in request_params.items():
         body.append(f"--{boundary}\r\n".encode())
         body.append(f'Content-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode())
     body.append(f"--{boundary}\r\n".encode())
@@ -933,10 +956,12 @@ def api_post_multipart(endpoint: str, params: dict[str, str], file_path: Path, c
     body.append(file_path.read_bytes())
     body.append(b"\r\n")
     body.append(f"--{boundary}--\r\n".encode())
+    headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+    if api_key: headers["X-PAN-KEY"] = api_key
     request = urllib.request.Request(
         endpoint.rstrip("/") + "/api/",
         data=b"".join(body),
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        headers=headers,
         method="POST",
     )
     with urllib.request.urlopen(request, context=ctx, timeout=300) as response:
@@ -944,7 +969,7 @@ def api_post_multipart(endpoint: str, params: dict[str, str], file_path: Path, c
 
 
 def parse_api_response(xml_text: str) -> tuple[str | None, str | None, ET.Element]:
-    root = ET.fromstring(xml_text)
+    root = SafeET.fromstring(xml_text)
     return root.attrib.get("status"), root.attrib.get("code"), root
 
 
@@ -970,7 +995,7 @@ def xml_section_has_entries(tree: ET.ElementTree, path: str) -> bool:
 
 
 def partial_load_sections(xml_path: Path, deployment: DeploymentConfig) -> list[tuple[str, str]]:
-    tree = ET.parse(xml_path)
+    tree = SafeET.parse(xml_path)
     device_name = xpath_literal("localhost.localdomain")
     sections: list[tuple[str, str, str]] = []
     format_values = {
@@ -1188,7 +1213,7 @@ def fetch_scm_inventory(scm: SCMConfig) -> ExistingConfigInventory:
 
 def panos_api_key(deployment: DeploymentConfig, ctx: ssl.SSLContext) -> str:
     key_root = require_success(
-        api_get(deployment.panos_endpoint, {"type": "keygen", "user": deployment.panos_username, "password": deployment.panos_password}, ctx),
+        api_post_form(deployment.panos_endpoint, {"type": "keygen", "user": deployment.panos_username, "password": deployment.panos_password}, ctx),
         "keygen",
     )
     key = key_root.findtext(".//key")
@@ -1268,7 +1293,7 @@ def collision_safe_name(name: str, semantic: str, occupied: set[str]) -> str:
     if name not in occupied:
         occupied.add(name)
         return name
-    digest = hashlib.sha1(semantic.encode("utf-8")).hexdigest()[:7]
+    digest = hashlib.sha1(semantic.encode("utf-8"), usedforsecurity=False).hexdigest()[:7]
     candidate = suffix_name(name, f"forge-{digest}")
     counter = 2
     while candidate in occupied:
@@ -1622,17 +1647,7 @@ def rules_xpath(deployment: DeploymentConfig) -> str:
 
 def fetch_panos_rule_entries(deployment: DeploymentConfig) -> list[ET.Element]:
     ctx = ssl._create_unverified_context()
-    key_root = require_success(
-        api_get(
-            deployment.panos_endpoint,
-            {"type": "keygen", "user": deployment.panos_username, "password": deployment.panos_password},
-            ctx,
-        ),
-        "keygen",
-    )
-    key = key_root.findtext(".//key")
-    if not key:
-        raise RuntimeError("keygen succeeded but did not return an API key")
+    key = panos_api_key(deployment, ctx)
     response = require_success(
         api_get(
             deployment.panos_endpoint,
@@ -1930,17 +1945,7 @@ def push_to_device(xml_path: Path, deployment: DeploymentConfig, review_rows: li
         raise RuntimeError("Auto-push requested but panos endpoint/username/password is incomplete")
 
     ctx = ssl._create_unverified_context()
-    key_root = require_success(
-        api_get(
-            deployment.panos_endpoint,
-            {"type": "keygen", "user": deployment.panos_username, "password": deployment.panos_password},
-            ctx,
-        ),
-        "keygen",
-    )
-    key = key_root.findtext(".//key")
-    if not key:
-        raise RuntimeError("keygen succeeded but did not return an API key")
+    key = panos_api_key(deployment, ctx)
     existing_rule_names = {entry.attrib["name"] for entry in fetch_panos_rule_entries(deployment) if entry.attrib.get("name")}
 
     import_name = import_name_for_path(xml_path)
@@ -2218,7 +2223,7 @@ def push_prebuilt_candidate(
 ) -> int:
     if not builder.xml_output.exists() or not builder.review_csv.exists():
         raise SystemExit("Prepared policy.xml or review.csv is missing")
-    tree = ET.parse(builder.xml_output)
+    tree = SafeET.parse(builder.xml_output)
     with builder.review_csv.open(newline="") as handle:
         review_rows = list(csv.DictReader(handle))
     for entry in tree.findall(".//rules/entry"):

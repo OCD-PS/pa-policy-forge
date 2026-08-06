@@ -1,1 +1,1 @@
-<14>Jun 29 12:00:00 pa-vm 1,2026/06/29 12:00:00,001801000000,,TRAFFIC,end,,10.1.1.10,198.51.100.10,,,allow-web-out,domain\user,,web-browsing,,trust,untrust,,,,,3,,,443,,,,tcp,allow,12345,,,,,,,,,,,,,,,,computer-and-internet-info,,,,,,,,,,,,
+<14>Jun 29 12:00:00 pa-vm 1,2026/06/29 12:00:00,001801000000,TRAFFIC,end,3073,2026/06/29 12:00:00,10.1.1.10,198.51.100.10,0.0.0.0,0.0.0.0,allow-web-out,domain\user,,web-browsing,vsys1,trust,untrust,ethernet1/1,ethernet1/2,log-forwarding,2026/06/29 12:00:01,1,3,50123,443,0,0,0x19,tcp,allow,12345
