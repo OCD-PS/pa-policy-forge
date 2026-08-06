@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bulk-preview · PA Policy Forge</title>
+<link rel="stylesheet" href="{{url_for('static',filename='app.css')}}">
+</head>
+<body><main class="content" style="margin:auto">
+<div class="page-header"><div><p class="eyebrow">Policybeheer</p><h1>Bulk-preview · {{profile.name}}</h1></div>
+<div class="cluster"><a class="btn" href="{{url_for('index',policy_profile=profile.id)}}#policy-management">Annuleren</a>
+<form method="post" action="{{url_for('policy_bulk_push',draft_id=draft_id)}}" data-confirm="Deze wijzigingen naar SCM candidate schrijven?">
+<input type="hidden" name="csrf" value="{{csrf_token()}}"><button class="btn btn-primary" type="submit">Push</button></form></div></div>
+<div class="table-wrap"><table><thead><tr><th>Policy</th><th>Veld</th><th>Voor</th><th>Na</th></tr></thead><tbody>
+{% for change in changes %}{% for field in change.before.keys() if change.before[field] != change.after[field] %}
+<tr><td>{{change.before.name}}</td><td>{{field}}</td><td>{{change.before[field]|join(', ') if change.before[field] is sequence and change.before[field] is not string else change.before[field]}}</td><td>{{change.after[field]|join(', ') if change.after[field] is sequence and change.after[field] is not string else change.after[field]}}</td></tr>
+{% endfor %}{% endfor %}
+</tbody></table></div>
+</main><script src="{{url_for('static',filename='app.js')}}"></script></body></html>

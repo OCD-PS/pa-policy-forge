@@ -12,6 +12,7 @@ import shutil
 import socketserver
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ from cryptography.fernet import Fernet
 from flask import Flask, Response, flash, has_request_context, redirect, render_template, request, send_file, session, url_for
 
 from vendor.paloalto_light_syslog import FlowStore, parse_panos_syslog
+from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations
 
 BASE = Path(__file__).resolve().parent.parent
 DATA = Path(os.getenv("PPF_DATA_DIR", "/data"))
@@ -28,6 +30,7 @@ APP_DB = DATA / "forge.sqlite3"
 FLOW_DB = DATA / "flows.sqlite3"
 RUNS = DATA / "runs"
 SECRETS = DATA / "secrets"
+POLICY_DRAFTS = DATA / "policy-drafts"
 MAX_BYTES = int(float(os.getenv("PPF_MAX_GIB", "50")) * 1024**3)
 PREPARE_INTERVAL = max(300, int(os.getenv("PPF_PREPARE_INTERVAL", "1800")))
 PREPARE_INITIAL_DELAY = max(30, int(os.getenv("PPF_PREPARE_INITIAL_DELAY", "60")))
@@ -37,6 +40,7 @@ app = Flask(__name__)
 DATA.mkdir(parents=True, exist_ok=True)
 RUNS.mkdir(parents=True, exist_ok=True)
 SECRETS.mkdir(parents=True, exist_ok=True)
+POLICY_DRAFTS.mkdir(parents=True, exist_ok=True)
 
 
 def secret_file(name: str, generator) -> bytes:
@@ -50,6 +54,8 @@ def secret_file(name: str, generator) -> bytes:
 app.secret_key = secret_file("session.key", lambda: secrets.token_bytes(64))
 fernet = Fernet(secret_file("encryption.key", Fernet.generate_key))
 flow_store = FlowStore(FLOW_DB, retention_days=0)
+sys.path.insert(0, str(BASE / "vendor"))
+from vendor import bdnd_panos_policy_builder as policy_api
 
 
 def db() -> sqlite3.Connection:
@@ -216,6 +222,79 @@ def profile_serials(profile) -> list[str]:
     ))
 
 
+def scm_client(profile):
+    settings = profile_settings(profile)
+    secret = json.loads(fernet.decrypt(profile["secret_blob"]).decode()) if profile["secret_blob"] else {}
+    scm = policy_api.SCMConfig(
+        secret.get("client_id", ""), secret.get("client_secret", ""), secret.get("tsg_id", ""),
+        "https://auth.apps.paloaltonetworks.com/oauth2/access_token",
+        "https://api.strata.paloaltonetworks.com/config/security/v1",
+        settings.get("folder", ""), settings.get("object_folder") or settings.get("folder", ""),
+        settings.get("snippet", ""), settings.get("device", ""), settings.get("rulebase", "pre"), settings.get("log_profile", ""),
+    )
+    token = policy_api.get_scm_token(scm)
+    endpoint = policy_api.scm_api_root(scm.scm_api_base) + "/config/security/v1/security-rules"
+    container = policy_api.scm_container(folder=scm.scm_folder, snippet=scm.scm_snippet, device=scm.scm_device)
+    return scm, token, endpoint, container
+
+
+def normalize_scm_policy(rule: dict) -> dict:
+    normalized = {
+        "id": str(rule.get("id", "")), "name": str(rule.get("name", "")),
+        "action": str(rule.get("action", "allow")), "disabled": bool(rule.get("disabled", False)),
+        "log_setting": str(rule.get("log_setting", "") or ""),
+        "profile_group": ", ".join((rule.get("profile_setting") or {}).get("group", [])),
+        "description": str(rule.get("description", "") or ""),
+        "source_user": list(rule.get("source_user", []) or ["any"]),
+        "category": list(rule.get("category", []) or ["any"]),
+        "source_hip": list(rule.get("source_hip", []) or ["any"]),
+        "destination_hip": list(rule.get("destination_hip", []) or ["any"]),
+        "negate_source": bool(rule.get("negate_source", False)),
+        "negate_destination": bool(rule.get("negate_destination", False)),
+        "schedule": str(rule.get("schedule", "") or ""),
+        "log_start": rule.get("log_start"), "log_end": rule.get("log_end"),
+    }
+    for field in POLICY_LIST_FIELDS:
+        value = rule.get(field, []) or []
+        normalized[field] = [str(item) for item in (value if isinstance(value, list) else [value])]
+    return normalized
+
+
+def fetch_security_policies(profile) -> list[dict]:
+    if profile["target_type"] != "scm":
+        raise ValueError("Policybeheer is in deze eerste testversie beschikbaar voor SCM; Panorama en standalone volgen via dezelfde interface.")
+    scm, token, endpoint, container = scm_client(profile)
+    return [normalize_scm_policy(rule) for rule in policy_api.scm_fetch_rules(endpoint, token, container, scm.scm_rulebase)]
+
+
+def policy_fingerprint(policy: dict) -> str:
+    return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def split_values(value: str) -> list[str]:
+    return list(dict.fromkeys(item.strip() for item in value.replace("\n", ",").split(",") if item.strip()))
+
+
+def scm_policy_payload(policy: dict, container: dict) -> dict:
+    payload = {
+        "name": policy["name"], "from": policy["from"], "to": policy["to"],
+        "source": policy["source"], "destination": policy["destination"],
+        "source_user": policy["source_user"], "category": policy["category"],
+        "application": policy["application"], "service": policy["service"],
+        "action": policy["action"], "disabled": policy["disabled"],
+        "negate_source": policy["negate_source"], "negate_destination": policy["negate_destination"],
+        **container,
+    }
+    for field in ("description", "log_setting", "schedule"):
+        if policy.get(field): payload[field] = policy[field]
+    for field in ("source_hip", "destination_hip", "tag"):
+        if policy.get(field): payload[field] = policy[field]
+    for field in ("log_start", "log_end"):
+        if policy.get(field) is not None: payload[field] = policy[field]
+    if policy.get("profile_group"): payload["profile_setting"] = {"group": split_values(policy["profile_group"])}
+    return payload
+
+
 @app.get("/")
 @login_required
 def index():
@@ -248,7 +327,14 @@ def index():
             if serials:
                 placeholders = ",".join("?" for _ in serials)
                 flows = conn.execute(f"SELECT * FROM flows WHERE serial IN ({placeholders}) ORDER BY last_seen DESC LIMIT 100", serials).fetchall()
-    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
+    policy_profile = None; policies = []; policy_error = ""
+    policy_profile_id = request.args.get("policy_profile", type=int)
+    if policy_profile_id:
+        policy_profile = next((profile for profile in profiles if profile["id"] == policy_profile_id), None)
+        if policy_profile:
+            try: policies = fetch_security_policies(policy_profile)
+            except Exception as exc: policy_error = str(exc)
+    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, policy_profile=policy_profile, policies=policies, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
 
 
 def parse_zones(text: str) -> dict[str, str]:
@@ -385,6 +471,69 @@ def export_profile_flows(profile, path: Path) -> int:
     with path.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields); writer.writeheader(); writer.writerows(dict(r) for r in rows)
     return len(rows)
+
+
+@app.post("/policies/<int:profile_id>/preview")
+@login_required
+def policy_bulk_preview(profile_id):
+    with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+    if not profile: return "Not found", 404
+    selected_ids = set(request.form.getlist("policy_id"))
+    if not selected_ids:
+        flash("Selecteer minstens één security policy.", "error")
+        return redirect(url_for("index", policy_profile=profile_id) + "#policy-management")
+    operations = {}
+    for field in POLICY_LIST_FIELDS:
+        operations[field] = {"add": split_values(request.form.get(f"{field}_add", "")), "remove": split_values(request.form.get(f"{field}_remove", ""))}
+    for field in ("action", "log_setting", "profile_group"):
+        operations[field] = request.form.get(field) or None
+    disabled = request.form.get("disabled", "")
+    operations["disabled"] = disabled == "true" if disabled in {"true", "false"} else None
+    try:
+        current = fetch_security_policies(profile)
+        selected = [policy for policy in current if policy["id"] in selected_ids]
+        if len(selected) != len(selected_ids): raise ValueError("Niet alle geselecteerde policies bestaan nog. Vernieuw de rulebase.")
+        changes = []
+        for policy in selected:
+            updated = apply_bulk_operations(policy, operations)
+            if updated != policy:
+                changes.append({"before": policy, "after": updated, "fingerprint": policy_fingerprint(policy)})
+        if not changes: raise ValueError("De gekozen bulkbewerking veroorzaakt geen wijzigingen.")
+        draft_id = secrets.token_urlsafe(18)
+        draft = {"profile_id": profile_id, "created_at": now(), "changes": changes}
+        path = POLICY_DRAFTS / f"{draft_id}.json"; path.write_text(json.dumps(draft)); path.chmod(0o600)
+        audit("policy-bulk-preview", f"profile={profile['name']} rules={len(changes)}")
+        return render_template("policy_preview.html", profile=profile, changes=changes, draft_id=draft_id)
+    except Exception as exc:
+        flash(f"Bulk-preview mislukt: {exc}", "error")
+        return redirect(url_for("index", policy_profile=profile_id) + "#policy-management")
+
+
+@app.post("/policies/drafts/<draft_id>/push")
+@login_required
+def policy_bulk_push(draft_id):
+    if not draft_id or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in draft_id): return "Not found", 404
+    path = POLICY_DRAFTS / f"{draft_id}.json"
+    if not path.exists(): return "Not found", 404
+    draft = json.loads(path.read_text())
+    with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (draft["profile_id"],)).fetchone()
+    if not profile: return "Not found", 404
+    try:
+        current = {policy["id"]: policy for policy in fetch_security_policies(profile)}
+        for change in draft["changes"]:
+            live = current.get(change["before"]["id"])
+            if not live or policy_fingerprint(live) != change["fingerprint"]:
+                raise RuntimeError(f"Policy {change['before']['name']} is intussen gewijzigd; Push gestopt.")
+        scm, token, endpoint, container = scm_client(profile)
+        for change in draft["changes"]:
+            policy_api.scm_http_request("PUT", f"{endpoint}/{change['after']['id']}", token, payload=scm_policy_payload(change["after"], container), params={"position": scm.scm_rulebase})
+        path.unlink()
+        audit("policy-bulk-candidate", f"profile={profile['name']} rules={len(draft['changes'])}")
+        flash(f"{len(draft['changes'])} security policies bijgewerkt in SCM candidate.", "success")
+        return redirect(url_for("index", policy_profile=profile["id"]) + "#policy-management")
+    except Exception as exc:
+        flash(f"Bulk-Push gestopt: {exc}", "error")
+        return redirect(url_for("index", policy_profile=profile["id"]) + "#policy-management")
 
 
 def build_fingerprint(profile, include_flows: bool = True) -> str:

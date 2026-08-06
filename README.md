@@ -66,6 +66,18 @@ artifact directory is inside the configured runs root. Active runs cannot be del
 The Flows page always starts with a device/firewall-group chooser. Flow details
 open only after selecting a logical firewall or HA pair.
 
+## Policy management
+
+The **Policybeheer** page uses an Expedition-inspired filter, selection, and
+bulk-change workflow. SCM security rules are loaded in rulebase order and can
+be filtered independently by name, source/destination zone and address,
+application, and service. Bulk list changes are explicit add/remove operations:
+removing one zone or object never removes the other existing members. A preview
+shows every changed value before a separate candidate write. The candidate
+write re-fetches the live rules and stops on concurrent changes. SCM is the
+first enabled connector; Panorama and standalone use the same UI but are not
+enabled for bulk writes yet.
+
 Flow aggregation happens continuously while syslog arrives. CPU-parallel builder work
 defaults to `max(1, detected CPUs - 2)`, reserving two logical CPUs for the web UI,
 syslog receiver, and operating system.

@@ -201,6 +201,38 @@
     dialog.addEventListener("cancel", function () { pendingForm = null; });
   }
 
+  function setupPolicyManagement() {
+    var rows = all("[data-policy-row]");
+    var filters = all("[data-policy-filter]");
+    function applyFilters() {
+      rows.forEach(function (row) {
+        row.hidden = filters.some(function (input) {
+          var query = input.value.toLocaleLowerCase().trim();
+          return query && !(row.dataset[input.getAttribute("data-policy-filter")] || "").includes(query);
+        });
+      });
+    }
+    filters.forEach(function (input) { input.addEventListener("input", applyFilters); });
+
+    var selectVisible = document.querySelector("[data-policy-select-visible]");
+    if (selectVisible) selectVisible.addEventListener("change", function () {
+      rows.forEach(function (row) {
+        if (!row.hidden) row.querySelector("[data-policy-select]").checked = selectVisible.checked;
+      });
+    });
+
+    var dialog = document.querySelector("[data-policy-bulk-dialog]");
+    var opener = document.querySelector("[data-open-policy-bulk]");
+    if (dialog && opener) opener.addEventListener("click", function () {
+      var count = all("[data-policy-select]:checked").length;
+      if (!count) { window.alert("Selecteer minstens één security policy."); return; }
+      dialog.querySelector("[data-policy-selected-count]").textContent = count;
+      dialog.showModal();
+    });
+    var cancel = document.querySelector("[data-policy-bulk-cancel]");
+    if (cancel) cancel.addEventListener("click", function () { dialog.close(); });
+  }
+
   document.addEventListener("DOMContentLoaded", function () {
     setupNavigation();
     setupPasswords();
@@ -210,5 +242,6 @@
     setupFilters();
     setupConditionalTargets();
     setupPushOptions();
+    setupPolicyManagement();
   });
 })();
