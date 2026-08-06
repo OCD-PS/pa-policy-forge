@@ -8,6 +8,8 @@ Self-hosted Palo Alto traffic-flow policy builder with an HTTPS web interface, U
 - Separates flows per firewall serial before policy generation.
 - Supports an active and optional passive serial in one logical firewall profile;
   failover logs are shown, exported, analyzed, and purged together.
+- Stores a separate optional recognition/source IP for each HA node, covering
+  deployments where syslog uses distinct management or service-route addresses.
 - Fetches a fresh target inventory for every preview and candidate write.
 - Reuses exact existing address/service objects and exact matching address,
   service, and application groups; same-name semantic conflicts are never overwritten.

@@ -133,8 +133,12 @@
 <input name="passive_serial" value="{{ep.passive_serial if ep else ''}}" placeholder="0070...">
 </div>
 <div class="field">
-<label>Bron-IP (herkenning)</label>
+<label>Actieve bron-IP (herkenning)</label>
 <input name="source_ip" value="{{ep.source_ip if ep else ''}}" placeholder="10.0.0.1">
+</div>
+<div class="field">
+<label>Passieve bron-IP (herkenning)</label>
+<input name="passive_source_ip" value="{{ep.passive_source_ip if ep else ''}}" placeholder="10.0.0.2">
 </div>
 <div class="field">
 <label>Target</label>
@@ -273,20 +277,19 @@
 <div class="card-header">
 <div>
 <h2>{{p.name}}</h2>
-<p class="mono muted">Actief: {{p.serial}}{% if p.passive_serial %}<br>Passief: {{p.passive_serial}}{% endif %}</p>
 </div>
 <span class="badge badge-orange">{{p.target_type|upper}}</span>
 </div>
-<form method="post" action="{{url_for('profile_passive_serial',profile_id=p.id)}}" class="form-grid" style="margin:16px 0">
-<input type="hidden" name="csrf" value="{{csrf_token()}}">
-<div class="field">
-<label>Passieve firewallserial</label>
-<input name="passive_serial" value="{{p.passive_serial}}" placeholder="Leeg voor geen passieve node">
+<div class="profile-meta">
+<div class="profile-meta-block">
+<strong>Firewallserials</strong>
+<div class="profile-meta-values mono"><span>{{p.serial}}</span>{% if p.passive_serial %}<span>{{p.passive_serial}}</span>{% else %}<span class="muted">Geen passieve node</span>{% endif %}</div>
 </div>
-<div class="field" style="align-self:end">
-<button class="btn" type="submit">Passieve node opslaan</button>
+<div class="profile-meta-block">
+<strong>Bron-IP herkenning</strong>
+<div class="profile-meta-values mono"><span>{{p.source_ip or '—'}}</span><span>{{p.passive_source_ip or '—'}}</span></div>
 </div>
-</form>
+</div>
 <div class="cluster">
 <a class="btn" href="{{url_for('index',edit_profile=p.id)}}#profiles">Bewerken</a>
 <form method="post" action="{{url_for('build',profile_id=p.id)}}">

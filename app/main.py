@@ -229,6 +229,7 @@ def index():
             settings = profile_settings(row)
             profile.update(settings)
             profile["passive_serial"] = settings.get("passive_serial", "")
+            profile["passive_source_ip"] = settings.get("passive_source_ip", "")
             profile["zones_text"] = "\n".join(f"{zone} = {role}" for zone, role in settings.get("zones", {}).items())
             profile["scm_scope_type"] = "snippet" if settings.get("snippet") else "device" if settings.get("device") else "folder"
             profile["flow_count"] = sum(counts.get(serial, 0) for serial in profile_serials(row))
@@ -287,6 +288,7 @@ def profile_save():
             "object_folder": request.form.get("object_folder", "").strip(),
             "log_profile": request.form.get("log_profile", "").strip(),
             "passive_serial": passive_serial,
+            "passive_source_ip": request.form.get("passive_source_ip", "").strip(),
         }
         supplied = {k: request.form.get(k, "") for k in ("username", "password", "client_id", "client_secret", "tsg_id")}
         if request.form["target_type"] in {"panorama", "panos"} and not settings["endpoint"]:
@@ -312,25 +314,6 @@ def profile_save():
         audit("profile-saved", request.form["name"]); flash("Firewallprofiel opgeslagen.", "success")
     except Exception as exc:
         flash(f"Profiel niet opgeslagen: {exc}", "error")
-    return redirect(url_for("index") + "#profiles")
-
-
-@app.post("/profiles/<int:profile_id>/passive-serial")
-@login_required
-def profile_passive_serial(profile_id):
-    passive_serial = request.form.get("passive_serial", "").strip()
-    with db() as conn:
-        profile = conn.execute("SELECT name,serial,settings_json FROM profiles WHERE id=?", (profile_id,)).fetchone()
-        if not profile:
-            return "Not found", 404
-        if passive_serial and passive_serial == profile["serial"]:
-            flash("Passieve serial moet verschillen van de actieve serial.", "error")
-            return redirect(url_for("index") + "#profiles")
-        settings = profile_settings(profile)
-        settings["passive_serial"] = passive_serial
-        conn.execute("UPDATE profiles SET settings_json=?,updated_at=? WHERE id=?", (json.dumps(settings), now(), profile_id))
-    audit("passive-serial-updated", f"profile={profile['name']} passive_serial={passive_serial or 'cleared'}")
-    flash("Passieve firewallserial opgeslagen.", "success")
     return redirect(url_for("index") + "#profiles")
 
 
