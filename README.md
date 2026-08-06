@@ -42,11 +42,10 @@ Ports:
 - `443/tcp`: HTTPS GUI
 - `514/udp`: PAN-OS syslog
 
-The installer generates a unique bootstrap password in the root-only
-`/opt/pa-policy-forge/.env` file. The initial username is `admin`; PA Policy
-Forge forces a password change before any other page is accessible. Direct
-Docker Compose deployments must provide `PPF_BOOTSTRAP_PASSWORD` before the
-first start.
+The initial login is `admin` / `admin`. PA Policy Forge forces an immediate
+password change before any other page is accessible. Direct Docker Compose
+deployments may override the initial password through
+`PPF_BOOTSTRAP_PASSWORD`; the mandatory password change still applies.
 
 The installer also pins the published container ports to the appliance's
 primary address through `PPF_BIND_ADDRESS`. Override `PPF_BIND_ADDRESS` and

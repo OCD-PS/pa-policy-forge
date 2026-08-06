@@ -46,7 +46,10 @@ PREPARE_INITIAL_DELAY = max(30, int(os.getenv("PPF_PREPARE_INITIAL_DELAY", "60")
 PREPARE_MAX_AGE = PREPARE_INTERVAL + 300
 LOGIN_WINDOW_SECONDS = 900
 LOGIN_MAX_FAILURES = 10
-BLOCKED_PASSWORD_SHA256 = {"421d2f00ccdd4ccccf0455cdd0557d5af23dc70b06c83b94cf210ba9d4f3bf58"}
+BLOCKED_PASSWORD_SHA256 = {
+    "421d2f00ccdd4ccccf0455cdd0557d5af23dc70b06c83b94cf210ba9d4f3bf58",
+    "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918",
+}
 
 app = Flask(__name__)
 DATA.mkdir(parents=True, exist_ok=True)
@@ -183,9 +186,9 @@ def init_db() -> None:
         );
         """)
         if not conn.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
-            bootstrap_password = os.getenv("PPF_BOOTSTRAP_PASSWORD", "")
-            if len(bootstrap_password) < 12 or password_is_blocked(bootstrap_password):
-                raise RuntimeError("Set a unique PPF_BOOTSTRAP_PASSWORD of at least 12 characters before first start")
+            bootstrap_password = os.getenv("PPF_BOOTSTRAP_PASSWORD", "admin") or "admin"
+            if bootstrap_password != "admin" and (len(bootstrap_password) < 12 or password_is_blocked(bootstrap_password)):
+                raise RuntimeError("Set PPF_BOOTSTRAP_PASSWORD to admin or a unique value of at least 12 characters")
             conn.execute("INSERT INTO users(username,password_hash,must_change) VALUES(?,?,1)",
                          ("admin", password_hash(bootstrap_password)))
 

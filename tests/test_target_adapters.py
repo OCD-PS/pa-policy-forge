@@ -63,8 +63,9 @@ class TargetAdapterTests(unittest.TestCase):
         with self.assertRaises(ValueError): main.optional_ip_address("not-an-ip")
         self.assertEqual(main.TARGET_TYPES, {"scm", "panorama", "panos"})
 
-    def test_known_distribution_password_is_blocked_without_plaintext_in_runtime(self):
+    def test_known_distribution_passwords_are_blocked_on_change(self):
         self.assertTrue(main.password_is_blocked("OCD1234!"))
+        self.assertTrue(main.password_is_blocked("admin"))
         self.assertFalse(main.password_is_blocked("a-different-strong-password"))
 
     def test_trusted_host_rejects_host_header_injection(self):

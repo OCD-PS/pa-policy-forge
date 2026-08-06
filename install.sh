@@ -31,11 +31,9 @@ fi
 cd "$APP_DIR"
 if [[ ! -s "$APP_DIR/.env" ]]; then
   umask 077
-  bootstrap_password="$(openssl rand -base64 24 | tr -d '\n')"
   trusted_hosts="$(hostname -f),$(hostname -I | awk '{print $1}'),127.0.0.1,localhost"
   bind_address="$(hostname -I | awk '{print $1}')"
-  printf 'PPF_BOOTSTRAP_PASSWORD=%s\nPPF_TRUSTED_HOSTS=%s\nPPF_BIND_ADDRESS=%s\n' "$bootstrap_password" "$trusted_hosts" "$bind_address" > "$APP_DIR/.env"
-  unset bootstrap_password
+  printf 'PPF_BOOTSTRAP_PASSWORD=admin\nPPF_TRUSTED_HOSTS=%s\nPPF_BIND_ADDRESS=%s\n' "$trusted_hosts" "$bind_address" > "$APP_DIR/.env"
 fi
 if ! grep -q '^PPF_TRUSTED_HOSTS=' "$APP_DIR/.env"; then
   trusted_hosts="$(hostname -f),$(hostname -I | awk '{print $1}'),127.0.0.1,localhost"
@@ -46,5 +44,5 @@ if ! grep -q '^PPF_BIND_ADDRESS=' "$APP_DIR/.env"; then
 fi
 docker compose up -d --build
 echo "PA Policy Forge is available on https://$(hostname -I | awk '{print $1}')"
-echo "Initial username: admin"
-echo "The generated bootstrap password is stored root-only in $APP_DIR/.env and must be changed after login."
+echo "Initial login: admin / admin"
+echo "PA Policy Forge requires an immediate password change after the first login."

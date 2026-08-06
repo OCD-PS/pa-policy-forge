@@ -29,11 +29,13 @@ class SafetyTests(unittest.TestCase):
         text=(ROOT/"docker-compose.yml").read_text()
         self.assertNotIn('"80:', text)
 
-    def test_distribution_has_no_default_bootstrap_password(self):
+    def test_distribution_uses_documented_forced_change_bootstrap_login(self):
         compose=(ROOT/"docker-compose.yml").read_text()
         installer=(ROOT/"install.sh").read_text()
         self.assertNotIn("OCD1234!", compose)
-        self.assertIn("openssl rand", installer)
+        self.assertIn("${PPF_BOOTSTRAP_PASSWORD:-admin}", compose)
+        self.assertIn("PPF_BOOTSTRAP_PASSWORD=admin", installer)
+        self.assertIn("Initial login: admin / admin", installer)
 
     def test_untrusted_api_xml_uses_defusedxml(self):
         text=(ROOT/"vendor/bdnd_panos_policy_builder.py").read_text()

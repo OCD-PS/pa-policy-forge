@@ -11,7 +11,7 @@ services:
       PPF_DATA_DIR: /data
       PPF_SYSLOG_PORT: "5514"
       PPF_MAX_GIB: "50"
-      PPF_BOOTSTRAP_PASSWORD: ${PPF_BOOTSTRAP_PASSWORD:-}
+      PPF_BOOTSTRAP_PASSWORD: ${PPF_BOOTSTRAP_PASSWORD:-admin}
       PPF_TRUSTED_HOSTS: ${PPF_TRUSTED_HOSTS:-}
     volumes:
       - /var/lib/pa-policy-forge:/data
