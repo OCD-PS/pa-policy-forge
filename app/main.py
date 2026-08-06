@@ -346,13 +346,14 @@ def toml_string(value) -> str:
     return json.dumps(str(value))
 
 
-def write_config(profile, run_dir: Path, push: bool) -> dict:
+def write_config(profile, run_dir: Path, push: bool, disabled_override: bool | None = None) -> dict:
     s = json.loads(profile["settings_json"]); secret = json.loads(fernet.decrypt(profile["secret_blob"]).decode()) if profile["secret_blob"] else {}
     target = profile["target_type"]
+    generated_disabled = s.get("disabled") if disabled_override is None else disabled_override
     lines = [
         "[deployment]", f"panorama = {'true' if target == 'panorama' else 'false'}", f"scm = {'true' if target == 'scm' else 'false'}", "",
         "[builder]", 'logs = ["flows.csv"]', 'xml_output = "policy.xml"', 'review_csv = "review.csv"', 'ptr_cache_file = "ptr-cache.json"',
-        f"disabled = {'true' if s.get('disabled') else 'false'}", "tags = [" + ",".join(toml_string(x) for x in s.get("tags", [])) + "]",
+        f"disabled = {'true' if generated_disabled else 'false'}", "tags = [" + ",".join(toml_string(x) for x in s.get("tags", [])) + "]",
         f"global_ping_traceroute = {'true' if s.get('global_ping', True) else 'false'}", 'global_ping_traceroute_apps = ["ping","traceroute"]',
         f"global_dns = {'true' if s.get('global_dns', True) else 'false'}", 'global_dns_apps = ["dns-base"]', 'global_dns_internal_resolvers = []', 'global_dns_external_resolvers = ["1.1.1.1","9.9.9.9"]',
         f"min_sessions = {s.get('min_sessions', 3)}", "limit = 0", "group_threshold = 10", "source_any_threshold = 5", f"workers = {max(1, (os.cpu_count() or 1) - 2)}", 'include_actions = ["allow"]', f"log_setting = {toml_string(s.get('log_profile',''))}", "",
@@ -387,6 +388,9 @@ def export_profile_flows(profile, path: Path) -> int:
 @login_required
 def build(profile_id):
     push = request.form.get("mode") == "push"
+    disabled_override = None
+    if push and request.form.get("disabled_override") in {"true", "false"}:
+        disabled_override = request.form["disabled_override"] == "true"
     with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
     if not profile: return "Not found", 404
     run_dir = RUNS / (datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{profile_id}-{secrets.token_hex(3)}"); run_dir.mkdir(mode=0o700)
@@ -397,7 +401,7 @@ def build(profile_id):
         if not count: raise ValueError("Geen geaggregeerde flows voor deze firewall")
         shutil.copy(BASE / "vendor/bdnd_panos_policy_builder.py", run_dir)
         shutil.copy(BASE / "vendor/bdnd_bpa_policy_builder.py", run_dir)
-        run_secret = write_config(profile, run_dir, push)
+        run_secret = write_config(profile, run_dir, push, disabled_override)
         run_env = {**os.environ,
             "PPF_PANOS_USERNAME": run_secret.get("username", ""), "PPF_PANOS_PASSWORD": run_secret.get("password", ""),
             "PPF_SCM_CLIENT_ID": run_secret.get("client_id", ""), "PPF_SCM_CLIENT_SECRET": run_secret.get("client_secret", ""),
@@ -408,7 +412,7 @@ def build(profile_id):
         if result.returncode: raise RuntimeError(output)
         with (run_dir / "review.csv").open(newline="") as fh: rules = sum(1 for _ in csv.DictReader(fh))
         with db() as conn: conn.execute("UPDATE runs SET status='complete',finished_at=?,rule_count=?,output=? WHERE id=?", (now(),rules,output,run_id))
-        audit("candidate-written" if push else "policy-preview", f"profile={profile['name']} run={run_id} rules={rules}")
+        audit("candidate-written" if push else "policy-preview", f"profile={profile['name']} run={run_id} rules={rules} disabled={disabled_override if push else 'profile-default'}")
         flash(("Candidateconfiguratie geschreven; geen commit/deployment uitgevoerd." if push else "Policy-preview gegenereerd.") + f" {rules} regels.", "success")
     except Exception as exc:
         with db() as conn: conn.execute("UPDATE runs SET status='failed',finished_at=?,output=? WHERE id=?", (now(),str(exc)[-12000:],run_id))

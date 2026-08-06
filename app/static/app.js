@@ -148,6 +148,59 @@
     });
   }
 
+  function setupPushOptions() {
+    var forms = all("form[data-push-options]");
+    if (!forms.length) return;
+
+    var dialog = document.createElement("dialog");
+    dialog.className = "push-dialog";
+    dialog.innerHTML = '<div class="push-dialog-brand">OCD</div>' +
+      '<div class="push-dialog-body"><h2>Security policies disabled pushen?</h2>' +
+      '<div class="cluster push-dialog-actions">' +
+      '<button class="btn btn-primary" type="button" data-push-choice="true">Ja</button>' +
+      '<button class="btn" type="button" data-push-choice="false">Nee</button>' +
+      '<button class="btn" type="button" data-push-cancel>Annuleren</button>' +
+      '</div></div>';
+    document.body.appendChild(dialog);
+    var pendingForm = null;
+
+    forms.forEach(function (form) {
+      form.addEventListener("submit", function (event) {
+        if (form.dataset.pushConfirmed === "true") {
+          delete form.dataset.pushConfirmed;
+          return;
+        }
+        event.preventDefault();
+        pendingForm = form;
+        dialog.showModal();
+      });
+    });
+
+    all("[data-push-choice]", dialog).forEach(function (button) {
+      button.addEventListener("click", function () {
+        if (!pendingForm) return;
+        var input = pendingForm.querySelector('input[name="disabled_override"]');
+        if (!input) {
+          input = document.createElement("input");
+          input.type = "hidden";
+          input.name = "disabled_override";
+          pendingForm.appendChild(input);
+        }
+        input.value = button.getAttribute("data-push-choice");
+        var form = pendingForm;
+        pendingForm = null;
+        form.dataset.pushConfirmed = "true";
+        dialog.close();
+        form.requestSubmit();
+      });
+    });
+    dialog.querySelector("[data-push-cancel]").addEventListener("click", function () {
+      pendingForm = null;
+      dialog.close();
+    });
+    dialog.addEventListener("cancel", function () { pendingForm = null; });
+  }
+
   document.addEventListener("DOMContentLoaded", function () {
     setupNavigation();
     setupPasswords();
@@ -156,5 +209,6 @@
     setupBulkSelection();
     setupFilters();
     setupConditionalTargets();
+    setupPushOptions();
   });
 })();
