@@ -89,6 +89,14 @@ h3 { margin-bottom: 10px; font-size: 16px; }
 .config-tree.is-collapsed { width: 58px; overflow: hidden; }
 .config-tree.is-collapsed strong, .config-tree.is-collapsed details { display: none; }
 .config-workspace-shell:has(.config-tree.is-collapsed) { grid-template-columns: 58px minmax(0,1fr); }
+.workspace-editor-content { max-width: 1800px; margin: 0 auto; }
+.workspace-scope-bar { padding: 14px 18px; }
+.workspace-scope-bar .field { max-width: 520px; }
+.inherited-row { opacity: .68; }
+.inherited-row td:first-child::after { content: " inherited"; color: var(--muted); font-size: 11px; margin-left: 7px; }
+.workspace-policy-dialog { width: min(1040px, calc(100vw - 32px)); max-height: calc(100vh - 32px); overflow: auto; }
+.workspace-policy-dialog .bulk-dialog-body { padding: 22px; }
+.xml-preview { max-height: 55vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: #ddd; font-size: 12px; }
 .card { min-width: 0; padding: 22px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: 0 1px 0 rgba(255,255,255,.025); }
 .card-header { display: flex; justify-content: space-between; gap: 14px; align-items: start; margin-bottom: 18px; }
 .card-header h2, .card-header h3, .card-header p { margin-bottom: 0; }

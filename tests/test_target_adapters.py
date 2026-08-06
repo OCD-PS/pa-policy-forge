@@ -83,7 +83,7 @@ class TargetAdapterTests(unittest.TestCase):
 
     def test_protected_routes_require_authentication(self):
         client = main.app.test_client()
-        for path in ("/", "/runs/1", "/runs/1/csv", "/profiles/1/catalog/applications", "/config-workspaces/1/export/xml", "/config-workspaces/1/push-preview"):
+        for path in ("/", "/runs/1", "/runs/1/csv", "/profiles/1/catalog/applications", "/config-workspaces/1/export/xml", "/config-workspaces/1/push-preview", "/config-workspaces/1/edit"):
             response = client.get(path, base_url="https://forge.test")
             self.assertEqual(response.status_code, 302)
             self.assertEqual(response.headers["Location"], "/login")
@@ -91,6 +91,8 @@ class TargetAdapterTests(unittest.TestCase):
     def test_offline_workspace_templates_compile(self):
         main.app.jinja_env.get_template("app.html")
         main.app.jinja_env.get_template("workspace_push.html")
+        main.app.jinja_env.get_template("workspace_editor.html")
+        main.app.jinja_env.get_template("workspace_policy_preview.html")
 
     def test_offline_workspace_storage_keeps_full_xml_and_inventory(self):
         timestamp = main.now()
@@ -110,6 +112,14 @@ class TargetAdapterTests(unittest.TestCase):
         try:
             self.assertEqual(json.loads(workspace["metadata_json"])["vsys"], ["vsys1"])
             self.assertTrue(main.workspace_config_path(workspace).read_bytes().startswith(b"<?xml"))
+            client = main.app.test_client()
+            with client.session_transaction(base_url="https://forge.test") as login:
+                login["user_id"] = 1
+                login["username"] = "test"
+                login["must_change"] = False
+            response = client.get(f"/config-workspaces/{workspace_id}/edit", base_url="https://forge.test", follow_redirects=True)
+            self.assertEqual(response.status_code, 200, response.data.decode())
+            self.assertIn(b"Virtual system", response.data)
         finally:
             main.workspace_config_path(workspace).unlink(missing_ok=True)
             with main.db() as conn:

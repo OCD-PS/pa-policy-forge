@@ -102,6 +102,15 @@ candidate automatically. Device groups, templates, VSYS selections, and unknown
 XML nodes remain preserved so later graphical editors can operate as scoped diffs
 without reconstructing or dropping unsupported configuration.
 
+The offline editor resolves Panorama policy and object inheritance from Shared
+through parent device groups to the selected device group. Inherited entries are
+visible but read-only. Standalone workspaces use the selected VSYS while retaining
+device-level Network configuration. A local policy edit has a before/after preview
+and creates a new immutable workspace version: only the exact selected rule node is
+replaced, unknown XML is preserved, and a fingerprint prevents applying a draft to
+a changed source snapshot. Network and Device currently provide XML inventories;
+their node-specific editors and Panorama template ownership are the next layer.
+
 ## Policy management
 
 The **Policybeheer** page uses an Expedition-inspired filter, selection, and

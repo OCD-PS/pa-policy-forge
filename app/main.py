@@ -31,7 +31,13 @@ from flask import Flask, Response, flash, has_request_context, redirect, render_
 
 from vendor.paloalto_light_syslog import FlowStore, parse_panos_syslog
 from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_single_replacements
-from app.offline_config import OfflineConfigError, normalized_config_xml, parse_snapshot, render_set_commands, safe_workspace_path, snapshot_sha256
+from app.offline_config import (
+    OBJECT_NODES, POLICY_NODES, OfflineConfigError, available_scopes,
+    configuration_inventory, normalized_config_xml, parse_snapshot,
+    policy_fingerprint as offline_policy_fingerprint, render_set_commands,
+    replace_policy_in_snapshot, safe_workspace_path, scoped_objects,
+    scoped_policies, snapshot_sha256,
+)
 
 BASE = Path(__file__).resolve().parent.parent
 DATA = Path(os.getenv("PPF_DATA_DIR", "/data"))
@@ -947,6 +953,140 @@ def workspace_config_path(workspace) -> Path:
     if not path.is_file():
         raise FileNotFoundError("Workspace XML ontbreekt")
     return path
+
+
+OFFLINE_POLICY_FIELDS = (
+    "from", "to", "source", "destination", "source_user", "category",
+    "application", "service", "tag",
+)
+
+
+@app.get("/config-workspaces/<int:workspace_id>/edit")
+@login_required
+def config_workspace_editor(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    try:
+        xml_bytes = workspace_config_path(workspace).read_bytes()
+        _, snapshot = parse_snapshot(xml_bytes)
+        scopes = available_scopes(snapshot)
+        if not scopes:
+            raise OfflineConfigError("Geen device group of VSYS gevonden")
+        scope = request.args.get("scope", "").strip() or scopes[0]
+        if scope not in scopes:
+            raise OfflineConfigError("De gekozen scope bestaat niet")
+        workspace_view = request.args.get("workspace_view", "policies")
+        if workspace_view not in {"policies", "objects", "network", "device"}:
+            workspace_view = "policies"
+        policy_kind = request.args.get("policy_kind", "security")
+        if policy_kind not in POLICY_NODES:
+            policy_kind = "security"
+        rulebase = request.args.get("rulebase", "pre" if snapshot.kind == "panorama" else "standard")
+        if snapshot.kind == "panorama" and rulebase not in {"pre", "post"}:
+            rulebase = "pre"
+        object_type = request.args.get("object_type", "addresses")
+        if object_type not in OBJECT_NODES:
+            object_type = "addresses"
+        policies = objects = []
+        inventory = {"network": [], "device": []}
+        if workspace_view == "policies":
+            _, policies = scoped_policies(xml_bytes, scope, policy_kind, rulebase)
+        elif workspace_view == "objects":
+            _, objects = scoped_objects(xml_bytes, scope, object_type)
+        else:
+            inventory = configuration_inventory(xml_bytes, scope)
+        edit_name = request.args.get("edit_policy", "")
+        edit_policy = next((item for item in policies if item["name"] == edit_name and item["editable"]), None)
+        return render_template(
+            "workspace_editor.html", workspace=workspace, snapshot=snapshot,
+            scopes=scopes, scope=scope, workspace_view=workspace_view,
+            policy_kind=policy_kind, policy_nodes=POLICY_NODES,
+            rulebase=rulebase, policies=policies, edit_policy=edit_policy,
+            object_type=object_type, object_nodes=OBJECT_NODES, objects=objects,
+            inventory=inventory, offline_policy_fields=OFFLINE_POLICY_FIELDS,
+        )
+    except Exception as exc:
+        flash(f"Workspace niet geopend: {exc}", "error")
+        return redirect(url_for("index", config_profile=workspace["profile_id"], workspace=workspace_id) + "#config-workspaces")
+
+
+@app.post("/config-workspaces/<int:workspace_id>/policies/preview")
+@login_required
+def config_workspace_policy_preview(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    try:
+        xml_bytes = workspace_config_path(workspace).read_bytes()
+        scope = request.form.get("scope", "")
+        kind = request.form.get("policy_kind", "security")
+        rulebase = request.form.get("rulebase", "pre")
+        name = request.form.get("policy_name", "")
+        _, policies = scoped_policies(xml_bytes, scope, kind, rulebase)
+        before = next((item for item in policies if item["name"] == name and item["editable"]), None)
+        if before is None:
+            raise OfflineConfigError("Alleen een policy uit de geselecteerde scope kan hier worden gewijzigd")
+        updated = copy.deepcopy(before)
+        for field in OFFLINE_POLICY_FIELDS:
+            updated[field] = split_values(request.form.get(field, ""))
+        updated["action"] = request.form.get("action", "").strip()
+        updated["description"] = request.form.get("description", "").strip()
+        updated["log_setting"] = request.form.get("log_setting", "").strip()
+        updated["schedule"] = request.form.get("schedule", "").strip()
+        updated["disabled"] = request.form.get("disabled") == "yes"
+        replacement_xml = update_xml_policy(updated)
+        if replacement_xml == before["_xml"]:
+            raise OfflineConfigError("Er zijn geen wijzigingen om te bewaren")
+        draft_id = secrets.token_urlsafe(24)
+        draft = {
+            "workspace_id": workspace_id, "scope": scope, "kind": kind,
+            "rulebase": rulebase, "policy_name": name,
+            "fingerprint": offline_policy_fingerprint(before),
+            "before": before, "after": updated,
+            "replacement_xml": replacement_xml, "created_at": now(),
+        }
+        draft_path = POLICY_DRAFTS / f"offline-{draft_id}.json"
+        draft_path.write_text(json.dumps(draft))
+        draft_path.chmod(0o600)
+        return render_template("workspace_policy_preview.html", workspace=workspace, draft_id=draft_id, draft=draft)
+    except Exception as exc:
+        flash(f"Wijziging niet voorbereid: {exc}", "error")
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
+
+
+@app.post("/config-workspaces/policy-drafts/<draft_id>/apply")
+@login_required
+def config_workspace_policy_apply(draft_id):
+    if not draft_id or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in draft_id):
+        return "Not found", 404
+    draft_path = POLICY_DRAFTS / f"offline-{draft_id}.json"
+    if not draft_path.is_file():
+        return "Not found", 404
+    try:
+        draft = json.loads(draft_path.read_text())
+        workspace = workspace_row(int(draft["workspace_id"]))
+        if not workspace:
+            raise OfflineConfigError("De bronworkspace bestaat niet meer")
+        new_xml = replace_policy_in_snapshot(
+            workspace_config_path(workspace).read_bytes(), draft["scope"], draft["kind"],
+            draft["rulebase"], draft["policy_name"], draft["fingerprint"], draft["replacement_xml"],
+        )
+        with db() as conn:
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+        if not profile:
+            raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
+        new_id = store_config_workspace(
+            profile, f"{workspace['name']} · edit {now()}", workspace["original_name"], new_xml, "edit",
+        )
+        audit("config-workspace-policy-edited", f"source={workspace['id']} workspace={new_id} scope={draft['scope']} policy={draft['policy_name']}")
+        draft_path.unlink(missing_ok=True)
+        flash("Policy gewijzigd in een nieuwe workspaceversie; de bronsnapshot bleef onaangeroerd.", "success")
+        return redirect(url_for("config_workspace_editor", workspace_id=new_id, scope=draft["scope"], policy_kind=draft["kind"], rulebase=draft["rulebase"]))
+    except Exception as exc:
+        flash(f"Wijziging niet bewaard: {exc}", "error")
+        workspace_id = json.loads(draft_path.read_text()).get("workspace_id") if draft_path.is_file() else None
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id)) if workspace_id else redirect(url_for("index"))
 
 
 @app.post("/profiles/<int:profile_id>/config-workspaces/upload")
