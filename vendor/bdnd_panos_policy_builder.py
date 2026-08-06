@@ -1595,8 +1595,6 @@ def preflight_scm_rules(
         device=scm.scm_device,
     )
     existing_rules = scm_fetch_rules(f"{security_base}/security-rules", token, rule_container, scm.scm_rulebase)
-    if deployment.panos_auto_push:
-        validate_anchor_rules(rows, {normalized_scm_rule_name(str(rule["name"])) for rule in existing_rules if rule.get("name")}, normalized_scm_rule_name)
     existing_name_keys = {
         normalized_scm_rule_name(str(rule["name"])): payload_rule_key(rule)
         for rule in existing_rules
@@ -1652,8 +1650,6 @@ def preflight_panos_rules(
     deployment: DeploymentConfig,
 ) -> Counter[str]:
     existing_entries = fetch_panos_rule_entries(deployment)
-    if deployment.panos_auto_push:
-        validate_anchor_rules(rows, {entry.attrib["name"] for entry in existing_entries if entry.attrib.get("name")})
     existing_name_keys = {
         entry.attrib["name"]: xml_rule_key(entry)
         for entry in existing_entries
@@ -1668,22 +1664,16 @@ def preflight_panos_rules(
     return set_preflight_statuses(rows, generated_rules, existing_name_keys, existing_rule_keys)
 
 
-def validate_anchor_rules(rows: list[dict[str, str]], existing_names: set[str], normalizer=lambda value: value) -> None:
-    missing = sorted({
-        row.get("anchor_rule", "").strip() or "<empty>"
-        for row in rows
-        if normalizer(row.get("anchor_rule", "").strip()) not in existing_names
-    })
-    if missing:
-        raise RuntimeError("Cannot position generated policies; source policy not found: " + ", ".join(missing))
-
-
 def movable_anchor_map(rows: list[dict[str, str]]) -> dict[str, str]:
     return {
         row["name"]: row["anchor_rule"]
         for row in rows
         if row.get("name") and row.get("anchor_rule") and row.get("preflight_status") != "duplicate-match-skip"
     }
+
+
+def rule_move_destination(anchor_name: str, existing_names: set[str], normalizer=lambda value: value) -> tuple[str, str]:
+    return ("before", anchor_name) if normalizer(anchor_name) in existing_names else ("bottom", "")
 
 
 def normalized_scm_rule_name(name: str) -> str:
@@ -1920,13 +1910,15 @@ def push_to_scm(
     for generated_name, anchor_name in movable_anchor_map(review_rows).items():
         generated = rules_by_name.get(normalized_scm_rule_name(generated_name))
         anchor = rules_by_name.get(normalized_scm_rule_name(anchor_name))
-        if not generated or not anchor:
-            raise RuntimeError(f"Cannot move {generated_name!r} before source policy {anchor_name!r}")
+        if not generated:
+            raise RuntimeError(f"Cannot move generated policy {generated_name!r}: rule was not returned by SCM")
+        destination, _ = rule_move_destination(anchor_name, set(rules_by_name), normalized_scm_rule_name)
+        move_payload = {"destination": "before", "rulebase": scm.scm_rulebase, "destination_rule": anchor["id"]} if destination == "before" else {"destination": "bottom", "rulebase": scm.scm_rulebase}
         scm_http_request(
             "POST",
             f"{security_base}/security-rules/{generated['id']}:move",
             token,
-            payload={"destination": "before", "rulebase": scm.scm_rulebase, "destination_rule": anchor["id"]},
+            payload=move_payload,
         )
 
     # PA Policy Forge intentionally stops after writing candidate objects and
@@ -1949,6 +1941,7 @@ def push_to_device(xml_path: Path, deployment: DeploymentConfig, review_rows: li
     key = key_root.findtext(".//key")
     if not key:
         raise RuntimeError("keygen succeeded but did not return an API key")
+    existing_rule_names = {entry.attrib["name"] for entry in fetch_panos_rule_entries(deployment) if entry.attrib.get("name")}
 
     import_name = import_name_for_path(xml_path)
     upload_path = xml_path if xml_path.name == import_name else xml_path.with_name(import_name)
@@ -1985,13 +1978,15 @@ def push_to_device(xml_path: Path, deployment: DeploymentConfig, review_rows: li
             )
         for generated_name, anchor_name in movable_anchor_map(review_rows).items():
             xpath = f"{rules_xpath(deployment)}/entry[@name={xpath_literal(generated_name)}]"
+            destination, destination_rule = rule_move_destination(anchor_name, existing_rule_names)
+            position = {"where": "before", "dst": destination_rule} if destination == "before" else {"where": "bottom"}
             require_success(
                 api_get(
                     deployment.panos_endpoint,
-                    {"type": "config", "action": "move", "xpath": xpath, "where": "before", "dst": anchor_name, "key": key},
+                    {"type": "config", "action": "move", "xpath": xpath, "key": key, **position},
                     ctx,
                 ),
-                f"move {generated_name} before {anchor_name}",
+                f"move {generated_name} before {anchor_name}" if destination == "before" else f"move {generated_name} to bottom",
             )
     finally:
         if copied and upload_path.exists():

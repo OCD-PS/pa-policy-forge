@@ -17,7 +17,7 @@ from vendor.bdnd_panos_policy_builder import (
     apply_existing_inventory,
     merge_candidates,
     movable_anchor_map,
-    validate_anchor_rules,
+    rule_move_destination,
 )
 
 class SafetyTests(unittest.TestCase):
@@ -106,11 +106,10 @@ class SafetyTests(unittest.TestCase):
         candidates = merge_candidates(aggregates, 1, 0, ZoneRoleConfig({"trust": "client", "dmz": "server"}))
         self.assertEqual({candidate.anchor_rule for candidate in candidates}, {"Discovery-A", "Discovery-B"})
 
-    def test_missing_position_anchor_stops_candidate_write(self):
+    def test_source_rule_is_kept_for_positioning(self):
         rows = [{"name": "generated", "anchor_rule": "Discovery", "preflight_status": "new"}]
-        with self.assertRaisesRegex(RuntimeError, "Discovery"):
-            validate_anchor_rules(rows, {"Different-Rule"})
-        validate_anchor_rules(rows, {"Discovery"})
         self.assertEqual(movable_anchor_map(rows), {"generated": "Discovery"})
+        self.assertEqual(rule_move_destination("Discovery", {"Discovery"}), ("before", "Discovery"))
+        self.assertEqual(rule_move_destination("Missing", {"Discovery"}), ("bottom", ""))
 
 if __name__ == "__main__": unittest.main()
