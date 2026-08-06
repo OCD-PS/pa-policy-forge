@@ -11,6 +11,11 @@ Self-hosted Palo Alto traffic-flow policy builder with an HTTPS web interface, U
 - Stores a separate optional recognition/source IP for each HA node, covering
   deployments where syslog uses distinct management or service-route addresses.
 - Fetches a fresh target inventory for every preview and candidate write.
+- Prepares a non-pushing policy run for each active profile every 30 minutes. A
+  candidate write reuses the latest flow snapshot only while the profile,
+  credentials, and builder version still match and the snapshot is at most one
+  preparation interval old. Target inventory and duplicate checks are refreshed
+  immediately before writing the candidate.
 - Reuses exact existing address/service objects and exact matching address,
   service, and application groups; same-name semantic conflicts are never overwritten.
 - Encrypts target credentials with a local key stored outside the application database.
@@ -59,3 +64,6 @@ open only after selecting a logical firewall or HA pair.
 Flow aggregation happens continuously while syslog arrives. CPU-parallel builder work
 defaults to `max(1, detected CPUs - 2)`, reserving two logical CPUs for the web UI,
 syslog receiver, and operating system.
+
+The preparation cadence can be changed with `PPF_PREPARE_INTERVAL` (seconds,
+minimum 300). Automatic preparation never writes or deploys candidate configuration.

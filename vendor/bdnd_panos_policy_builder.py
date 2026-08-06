@@ -2150,6 +2150,52 @@ def discover_log_paths(script_path: Path) -> list[Path]:
     )
 
 
+def push_prebuilt_candidate(
+    builder: BuilderConfig,
+    zone_roles: ZoneRoleConfig,
+    deployment: DeploymentConfig,
+    scm: SCMConfig,
+    profile_groups: ProfileGroupConfig,
+) -> int:
+    if not builder.xml_output.exists() or not builder.review_csv.exists():
+        raise SystemExit("Prepared policy.xml or review.csv is missing")
+    tree = ET.parse(builder.xml_output)
+    with builder.review_csv.open(newline="") as handle:
+        review_rows = list(csv.DictReader(handle))
+    for entry in tree.findall(".//rules/entry"):
+        disabled = entry.find("disabled")
+        if builder.disabled:
+            if disabled is None:
+                disabled = ET.SubElement(entry, "disabled")
+            disabled.text = "yes"
+        elif disabled is not None:
+            entry.remove(disabled)
+    for row in review_rows:
+        row["disabled"] = "yes" if builder.disabled else "no"
+
+    if deployment.scm:
+        inventory = fetch_scm_inventory(scm)
+        reused = apply_existing_inventory(tree, review_rows, deployment, inventory)
+        statuses = preflight_scm_rules(tree, review_rows, deployment, scm, zone_roles, profile_groups)
+    else:
+        inventory = fetch_panos_inventory(deployment)
+        reused = apply_existing_inventory(tree, review_rows, deployment, inventory)
+        statuses = preflight_panos_rules(tree, review_rows, deployment)
+    skipped = remove_skipped_xml_rules(tree, deployment, review_rows)
+    ET.indent(tree, space="  ")
+    tree.write(builder.xml_output, encoding="utf-8", xml_declaration=True)
+    write_review_csv(builder.review_csv, review_rows)
+    print(f"Refreshed target inventory: {inventory.summary()}")
+    print("Reused existing config: " + (", ".join(f"{kind}={count}" for kind, count in sorted(reused.items())) or "none"))
+    print("Preflight existing policy check: " + ", ".join(f"{status}={count}" for status, count in sorted(statuses.items())) + f"; skipped duplicate matches={skipped}")
+    if deployment.scm:
+        push_to_scm(tree, deployment, scm, zone_roles, profile_groups)
+    else:
+        push_to_device(builder.xml_output, deployment)
+    print("Pushed prepared candidate after fresh target validation")
+    return 0
+
+
 def main() -> int:
     if len(sys.argv) > 1:
         raise SystemExit("This script does not accept arguments. Edit bdnd_panos_zone_roles.toml instead.")
@@ -2159,6 +2205,10 @@ def main() -> int:
         raise SystemExit(f"Missing builder config: {config_file}")
 
     builder, zone_roles, deployment, scm, profile_groups = load_builder_config(config_file)
+    if os.getenv("PPF_PUSH_PREBUILT") == "1":
+        if not deployment.panos_auto_push:
+            raise SystemExit("Prepared push requires panos_auto_push=true")
+        return push_prebuilt_candidate(builder, zone_roles, deployment, scm, profile_groups)
     logs = list(builder.logs) or discover_log_paths(Path(__file__))
     if not logs:
         raise SystemExit(

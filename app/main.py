@@ -29,6 +29,9 @@ FLOW_DB = DATA / "flows.sqlite3"
 RUNS = DATA / "runs"
 SECRETS = DATA / "secrets"
 MAX_BYTES = int(float(os.getenv("PPF_MAX_GIB", "50")) * 1024**3)
+PREPARE_INTERVAL = max(300, int(os.getenv("PPF_PREPARE_INTERVAL", "1800")))
+PREPARE_INITIAL_DELAY = max(30, int(os.getenv("PPF_PREPARE_INITIAL_DELAY", "60")))
+PREPARE_MAX_AGE = PREPARE_INTERVAL + 300
 
 app = Flask(__name__)
 DATA.mkdir(parents=True, exist_ok=True)
@@ -384,6 +387,89 @@ def export_profile_flows(profile, path: Path) -> int:
     return len(rows)
 
 
+def build_fingerprint(profile, include_flows: bool = True) -> str:
+    serials = profile_serials(profile)
+    flow_state = []
+    if include_flows and serials:
+        placeholders = ",".join("?" for _ in serials)
+        with flow_store._connect() as conn:
+            flow_state = list(conn.execute(
+                f"SELECT serial,COUNT(*) count,MAX(last_seen) last_seen,SUM(repeat) sessions,SUM(bytes) bytes FROM flows WHERE action='allow' AND serial IN ({placeholders}) GROUP BY serial ORDER BY serial",
+                serials,
+            ))
+    state = {
+        "profile": {key: profile[key] for key in ("id", "enabled", "serial", "source_ip", "target_type", "settings_json", "updated_at")},
+        "secret": hashlib.sha256(bytes(profile["secret_blob"] or b"")).hexdigest(),
+        "builder": hashlib.sha256((BASE / "vendor/bdnd_panos_policy_builder.py").read_bytes()).hexdigest(),
+    }
+    if include_flows: state["flows"] = [dict(row) for row in flow_state]
+    return hashlib.sha256(json.dumps(state, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def execute_run(profile, mode: str, disabled_override: bool | None = None, prepared=None) -> int:
+    push = mode == "push"
+    run_dir = RUNS / (datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{profile['id']}-{secrets.token_hex(3)}")
+    run_dir.mkdir(mode=0o700)
+    with db() as conn:
+        cur = conn.execute("INSERT INTO runs(profile_id,mode,status,started_at,run_dir) VALUES(?,?,?,?,?)", (profile["id"], mode, "running", now(), str(run_dir)))
+        run_id = cur.lastrowid
+    try:
+        profile_fingerprint = build_fingerprint(profile, include_flows=False)
+        flow_fingerprint = build_fingerprint(profile, include_flows=True)
+        if prepared:
+            shutil.copy(Path(prepared["run_dir"]) / "flows.csv", run_dir / "flows.csv")
+            shutil.copy(Path(prepared["run_dir"]) / "policy.xml", run_dir / "policy.xml")
+            shutil.copy(Path(prepared["run_dir"]) / "review.csv", run_dir / "review.csv")
+            ptr_cache = Path(prepared["run_dir"]) / "ptr-cache.json"
+            if ptr_cache.exists(): shutil.copy(ptr_cache, run_dir / "ptr-cache.json")
+            count = 1
+        else:
+            count = export_profile_flows(profile, run_dir / "flows.csv")
+        if not count: raise ValueError("Geen geaggregeerde flows voor deze firewall")
+        shutil.copy(BASE / "vendor/bdnd_panos_policy_builder.py", run_dir)
+        shutil.copy(BASE / "vendor/bdnd_bpa_policy_builder.py", run_dir)
+        run_secret = write_config(profile, run_dir, push, disabled_override)
+        run_env = {**os.environ,
+            "PPF_PANOS_USERNAME": run_secret.get("username", ""), "PPF_PANOS_PASSWORD": run_secret.get("password", ""),
+            "PPF_SCM_CLIENT_ID": run_secret.get("client_id", ""), "PPF_SCM_CLIENT_SECRET": run_secret.get("client_secret", ""),
+            "PPF_SCM_TSG_ID": run_secret.get("tsg_id", "")}
+        if prepared: run_env["PPF_PUSH_PREBUILT"] = "1"
+        result = subprocess.run(["python3", "bdnd_panos_policy_builder.py"], cwd=run_dir, env=run_env, capture_output=True, text=True, timeout=1800)
+        run_secret = {}; run_env = {}
+        output = (result.stdout + "\n" + result.stderr)[-12000:]
+        if result.returncode: raise RuntimeError(output)
+        with (run_dir / "review.csv").open(newline="") as fh: rules = sum(1 for _ in csv.DictReader(fh))
+        (run_dir / "fingerprint").write_text(json.dumps({
+            "profile": profile_fingerprint,
+            "flows": flow_fingerprint,
+            "prepared_at": int(time.time()),
+        }))
+        with db() as conn: conn.execute("UPDATE runs SET status='complete',finished_at=?,rule_count=?,output=? WHERE id=?", (now(), rules, output, run_id))
+        audit("policy-prepared" if mode == "prepared" else "candidate-written" if push else "policy-preview", f"profile={profile['name']} run={run_id} rules={rules} reused={bool(prepared)} disabled={disabled_override if push else 'profile-default'}")
+        return run_id
+    except Exception as exc:
+        with db() as conn: conn.execute("UPDATE runs SET status='failed',finished_at=?,output=? WHERE id=?", (now(), str(exc)[-12000:], run_id))
+        audit("build-failed", f"profile={profile['name']} run={run_id} mode={mode}")
+        if mode != "prepared": raise
+        return run_id
+
+
+def fresh_prepared_run(profile):
+    profile_fingerprint = build_fingerprint(profile, include_flows=False)
+    with db() as conn:
+        candidates = conn.execute("SELECT * FROM runs WHERE profile_id=? AND mode='prepared' AND status='complete' ORDER BY id DESC LIMIT 3", (profile["id"],)).fetchall()
+    for candidate in candidates:
+        marker = Path(candidate["run_dir"]) / "fingerprint"
+        if marker.exists():
+            try:
+                metadata = json.loads(marker.read_text())
+                if metadata["profile"] == profile_fingerprint and time.time() - int(metadata["prepared_at"]) <= PREPARE_MAX_AGE:
+                    return candidate
+            except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+    return None
+
+
 @app.post("/profiles/<int:profile_id>/build")
 @login_required
 def build(profile_id):
@@ -393,31 +479,36 @@ def build(profile_id):
         disabled_override = request.form["disabled_override"] == "true"
     with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
     if not profile: return "Not found", 404
-    run_dir = RUNS / (datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{profile_id}-{secrets.token_hex(3)}"); run_dir.mkdir(mode=0o700)
-    with db() as conn:
-        cur = conn.execute("INSERT INTO runs(profile_id,mode,status,started_at,run_dir) VALUES(?,?,?,?,?)", (profile_id,"push" if push else "preview","running",now(),str(run_dir))); run_id = cur.lastrowid
     try:
-        count = export_profile_flows(profile, run_dir / "flows.csv")
-        if not count: raise ValueError("Geen geaggregeerde flows voor deze firewall")
-        shutil.copy(BASE / "vendor/bdnd_panos_policy_builder.py", run_dir)
-        shutil.copy(BASE / "vendor/bdnd_bpa_policy_builder.py", run_dir)
-        run_secret = write_config(profile, run_dir, push, disabled_override)
-        run_env = {**os.environ,
-            "PPF_PANOS_USERNAME": run_secret.get("username", ""), "PPF_PANOS_PASSWORD": run_secret.get("password", ""),
-            "PPF_SCM_CLIENT_ID": run_secret.get("client_id", ""), "PPF_SCM_CLIENT_SECRET": run_secret.get("client_secret", ""),
-            "PPF_SCM_TSG_ID": run_secret.get("tsg_id", "")}
-        result = subprocess.run(["python3", "bdnd_panos_policy_builder.py"], cwd=run_dir, env=run_env, capture_output=True, text=True, timeout=1800)
-        run_secret = {}; run_env = {}
-        output = (result.stdout + "\n" + result.stderr)[-12000:]
-        if result.returncode: raise RuntimeError(output)
-        with (run_dir / "review.csv").open(newline="") as fh: rules = sum(1 for _ in csv.DictReader(fh))
-        with db() as conn: conn.execute("UPDATE runs SET status='complete',finished_at=?,rule_count=?,output=? WHERE id=?", (now(),rules,output,run_id))
-        audit("candidate-written" if push else "policy-preview", f"profile={profile['name']} run={run_id} rules={rules} disabled={disabled_override if push else 'profile-default'}")
-        flash(("Candidateconfiguratie geschreven; geen commit/deployment uitgevoerd." if push else "Policy-preview gegenereerd.") + f" {rules} regels.", "success")
+        prepared = fresh_prepared_run(profile) if push else None
+        run_id = execute_run(profile, "push" if push else "preview", disabled_override, prepared)
+        with db() as conn: completed = conn.execute("SELECT rule_count FROM runs WHERE id=?", (run_id,)).fetchone()
+        suffix = " Voorbereide berekening hergebruikt." if prepared else ""
+        flash(("Candidateconfiguratie geschreven; geen commit/deployment uitgevoerd." if push else "Policy-preview gegenereerd.") + f" {completed['rule_count']} regels.{suffix}", "success")
     except Exception as exc:
-        with db() as conn: conn.execute("UPDATE runs SET status='failed',finished_at=?,output=? WHERE id=?", (now(),str(exc)[-12000:],run_id))
-        audit("build-failed", f"profile={profile['name']} run={run_id}"); flash(f"Run mislukt: {exc}", "error")
+        flash(f"Run mislukt: {exc}", "error")
+        with db() as conn: failed = conn.execute("SELECT id FROM runs WHERE profile_id=? ORDER BY id DESC LIMIT 1", (profile_id,)).fetchone()
+        run_id = failed["id"] if failed else 0
     return redirect(url_for("run_detail", run_id=run_id))
+
+
+def prepare_loop():
+    time.sleep(PREPARE_INITIAL_DELAY)
+    while True:
+        try:
+            with db() as conn: profiles = conn.execute("SELECT * FROM profiles WHERE enabled=1 ORDER BY id").fetchall()
+            for profile in profiles:
+                if fresh_prepared_run(profile): continue
+                execute_run(profile, "prepared")
+                with db() as conn:
+                    old = conn.execute("SELECT * FROM runs WHERE profile_id=? AND mode='prepared' ORDER BY id DESC LIMIT -1 OFFSET 1", (profile["id"],)).fetchall()
+                for run in old:
+                    path = Path(run["run_dir"])
+                    if path.exists() and path.is_dir(): shutil.rmtree(path)
+                    with db() as conn: conn.execute("DELETE FROM runs WHERE id=?", (run["id"],))
+        except Exception:
+            app.logger.exception("scheduled policy preparation failed")
+        time.sleep(PREPARE_INTERVAL)
 
 
 def quota_loop():
@@ -513,6 +604,7 @@ def udp_loop():
 
 threading.Thread(target=udp_loop,daemon=True,name="syslog-udp").start()
 threading.Thread(target=quota_loop,daemon=True,name="storage-quota").start()
+threading.Thread(target=prepare_loop,daemon=True,name="policy-prepare").start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0",port=8080)
