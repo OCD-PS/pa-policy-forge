@@ -27,8 +27,6 @@
 <span class="nav-icon">⚒</span>Policy runs</button>
 <button class="nav-link" data-section="policy-management">
 <span class="nav-icon">☷</span>Policybeheer</button>
-<button class="nav-link" data-section="config-workspaces">
-<span class="nav-icon">≡</span>Offline config</button>
 <button class="nav-link" data-section="settings">
 <span class="nav-icon">⚙</span>Instellingen</button>
 </nav>
@@ -406,6 +404,14 @@
 {% if not policy_profile %}
 <div class="page-header"><div><h1>Policybeheer</h1></div></div>
 <div class="grid device-selector-grid">{% for p in profiles %}<a class="card" href="{{url_for('index',policy_profile=p.id)}}#policy-management" style="text-decoration:none;color:inherit"><h2>{{p.name}}</h2></a>{% endfor %}</div>
+{% elif policy_profile.target_type in ['panorama','panos'] and not policy_source %}
+<div class="page-header"><div><p class="eyebrow">{{policy_profile.target_type|upper}}</p><h1>{{policy_profile.name}}</h1><p class="lede">Kies hoe je de configuratie wilt openen. De gekozen bron blijft gekoppeld aan de volledige XML.</p></div><a class="btn" href="{{url_for('index')}}#policy-management">Terug naar devices</a></div>
+<div class="grid grid-3 policy-source-grid">
+<a class="card policy-source-card" href="{{url_for('index',policy_profile=policy_profile.id,policy_source='live',policy_view='policies')}}#policy-management" style="text-decoration:none;color:inherit"><span class="badge">API</span><h2>Huidige candidate</h2><p class="muted">Lees rechtstreeks uit {{'Panorama' if policy_profile.target_type=='panorama' else 'de firewall'}} en gebruik de bestaande candidate-writeflow.</p></a>
+<form class="card stack" method="post" action="{{url_for('config_workspace_pull',profile_id=policy_profile.id)}}"><input type="hidden" name="csrf" value="{{csrf_token()}}"><div><span class="badge">API → XML</span><h2>Volledige config ophalen</h2><p class="muted">Bewaar de volledige candidate als XML-workspace en vul de editor daaruit.</p></div><div class="field"><label>Naam workspace</label><input name="name" placeholder="Automatisch indien leeg"></div><button class="btn btn-primary" type="submit">Ophalen en openen</button></form>
+<form class="card stack" method="post" action="{{url_for('config_workspace_upload',profile_id=policy_profile.id)}}" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{{csrf_token()}}"><div><span class="badge">XML import</span><h2>Configuratie importeren</h2><p class="muted">Open een volledige Panorama- of firewallconfiguratie zonder live pull.</p></div><div class="field"><label>Naam workspace</label><input name="name" placeholder="Bijvoorbeeld migratie augustus"></div><div class="field"><label>XML-configuratie</label><input type="file" name="config_file" accept=".xml,application/xml,text/xml" required></div><button class="btn btn-primary" type="submit">Importeren en openen</button></form>
+</div>
+{% if policy_workspaces %}<div class="card"><div class="card-header"><div><h2>Bestaande configuraties</h2><p class="muted">De bron en volledige XML blijven per versie bewaard.</p></div><span class="badge">{{policy_workspaces|length}}</span></div><div class="config-workspace-tabs">{% for item in policy_workspaces %}<a href="{{url_for('config_workspace_editor',workspace_id=item.id)}}"><strong>{{item.name}}</strong><small>{{'API pull' if item.source=='api' else 'XML import' if item.source=='upload' else 'Bewerkte versie'}} · {{item.created_at}}</small></a>{% endfor %}</div></div>{% endif %}
 {% else %}
 <div class="page-header"><div><p class="eyebrow">{{policy_profile.target_type|upper}}</p><h1>{{policy_profile.name}}</h1></div><div class="cluster"><a class="btn" href="{{url_for('index')}}#policy-management">Terug naar devices</a></div></div>
 <nav class="workspace-nav"><a class="{{'active' if policy_view=='policies' else ''}}" href="{{url_for('index',policy_profile=policy_profile.id,policy_view='policies')}}#policy-management">Policies</a><a class="{{'active' if policy_view=='objects' else ''}}" href="{{url_for('index',policy_profile=policy_profile.id,policy_view='objects')}}#policy-management">Objects</a><a class="{{'active' if policy_view=='network' else ''}}" href="{{url_for('index',policy_profile=policy_profile.id,policy_view='network',object_type='zones')}}#policy-management">Network</a></nav>
@@ -456,7 +462,7 @@
 {% else %}<div class="empty-state"><strong>Geen {{policy_types[policy_kind][2]}} policies</strong>De geselecteerde rulebase is leeg.</div>{% endif %}
 {% endif %}
 </section>
-<section id="config-workspaces" class="page-section" data-title="Offline config" hidden>
+<section id="legacy-config-workspaces" class="page-section" data-title="Offline config" hidden style="display:none">
 {% if config_profiles and not selected_config_profile %}
 <div class="page-header"><div><p class="eyebrow">Panorama &amp; standalone</p><h1>Configuratieworkspaces</h1><p class="lede">Kies eerst het profiel waarvan je een volledige configuratie wilt ophalen of offline bewerken.</p></div></div>
 <div class="grid device-selector-grid">{% for p in config_profiles %}<a class="card" href="{{url_for('index',config_profile=p.id)}}#config-workspaces" style="text-decoration:none;color:inherit"><h2>{{p.name}}</h2><span class="badge">{{p.target_type|upper}}</span></a>{% endfor %}</div>

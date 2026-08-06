@@ -83,6 +83,11 @@ open only after selecting a logical firewall or HA pair.
 ## Offline configuration workspaces
 
 Panorama and standalone profiles support complete offline configuration snapshots.
+A workspace is selected from **Policybeheer** rather than from a separate product
+area. After choosing a Panorama or standalone profile, the user chooses between the
+live candidate, a complete API pull into XML, an XML import, or an existing XML
+workspace. SCM continues directly with its live API workflow. The editor displays
+the acquisition source and uses the complete XML as its backing document.
 A snapshot can be uploaded as PAN-OS XML or pulled from the target's complete
 candidate configuration through the XML API. PA Policy Forge validates the XML
 with a hardened parser, verifies that its flavor matches the selected profile,

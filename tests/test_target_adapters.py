@@ -126,6 +126,39 @@ class TargetAdapterTests(unittest.TestCase):
                 conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
                 conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
 
+    def test_panorama_policy_management_chooses_config_source_before_live_fetch(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("source-choice-test", 1, "", "", "panorama", "{}", b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        workspace_id = main.store_config_workspace(
+            profile, "API snapshot", "api-candidate.xml",
+            b'<config><devices><entry name="localhost.localdomain"><device-group><entry name="Branches"/></device-group></entry></devices></config>',
+            "api",
+        )
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1
+            login["username"] = "test"
+            login["must_change"] = False
+        try:
+            with patch.object(main, "fetch_scm_policy_type") as fetch:
+                response = client.get(f"/?policy_profile={profile_id}", base_url="https://forge.test")
+            self.assertEqual(response.status_code, 200)
+            self.assertIn(b"Kies hoe je de configuratie wilt openen", response.data)
+            self.assertIn(b"API snapshot", response.data)
+            fetch.assert_not_called()
+        finally:
+            workspace = main.workspace_row(workspace_id)
+            main.workspace_config_path(workspace).unlink(missing_ok=True)
+            with main.db() as conn:
+                conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
     def test_oversized_form_is_rejected(self):
         client = main.app.test_client()
         response = client.post(

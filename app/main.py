@@ -1008,7 +1008,7 @@ def config_workspace_editor(workspace_id):
         )
     except Exception as exc:
         flash(f"Workspace niet geopend: {exc}", "error")
-        return redirect(url_for("index", config_profile=workspace["profile_id"], workspace=workspace_id) + "#config-workspaces")
+        return redirect(url_for("index", policy_profile=workspace["profile_id"]) + "#policy-management")
 
 
 @app.post("/config-workspaces/<int:workspace_id>/policies/preview")
@@ -1099,7 +1099,7 @@ def config_workspace_upload(profile_id):
     uploaded = request.files.get("config_file")
     if not uploaded or not uploaded.filename:
         flash("Kies eerst een volledige XML-configuratie.", "error")
-        return redirect(url_for("index", config_profile=profile_id) + "#config-workspaces")
+        return redirect(url_for("index", policy_profile=profile_id) + "#policy-management")
     try:
         data = uploaded.read()
         workspace_id = store_config_workspace(
@@ -1110,10 +1110,10 @@ def config_workspace_upload(profile_id):
             "upload",
         )
         flash("Volledige configuratie veilig geïmporteerd; het oorspronkelijke XML blijft behouden.", "success")
-        return redirect(url_for("index", config_profile=profile_id, workspace=workspace_id) + "#config-workspaces")
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
     except Exception as exc:
         flash(f"Configuratie niet geïmporteerd: {exc}", "error")
-        return redirect(url_for("index", config_profile=profile_id) + "#config-workspaces")
+        return redirect(url_for("index", policy_profile=profile_id) + "#policy-management")
 
 
 @app.post("/profiles/<int:profile_id>/config-workspaces/pull")
@@ -1141,10 +1141,10 @@ def config_workspace_pull(profile_id):
             "api",
         )
         flash("Volledige candidateconfiguratie via API opgehaald.", "success")
-        return redirect(url_for("index", config_profile=profile_id, workspace=workspace_id) + "#config-workspaces")
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
     except Exception as exc:
         flash(f"Volledige configuratie niet opgehaald: {exc}", "error")
-        return redirect(url_for("index", config_profile=profile_id) + "#config-workspaces")
+        return redirect(url_for("index", policy_profile=profile_id) + "#policy-management")
 
 
 @app.get("/config-workspaces/<int:workspace_id>/export/<kind>")
@@ -1210,7 +1210,7 @@ def config_workspace_push(workspace_id):
         flash("Volledige XML-configuratie via API naar de candidate geladen; er is niet gecommit.", "success")
     except Exception as exc:
         flash(f"Volledige XML niet geladen: {exc}", "error")
-    return redirect(url_for("index", config_profile=workspace["profile_id"], workspace=workspace_id) + "#config-workspaces")
+    return redirect(url_for("index", policy_profile=workspace["profile_id"]) + "#policy-management")
 
 
 @app.post("/config-workspaces/<int:workspace_id>/delete")
@@ -1227,7 +1227,7 @@ def config_workspace_delete(workspace_id):
         flash("Offline configuratieworkspace verwijderd.", "success")
     except Exception as exc:
         flash(f"Workspace niet verwijderd: {exc}", "error")
-    return redirect(url_for("index", config_profile=workspace["profile_id"]) + "#config-workspaces")
+    return redirect(url_for("index", policy_profile=workspace["profile_id"]) + "#policy-management")
 
 
 @app.get("/")
@@ -1291,7 +1291,8 @@ def index():
         selected_workspace = next((item for item in config_workspaces if item["id"] == selected_workspace_id), None)
         if selected_workspace:
             workspace_metadata = json.loads(selected_workspace["metadata_json"] or "{}")
-    policy_profile = None; policies = []; policy_error = ""; policy_objects = []; object_catalog = []; policy_catalog = []
+    policy_profile = None; policies = []; policy_error = ""; policy_objects = []; object_catalog = []; policy_catalog = []; policy_workspaces = []
+    policy_source = request.args.get("policy_source", "").strip()
     policy_view = request.args.get("policy_view", "policies")
     if policy_view not in {"policies", "objects", "network"}: policy_view = "policies"
     policy_kind = request.args.get("policy_kind", "security")
@@ -1302,16 +1303,29 @@ def index():
     if policy_profile_id:
         policy_profile = next((profile for profile in profiles if profile["id"] == policy_profile_id), None)
         if policy_profile:
-            try:
-                if policy_view in {"objects", "network"}:
-                    if policy_view == "network": object_type = "zones"
-                    policy_objects = fetch_scm_objects(policy_profile, object_type)
-                    object_catalog = fetch_object_catalog(policy_profile, object_type)
-                else:
-                    policies = fetch_scm_policy_type(policy_profile, policy_kind)
-                    policy_catalog = fetch_object_catalog(policy_profile, "policy-picker")
-            except Exception as exc: policy_error = str(exc)
-    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, config_profiles=config_profiles, selected_config_profile=selected_config_profile, config_workspaces=config_workspaces, selected_workspace=selected_workspace, workspace_metadata=workspace_metadata, policy_profile=policy_profile, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
+            if policy_profile["target_type"] in {"panorama", "panos"}:
+                with db() as conn:
+                    policy_workspaces = conn.execute(
+                        "SELECT * FROM config_workspaces WHERE profile_id=? ORDER BY id DESC",
+                        (policy_profile["id"],),
+                    ).fetchall()
+                # Existing deep links already carry a view. Treat those as live
+                # target navigation while new profile selections first choose a source.
+                if not policy_source and "policy_view" in request.args:
+                    policy_source = "live"
+            else:
+                policy_source = "live"
+            if policy_source == "live":
+                try:
+                    if policy_view in {"objects", "network"}:
+                        if policy_view == "network": object_type = "zones"
+                        policy_objects = fetch_scm_objects(policy_profile, object_type)
+                        object_catalog = fetch_object_catalog(policy_profile, object_type)
+                    else:
+                        policies = fetch_scm_policy_type(policy_profile, policy_kind)
+                        policy_catalog = fetch_object_catalog(policy_profile, "policy-picker")
+                except Exception as exc: policy_error = str(exc)
+    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, config_profiles=config_profiles, selected_config_profile=selected_config_profile, config_workspaces=config_workspaces, selected_workspace=selected_workspace, workspace_metadata=workspace_metadata, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
 
 
 def parse_zones(text: str) -> dict[str, str]:
