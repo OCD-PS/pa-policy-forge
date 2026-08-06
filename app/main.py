@@ -448,6 +448,43 @@ def run_detail(run_id):
     return render_template("run.html", run=run, review=review)
 
 
+@app.post("/runs/<int:run_id>/delete")
+@login_required
+def run_delete(run_id):
+    with db() as conn:
+        run = conn.execute(
+            "SELECT runs.*,profiles.name profile_name FROM runs JOIN profiles ON profiles.id=runs.profile_id WHERE runs.id=?",
+            (run_id,),
+        ).fetchone()
+    if not run:
+        return "Not found", 404
+    if run["status"] == "running":
+        flash("Een actieve policy-run kan niet worden verwijderd.", "error")
+        return redirect(url_for("index") + "#runs")
+
+    runs_root = RUNS.resolve()
+    run_path = Path(run["run_dir"]).resolve()
+    try:
+        run_path.relative_to(runs_root)
+    except ValueError:
+        app.logger.error("Refused to delete run outside runs root: %s", run_path)
+        flash("Run niet verwijderd: ongeldig artifactpad.", "error")
+        return redirect(url_for("index") + "#runs")
+    if run_path == runs_root:
+        flash("Run niet verwijderd: ongeldig artifactpad.", "error")
+        return redirect(url_for("index") + "#runs")
+    if run_path.exists():
+        if not run_path.is_dir():
+            flash("Run niet verwijderd: artifactpad is geen map.", "error")
+            return redirect(url_for("index") + "#runs")
+        shutil.rmtree(run_path)
+    with db() as conn:
+        conn.execute("DELETE FROM runs WHERE id=?", (run_id,))
+    audit("policy-run-deleted", f"run={run_id} profile={run['profile_name']}")
+    flash(f"Policy-run #{run_id} en bijhorende artifacts verwijderd.", "success")
+    return redirect(url_for("index") + "#runs")
+
+
 @app.get("/runs/<int:run_id>/<kind>")
 @login_required
 def run_download(run_id, kind):

@@ -49,6 +49,10 @@ For offline customers, transfer the repository plus a saved container image bund
 6. Use **Naar candidate schrijven** only after review. Commit/deploy separately in SCM, Panorama, or PAN-OS.
 7. After the accepted rules are manually positioned and deployed, use **Flows purgen** on the profile to start a clean observation cycle. Profiles and run history are retained.
 
+Policy runs can be removed individually from the run history. Deletion removes
+the database record plus its review/XML artifacts, after verifying that the
+artifact directory is inside the configured runs root. Active runs cannot be deleted.
+
 The Flows page always starts with a device/firewall-group chooser. Flow details
 open only after selecting a logical firewall or HA pair.
 
