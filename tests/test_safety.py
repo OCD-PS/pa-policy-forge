@@ -1,7 +1,9 @@
 import pathlib
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -15,15 +17,39 @@ from vendor.bdnd_panos_policy_builder import (
     ExistingConfigInventory,
     ZoneRoleConfig,
     apply_existing_inventory,
+    deploy_scm_candidate,
     merge_candidates,
     movable_anchor_map,
     rule_move_destination,
 )
 
 class SafetyTests(unittest.TestCase):
-    def test_scm_never_calls_candidate_push(self):
+    def test_scm_deploy_is_explicitly_device_scoped(self):
         text=(ROOT/"vendor/bdnd_panos_policy_builder.py").read_text()
-        self.assertNotIn('config-versions/candidate:push', text)
+        self.assertIn('config-versions/candidate:push', text)
+        self.assertIn('payload={"devices": targets}', text)
+        self.assertNotIn('payload={"folder":', text)
+
+    def test_scm_deploy_devices_are_runtime_only(self):
+        app_text=(ROOT/"app/main.py").read_text()
+        self.assertIn('"PPF_SCM_DEPLOY_DEVICES": ",".join(profile_serials(profile))', app_text)
+        config_block = app_text[app_text.index("def write_config"):app_text.index("def export_profile_flows")]
+        self.assertNotIn("PPF_SCM_DEPLOY_DEVICES", config_block)
+
+    @patch("vendor.bdnd_panos_policy_builder.get_scm_token", return_value="test-token")
+    @patch("vendor.bdnd_panos_policy_builder.scm_http_request")
+    def test_scm_deploy_waits_for_both_device_jobs(self, request, _token):
+        request.side_effect = [
+            {"data": [{"id": "100"}]},
+            {"data": [{"id": "100", "status_str": "FIN", "result_str": "OK"}]},
+            {"data": [
+                {"id": "101", "parent_id": "100", "device_name": "active", "status_str": "FIN", "result_str": "OK"},
+                {"id": "102", "parent_id": "100", "device_name": "passive", "status_str": "FIN", "result_str": "OK"},
+            ]},
+        ]
+        scm = SimpleNamespace(scm_api_base="https://api.strata.paloaltonetworks.com/config/security/v1")
+        self.assertEqual(deploy_scm_candidate(scm, ["active", "passive"]), "100")
+        self.assertEqual(request.call_args_list[0].kwargs["payload"], {"devices": ["active", "passive"]})
 
     def test_no_http_port_exposed(self):
         text=(ROOT/"docker-compose.yml").read_text()

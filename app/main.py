@@ -1357,7 +1357,8 @@ def execute_run(profile, mode: str, disabled_override: bool | None = None, prepa
         run_env = {**os.environ,
             "PPF_PANOS_USERNAME": run_secret.get("username", ""), "PPF_PANOS_PASSWORD": run_secret.get("password", ""),
             "PPF_SCM_CLIENT_ID": run_secret.get("client_id", ""), "PPF_SCM_CLIENT_SECRET": run_secret.get("client_secret", ""),
-            "PPF_SCM_TSG_ID": run_secret.get("tsg_id", "")}
+            "PPF_SCM_TSG_ID": run_secret.get("tsg_id", ""),
+            "PPF_SCM_DEPLOY_DEVICES": ",".join(profile_serials(profile)) if push and profile["target_type"] == "scm" else ""}
         if prepared: run_env["PPF_PUSH_PREBUILT"] = "1"
         result = subprocess.run([sys.executable, "bdnd_panos_policy_builder.py"], cwd=run_dir, env=run_env, capture_output=True, text=True, timeout=1800)
         run_secret = {}; run_env = {}

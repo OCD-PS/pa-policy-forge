@@ -17,6 +17,7 @@ import os
 import ssl
 import subprocess
 import sys
+import time
 import tomllib
 import urllib.error
 import urllib.parse
@@ -1137,6 +1138,70 @@ def response_items(response: Any) -> list[dict[str, Any]]:
             if nested:
                 return nested
     return [response] if response.get("id") or response.get("name") else []
+
+
+def response_id(response: Any) -> str:
+    if isinstance(response, dict):
+        for key in ("id", "job_id", "jobId"):
+            if response.get(key) not in (None, ""):
+                return str(response[key])
+        for value in response.values():
+            found = response_id(value)
+            if found:
+                return found
+    elif isinstance(response, list):
+        for value in response:
+            found = response_id(value)
+            if found:
+                return found
+    return ""
+
+
+def deploy_scm_candidate(scm: SCMConfig, devices: list[str], timeout: int = 900) -> str:
+    targets = list(dict.fromkeys(str(device).strip() for device in devices if str(device).strip()))
+    if not targets:
+        raise RuntimeError("SCM deploy requires at least one target device serial")
+    token = get_scm_token(scm)
+    operations = scm_api_root(scm.scm_api_base) + "/config/operations/v1"
+    created = scm_http_request(
+        "POST", operations + "/config-versions/candidate:push", token,
+        payload={"devices": targets},
+    )
+    job_id = response_id(created)
+    if not job_id:
+        raise RuntimeError(f"SCM candidate push returned no job ID: {created!r}")
+
+    terminal = {"FIN", "PUSHFAIL", "PUSHABORT", "PUSHTIMEOUT"}
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        parent_rows = response_items(scm_http_request("GET", f"{operations}/jobs/{job_id}", token))
+        jobs = response_items(scm_http_request(
+            "GET", operations + "/jobs", token, params={"limit": "200", "offset": "0"}
+        ))
+        children = [row for row in jobs if str(row.get("parent_id", "")) == job_id]
+        children_by_device = {str(row.get("device_name", "")): row for row in children}
+        target_children = [children_by_device.get(device) for device in targets]
+        if parent_rows and all(row.get("status_str") in terminal for row in parent_rows):
+            parent_ok = all(row.get("status_str") == "FIN" and row.get("result_str") == "OK" for row in parent_rows)
+            children_done = all(row and row.get("status_str") in terminal for row in target_children)
+            if parent_ok and children_done and all(
+                row.get("status_str") == "FIN" and row.get("result_str") == "OK"
+                for row in target_children
+            ):
+                return job_id
+            if not parent_ok or children_done:
+                details = [
+                    {
+                        "device": row.get("device_name", "") if row else device,
+                        "status": row.get("status_str", "missing") if row else "missing",
+                        "result": row.get("result_str", "") if row else "",
+                        "summary": row.get("summary", "") if row else "",
+                    }
+                    for device, row in zip(targets, target_children)
+                ]
+                raise RuntimeError(f"SCM deploy job {job_id} failed: {details!r}")
+        time.sleep(10)
+    raise RuntimeError(f"Timed out waiting for SCM deploy job {job_id}")
 
 
 def normalized_address_value(kind: str, value: str) -> tuple[str, str]:
@@ -2261,6 +2326,8 @@ def push_prebuilt_candidate(
     print("Preflight existing policy check: " + ", ".join(f"{status}={count}" for status, count in sorted(statuses.items())) + f"; skipped duplicate matches={skipped}")
     if deployment.scm:
         push_to_scm(tree, deployment, scm, zone_roles, profile_groups, review_rows)
+        job_id = deploy_scm_candidate(scm, os.getenv("PPF_SCM_DEPLOY_DEVICES", "").split(","))
+        print(f"SCM candidate deployed successfully; job={job_id}")
     else:
         push_to_device(builder.xml_output, deployment, review_rows)
     print("Pushed prepared candidate after fresh target validation")
@@ -2345,9 +2412,10 @@ def main() -> int:
     if deployment.panos_auto_push:
         if deployment.scm:
             push_to_scm(tree, deployment, scm, zone_roles, profile_groups, review_rows)
+            job_id = deploy_scm_candidate(scm, os.getenv("PPF_SCM_DEPLOY_DEVICES", "").split(","))
             print(
                 f"Auto-pushed generated config to SCM folder {scm.scm_folder} "
-                f"with objects in {scm.scm_object_folder}"
+                f"with objects in {scm.scm_object_folder}; deployed job={job_id}"
             )
         else:
             push_to_device(builder.xml_output, deployment, review_rows)

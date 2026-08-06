@@ -1,6 +1,6 @@
 # PA Policy Forge
 
-Self-hosted Palo Alto traffic-flow policy builder with an HTTPS web interface, UDP syslog collection, encrypted target credentials, policy review, and candidate-only writes to SCM, Panorama, or standalone PAN-OS.
+Self-hosted Palo Alto traffic-flow policy builder with an HTTPS web interface, UDP syslog collection, encrypted target credentials, policy review, and target-aware pushes to SCM, Panorama, or standalone PAN-OS.
 
 ## Safety guarantees
 
@@ -21,7 +21,11 @@ Self-hosted Palo Alto traffic-flow policy builder with an HTTPS web interface, U
 - Encrypts target credentials with a local key stored outside the application database.
 - Existing profiles can be edited without exposing stored credentials. Blank credential
   fields preserve the existing encrypted value; only explicitly entered replacements are saved.
-- SCM writes objects/rules but never calls `candidate:push`.
+- SCM generated-policy pushes write objects/rules to the configured folder, then deploy
+  the candidate to the active and optional passive serial from the firewall profile.
+  Device serials are used only by the deployment operation and never added to policy payloads.
+- SCM deployment success requires both the parent job and every targeted firewall child job
+  to finish with `FIN/OK`.
 - Panorama and standalone use import/partial-load only and never commit.
 - The source security-policy name from each syslog flow is retained as its
   positioning anchor. Candidate rules are moved directly before that source
@@ -64,7 +68,9 @@ For offline customers, transfer the repository plus a saved container image bund
 4. Create a profile, map zones to roles, and enter the target credentials.
    For HA pairs, configure both the active and passive firewall serial.
 5. Generate a preview and inspect/download the review CSV and XML.
-6. Use **Naar candidate schrijven** only after review. Commit/deploy separately in SCM, Panorama, or PAN-OS.
+6. Use **Push** only after review. SCM-generated policies are written to the configured
+   folder and deployed to the profile's HA targets. Panorama and standalone writes remain
+   candidate-only and require their normal commit workflow.
 7. After the accepted rules are manually positioned and deployed, use **Flows purgen** on the profile to start a clean observation cycle. Profiles and run history are retained.
 
 Policy runs can be removed individually from the run history. Deletion removes
