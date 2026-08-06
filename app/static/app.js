@@ -315,10 +315,10 @@
       if (!values.length) { var empty = document.createElement("span"); empty.className = "muted small"; empty.textContent = "Geen bestaande waarden"; container.appendChild(empty); }
     }
     function prepareBulkFields() {
-      var selected = selectedRows();
+      var selected = selectedRows(); var datasetKeys = {source_user: "sourceUser", destination_user: "destinationUser", source_hip: "sourceHip", destination_hip: "destinationHip"};
       all("[data-bulk-field]", dialog).forEach(function (fieldNode) {
-        var field = fieldNode.dataset.bulkField; var values = []; var seen = new Set();
-        selected.forEach(function (row) { (row.dataset[field] || "").split("|||").filter(Boolean).forEach(function (value) { if (!seen.has(value)) { seen.add(value); values.push(value); } }); });
+        var field = fieldNode.dataset.bulkField; var dataKey = datasetKeys[field] || field; var values = []; var seen = new Set();
+        selected.forEach(function (row) { (row.dataset[dataKey] || "").split("|||").filter(Boolean).forEach(function (value) { if (!seen.has(value)) { seen.add(value); values.push(value); } }); });
         var removed = new Set(); fieldNode._removedValues = removed;
         fieldNode.querySelector("[data-bulk-remove]").value = ""; fieldNode.querySelector("[data-bulk-add]").value = ""; fieldNode.querySelector("[data-bulk-add]").dataset.values = "";
         renderBulkField(fieldNode, values, removed);
@@ -341,6 +341,12 @@
       }
       button.addEventListener("click", addValue);
       input.addEventListener("keydown", function (event) { if (event.key === "Enter") { event.preventDefault(); addValue(); } });
+    });
+    all("[data-policy-tab]", dialog).forEach(function (tab) {
+      tab.addEventListener("click", function () {
+        all("[data-policy-tab]", dialog).forEach(function (item) { item.classList.toggle("is-active", item === tab); });
+        all("[data-policy-panel]", dialog).forEach(function (panel) { panel.classList.toggle("is-active", panel.dataset.policyPanel === tab.dataset.policyTab); });
+      });
     });
     var cancel = document.querySelector("[data-policy-bulk-cancel]");
     if (cancel) cancel.addEventListener("click", function () { dialog.close(); });

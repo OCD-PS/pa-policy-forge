@@ -20,5 +20,18 @@ class PolicyBulkTests(unittest.TestCase):
         self.assertEqual(changed["to"], ["Internet"])
         self.assertEqual(policy["from"], ["Trust", "DMZ"])
 
+    def test_description_is_appended_without_replacing_existing_text(self):
+        policy = {
+            "from": ["Trust"], "to": ["Internet"], "source": ["any"], "destination": ["any"],
+            "source_user": ["any"], "destination_user": ["any"], "source_hip": ["any"],
+            "destination_hip": ["any"], "application": ["ssl"], "service": ["application-default"],
+            "category": ["any"], "tag": [], "description": "Bestaande tekst", "action": "allow",
+            "disabled": False, "log_setting": "forward", "profile_group": "best-practice",
+        }
+        operations = {field: {"add": [], "remove": []} for field in policy if isinstance(policy[field], list)}
+        operations.update(action=None, disabled=None, log_setting=None, profile_group=None, description_append="Nieuwe tekst")
+        changed = apply_bulk_operations(policy, operations)
+        self.assertEqual(changed["description"], "Bestaande tekst Nieuwe tekst")
+
 
 if __name__ == "__main__": unittest.main()

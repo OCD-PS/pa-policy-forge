@@ -281,7 +281,7 @@ def scm_policy_payload(policy: dict, container: dict) -> dict:
     payload = {
         "name": policy["name"], "from": policy["from"], "to": policy["to"],
         "source": policy["source"], "destination": policy["destination"],
-        "source_user": policy["source_user"], "category": policy["category"],
+        "source_user": policy["source_user"], "destination_user": policy["destination_user"], "category": policy["category"],
         "application": policy["application"], "service": policy["service"],
         "action": policy["action"], "disabled": policy["disabled"],
         "negate_source": policy["negate_source"], "negate_destination": policy["negate_destination"],
@@ -489,6 +489,7 @@ def policy_bulk_preview(profile_id):
         operations[field] = {"add": split_values(request.form.get(f"{field}_add", "")), "remove": split_values(request.form.get(f"{field}_remove", ""))}
     for field in ("action", "log_setting", "profile_group"):
         operations[field] = request.form.get(field) or None
+    operations["description_append"] = request.form.get("description_append", "").strip()
     disabled = request.form.get("disabled", "")
     operations["disabled"] = disabled == "true" if disabled in {"true", "false"} else None
     try:
