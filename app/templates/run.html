@@ -1,1 +1,46 @@
-<!doctype html><html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Run #{{run.id}} · PA Policy Forge</title><link rel="stylesheet" href="{{url_for('static',filename='app.css')}}"></head><body><main class="content" style="margin:auto"><div class="page-header"><div><p class="eyebrow">{{run.mode}}</p><h1>Run #{{run.id}} · {{run.profile_name}}</h1><p class="lede">{{run.started_at}} — {{run.finished_at or 'bezig'}}</p></div><div class="cluster"><a class="btn" href="{{url_for('index')}}#runs">Terug</a>{% if run.status=='complete' %}<a class="btn" href="{{url_for('run_download',run_id=run.id,kind='csv')}}">Review CSV</a><a class="btn btn-primary" href="{{url_for('run_download',run_id=run.id,kind='xml')}}">Policy XML</a>{% endif %}</div></div><div class="callout"><strong>{{run.rule_count}} regels.</strong> {% if run.mode=='push' %}Geschreven naar candidate configuration; er is geen commit of deployment uitgevoerd.{% else %}Preview-only; het target is niet aangepast.{% endif %}</div>{% if review %}<div class="review-toolbar" style="margin-top:22px"><input class="search" data-table-filter="#review" placeholder="Filter review..."></div><div class="table-wrap"><table id="review"><thead><tr>{% for k in review[0].keys() %}<th>{{k}}</th>{% endfor %}</tr></thead><tbody>{% for row in review %}<tr>{% for value in row.values() %}<td>{{value}}</td>{% endfor %}</tr>{% endfor %}</tbody></table></div>{% else %}<div class="card" style="margin-top:22px"><h2>Uitvoer</h2><pre style="white-space:pre-wrap">{{run.output}}</pre></div>{% endif %}</main><script src="{{url_for('static',filename='app.js')}}"></script></body></html>
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Run #{{run.id}} · PA Policy Forge</title>
+<link rel="stylesheet" href="{{url_for('static',filename='app.css')}}">
+</head>
+<body>
+<main class="content" style="margin:auto">
+<div class="page-header">
+<div>
+<p class="eyebrow">{{run.mode}}</p>
+<h1>Run #{{run.id}} · {{run.profile_name}}</h1>
+<p class="lede">{{run.started_at}} — {{run.finished_at or 'bezig'}}</p>
+</div>
+<div class="cluster">
+<a class="btn" href="{{url_for('index')}}#runs">Terug</a>
+{% if run.status=='complete' %}
+<a class="btn" href="{{url_for('run_download',run_id=run.id,kind='csv')}}">Review CSV</a>
+<a class="btn" href="{{url_for('run_download',run_id=run.id,kind='xml')}}">Policy XML</a>
+{% if run.mode=='preview' %}
+<form method="post" action="{{url_for('build',profile_id=run.profile_id)}}" data-confirm="Nieuwe push-run starten met actuele flows en verse targetconfiguratie?">
+<input type="hidden" name="csrf" value="{{csrf_token()}}">
+<input type="hidden" name="mode" value="push">
+<button class="btn btn-primary" type="submit">Push</button>
+</form>
+{% endif %}
+{% endif %}
+</div>
+</div>
+{% if review %}
+<div class="review-toolbar" style="margin-top:22px"><input class="search" data-table-filter="#review" placeholder="Filter review..."></div>
+<div class="table-wrap">
+<table id="review">
+<thead><tr>{% for k in review[0].keys() %}<th>{{k}}</th>{% endfor %}</tr></thead>
+<tbody>{% for row in review %}<tr>{% for value in row.values() %}<td>{{value}}</td>{% endfor %}</tr>{% endfor %}</tbody>
+</table>
+</div>
+{% else %}
+<div class="card" style="margin-top:22px"><h2>Uitvoer</h2><pre style="white-space:pre-wrap">{{run.output}}</pre></div>
+{% endif %}
+</main>
+<script src="{{url_for('static',filename='app.js')}}"></script>
+</body>
+</html>
