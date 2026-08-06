@@ -82,12 +82,19 @@ application groups, services, service groups, and tags can be prepared through
 a preview and then written to SCM candidate. Existing objects open in a
 PAN-OS-style editor; multi-select delete is available from the fixed bottom
 action bar. Addresses support all four PAN-OS address types and tags. Address
-groups support static members and dynamic filters. Services support TCP/UDP,
+groups support static members and dynamic filters. Address, service, and
+application groups use searchable member pickers and removable member chips.
+Installed applications open as read-only details and their target-specific SCM
+catalog is cached for 30 minutes, with background refresh to keep pages responsive.
+Services support TCP/UDP,
 destination/source ports, and optional timeout overrides. Creation is stopped
 when the name or equivalent object already exists, and stale edit/delete drafts
 are rejected. Object changes never commit or push the SCM candidate
 configuration automatically.
-removing one zone or object never removes the other existing members. A preview
+SCM policy inventory includes Security, NAT, QoS, Policy Based Forwarding,
+Decryption, Application Override, and Authentication. Unsupported or unavailable
+tenant categories are shown explicitly instead of blocking the workspace.
+Removing one zone or object never removes the other existing members. A preview
 shows every changed value before a separate candidate write. The candidate
 write re-fetches the live rules and stops on concurrent changes. SCM is the
 first enabled connector; Panorama and standalone use the same UI but are not

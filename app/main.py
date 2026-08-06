@@ -32,6 +32,7 @@ RUNS = DATA / "runs"
 SECRETS = DATA / "secrets"
 POLICY_DRAFTS = DATA / "policy-drafts"
 OBJECT_DRAFTS = DATA / "object-drafts"
+OBJECT_CACHE = DATA / "object-cache"
 MAX_BYTES = int(float(os.getenv("PPF_MAX_GIB", "50")) * 1024**3)
 PREPARE_INTERVAL = max(300, int(os.getenv("PPF_PREPARE_INTERVAL", "1800")))
 PREPARE_INITIAL_DELAY = max(30, int(os.getenv("PPF_PREPARE_INITIAL_DELAY", "60")))
@@ -43,6 +44,21 @@ RUNS.mkdir(parents=True, exist_ok=True)
 SECRETS.mkdir(parents=True, exist_ok=True)
 POLICY_DRAFTS.mkdir(parents=True, exist_ok=True)
 OBJECT_DRAFTS.mkdir(parents=True, exist_ok=True)
+OBJECT_CACHE.mkdir(parents=True, exist_ok=True)
+
+SCM_POLICY_TYPES = {
+    "security": ("security", "security-rules", "Security"),
+    "nat": ("network", "nat-rules", "NAT"),
+    "qos": ("network", "qos-policy-rules", "QoS"),
+    "pbf": ("network", "pbf-rules", "Policy Based Forwarding"),
+    "decryption": ("security", "decryption-rules", "Decryption"),
+    "tunnel-inspection": ("security", "tunnel-inspection-rules", "Tunnel Inspection"),
+    "application-override": ("security", "app-override-rules", "Application Override"),
+    "authentication": ("identity", "authentication-rules", "Authentication"),
+    "dos": ("network", "dos-rules", "DoS Protection"),
+    "sdwan": ("network", "sdwan-rules", "SD-WAN"),
+}
+SCM_UNAVAILABLE_POLICY_TYPES = {"tunnel-inspection", "dos", "sdwan"}
 
 SCM_OBJECT_TYPES = {
     "addresses": {"label": "Addresses", "creatable": True},
@@ -54,6 +70,8 @@ SCM_OBJECT_TYPES = {
     "service-groups": {"label": "Service Groups", "creatable": True},
     "tags": {"label": "Tags", "creatable": True},
 }
+_catalog_refreshing: set[tuple[int, str]] = set()
+_catalog_refresh_lock = threading.Lock()
 
 
 def secret_file(name: str, generator) -> bytes:
@@ -282,6 +300,17 @@ def fetch_security_policies(profile) -> list[dict]:
     return [normalize_scm_policy(rule) for rule in policy_api.scm_fetch_rules(endpoint, token, container, scm.scm_rulebase)]
 
 
+def fetch_scm_policy_type(profile, policy_kind: str) -> list[dict]:
+    if policy_kind not in SCM_POLICY_TYPES: raise ValueError("Onbekend policytype")
+    if profile["target_type"] == "scm" and policy_kind in SCM_UNAVAILABLE_POLICY_TYPES: return []
+    if policy_kind == "security": return fetch_security_policies(profile)
+    if profile["target_type"] != "scm": raise ValueError("Deze policycategorie wordt eerst via SCM gevalideerd.")
+    service, endpoint_name, _ = SCM_POLICY_TYPES[policy_kind]
+    scm, token, _, container = scm_client(profile)
+    endpoint = policy_api.scm_api_root(scm.scm_api_base) + f"/config/{service}/v1/{endpoint_name}"
+    return policy_api.scm_fetch_all(endpoint, token, {**container, "position": scm.scm_rulebase})
+
+
 def fetch_scm_objects(profile, object_type: str) -> list[dict]:
     if object_type not in SCM_OBJECT_TYPES:
         raise ValueError("Onbekend objecttype")
@@ -291,6 +320,39 @@ def fetch_scm_objects(profile, object_type: str) -> list[dict]:
     root = policy_api.scm_api_root(scm.scm_api_base) + "/config/objects/v1"
     container = policy_api.scm_container(folder=scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
     return policy_api.scm_fetch_all(f"{root}/{object_type}", token, container)
+
+
+def fetch_object_catalog(profile, object_type: str) -> list[dict]:
+    related = {"address-groups": ("addresses", "address-groups"), "service-groups": ("services", "service-groups"), "application-groups": ("applications", "application-groups")}.get(object_type, ())
+    catalog = []
+    for kind in related:
+        cache_path = OBJECT_CACHE / f"{profile['id']}-{kind}.json"
+        cached = None
+        if cache_path.exists():
+            try: cached = json.loads(cache_path.read_text())
+            except (OSError, json.JSONDecodeError): cached = None
+        stale = not cache_path.exists() or time.time() - cache_path.stat().st_mtime >= 1800
+        if kind == "applications" and stale:
+            key = (int(profile["id"]), kind)
+            with _catalog_refresh_lock:
+                if key not in _catalog_refreshing:
+                    _catalog_refreshing.add(key)
+                    def refresh_catalog(profile=profile, kind=kind, cache_path=cache_path, key=key):
+                        try:
+                            fresh = fetch_scm_objects(profile, kind)
+                            cache_path.write_text(json.dumps(fresh)); cache_path.chmod(0o600)
+                        finally:
+                            with _catalog_refresh_lock: _catalog_refreshing.discard(key)
+                    threading.Thread(target=refresh_catalog, name=f"catalog-{profile['id']}-{kind}", daemon=True).start()
+        elif cached is None or stale:
+            try:
+                cached = fetch_scm_objects(profile, kind)
+                cache_path.write_text(json.dumps(cached)); cache_path.chmod(0o600)
+            except Exception:
+                if cached is None: raise
+        cached = cached or []
+        catalog.extend({"name": item.get("name", ""), "kind": kind} for item in cached if item.get("name"))
+    return sorted(catalog, key=lambda item: (item["name"].lower(), item["kind"]))
 
 
 def scm_object_payload(object_type: str, form, container: dict) -> dict:
@@ -429,21 +491,24 @@ def index():
             if serials:
                 placeholders = ",".join("?" for _ in serials)
                 flows = conn.execute(f"SELECT * FROM flows WHERE serial IN ({placeholders}) ORDER BY last_seen DESC LIMIT 100", serials).fetchall()
-    policy_profile = None; policies = []; policy_error = ""; policy_objects = []
+    policy_profile = None; policies = []; policy_error = ""; policy_objects = []; object_catalog = []
     policy_view = request.args.get("policy_view", "policies")
     if policy_view not in {"policies", "objects"}: policy_view = "policies"
     policy_kind = request.args.get("policy_kind", "security")
     object_type = request.args.get("object_type", "addresses")
     if object_type not in SCM_OBJECT_TYPES: object_type = "addresses"
+    if policy_kind not in SCM_POLICY_TYPES: policy_kind = "security"
     policy_profile_id = request.args.get("policy_profile", type=int)
     if policy_profile_id:
         policy_profile = next((profile for profile in profiles if profile["id"] == policy_profile_id), None)
         if policy_profile:
             try:
-                if policy_view == "objects": policy_objects = fetch_scm_objects(policy_profile, object_type)
-                elif policy_kind == "security": policies = fetch_security_policies(policy_profile)
+                if policy_view == "objects":
+                    policy_objects = fetch_scm_objects(policy_profile, object_type)
+                    object_catalog = fetch_object_catalog(policy_profile, object_type)
+                else: policies = fetch_scm_policy_type(policy_profile, policy_kind)
             except Exception as exc: policy_error = str(exc)
-    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, policy_profile=policy_profile, policies=policies, policy_objects=policy_objects, policy_view=policy_view, policy_kind=policy_kind, object_type=object_type, object_types=SCM_OBJECT_TYPES, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
+    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, policy_profile=policy_profile, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
 
 
 def parse_zones(text: str) -> dict[str, str]:

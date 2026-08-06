@@ -380,6 +380,11 @@
     checkboxes.forEach(function (checkbox) { checkbox.addEventListener("change", updateCount); });
     var master = document.querySelector("[data-object-select-visible]");
     if (master) master.addEventListener("change", function () { rows.forEach(function (row) { var checkbox = row.querySelector("[data-object-select]"); if (checkbox && !row.hidden) checkbox.checked = master.checked; }); updateCount(); });
+    var detailDialog = document.querySelector("[data-object-detail-dialog]");
+    if (detailDialog) {
+      rows.forEach(function (row) { var button = row.querySelector("[data-object-detail]"); if (!button) return; var item = JSON.parse(row.dataset.object); button.addEventListener("click", function () { detailDialog.querySelector("[data-object-detail-title]").textContent = item.name; var body = detailDialog.querySelector("[data-object-detail-body]"); body.innerHTML = ""; Object.keys(item).sort().forEach(function (key) { var tr = document.createElement("tr"); var name = document.createElement("td"); name.textContent = key; var value = document.createElement("td"); value.className = "mono"; value.textContent = typeof item[key] === "object" ? JSON.stringify(item[key]) : item[key]; tr.appendChild(name); tr.appendChild(value); body.appendChild(tr); }); detailDialog.showModal(); }); });
+      detailDialog.querySelector("[data-object-detail-close]").addEventListener("click", function () { detailDialog.close(); });
+    }
     if (!dialog || !form) { updateCount(); return; }
     var groupType = form.querySelector("[data-object-group-type]");
     function updateGroupType() { if (!groupType) return; var dynamic = groupType.value === "dynamic"; var staticNode = form.querySelector("[data-static-members]"); var dynamicNode = form.querySelector("[data-dynamic-filter]"); if (staticNode) staticNode.hidden = dynamic; if (dynamicNode) dynamicNode.hidden = !dynamic; }
@@ -387,15 +392,19 @@
     var override = form.querySelector("[data-service-override]");
     function updateTimeouts() { all("[data-timeout-field]", form).forEach(function (node) { node.hidden = !(override && override.checked); }); }
     if (override) override.addEventListener("change", updateTimeouts);
+    var memberInput = form.querySelector("[data-member-input]"); var memberSet = new Set();
+    function renderMembers() { var container = form.querySelector("[data-member-values]"); if (!container) return; container.innerHTML = ""; memberSet.forEach(function (value) { var chip = document.createElement("span"); chip.className = "policy-value-chip"; var label = document.createElement("span"); label.textContent = value; var remove = document.createElement("button"); remove.type = "button"; remove.textContent = "−"; remove.title = "Member verwijderen"; remove.addEventListener("click", function () { memberSet.delete(value); memberInput.value = Array.from(memberSet).join(","); renderMembers(); }); chip.appendChild(label); chip.appendChild(remove); container.appendChild(chip); }); if (!memberSet.size) { var empty = document.createElement("span"); empty.className = "muted small"; empty.textContent = "Geen members"; container.appendChild(empty); } }
+    function setMembers(values) { memberSet = new Set(Array.isArray(values) ? values : (values ? String(values).split(",").map(function (value) { return value.trim(); }).filter(Boolean) : [])); if (memberInput) memberInput.value = Array.from(memberSet).join(","); renderMembers(); }
     function setField(name, value) { var field = form.querySelector('[data-object-field="' + name + '"]'); if (!field) return; field.value = Array.isArray(value) ? value.join(", ") : (value == null ? "" : value); }
     function openEditor(item) {
       form.reset(); form.querySelector("[data-object-id]").value = item && item.id ? item.id : "";
       dialog.querySelector("[data-object-dialog-title]").textContent = (item ? "Edit " : "Add ") + document.querySelector(".object-list h2").textContent;
+      setMembers([]);
       if (item) {
         setField("name", item.name); setField("description", item.description); setField("comments", item.comments); setField("tag", item.tag);
         ["ip_netmask", "ip_range", "ip_wildcard", "fqdn"].some(function (kind) { if (item[kind]) { setField("value_type", kind); setField("value", item[kind]); return true; } return false; });
-        if (item.dynamic) { if (groupType) groupType.value = "dynamic"; setField("dynamic_filter", typeof item.dynamic === "object" ? item.dynamic.filter : item.dynamic); } else { if (groupType) groupType.value = "static"; setField("static", item.static); }
-        setField("members", item.members);
+        if (item.dynamic) { if (groupType) groupType.value = "dynamic"; setField("dynamic_filter", typeof item.dynamic === "object" ? item.dynamic.filter : item.dynamic); } else { if (groupType) groupType.value = "static"; setMembers(item.static); }
+        if (item.members) setMembers(item.members);
         if (item.protocol) { var protocolName = Object.keys(item.protocol)[0]; var details = item.protocol[protocolName] || {}; setField("protocol_name", protocolName); ["port", "source_port", "timeout", "halfclose_timeout", "timewait_timeout"].forEach(function (key) { setField(key, details[key]); }); if (override) override.checked = Boolean(details.override || details.timeout || details.halfclose_timeout || details.timewait_timeout); }
         setField("color", item.color);
       }
@@ -404,6 +413,11 @@
     var add = document.querySelector("[data-object-add]"); if (add) add.addEventListener("click", function () { openEditor(null); });
     rows.forEach(function (row) { var button = row.querySelector("[data-object-edit]"); if (!button) return; var item = JSON.parse(row.dataset.object); button.addEventListener("click", function () { openEditor(item); }); row.addEventListener("click", function (event) { if (!event.target.closest("input,button,a")) openEditor(item); }); });
     var cancel = dialog.querySelector("[data-object-cancel]"); if (cancel) cancel.addEventListener("click", function () { dialog.close(); });
+    var pickerPanel = dialog.querySelector("[data-member-picker-panel]"); var catalogNode = dialog.querySelector("[data-object-catalog]"); var catalog = catalogNode ? JSON.parse(catalogNode.textContent || "[]") : [];
+    function renderCatalog(query) { if (!pickerPanel) return; var results = pickerPanel.querySelector("[data-member-results]"); results.innerHTML = ""; var ownName = form.querySelector('[name="name"]').value; var matches = catalog.filter(function (item) { return item.name !== ownName && (!query || item.name.toLocaleLowerCase().includes(query)); }); matches.forEach(function (item) { var row = document.createElement("div"); row.className = "member-result"; var copy = document.createElement("div"); var strong = document.createElement("strong"); strong.textContent = item.name; var small = document.createElement("small"); small.textContent = item.kind; copy.appendChild(strong); copy.appendChild(small); var button = document.createElement("button"); button.className = "btn btn-small"; button.type = "button"; button.textContent = memberSet.has(item.name) ? "Toegevoegd" : "+"; button.disabled = memberSet.has(item.name); button.addEventListener("click", function () { memberSet.add(item.name); memberInput.value = Array.from(memberSet).join(","); renderMembers(); renderCatalog((pickerPanel.querySelector("[data-member-filter]").value || "").toLocaleLowerCase()); }); row.appendChild(copy); row.appendChild(button); results.appendChild(row); }); if (!matches.length) { var empty = document.createElement("div"); empty.className = "muted member-result"; empty.textContent = catalog.length ? "Geen resultaten" : "Catalogus wordt bijgewerkt; vernieuw deze pagina over enkele ogenblikken."; results.appendChild(empty); } }
+    var pickerOpen = dialog.querySelector("[data-member-picker-open]"); if (pickerOpen) pickerOpen.addEventListener("click", function () { pickerPanel.hidden = false; renderCatalog(""); pickerPanel.querySelector("[data-member-filter]").focus(); });
+    var pickerClose = dialog.querySelector("[data-member-picker-close]"); if (pickerClose) pickerClose.addEventListener("click", function () { pickerPanel.hidden = true; });
+    var memberFilter = dialog.querySelector("[data-member-filter]"); if (memberFilter) memberFilter.addEventListener("input", function () { renderCatalog(memberFilter.value.toLocaleLowerCase().trim()); });
     updateCount(); updateGroupType(); updateTimeouts();
   }
 
