@@ -83,6 +83,10 @@ SCM_OBJECT_TYPES = {
 }
 _catalog_refreshing: set[tuple[int, str]] = set()
 _catalog_refresh_lock = threading.Lock()
+_catalog_errors: dict[tuple[int, str], str] = {}
+_panos_key_cache: dict[int, tuple[str, str, str, float]] = {}
+_panos_key_cache_lock = threading.Lock()
+PANOS_KEY_CACHE_SECONDS = 900
 
 
 def secret_file(name: str, generator) -> bytes:
@@ -364,11 +368,32 @@ def panos_profile_context(profile):
     secret = json.loads(fernet.decrypt(profile["secret_blob"]).decode()) if profile["secret_blob"] else {}
     endpoint = settings.get("endpoint", "").rstrip("/")
     if not endpoint: raise ValueError("PAN-OS/Panorama endpoint ontbreekt")
+    profile_id = int(profile["id"]) if "id" in profile.keys() else 0
+    profile_version = str(profile["updated_at"]) if "updated_at" in profile.keys() else ""
     ctx = ssl._create_unverified_context()
+    if profile_id:
+        with _panos_key_cache_lock:
+            cached = _panos_key_cache.get(profile_id)
+            if cached and cached[0] == profile_version and cached[1] == endpoint and cached[3] > time.time():
+                return settings, endpoint, cached[2], ctx
     key_root = policy_api.require_success(policy_api.api_get(endpoint, {"type": "keygen", "user": secret.get("username", ""), "password": secret.get("password", "")}, ctx), "keygen")
     key = key_root.findtext(".//key")
     if not key: raise RuntimeError("API key generation gaf geen sleutel terug")
+    if profile_id:
+        with _panos_key_cache_lock:
+            _panos_key_cache[profile_id] = (profile_version, endpoint, key, time.time() + PANOS_KEY_CACHE_SECONDS)
     return settings, endpoint, key, ctx
+
+
+def invalidate_profile_caches(profile_id: int) -> None:
+    for cache_path in OBJECT_CACHE.glob(f"{profile_id}-*.json"):
+        try: cache_path.unlink()
+        except FileNotFoundError: pass
+    with _catalog_refresh_lock:
+        for key in [key for key in _catalog_errors if key[0] == profile_id]:
+            _catalog_errors.pop(key, None)
+    with _panos_key_cache_lock:
+        _panos_key_cache.pop(profile_id, None)
 
 
 def panos_api_post(endpoint: str, params: dict, ctx: ssl.SSLContext) -> str:
@@ -486,8 +511,11 @@ def refresh_catalog_async(profile, kind: str, cache_path: Path) -> None:
     def refresh():
         try:
             fresh = fetch_scm_objects(profile, kind)
-            cache_path.write_text(json.dumps(fresh)); cache_path.chmod(0o600)
-        except Exception:
+            temporary = cache_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(fresh)); temporary.chmod(0o600); temporary.replace(cache_path)
+            with _catalog_refresh_lock: _catalog_errors.pop(key, None)
+        except Exception as exc:
+            with _catalog_refresh_lock: _catalog_errors[key] = f"{type(exc).__name__}: ophalen mislukt"
             app.logger.exception("catalog refresh failed for profile=%s kind=%s", profile["id"], kind)
         finally:
             with _catalog_refresh_lock: _catalog_refreshing.discard(key)
@@ -529,7 +557,10 @@ def application_catalog(profile_id):
         except (OSError, json.JSONDecodeError): items = []
     stale = not cache_path.exists() or time.time() - cache_path.stat().st_mtime >= 1800
     if stale: refresh_catalog_async(profile, "applications", cache_path)
-    return {"ready": bool(items), "refreshing": (profile_id, "applications") in _catalog_refreshing, "items": [{"name": item.get("name", ""), "kind": "applications"} for item in items if item.get("name")]}
+    with _catalog_refresh_lock:
+        refreshing = (profile_id, "applications") in _catalog_refreshing
+        error = _catalog_errors.get((profile_id, "applications"), "")
+    return {"ready": bool(items), "refreshing": refreshing, "error": error, "items": [{"name": item.get("name", ""), "kind": "applications"} for item in items if item.get("name")]}
 
 
 def scm_object_payload(object_type: str, form, container: dict) -> dict:
@@ -859,7 +890,9 @@ def profile_save():
             if profile_id:
                 conn.execute("UPDATE profiles SET name=?,enabled=?,serial=?,source_ip=?,target_type=?,settings_json=?,secret_blob=?,updated_at=? WHERE id=?", (*values, profile_id))
             else:
-                conn.execute("INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (*values, now()))
+                cursor = conn.execute("INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (*values, now()))
+                profile_id = int(cursor.lastrowid)
+        invalidate_profile_caches(profile_id)
         audit("profile-saved", request.form["name"]); flash("Firewallprofiel opgeslagen.", "success")
     except Exception as exc:
         flash(f"Profiel niet opgeslagen: {exc}", "error")
@@ -869,10 +902,19 @@ def profile_save():
 @app.post("/profiles/<int:profile_id>/delete")
 @login_required
 def profile_delete(profile_id):
-    with db() as conn:
-        row = conn.execute("SELECT name FROM profiles WHERE id=?", (profile_id,)).fetchone()
-        if row: conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,)); audit("profile-deleted", row["name"])
-    flash("Profiel verwijderd.", "success")
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT name FROM profiles WHERE id=?", (profile_id,)).fetchone()
+            if not row: return "Not found", 404
+            run_count = conn.execute("SELECT COUNT(*) FROM runs WHERE profile_id=?", (profile_id,)).fetchone()[0]
+            if run_count: raise ValueError(f"Verwijder eerst de {run_count} policy run(s) van dit profiel")
+            conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+            deleted_name = row["name"]
+        invalidate_profile_caches(profile_id)
+        audit("profile-deleted", deleted_name)
+        flash("Profiel verwijderd.", "success")
+    except Exception as exc:
+        flash(f"Profiel niet verwijderd: {exc}", "error")
     return redirect(url_for("index") + "#profiles")
 
 

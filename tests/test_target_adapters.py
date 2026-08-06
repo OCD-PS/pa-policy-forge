@@ -65,6 +65,28 @@ class TargetAdapterTests(unittest.TestCase):
         base = main.panos_object_bases(self.profile("panos"), "zones")[0]
         self.assertIn("vsys/entry[@name='vsys2']", base)
 
+    def test_panos_api_key_is_reused_for_unchanged_profile(self):
+        profile = {**self.profile("panos"), "id": 42, "updated_at": "2026-08-06 12:00:00"}
+        profile["secret_blob"] = main.fernet.encrypt(json.dumps({"username": "user", "password": "password"}).encode())
+        response = "<response status='success'><result><key>cached-key</key></result></response>"
+        main.invalidate_profile_caches(42)
+        with patch("app.main.policy_api.api_get", return_value=response) as request:
+            self.assertEqual(main.panos_profile_context(profile)[2], "cached-key")
+            self.assertEqual(main.panos_profile_context(profile)[2], "cached-key")
+        self.assertEqual(request.call_count, 1)
+        main.invalidate_profile_caches(42)
+
+    def test_profile_cache_invalidation_removes_catalog_and_api_key(self):
+        profile_id = 4242
+        cache_path = main.OBJECT_CACHE / f"{profile_id}-applications.json"
+        cache_path.write_text("[]")
+        main._panos_key_cache[profile_id] = ("version", "endpoint", "key", main.time.time() + 60)
+        main._catalog_errors[(profile_id, "applications")] = "failure"
+        main.invalidate_profile_caches(profile_id)
+        self.assertFalse(cache_path.exists())
+        self.assertNotIn(profile_id, main._panos_key_cache)
+        self.assertNotIn((profile_id, "applications"), main._catalog_errors)
+
     def test_panorama_zone_scope_uses_device_group_reference_template(self):
         responses = ["<response status='success'><result><entry name='Branches'><reference-templates><member>Branch-Template</member></reference-templates></entry></result></response>", "<response status='success'><result/></response>"]
         with patch("app.main.panos_profile_context", return_value=({}, "https://example.invalid", "key", object())), patch("app.main.policy_api.api_get", side_effect=responses):
