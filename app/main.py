@@ -26,7 +26,7 @@ from cryptography.fernet import Fernet
 from flask import Flask, Response, flash, has_request_context, redirect, render_template, request, send_file, session, url_for
 
 from vendor.paloalto_light_syslog import FlowStore, parse_panos_syslog
-from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations
+from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_single_replacements
 
 BASE = Path(__file__).resolve().parent.parent
 DATA = Path(os.getenv("PPF_DATA_DIR", "/data"))
@@ -907,6 +907,40 @@ def policy_bulk_preview(profile_id):
         return render_template("policy_preview.html", profile=profile, changes=changes, draft_id=draft_id, policy_kind=policy_kind, policy_label=SCM_POLICY_TYPES[policy_kind][2])
     except Exception as exc:
         flash(f"Bulk-preview mislukt: {exc}", "error")
+        return redirect(url_for("index", policy_profile=profile_id, policy_kind=policy_kind) + "#policy-management")
+
+
+@app.post("/policies/<int:profile_id>/single-preview")
+@login_required
+def policy_single_preview(profile_id):
+    with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+    if not profile: return "Not found", 404
+    policy_kind = request.form.get("policy_kind", "security")
+    if policy_kind not in SCM_POLICY_TYPES or (profile["target_type"] == "scm" and policy_kind in SCM_UNAVAILABLE_POLICY_TYPES): return "Not found", 404
+    policy_id = request.form.get("policy_id", "").strip()
+    try:
+        current = fetch_scm_policy_type(profile, policy_kind)
+        policy = next((item for item in current if item["id"] == policy_id), None)
+        if not policy: raise ValueError("De policy bestaat niet meer. Vernieuw de rulebase.")
+        replacements = {}
+        for field in POLICY_LIST_FIELDS:
+            if request.form.get(f"{field}_present") == "1":
+                values = split_values(request.form.get(field, ""))
+                replacements[field] = values or ([] if field == "tag" else ["any"])
+        for field in ("action", "log_setting", "profile_group", "schedule"):
+            if request.form.get(f"{field}_present") == "1": replacements[field] = request.form.get(field, "").strip()
+        if request.form.get("description_present") == "1": replacements["description"] = request.form.get("description", "").strip()
+        if request.form.get("disabled_present") == "1": replacements["disabled"] = request.form.get("disabled") == "true"
+        updated = apply_single_replacements(policy, replacements)
+        if updated == policy: raise ValueError("De policy bevat geen wijzigingen.")
+        draft_id = secrets.token_urlsafe(18)
+        changes = [{"before": policy, "after": updated, "fingerprint": policy_fingerprint(policy)}]
+        draft = {"profile_id": profile_id, "policy_kind": policy_kind, "created_at": now(), "changes": changes}
+        path = POLICY_DRAFTS / f"{draft_id}.json"; path.write_text(json.dumps(draft)); path.chmod(0o600)
+        audit("policy-single-preview", f"profile={profile['name']} rule={policy['name']}")
+        return render_template("policy_preview.html", profile=profile, changes=changes, draft_id=draft_id, policy_kind=policy_kind, policy_label=SCM_POLICY_TYPES[policy_kind][2])
+    except Exception as exc:
+        flash(f"Policy-preview mislukt: {exc}", "error")
         return redirect(url_for("index", policy_profile=profile_id, policy_kind=policy_kind) + "#policy-management")
 
 

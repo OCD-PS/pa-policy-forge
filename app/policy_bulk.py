@@ -28,3 +28,10 @@ def apply_bulk_operations(policy: dict, operations: dict) -> dict:
     if description_append:
         changed["description"] = " ".join(part for part in ((changed.get("description") or "").strip(), description_append) if part)
     return changed
+
+
+def apply_single_replacements(policy: dict, replacements: dict) -> dict:
+    changed = json.loads(json.dumps(policy))
+    for field, value in replacements.items():
+        changed[field] = value
+    return changed

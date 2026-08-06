@@ -303,6 +303,35 @@
       });
     });
 
+    var singleDialog = document.querySelector("[data-policy-single-dialog]");
+    if (singleDialog) {
+      rows.forEach(function (row) {
+        var button = row.querySelector("[data-policy-edit]");
+        if (!button) return;
+        button.addEventListener("click", function () {
+          var policy = JSON.parse(row.dataset.policy);
+          singleDialog.querySelector("[data-single-policy-id]").value = policy.id;
+          singleDialog.querySelector("[data-single-policy-title]").textContent = policy.name;
+          all("[data-single-field]", singleDialog).forEach(function (field) {
+            var value = policy[field.dataset.singleField];
+            if (Array.isArray(value)) value = value.join(", ");
+            if (field.dataset.singleField === "disabled") value = value ? "true" : "false";
+            field.value = value === undefined || value === null ? "" : value;
+          });
+          all("[data-single-tab]", singleDialog).forEach(function (tab, index) { tab.classList.toggle("is-active", index === 0); });
+          all("[data-single-panel]", singleDialog).forEach(function (panel, index) { panel.classList.toggle("is-active", index === 0); });
+          singleDialog.showModal();
+        });
+      });
+      all("[data-single-tab]", singleDialog).forEach(function (tab) {
+        tab.addEventListener("click", function () {
+          all("[data-single-tab]", singleDialog).forEach(function (item) { item.classList.toggle("is-active", item === tab); });
+          all("[data-single-panel]", singleDialog).forEach(function (panel) { panel.classList.toggle("is-active", panel.dataset.singlePanel === tab.dataset.singleTab); });
+        });
+      });
+      singleDialog.querySelector("[data-policy-single-cancel]").addEventListener("click", function () { singleDialog.close(); });
+    }
+
     var dialog = document.querySelector("[data-policy-bulk-dialog]");
     var opener = document.querySelector("[data-open-policy-bulk]");
     function selectedRows() { return rows.filter(function (row) { return row.querySelector("[data-policy-select]").checked; }); }

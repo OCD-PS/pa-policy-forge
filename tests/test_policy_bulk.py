@@ -1,6 +1,6 @@
 import unittest
 
-from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations
+from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_single_replacements
 
 
 class PolicyBulkTests(unittest.TestCase):
@@ -38,6 +38,19 @@ class PolicyBulkTests(unittest.TestCase):
         operations.update(action=None, disabled=None, log_setting=None, profile_group=None, description_append="Nieuwe tekst")
         changed = apply_bulk_operations(policy, operations)
         self.assertEqual(changed["description"], "Bestaande tekst Nieuwe tekst")
+
+    def test_single_edit_preserves_unedited_nat_configuration(self):
+        policy = {
+            "id": "nat-1", "name": "NAT-1", "from": ["Trust"], "to": ["Internet"],
+            "source": ["any"], "destination": ["public-ip"], "service": ["any"],
+            "source_translation": {"dynamic_ip_and_port": {"interface_address": {}}},
+            "destination_translation": {"translated_address": "server-1", "translated_port": "443"},
+        }
+        changed = apply_single_replacements(policy, {"from": ["Clients"], "disabled": True})
+        self.assertEqual(changed["from"], ["Clients"])
+        self.assertTrue(changed["disabled"])
+        self.assertEqual(changed["source_translation"], policy["source_translation"])
+        self.assertEqual(changed["destination_translation"], policy["destination_translation"])
 
 
 if __name__ == "__main__": unittest.main()
