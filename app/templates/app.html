@@ -280,16 +280,6 @@
 </div>
 <span class="badge badge-orange">{{p.target_type|upper}}</span>
 </div>
-<div class="profile-meta">
-<div class="profile-meta-block">
-<strong>Firewallserials</strong>
-<div class="profile-meta-values mono"><span>{{p.serial}}</span>{% if p.passive_serial %}<span>{{p.passive_serial}}</span>{% else %}<span class="muted">Geen passieve node</span>{% endif %}</div>
-</div>
-<div class="profile-meta-block">
-<strong>Bron-IP herkenning</strong>
-<div class="profile-meta-values mono"><span>{{p.source_ip or '—'}}</span><span>{{p.passive_source_ip or '—'}}</span></div>
-</div>
-</div>
 <div class="cluster">
 <a class="btn" href="{{url_for('index',edit_profile=p.id)}}#profiles">Bewerken</a>
 <form method="post" action="{{url_for('build',profile_id=p.id)}}">
@@ -300,7 +290,7 @@
 <form method="post" action="{{url_for('build',profile_id=p.id)}}" data-confirm="Schrijf objecten en regels naar candidate configuration? Er wordt niet gecommit of gedeployed.">
 <input type="hidden" name="csrf" value="{{csrf_token()}}">
 <input type="hidden" name="mode" value="push">
-<button class="btn btn-primary" type="submit">{% if p.target_type == 'scm' %}Schrijf naar SCM candidate{% elif p.target_type == 'panorama' %}Laad in Panorama{% else %}Laad in standalone firewall{% endif %}</button>
+<button class="btn btn-primary" type="submit">Push</button>
 </form>
 <form method="post" action="{{url_for('profile_delete',profile_id=p.id)}}" data-confirm="Profiel verwijderen? Flows en runs blijven bewaard.">
 <input type="hidden" name="csrf" value="{{csrf_token()}}">
