@@ -53,6 +53,25 @@
     apply();
   }
 
+  function setupConfigTree() {
+    all("[data-config-tree]").forEach(function (tree) {
+      var button = tree.querySelector("[data-config-tree-toggle]");
+      if (!button) return;
+      var collapsed = window.localStorage.getItem("ppf-config-tree-collapsed") === "true";
+      function apply() {
+        tree.classList.toggle("is-collapsed", collapsed);
+        button.textContent = collapsed ? "›" : "‹";
+        button.title = collapsed ? "Configuratiemenu uitklappen" : "Configuratiemenu inklappen";
+      }
+      button.addEventListener("click", function () {
+        collapsed = !collapsed;
+        window.localStorage.setItem("ppf-config-tree-collapsed", String(collapsed));
+        apply();
+      });
+      apply();
+    });
+  }
+
   function setupPasswords() {
     all("[data-password-toggle]").forEach(function (button) {
       var explicitId = button.getAttribute("data-password-toggle");
@@ -484,6 +503,7 @@
   document.addEventListener("DOMContentLoaded", function () {
     setupNavigation();
     setupSidebarCollapse();
+    setupConfigTree();
     setupPasswords();
     setupConfirmations();
     setupFlashes();

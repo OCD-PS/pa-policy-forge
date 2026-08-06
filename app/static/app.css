@@ -74,6 +74,21 @@ h3 { margin-bottom: 10px; font-size: 16px; }
 .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .device-selector-grid { grid-template-columns: repeat(auto-fit, minmax(220px, 320px)); align-items: stretch; }
+.config-import-grid { margin-bottom: 18px; }
+.config-workspace-tabs { display: flex; gap: 8px; overflow-x: auto; margin: 22px 0; padding-bottom: 4px; }
+.config-workspace-tabs a { min-width: 190px; padding: 10px 13px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); }
+.config-workspace-tabs a.active { border-color: var(--orange); background: var(--orange-soft); }
+.config-workspace-tabs small { display: block; color: var(--muted); margin-top: 3px; }
+.config-workspace-shell { display: grid; grid-template-columns: 250px minmax(0,1fr); gap: 18px; align-items: start; }
+.config-tree { position: sticky; top: 94px; max-height: calc(100vh - 120px); overflow: auto; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius); background: #101010; }
+.config-tree-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 2px 3px 10px; }
+.config-tree details { border-top: 1px solid #292929; padding: 7px 0; }
+.config-tree summary { cursor: pointer; color: var(--orange-2); font-weight: 800; padding: 5px; }
+.config-tree details button { display: block; width: 100%; padding: 7px 10px 7px 18px; border: 0; border-radius: 4px; background: transparent; color: #ccc; text-align: left; cursor: pointer; }
+.config-tree details button:hover { background: var(--surface-2); color: #fff; }
+.config-tree.is-collapsed { width: 58px; overflow: hidden; }
+.config-tree.is-collapsed strong, .config-tree.is-collapsed details { display: none; }
+.config-workspace-shell:has(.config-tree.is-collapsed) { grid-template-columns: 58px minmax(0,1fr); }
 .card { min-width: 0; padding: 22px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: 0 1px 0 rgba(255,255,255,.025); }
 .card-header { display: flex; justify-content: space-between; gap: 14px; align-items: start; margin-bottom: 18px; }
 .card-header h2, .card-header h3, .card-header p { margin-bottom: 0; }
@@ -242,6 +257,7 @@ body.sidebar-collapsed .object-actionbar { left: 100px; }
   .grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .objects-layout { grid-template-columns: 1fr; }
   .object-create { position: static; }
+  .config-workspace-shell { grid-template-columns: 210px minmax(0,1fr); }
 }
 @media (max-width: 780px) {
   .app-shell { grid-template-columns: 1fr; }
@@ -255,6 +271,9 @@ body.sidebar-collapsed .object-actionbar { left: 100px; }
   .content { padding: 22px 16px 44px; }
   .page-header { align-items: start; flex-direction: column; }
   .grid-2, .grid-3, .grid-4, .form-grid, .policy-filters, .bulk-grid, .ha-columns { grid-template-columns: 1fr; }
+  .config-workspace-shell { grid-template-columns: 1fr; }
+  .config-tree { position: static; max-height: none; }
+  .config-tree.is-collapsed { width: 100%; }
   .sidebar-collapse { display: none; }
   .field.full { grid-column: auto; }
   .login-page { grid-template-columns: 1fr; }

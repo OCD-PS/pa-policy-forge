@@ -83,10 +83,38 @@ class TargetAdapterTests(unittest.TestCase):
 
     def test_protected_routes_require_authentication(self):
         client = main.app.test_client()
-        for path in ("/", "/runs/1", "/runs/1/csv", "/profiles/1/catalog/applications"):
+        for path in ("/", "/runs/1", "/runs/1/csv", "/profiles/1/catalog/applications", "/config-workspaces/1/export/xml", "/config-workspaces/1/push-preview"):
             response = client.get(path, base_url="https://forge.test")
             self.assertEqual(response.status_code, 302)
             self.assertEqual(response.headers["Location"], "/login")
+
+    def test_offline_workspace_templates_compile(self):
+        main.app.jinja_env.get_template("app.html")
+        main.app.jinja_env.get_template("workspace_push.html")
+
+    def test_offline_workspace_storage_keeps_full_xml_and_inventory(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("offline-test", 1, "", "", "panos", "{}", b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        workspace_id = main.store_config_workspace(
+            profile, "offline", "config.xml",
+            b'<config version="12.1"><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"/></vsys></entry></devices></config>',
+            "upload",
+        )
+        workspace = main.workspace_row(workspace_id)
+        try:
+            self.assertEqual(json.loads(workspace["metadata_json"])["vsys"], ["vsys1"])
+            self.assertTrue(main.workspace_config_path(workspace).read_bytes().startswith(b"<?xml"))
+        finally:
+            main.workspace_config_path(workspace).unlink(missing_ok=True)
+            with main.db() as conn:
+                conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
 
     def test_oversized_form_is_rejected(self):
         client = main.app.test_client()

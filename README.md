@@ -80,6 +80,28 @@ artifact directory is inside the configured runs root. Active runs cannot be del
 The Flows page always starts with a device/firewall-group chooser. Flow details
 open only after selecting a logical firewall or HA pair.
 
+## Offline configuration workspaces
+
+Panorama and standalone profiles support complete offline configuration snapshots.
+A snapshot can be uploaded as PAN-OS XML or pulled from the target's complete
+candidate configuration through the XML API. PA Policy Forge validates the XML
+with a hardened parser, verifies that its flavor matches the selected profile,
+stores the complete normalized XML with a SHA-256 fingerprint, and inventories:
+
+- Panorama device groups, parent relationships, reference templates, templates,
+  template stacks, pre/post policies, and object counts;
+- standalone virtual systems, interfaces, zones, policies, and objects;
+- the PAN-OS version and the full configurable Policies, Objects, Network, and
+  Device navigation tree.
+
+The workspace navigation is vertical and independently collapsible. Complete XML
+and best-effort set-command exports are available. A complete snapshot can also be
+uploaded through the target XML API and loaded as the new candidate configuration.
+This high-impact action requires typing the workspace name and never commits the
+candidate automatically. Device groups, templates, VSYS selections, and unknown
+XML nodes remain preserved so later graphical editors can operate as scoped diffs
+without reconstructing or dropping unsupported configuration.
+
 ## Policy management
 
 The **Policybeheer** page uses an Expedition-inspired filter, selection, and

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import html
 import hmac
 import io
 import ipaddress
@@ -30,6 +31,7 @@ from flask import Flask, Response, flash, has_request_context, redirect, render_
 
 from vendor.paloalto_light_syslog import FlowStore, parse_panos_syslog
 from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_single_replacements
+from app.offline_config import OfflineConfigError, normalized_config_xml, parse_snapshot, render_set_commands, safe_workspace_path, snapshot_sha256
 
 BASE = Path(__file__).resolve().parent.parent
 DATA = Path(os.getenv("PPF_DATA_DIR", "/data"))
@@ -58,6 +60,8 @@ SECRETS.mkdir(parents=True, exist_ok=True)
 POLICY_DRAFTS.mkdir(parents=True, exist_ok=True)
 OBJECT_DRAFTS.mkdir(parents=True, exist_ok=True)
 OBJECT_CACHE.mkdir(parents=True, exist_ok=True)
+CONFIG_WORKSPACES = DATA / "config-workspaces"
+CONFIG_WORKSPACES.mkdir(parents=True, exist_ok=True)
 
 SCM_POLICY_TYPES = {
     "security": ("security", "security-rules", "Security"),
@@ -113,7 +117,7 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Strict",
     PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
-    MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+    MAX_CONTENT_LENGTH=int(os.getenv("PPF_MAX_CONFIG_UPLOAD_BYTES", str(100 * 1024 * 1024))),
     MAX_FORM_MEMORY_SIZE=512 * 1024,
     MAX_FORM_PARTS=200,
 )
@@ -183,6 +187,13 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS audit (
           id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, username TEXT NOT NULL,
           action TEXT NOT NULL, detail TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS config_workspaces (
+          id INTEGER PRIMARY KEY, profile_id INTEGER NOT NULL, name TEXT NOT NULL,
+          source TEXT NOT NULL, original_name TEXT NOT NULL, config_path TEXT NOT NULL,
+          sha256 TEXT NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          FOREIGN KEY(profile_id) REFERENCES profiles(id)
         );
         """)
         if not conn.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
@@ -899,6 +910,186 @@ def write_target_policy(profile, policy_kind: str, policy: dict) -> None:
     policy_api.require_success(panos_api_post(endpoint, {"type": "config", "action": "edit", "xpath": xpath, "element": update_xml_policy(policy), "key": key}, ctx), f"edit {policy_kind} rule {policy['name']}")
 
 
+def workspace_row(workspace_id: int):
+    with db() as conn:
+        return conn.execute(
+            "SELECT config_workspaces.*,profiles.name profile_name,profiles.target_type,profiles.settings_json,profiles.secret_blob,profiles.updated_at profile_updated_at "
+            "FROM config_workspaces JOIN profiles ON profiles.id=config_workspaces.profile_id WHERE config_workspaces.id=?",
+            (workspace_id,),
+        ).fetchone()
+
+
+def store_config_workspace(profile, name: str, original_name: str, xml_bytes: bytes, source: str) -> int:
+    expected = "panorama" if profile["target_type"] == "panorama" else "panos"
+    root, snapshot = parse_snapshot(xml_bytes, expected_kind=expected)
+    normalized = normalized_config_xml(root)
+    workspace_token = secrets.token_hex(16)
+    path = CONFIG_WORKSPACES / f"{workspace_token}.xml"
+    path.write_bytes(normalized)
+    path.chmod(0o600)
+    timestamp = now()
+    try:
+        with db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO config_workspaces(profile_id,name,source,original_name,config_path,sha256,metadata_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (profile["id"], name[:120], source, original_name[:255], str(path), snapshot_sha256(normalized), json.dumps(snapshot.as_dict()), timestamp, timestamp),
+            )
+            workspace_id = int(cursor.lastrowid)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    audit("config-workspace-created", f"workspace={workspace_id} profile={profile['name']} source={source} kind={snapshot.kind}")
+    return workspace_id
+
+
+def workspace_config_path(workspace) -> Path:
+    path = safe_workspace_path(CONFIG_WORKSPACES, workspace["config_path"])
+    if not path.is_file():
+        raise FileNotFoundError("Workspace XML ontbreekt")
+    return path
+
+
+@app.post("/profiles/<int:profile_id>/config-workspaces/upload")
+@login_required
+def config_workspace_upload(profile_id):
+    with db() as conn:
+        profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+    if not profile or profile["target_type"] not in {"panorama", "panos"}:
+        return "Not found", 404
+    uploaded = request.files.get("config_file")
+    if not uploaded or not uploaded.filename:
+        flash("Kies eerst een volledige XML-configuratie.", "error")
+        return redirect(url_for("index", config_profile=profile_id) + "#config-workspaces")
+    try:
+        data = uploaded.read()
+        workspace_id = store_config_workspace(
+            profile,
+            request.form.get("name", "").strip() or Path(uploaded.filename).stem,
+            Path(uploaded.filename).name,
+            data,
+            "upload",
+        )
+        flash("Volledige configuratie veilig geïmporteerd; het oorspronkelijke XML blijft behouden.", "success")
+        return redirect(url_for("index", config_profile=profile_id, workspace=workspace_id) + "#config-workspaces")
+    except Exception as exc:
+        flash(f"Configuratie niet geïmporteerd: {exc}", "error")
+        return redirect(url_for("index", config_profile=profile_id) + "#config-workspaces")
+
+
+@app.post("/profiles/<int:profile_id>/config-workspaces/pull")
+@login_required
+def config_workspace_pull(profile_id):
+    with db() as conn:
+        profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+    if not profile or profile["target_type"] not in {"panorama", "panos"}:
+        return "Not found", 404
+    try:
+        _, endpoint, key, ctx = panos_profile_context(profile)
+        root = policy_api.require_success(
+            panos_api_post(endpoint, {"type": "config", "action": "get", "xpath": "/config", "key": key}, ctx),
+            "volledige candidateconfiguratie ophalen",
+        )
+        config = root.find("./result/config")
+        if config is None:
+            raise RuntimeError("API-antwoord bevat geen volledige configuratie")
+        xml_bytes = normalized_config_xml(config)
+        workspace_id = store_config_workspace(
+            profile,
+            request.form.get("name", "").strip() or f"{profile['name']} candidate {now()}",
+            "api-candidate.xml",
+            xml_bytes,
+            "api",
+        )
+        flash("Volledige candidateconfiguratie via API opgehaald.", "success")
+        return redirect(url_for("index", config_profile=profile_id, workspace=workspace_id) + "#config-workspaces")
+    except Exception as exc:
+        flash(f"Volledige configuratie niet opgehaald: {exc}", "error")
+        return redirect(url_for("index", config_profile=profile_id) + "#config-workspaces")
+
+
+@app.get("/config-workspaces/<int:workspace_id>/export/<kind>")
+@login_required
+def config_workspace_export(workspace_id, kind):
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    path = workspace_config_path(workspace)
+    safe_name = "".join(char if char.isalnum() or char in "-_." else "-" for char in workspace["name"]).strip("-.") or f"workspace-{workspace_id}"
+    if kind == "xml":
+        return send_file(path, as_attachment=True, download_name=f"{safe_name}.xml", mimetype="application/xml")
+    if kind == "set":
+        return Response(render_set_commands(path.read_bytes()), mimetype="text/plain", headers={"Content-Disposition": f'attachment; filename="{safe_name}.set.txt"'})
+    return "Not found", 404
+
+
+@app.get("/config-workspaces/<int:workspace_id>/push-preview")
+@login_required
+def config_workspace_push_preview(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    metadata = json.loads(workspace["metadata_json"] or "{}")
+    return render_template("workspace_push.html", workspace=workspace, metadata=metadata)
+
+
+@app.post("/config-workspaces/<int:workspace_id>/push")
+@login_required
+def config_workspace_push(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    if request.form.get("confirm_name", "") != workspace["name"]:
+        flash("API-load gestopt: de workspacenaam kwam niet overeen.", "error")
+        return redirect(url_for("config_workspace_push_preview", workspace_id=workspace_id))
+    try:
+        with db() as conn:
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+        if not profile or profile["target_type"] not in {"panorama", "panos"}:
+            raise RuntimeError("Dit target ondersteunt geen volledige PAN-OS XML-load")
+        path = workspace_config_path(workspace)
+        expected = "panorama" if profile["target_type"] == "panorama" else "panos"
+        parse_snapshot(path.read_bytes(), expected_kind=expected)
+        _, endpoint, key, ctx = panos_profile_context(profile)
+        imported_name = f"ppf-workspace-{workspace_id}-{secrets.token_hex(4)}.xml"
+        import_path = path.with_name(imported_name)
+        shutil.copyfile(path, import_path)
+        import_path.chmod(0o600)
+        try:
+            policy_api.require_success(
+                policy_api.api_post_multipart(endpoint, {"type": "import", "category": "configuration", "key": key}, import_path, ctx),
+                "volledige configuratie uploaden",
+            )
+            load_command = f"<load><config><from>{html.escape(imported_name, quote=False)}</from></config></load>"
+            policy_api.require_success(
+                panos_api_post(endpoint, {"type": "op", "cmd": load_command, "key": key}, ctx),
+                "volledige configuratie naar candidate laden",
+            )
+        finally:
+            import_path.unlink(missing_ok=True)
+        audit("config-workspace-loaded", f"workspace={workspace_id} profile={profile['name']} sha256={workspace['sha256']}")
+        flash("Volledige XML-configuratie via API naar de candidate geladen; er is niet gecommit.", "success")
+    except Exception as exc:
+        flash(f"Volledige XML niet geladen: {exc}", "error")
+    return redirect(url_for("index", config_profile=workspace["profile_id"], workspace=workspace_id) + "#config-workspaces")
+
+
+@app.post("/config-workspaces/<int:workspace_id>/delete")
+@login_required
+def config_workspace_delete(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    try:
+        workspace_config_path(workspace).unlink(missing_ok=True)
+        with db() as conn:
+            conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
+        audit("config-workspace-deleted", f"workspace={workspace_id} profile={workspace['profile_name']}")
+        flash("Offline configuratieworkspace verwijderd.", "success")
+    except Exception as exc:
+        flash(f"Workspace niet verwijderd: {exc}", "error")
+    return redirect(url_for("index", config_profile=workspace["profile_id"]) + "#config-workspaces")
+
+
 @app.get("/")
 @login_required
 def index():
@@ -944,6 +1135,22 @@ def index():
             if serials:
                 placeholders = ",".join("?" for _ in serials)
                 flows = conn.execute(f"SELECT * FROM flows WHERE serial IN ({placeholders}) ORDER BY last_seen DESC LIMIT 100", serials).fetchall()
+    config_profiles = [profile for profile in profiles if profile["target_type"] in {"panorama", "panos"}]
+    config_profile_id = request.args.get("config_profile", type=int)
+    selected_config_profile = next((profile for profile in config_profiles if profile["id"] == config_profile_id), None)
+    config_workspaces = []
+    selected_workspace = None
+    workspace_metadata = {}
+    if selected_config_profile:
+        with db() as conn:
+            config_workspaces = conn.execute(
+                "SELECT * FROM config_workspaces WHERE profile_id=? ORDER BY id DESC",
+                (selected_config_profile["id"],),
+            ).fetchall()
+        selected_workspace_id = request.args.get("workspace", type=int)
+        selected_workspace = next((item for item in config_workspaces if item["id"] == selected_workspace_id), None)
+        if selected_workspace:
+            workspace_metadata = json.loads(selected_workspace["metadata_json"] or "{}")
     policy_profile = None; policies = []; policy_error = ""; policy_objects = []; object_catalog = []; policy_catalog = []
     policy_view = request.args.get("policy_view", "policies")
     if policy_view not in {"policies", "objects", "network"}: policy_view = "policies"
@@ -964,7 +1171,7 @@ def index():
                     policies = fetch_scm_policy_type(policy_profile, policy_kind)
                     policy_catalog = fetch_object_catalog(policy_profile, "policy-picker")
             except Exception as exc: policy_error = str(exc)
-    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
+    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, config_profiles=config_profiles, selected_config_profile=selected_config_profile, config_workspaces=config_workspaces, selected_workspace=selected_workspace, workspace_metadata=workspace_metadata, policy_profile=policy_profile, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
 
 
 def parse_zones(text: str) -> dict[str, str]:
