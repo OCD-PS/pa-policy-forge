@@ -57,6 +57,32 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertEqual(payload["source_translation"], raw["source_translation"])
         self.assertEqual(payload["folder"], "Branch")
 
+    def test_standalone_zone_scope_uses_vsys(self):
+        base = main.panos_object_bases(self.profile("panos"), "zones")[0]
+        self.assertIn("vsys/entry[@name='vsys2']", base)
+
+    def test_panorama_zone_scope_requires_template(self):
+        with self.assertRaisesRegex(ValueError, "Template"):
+            main.panos_object_bases(self.profile("panorama", template=""), "zones")
+        base = main.panos_object_bases(self.profile("panorama", template="Branch-Template"), "zones")[0]
+        self.assertIn("template/entry[@name='Branch-Template']", base)
+        self.assertIn("vsys/entry[@name='vsys2']", base)
+
+    def test_zone_xml_preserves_type_interfaces_and_profiles(self):
+        xml = main.ET.fromstring(main.object_payload_xml({"name": "Clients", "network": {"layer3": ["ethernet1/1"]}, "enable_user_identification": True, "zone_protection_profile": "strict"}))
+        self.assertEqual(xml.findtext("./network/layer3/member"), "ethernet1/1")
+        self.assertEqual(xml.findtext("./enable-user-identification"), "yes")
+        self.assertEqual(xml.findtext("./zone-protection-profile"), "strict")
+
+    def test_panorama_zone_create_uses_template_candidate(self):
+        profile = self.profile("panorama", template="Branch-Template")
+        draft = {"object_type": "zones", "operation": "create", "payload": {"name": "Clients", "network": {"layer3": []}}}
+        with patch("app.main.panos_profile_context", return_value=({}, "https://example.invalid", "key", object())), patch("app.main.panos_api_post", return_value="<response status='success'><result/></response>") as request, patch("app.main.policy_api.require_success"):
+            main.write_panos_object_draft(profile, draft)
+        params = request.call_args.args[1]
+        self.assertIn("template/entry[@name='Branch-Template']", params["xpath"])
+        self.assertEqual(params["action"], "set")
+
 
 if __name__ == "__main__":
     unittest.main()

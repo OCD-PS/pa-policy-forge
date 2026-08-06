@@ -79,6 +79,7 @@ SCM_OBJECT_TYPES = {
     "services": {"label": "Services", "creatable": True},
     "service-groups": {"label": "Service Groups", "creatable": True},
     "tags": {"label": "Tags", "creatable": True},
+    "zones": {"label": "Zones", "creatable": True, "network": True},
 }
 _catalog_refreshing: set[tuple[int, str]] = set()
 _catalog_refresh_lock = threading.Lock()
@@ -417,18 +418,28 @@ def fetch_scm_objects(profile, object_type: str) -> list[dict]:
         raise ValueError("Onbekend objecttype")
     if profile["target_type"] != "scm": return fetch_panos_objects(profile, object_type)
     scm, token, _, _ = scm_client(profile)
-    root = policy_api.scm_api_root(scm.scm_api_base) + "/config/objects/v1"
-    container = policy_api.scm_container(folder=scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
+    service = "network" if object_type == "zones" else "objects"
+    root = policy_api.scm_api_root(scm.scm_api_base) + f"/config/{service}/v1"
+    container = policy_api.scm_container(folder=scm.scm_folder if object_type == "zones" else scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
     return policy_api.scm_fetch_all(f"{root}/{object_type}", token, container)
 
 
-PANOS_OBJECT_NODES = {"addresses": "address", "address-groups": "address-group", "applications": "application", "application-groups": "application-group", "application-filters": "application-filter", "services": "service", "service-groups": "service-group", "tags": "tag"}
+def managed_view(object_type: str) -> str:
+    return "network" if object_type == "zones" else "objects"
+
+
+PANOS_OBJECT_NODES = {"addresses": "address", "address-groups": "address-group", "applications": "application", "application-groups": "application-group", "application-filters": "application-filter", "services": "service", "service-groups": "service-group", "tags": "tag", "zones": "zone"}
 
 
 def panos_object_bases(profile, object_type: str) -> list[str]:
     settings = json.loads(profile["settings_json"] or "{}")
     if object_type == "applications": return ["/config/predefined"]
     device = policy_api.xpath_literal("localhost.localdomain")
+    if object_type == "zones" and profile["target_type"] == "panorama":
+        template = settings.get("template", "").strip()
+        if not template: raise ValueError("Selecteer eerst een Panorama Template in het firewallprofiel voor zonebeheer")
+        vsys = policy_api.xpath_literal(settings.get("vsys", "vsys1"))
+        return [f"/config/devices/entry[@name={device}]/template/entry[@name={policy_api.xpath_literal(template)}]/config/devices/entry[@name={device}]/vsys/entry[@name={vsys}]"]
     if profile["target_type"] == "panorama":
         group = policy_api.xpath_literal(settings.get("device_group", ""))
         return ["/config/shared", f"/config/devices/entry[@name={device}]/device-group/entry[@name={group}]"]
@@ -455,7 +466,7 @@ def fetch_panos_objects(profile, object_type: str) -> list[dict]:
 
 
 def fetch_object_catalog(profile, object_type: str) -> list[dict]:
-    related = {"address-groups": ("addresses", "address-groups"), "service-groups": ("services", "service-groups"), "application-groups": ("applications", "application-groups")}.get(object_type, ())
+    related = {"addresses": ("tags",), "services": ("tags",), "address-groups": ("addresses", "address-groups", "tags"), "service-groups": ("services", "service-groups", "tags"), "application-groups": ("applications", "application-groups", "tags"), "zones": ("zones",), "policy-picker": ("zones", "addresses", "address-groups", "applications", "application-groups", "application-filters", "services", "service-groups", "tags")}.get(object_type, ())
     catalog = []
     for kind in related:
         cache_path = OBJECT_CACHE / f"{profile['id']}-{kind}.json"
@@ -481,7 +492,7 @@ def fetch_object_catalog(profile, object_type: str) -> list[dict]:
                 cached = fetch_scm_objects(profile, kind)
                 cache_path.write_text(json.dumps(cached)); cache_path.chmod(0o600)
             except Exception:
-                if cached is None: raise
+                if cached is None and object_type != "policy-picker": raise
         cached = cached or []
         catalog.extend({"name": item.get("name", ""), "kind": kind} for item in cached if item.get("name"))
     return sorted(catalog, key=lambda item: (item["name"].lower(), item["kind"]))
@@ -538,6 +549,15 @@ def scm_object_payload(object_type: str, form, container: dict) -> dict:
         comments = form.get("comments", "").strip() or description
         if color: payload["color"] = color
         if comments: payload["comments"] = comments
+    elif object_type == "zones":
+        zone_type = form.get("zone_type", "layer3")
+        if zone_type not in {"layer3", "layer2", "virtual_wire", "tap", "tunnel"}: raise ValueError("Ongeldig zonetype")
+        interfaces = split_values(form.get("interfaces", ""))
+        payload["network"] = {zone_type: interfaces}
+        payload["enable_user_identification"] = form.get("enable_user_identification") == "on"
+        for form_key, payload_key in (("zone_protection_profile", "zone_protection_profile"), ("log_setting", "log_setting")):
+            value = form.get(form_key, "").strip()
+            if value: payload[payload_key] = value
     else:
         raise ValueError("Dit objecttype is momenteel alleen-lezen")
     return payload
@@ -563,7 +583,7 @@ def object_payload_xml(payload: dict) -> str:
                 elif isinstance(child_value, list):
                     for member in child_value: ET.SubElement(child, "member").text = str(member)
                 else: child.text = str(child_value)
-        else: node.text = str(value)
+        else: node.text = "yes" if value is True else "no" if value is False else str(value)
     return ET.tostring(entry, encoding="unicode")
 
 
@@ -571,17 +591,17 @@ def write_panos_object_draft(profile, draft: dict) -> None:
     _, endpoint, key, ctx = panos_profile_context(profile)
     object_type = draft["object_type"]; node = PANOS_OBJECT_NODES[object_type]; operation = draft["operation"]
     if operation == "create":
-        base = "/config/shared" if profile["target_type"] == "panorama" else panos_object_bases(profile, object_type)[0]
+        base = "/config/shared" if profile["target_type"] == "panorama" and object_type != "zones" else panos_object_bases(profile, object_type)[0]
         params = {"type": "config", "action": "set", "xpath": f"{base}/{node}", "element": object_payload_xml(draft["payload"]), "key": key}
         policy_api.require_success(panos_api_post(endpoint, params, ctx), f"create {object_type}")
     elif operation == "update":
-        before = draft["before"]; base = before.get("_scope_xpath") or ("/config/shared" if profile["target_type"] == "panorama" else panos_object_bases(profile, object_type)[0])
+        before = draft["before"]; base = before.get("_scope_xpath") or ("/config/shared" if profile["target_type"] == "panorama" and object_type != "zones" else panos_object_bases(profile, object_type)[0])
         xpath = f"{base}/{node}/entry[@name={policy_api.xpath_literal(before['name'])}]"
         params = {"type": "config", "action": "edit", "xpath": xpath, "element": object_payload_xml(draft["payload"]), "key": key}
         policy_api.require_success(panos_api_post(endpoint, params, ctx), f"update {object_type}")
     else:
         for wrapped in draft["objects"]:
-            item = wrapped["value"]; base = item.get("_scope_xpath") or ("/config/shared" if profile["target_type"] == "panorama" else panos_object_bases(profile, object_type)[0])
+            item = wrapped["value"]; base = item.get("_scope_xpath") or ("/config/shared" if profile["target_type"] == "panorama" and object_type != "zones" else panos_object_bases(profile, object_type)[0])
             xpath = f"{base}/{node}/entry[@name={policy_api.xpath_literal(item['name'])}]"
             policy_api.require_success(panos_api_post(endpoint, {"type": "config", "action": "delete", "xpath": xpath, "key": key}, ctx), f"delete {object_type}")
 
@@ -594,7 +614,7 @@ def validate_object_payload(payload: dict, object_type: str, existing: list[dict
     comparable_keys = {
         "addresses": ("ip_netmask", "ip_range", "ip_wildcard", "fqdn"),
         "address-groups": ("static", "dynamic"), "application-groups": ("members",),
-        "services": ("protocol",), "service-groups": ("members",), "tags": ("color",),
+        "services": ("protocol",), "service-groups": ("members",), "tags": ("color",), "zones": ("network",),
     }[object_type]
     wanted = {key: payload.get(key) for key in comparable_keys if payload.get(key) is not None}
     equivalent = next((item for item in others if {key: item.get(key) for key in comparable_keys if item.get(key) is not None} == wanted), None)
@@ -608,6 +628,11 @@ def policy_fingerprint(policy: dict) -> str:
 
 def split_values(value: str) -> list[str]:
     return list(dict.fromkeys(item.strip() for item in value.replace("\n", ",").split(",") if item.strip()))
+
+
+def validate_policy_zones(policy: dict, zone_names: set[str]) -> None:
+    missing = sorted({value for field in ("from", "to") for value in policy.get(field, []) if value != "any" and value not in zone_names})
+    if missing: raise ValueError("Onbekende zone(s): " + ", ".join(missing) + ". Maak ze eerst aan onder Network > Zones.")
 
 
 def scm_policy_payload(policy: dict, container: dict) -> dict:
@@ -715,9 +740,9 @@ def index():
             if serials:
                 placeholders = ",".join("?" for _ in serials)
                 flows = conn.execute(f"SELECT * FROM flows WHERE serial IN ({placeholders}) ORDER BY last_seen DESC LIMIT 100", serials).fetchall()
-    policy_profile = None; policies = []; policy_error = ""; policy_objects = []; object_catalog = []
+    policy_profile = None; policies = []; policy_error = ""; policy_objects = []; object_catalog = []; policy_catalog = []
     policy_view = request.args.get("policy_view", "policies")
-    if policy_view not in {"policies", "objects"}: policy_view = "policies"
+    if policy_view not in {"policies", "objects", "network"}: policy_view = "policies"
     policy_kind = request.args.get("policy_kind", "security")
     object_type = request.args.get("object_type", "addresses")
     if object_type not in SCM_OBJECT_TYPES: object_type = "addresses"
@@ -727,12 +752,15 @@ def index():
         policy_profile = next((profile for profile in profiles if profile["id"] == policy_profile_id), None)
         if policy_profile:
             try:
-                if policy_view == "objects":
+                if policy_view in {"objects", "network"}:
+                    if policy_view == "network": object_type = "zones"
                     policy_objects = fetch_scm_objects(policy_profile, object_type)
                     object_catalog = fetch_object_catalog(policy_profile, object_type)
-                else: policies = fetch_scm_policy_type(policy_profile, policy_kind)
+                else:
+                    policies = fetch_scm_policy_type(policy_profile, policy_kind)
+                    policy_catalog = fetch_object_catalog(policy_profile, "policy-picker")
             except Exception as exc: policy_error = str(exc)
-    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, policy_profile=policy_profile, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
+    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, policy_profile=policy_profile, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
 
 
 def parse_zones(text: str) -> dict[str, str]:
@@ -766,6 +794,7 @@ def profile_save():
             "endpoint": request.form.get("endpoint", "").strip(),
             "vsys": request.form.get("vsys", "vsys1").strip(),
             "device_group": request.form.get("device_group", "").strip(),
+            "template": request.form.get("template", "").strip(),
             "rulebase": request.form.get("rulebase", "pre"),
             "folder": request.form.get("folder", "").strip(),
             "snippet": request.form.get("snippet", "").strip(),
@@ -894,9 +923,10 @@ def policy_bulk_preview(profile_id):
         current = fetch_scm_policy_type(profile, policy_kind)
         selected = [policy for policy in current if policy["id"] in selected_ids]
         if len(selected) != len(selected_ids): raise ValueError("Niet alle geselecteerde policies bestaan nog. Vernieuw de rulebase.")
-        changes = []
+        changes = []; zones_changed = profile["target_type"] != "panorama" and any(operations[field]["add"] or operations[field]["remove"] for field in ("from", "to")); zone_names = {item.get("name", "") for item in fetch_scm_objects(profile, "zones")} if zones_changed else set()
         for policy in selected:
             updated = apply_bulk_operations(policy, operations)
+            if zones_changed: validate_policy_zones(updated, zone_names)
             if updated != policy:
                 changes.append({"before": policy, "after": updated, "fingerprint": policy_fingerprint(policy)})
         if not changes: raise ValueError("De gekozen bulkbewerking veroorzaakt geen wijzigingen.")
@@ -932,6 +962,8 @@ def policy_single_preview(profile_id):
         if request.form.get("description_present") == "1": replacements["description"] = request.form.get("description", "").strip()
         if request.form.get("disabled_present") == "1": replacements["disabled"] = request.form.get("disabled") == "true"
         updated = apply_single_replacements(policy, replacements)
+        if profile["target_type"] != "panorama" and (updated.get("from") != policy.get("from") or updated.get("to") != policy.get("to")):
+            validate_policy_zones(updated, {item.get("name", "") for item in fetch_scm_objects(profile, "zones")})
         if updated == policy: raise ValueError("De policy bevat geen wijzigingen.")
         draft_id = secrets.token_urlsafe(18)
         changes = [{"before": policy, "after": updated, "fingerprint": policy_fingerprint(policy)}]
@@ -954,7 +986,7 @@ def object_preview(profile_id, object_type):
         container = {}
         if profile["target_type"] == "scm":
             scm, _, _, _ = scm_client(profile)
-            container = policy_api.scm_container(folder=scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
+            container = policy_api.scm_container(folder=scm.scm_folder if object_type == "zones" else scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
         payload = scm_object_payload(object_type, request.form, container)
         existing = fetch_scm_objects(profile, object_type)
         object_id = request.form.get("object_id", "").strip()
@@ -968,7 +1000,7 @@ def object_preview(profile_id, object_type):
         return render_template("object_preview.html", profile=profile, object_type=object_type, object_label=SCM_OBJECT_TYPES[object_type]["label"], payload=payload, before=before, operation=draft["operation"], draft_id=draft_id)
     except Exception as exc:
         flash(f"Object-preview mislukt: {exc}", "error")
-        return redirect(url_for("index", policy_profile=profile_id, policy_view="objects", object_type=object_type) + "#policy-management")
+        return redirect(url_for("index", policy_profile=profile_id, policy_view=managed_view(object_type), object_type=object_type) + "#policy-management")
 
 
 @app.post("/objects/<int:profile_id>/<object_type>/delete-preview")
@@ -990,7 +1022,7 @@ def object_delete_preview(profile_id, object_type):
         return render_template("object_preview.html", profile=profile, object_type=object_type, object_label=SCM_OBJECT_TYPES[object_type]["label"], delete_objects=selected, operation="delete", draft_id=draft_id)
     except Exception as exc:
         flash(f"Delete-preview mislukt: {exc}", "error")
-        return redirect(url_for("index", policy_profile=profile_id, policy_view="objects", object_type=object_type) + "#policy-management")
+        return redirect(url_for("index", policy_profile=profile_id, policy_view=managed_view(object_type), object_type=object_type) + "#policy-management")
 
 
 @app.post("/objects/drafts/<draft_id>/push")
@@ -1019,8 +1051,9 @@ def object_push(draft_id):
         else: raise RuntimeError("Onbekende objectbewerking")
         if profile["target_type"] == "scm":
             scm, token, _, _ = scm_client(profile)
-            root = policy_api.scm_api_root(scm.scm_api_base) + "/config/objects/v1"
-            container = policy_api.scm_container(folder=scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
+            service = "network" if object_type == "zones" else "objects"
+            root = policy_api.scm_api_root(scm.scm_api_base) + f"/config/{service}/v1"
+            container = policy_api.scm_container(folder=scm.scm_folder if object_type == "zones" else scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
             if operation == "create": policy_api.scm_http_request("POST", f"{root}/{object_type}", token, payload=draft["payload"])
             elif operation == "update": policy_api.scm_http_request("PUT", f"{root}/{object_type}/{draft['before']['id']}", token, payload=draft["payload"])
             else:
@@ -1033,7 +1066,7 @@ def object_push(draft_id):
         flash(f"Objectbewerking ({operation}) geschreven naar {profile['target_type'].upper()} candidate.", "success")
     except Exception as exc:
         flash(f"Object-Push gestopt: {exc}", "error")
-    return redirect(url_for("index", policy_profile=profile["id"], policy_view="objects", object_type=draft["object_type"]) + "#policy-management")
+    return redirect(url_for("index", policy_profile=profile["id"], policy_view=managed_view(draft["object_type"]), object_type=draft["object_type"]) + "#policy-management")
 
 
 @app.post("/policies/drafts/<draft_id>/push")
