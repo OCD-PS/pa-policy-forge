@@ -61,12 +61,17 @@ class TargetAdapterTests(unittest.TestCase):
         base = main.panos_object_bases(self.profile("panos"), "zones")[0]
         self.assertIn("vsys/entry[@name='vsys2']", base)
 
-    def test_panorama_zone_scope_requires_template(self):
-        with self.assertRaisesRegex(ValueError, "Template"):
-            main.panos_object_bases(self.profile("panorama", template=""), "zones")
-        base = main.panos_object_bases(self.profile("panorama", template="Branch-Template"), "zones")[0]
+    def test_panorama_zone_scope_uses_device_group_reference_template(self):
+        responses = ["<response status='success'><result><entry name='Branches'><reference-templates><member>Branch-Template</member></reference-templates></entry></result></response>", "<response status='success'><result/></response>"]
+        with patch("app.main.panos_profile_context", return_value=({}, "https://example.invalid", "key", object())), patch("app.main.policy_api.api_get", side_effect=responses):
+            base = main.panos_object_bases(self.profile("panorama"), "zones")[0]
         self.assertIn("template/entry[@name='Branch-Template']", base)
         self.assertIn("vsys/entry[@name='vsys2']", base)
+
+    def test_panorama_without_reference_template_keeps_zones_freeform(self):
+        response = "<response status='success'><result><entry name='Branches'/></result></response>"
+        with patch("app.main.panos_profile_context", return_value=({}, "https://example.invalid", "key", object())), patch("app.main.policy_api.api_get", return_value=response):
+            self.assertEqual(main.panos_object_bases(self.profile("panorama"), "zones"), [])
 
     def test_zone_xml_preserves_type_interfaces_and_profiles(self):
         xml = main.ET.fromstring(main.object_payload_xml({"name": "Clients", "network": {"layer3": ["ethernet1/1"]}, "enable_user_identification": True, "zone_protection_profile": "strict"}))
@@ -75,9 +80,9 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertEqual(xml.findtext("./zone-protection-profile"), "strict")
 
     def test_panorama_zone_create_uses_template_candidate(self):
-        profile = self.profile("panorama", template="Branch-Template")
+        profile = self.profile("panorama")
         draft = {"object_type": "zones", "operation": "create", "payload": {"name": "Clients", "network": {"layer3": []}}}
-        with patch("app.main.panos_profile_context", return_value=({}, "https://example.invalid", "key", object())), patch("app.main.panos_api_post", return_value="<response status='success'><result/></response>") as request, patch("app.main.policy_api.require_success"):
+        with patch("app.main.panos_object_bases", return_value=["/config/devices/entry[@name='localhost.localdomain']/template/entry[@name='Branch-Template']/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys2']"]), patch("app.main.panos_profile_context", return_value=({}, "https://example.invalid", "key", object())), patch("app.main.panos_api_post", return_value="<response status='success'><result/></response>") as request, patch("app.main.policy_api.require_success"):
             main.write_panos_object_draft(profile, draft)
         params = request.call_args.args[1]
         self.assertIn("template/entry[@name='Branch-Template']", params["xpath"])

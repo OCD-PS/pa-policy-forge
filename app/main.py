@@ -436,10 +436,23 @@ def panos_object_bases(profile, object_type: str) -> list[str]:
     if object_type == "applications": return ["/config/predefined"]
     device = policy_api.xpath_literal("localhost.localdomain")
     if object_type == "zones" and profile["target_type"] == "panorama":
-        template = settings.get("template", "").strip()
-        if not template: raise ValueError("Selecteer eerst een Panorama Template in het firewallprofiel voor zonebeheer")
         vsys = policy_api.xpath_literal(settings.get("vsys", "vsys1"))
-        return [f"/config/devices/entry[@name={device}]/template/entry[@name={policy_api.xpath_literal(template)}]/config/devices/entry[@name={device}]/vsys/entry[@name={vsys}]"]
+        _, endpoint, key, ctx = panos_profile_context(profile)
+        group = policy_api.xpath_literal(settings.get("device_group", ""))
+        group_xpath = f"/config/devices/entry[@name={device}]/device-group/entry[@name={group}]"
+        root = policy_api.require_success(policy_api.api_get(endpoint, {"type": "config", "action": "get", "xpath": group_xpath, "key": key}, ctx), "fetch device-group reference templates")
+        references = []
+        for path in (".//reference-templates/member", ".//reference-template/member", ".//reference-template-stack/member"):
+            references.extend(node.text.strip() for node in root.findall(path) if node.text and node.text.strip())
+        references = list(dict.fromkeys(references))
+        bases = []
+        for reference in references:
+            literal = policy_api.xpath_literal(reference)
+            stack_xpath = f"/config/devices/entry[@name={device}]/template-stack/entry[@name={literal}]"
+            stack_root = policy_api.require_success(policy_api.api_get(endpoint, {"type": "config", "action": "get", "xpath": stack_xpath, "key": key}, ctx), f"inspect reference template {reference}")
+            kind = "template-stack" if stack_root.find(".//entry") is not None else "template"
+            bases.append(f"/config/devices/entry[@name={device}]/{kind}/entry[@name={literal}]/config/devices/entry[@name={device}]/vsys/entry[@name={vsys}]")
+        return bases
     if profile["target_type"] == "panorama":
         group = policy_api.xpath_literal(settings.get("device_group", ""))
         return ["/config/shared", f"/config/devices/entry[@name={device}]/device-group/entry[@name={group}]"]
@@ -591,7 +604,9 @@ def write_panos_object_draft(profile, draft: dict) -> None:
     _, endpoint, key, ctx = panos_profile_context(profile)
     object_type = draft["object_type"]; node = PANOS_OBJECT_NODES[object_type]; operation = draft["operation"]
     if operation == "create":
-        base = "/config/shared" if profile["target_type"] == "panorama" and object_type != "zones" else panos_object_bases(profile, object_type)[0]
+        bases = panos_object_bases(profile, object_type) if profile["target_type"] != "panorama" or object_type == "zones" else []
+        if object_type == "zones" and not bases: raise ValueError("De Device Group heeft geen Reference Template; de zonenaam blijft freeform en er is geen template-candidate om te wijzigen")
+        base = "/config/shared" if profile["target_type"] == "panorama" and object_type != "zones" else bases[0]
         params = {"type": "config", "action": "set", "xpath": f"{base}/{node}", "element": object_payload_xml(draft["payload"]), "key": key}
         policy_api.require_success(panos_api_post(endpoint, params, ctx), f"create {object_type}")
     elif operation == "update":
@@ -794,7 +809,6 @@ def profile_save():
             "endpoint": request.form.get("endpoint", "").strip(),
             "vsys": request.form.get("vsys", "vsys1").strip(),
             "device_group": request.form.get("device_group", "").strip(),
-            "template": request.form.get("template", "").strip(),
             "rulebase": request.form.get("rulebase", "pre"),
             "folder": request.form.get("folder", "").strip(),
             "snippet": request.form.get("snippet", "").strip(),
