@@ -310,13 +310,11 @@
 <div class="page-header">
 <div>
 <h1>Flows</h1>
-<p class="lede">Kies eerst het firewallprofiel waarvan je de flows wilt bekijken.</p>
 </div>
 </div>
 <div class="grid grid-2">
 {% for p in profiles %}<a class="card" href="{{url_for('index',flow_profile=p.id)}}#flows" style="text-decoration:none;color:inherit">
-<div class="card-header"><div><h2>{{p.name}}</h2></div><span class="badge badge-orange">{{p.target_type|upper}}</span></div>
-<p>{{p.flow_count}} geaggregeerde flows · Open dit device/firewallcluster.</p>
+<h2>{{p.name}}</h2>
 </a>{% endfor %}
 </div>
 {% elif selected_flow_profile %}
