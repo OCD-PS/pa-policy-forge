@@ -955,6 +955,47 @@ def workspace_config_path(workspace) -> Path:
     return path
 
 
+def active_config_workspace_id(profile) -> int:
+    try:
+        return int(profile_settings(profile).get("config_workspace_id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def set_active_config_workspace(profile_id: int, workspace_id: int | None) -> None:
+    with db() as conn:
+        profile = conn.execute("SELECT settings_json FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        if not profile:
+            raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
+        settings = json.loads(profile["settings_json"] or "{}")
+        if workspace_id:
+            owned = conn.execute(
+                "SELECT 1 FROM config_workspaces WHERE id=? AND profile_id=?",
+                (workspace_id, profile_id),
+            ).fetchone()
+            if not owned:
+                raise OfflineConfigError("De gekozen configuratie hoort niet bij dit profiel")
+            settings["config_workspace_id"] = int(workspace_id)
+        else:
+            settings.pop("config_workspace_id", None)
+        conn.execute("UPDATE profiles SET settings_json=? WHERE id=?", (json.dumps(settings), profile_id))
+
+
+@app.post("/config-workspaces/<int:workspace_id>/select")
+@login_required
+def config_workspace_select(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    try:
+        set_active_config_workspace(workspace["profile_id"], workspace_id)
+        audit("config-workspace-selected", f"workspace={workspace_id} profile={workspace['profile_name']}")
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
+    except Exception as exc:
+        flash(f"Configuratie niet geselecteerd: {exc}", "error")
+        return redirect(url_for("index", policy_profile=workspace["profile_id"], policy_source="choose") + "#policy-management")
+
+
 OFFLINE_POLICY_FIELDS = (
     "from", "to", "source", "destination", "source_user", "category",
     "application", "service", "tag",
@@ -1079,6 +1120,7 @@ def config_workspace_policy_apply(draft_id):
         new_id = store_config_workspace(
             profile, f"{workspace['name']} · edit {now()}", workspace["original_name"], new_xml, "edit",
         )
+        set_active_config_workspace(workspace["profile_id"], new_id)
         audit("config-workspace-policy-edited", f"source={workspace['id']} workspace={new_id} scope={draft['scope']} policy={draft['policy_name']}")
         draft_path.unlink(missing_ok=True)
         flash("Policy gewijzigd in een nieuwe workspaceversie; de bronsnapshot bleef onaangeroerd.", "success")
@@ -1109,6 +1151,7 @@ def config_workspace_upload(profile_id):
             data,
             "upload",
         )
+        set_active_config_workspace(profile_id, workspace_id)
         flash("Volledige configuratie veilig geïmporteerd; het oorspronkelijke XML blijft behouden.", "success")
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
     except Exception as exc:
@@ -1140,6 +1183,7 @@ def config_workspace_pull(profile_id):
             xml_bytes,
             "api",
         )
+        set_active_config_workspace(profile_id, workspace_id)
         flash("Volledige candidateconfiguratie via API opgehaald.", "success")
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
     except Exception as exc:
@@ -1220,9 +1264,14 @@ def config_workspace_delete(workspace_id):
     if not workspace:
         return "Not found", 404
     try:
+        with db() as conn:
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+        was_active = bool(profile and active_config_workspace_id(profile) == workspace_id)
         workspace_config_path(workspace).unlink(missing_ok=True)
         with db() as conn:
             conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
+        if was_active:
+            set_active_config_workspace(workspace["profile_id"], None)
         audit("config-workspace-deleted", f"workspace={workspace_id} profile={workspace['profile_name']}")
         flash("Offline configuratieworkspace verwijderd.", "success")
     except Exception as exc:
@@ -1309,10 +1358,11 @@ def index():
                         "SELECT * FROM config_workspaces WHERE profile_id=? ORDER BY id DESC",
                         (policy_profile["id"],),
                     ).fetchall()
-                # Existing deep links already carry a view. Treat those as live
-                # target navigation while new profile selections first choose a source.
-                if not policy_source and "policy_view" in request.args:
-                    policy_source = "live"
+                active_id = active_config_workspace_id(policy_profile)
+                active_workspace = next((item for item in policy_workspaces if item["id"] == active_id), None)
+                if policy_source != "choose" and active_workspace:
+                    return redirect(url_for("config_workspace_editor", workspace_id=active_workspace["id"]))
+                policy_source = "choose"
             else:
                 policy_source = "live"
             if policy_source == "live":
@@ -1345,6 +1395,12 @@ def parse_zones(text: str) -> dict[str, str]:
 def profile_save():
     try:
         profile_id = int(request.form.get("id") or 0)
+        preserved_workspace_id = 0
+        if profile_id:
+            with db() as conn:
+                existing_profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+            if existing_profile:
+                preserved_workspace_id = active_config_workspace_id(existing_profile)
         target_type = request.form.get("target_type", "")
         if target_type not in TARGET_TYPES: raise ValueError("Onbekend targettype")
         rulebase = request.form.get("rulebase", "pre")
@@ -1372,6 +1428,8 @@ def profile_save():
             "passive_serial": passive_serial,
             "passive_source_ip": optional_ip_address(request.form.get("passive_source_ip", "")),
         }
+        if preserved_workspace_id:
+            settings["config_workspace_id"] = preserved_workspace_id
         supplied = {k: request.form.get(k, "") for k in ("username", "password", "client_id", "client_secret", "tsg_id")}
         if target_type in {"panorama", "panos"} and not settings["endpoint"]:
             raise ValueError("Endpoint is verplicht voor Panorama en standalone PAN-OS")
@@ -1696,8 +1754,13 @@ def build_fingerprint(profile, include_flows: bool = True) -> str:
                 f"SELECT serial,COUNT(*) count,MAX(last_seen) last_seen,SUM(repeat) sessions,SUM(bytes) bytes FROM flows WHERE action='allow' AND serial IN ({placeholders}) GROUP BY serial ORDER BY serial",
                 serials,
             ))
+    builder_settings = json.loads(profile["settings_json"] or "{}")
+    builder_settings.pop("config_workspace_id", None)
     state = {
-        "profile": {key: profile[key] for key in ("id", "enabled", "serial", "source_ip", "target_type", "settings_json", "updated_at")},
+        "profile": {
+            **{key: profile[key] for key in ("id", "enabled", "serial", "source_ip", "target_type", "updated_at")},
+            "settings_json": json.dumps(builder_settings, sort_keys=True, separators=(",", ":")),
+        },
         "secret": hashlib.sha256(bytes(profile["secret_blob"] or b"")).hexdigest(),
         "builder": hashlib.sha256((BASE / "vendor/bdnd_panos_policy_builder.py").read_bytes()).hexdigest(),
     }

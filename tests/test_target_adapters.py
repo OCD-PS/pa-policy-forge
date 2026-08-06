@@ -149,7 +149,7 @@ class TargetAdapterTests(unittest.TestCase):
             with patch.object(main, "fetch_scm_policy_type") as fetch:
                 response = client.get(f"/?policy_profile={profile_id}", base_url="https://forge.test")
             self.assertEqual(response.status_code, 200)
-            self.assertIn(b"Kies hoe je de configuratie wilt openen", response.data)
+            self.assertIn(b"Kies \xc3\xa9\xc3\xa9n volledige configuratiebron", response.data)
             self.assertIn(b"API snapshot", response.data)
             fetch.assert_not_called()
         finally:
@@ -158,6 +158,44 @@ class TargetAdapterTests(unittest.TestCase):
             with main.db() as conn:
                 conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
                 conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
+    def test_panorama_and_standalone_remember_selected_full_config(self):
+        for target, xml in (
+            ("panorama", b'<config><devices><entry name="localhost.localdomain"><device-group><entry name="Branches"/></device-group></entry></devices></config>'),
+            ("panos", b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"/></vsys></entry></devices></config>'),
+        ):
+            timestamp = main.now()
+            with main.db() as conn:
+                cursor = conn.execute(
+                    "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (f"remember-{target}", 1, "", "", target, "{}", b"", timestamp, timestamp),
+                )
+                profile_id = cursor.lastrowid
+                profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+            workspace_id = main.store_config_workspace(profile, "remembered", "config.xml", xml, "upload")
+            fingerprint_before = main.build_fingerprint(profile, include_flows=False)
+            main.set_active_config_workspace(profile_id, workspace_id)
+            with main.db() as conn:
+                updated_profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+            self.assertEqual(main.active_config_workspace_id(updated_profile), workspace_id)
+            self.assertEqual(main.build_fingerprint(updated_profile, include_flows=False), fingerprint_before)
+            client = main.app.test_client()
+            with client.session_transaction(base_url="https://forge.test") as login:
+                login["user_id"] = 1
+                login["username"] = "test"
+                login["must_change"] = False
+            response = client.get(f"/?policy_profile={profile_id}", base_url="https://forge.test")
+            self.assertEqual(response.status_code, 302)
+            self.assertIn(f"/config-workspaces/{workspace_id}/edit", response.headers["Location"])
+            chooser = client.get(f"/?policy_profile={profile_id}&policy_source=choose", base_url="https://forge.test")
+            self.assertEqual(chooser.status_code, 200)
+            self.assertNotIn(b"Huidige candidate", chooser.data)
+            try:
+                main.workspace_config_path(main.workspace_row(workspace_id)).unlink(missing_ok=True)
+            finally:
+                with main.db() as conn:
+                    conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
+                    conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
 
     def test_oversized_form_is_rejected(self):
         client = main.app.test_client()
