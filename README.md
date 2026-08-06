@@ -79,9 +79,14 @@ add/remove operations:
 The workspace has separate **Policies** and **Objects** navigation. SCM object
 inventory is read from the configured object scope. Addresses, address groups,
 application groups, services, service groups, and tags can be prepared through
-a preview and then written to SCM candidate. Creation is stopped when the name
-or equivalent object already exists. Object creation never commits or pushes the
-SCM candidate configuration automatically.
+a preview and then written to SCM candidate. Existing objects open in a
+PAN-OS-style editor; multi-select delete is available from the fixed bottom
+action bar. Addresses support all four PAN-OS address types and tags. Address
+groups support static members and dynamic filters. Services support TCP/UDP,
+destination/source ports, and optional timeout overrides. Creation is stopped
+when the name or equivalent object already exists, and stale edit/delete drafts
+are rejected. Object changes never commit or push the SCM candidate
+configuration automatically.
 removing one zone or object never removes the other existing members. A preview
 shows every changed value before a separate candidate write. The candidate
 write re-fetches the live rules and stops on concurrent changes. SCM is the

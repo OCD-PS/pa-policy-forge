@@ -369,6 +369,44 @@
     applyFilter(); updateActionCount();
   }
 
+  function setupObjectManagement() {
+    var dialog = document.querySelector("[data-object-dialog]");
+    var form = document.querySelector("[data-object-form]");
+    var rows = all("[data-object-row]");
+    var checkboxes = all("[data-object-select]");
+    var countNode = document.querySelector("[data-object-selected-count]");
+    var deleteButton = document.querySelector("[data-object-delete]");
+    function updateCount() { var count = checkboxes.filter(function (item) { return item.checked; }).length; if (countNode) countNode.textContent = count; if (deleteButton) deleteButton.disabled = !count; }
+    checkboxes.forEach(function (checkbox) { checkbox.addEventListener("change", updateCount); });
+    var master = document.querySelector("[data-object-select-visible]");
+    if (master) master.addEventListener("change", function () { rows.forEach(function (row) { var checkbox = row.querySelector("[data-object-select]"); if (checkbox && !row.hidden) checkbox.checked = master.checked; }); updateCount(); });
+    if (!dialog || !form) { updateCount(); return; }
+    var groupType = form.querySelector("[data-object-group-type]");
+    function updateGroupType() { if (!groupType) return; var dynamic = groupType.value === "dynamic"; var staticNode = form.querySelector("[data-static-members]"); var dynamicNode = form.querySelector("[data-dynamic-filter]"); if (staticNode) staticNode.hidden = dynamic; if (dynamicNode) dynamicNode.hidden = !dynamic; }
+    if (groupType) groupType.addEventListener("change", updateGroupType);
+    var override = form.querySelector("[data-service-override]");
+    function updateTimeouts() { all("[data-timeout-field]", form).forEach(function (node) { node.hidden = !(override && override.checked); }); }
+    if (override) override.addEventListener("change", updateTimeouts);
+    function setField(name, value) { var field = form.querySelector('[data-object-field="' + name + '"]'); if (!field) return; field.value = Array.isArray(value) ? value.join(", ") : (value == null ? "" : value); }
+    function openEditor(item) {
+      form.reset(); form.querySelector("[data-object-id]").value = item && item.id ? item.id : "";
+      dialog.querySelector("[data-object-dialog-title]").textContent = (item ? "Edit " : "Add ") + document.querySelector(".object-list h2").textContent;
+      if (item) {
+        setField("name", item.name); setField("description", item.description); setField("comments", item.comments); setField("tag", item.tag);
+        ["ip_netmask", "ip_range", "ip_wildcard", "fqdn"].some(function (kind) { if (item[kind]) { setField("value_type", kind); setField("value", item[kind]); return true; } return false; });
+        if (item.dynamic) { if (groupType) groupType.value = "dynamic"; setField("dynamic_filter", typeof item.dynamic === "object" ? item.dynamic.filter : item.dynamic); } else { if (groupType) groupType.value = "static"; setField("static", item.static); }
+        setField("members", item.members);
+        if (item.protocol) { var protocolName = Object.keys(item.protocol)[0]; var details = item.protocol[protocolName] || {}; setField("protocol_name", protocolName); ["port", "source_port", "timeout", "halfclose_timeout", "timewait_timeout"].forEach(function (key) { setField(key, details[key]); }); if (override) override.checked = Boolean(details.override || details.timeout || details.halfclose_timeout || details.timewait_timeout); }
+        setField("color", item.color);
+      }
+      updateGroupType(); updateTimeouts(); dialog.showModal();
+    }
+    var add = document.querySelector("[data-object-add]"); if (add) add.addEventListener("click", function () { openEditor(null); });
+    rows.forEach(function (row) { var button = row.querySelector("[data-object-edit]"); if (!button) return; var item = JSON.parse(row.dataset.object); button.addEventListener("click", function () { openEditor(item); }); row.addEventListener("click", function (event) { if (!event.target.closest("input,button,a")) openEditor(item); }); });
+    var cancel = dialog.querySelector("[data-object-cancel]"); if (cancel) cancel.addEventListener("click", function () { dialog.close(); });
+    updateCount(); updateGroupType(); updateTimeouts();
+  }
+
   document.addEventListener("DOMContentLoaded", function () {
     setupNavigation();
     setupSidebarCollapse();
@@ -380,5 +418,6 @@
     setupConditionalTargets();
     setupPushOptions();
     setupPolicyManagement();
+    setupObjectManagement();
   });
 })();

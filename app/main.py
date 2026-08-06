@@ -299,8 +299,9 @@ def scm_object_payload(object_type: str, form, container: dict) -> dict:
         raise ValueError("Naam is verplicht")
     payload = {"name": name, **container}
     description = form.get("description", "").strip()
-    if description:
-        payload["description"] = description
+    if description: payload["description"] = description
+    tags = split_values(form.get("tags", ""))
+    if tags and object_type != "tags": payload["tag"] = tags
     if object_type == "addresses":
         value_type = form.get("value_type", "ip_netmask")
         if value_type not in {"ip_netmask", "ip_range", "ip_wildcard", "fqdn"}:
@@ -309,11 +310,19 @@ def scm_object_payload(object_type: str, form, container: dict) -> dict:
         if not value:
             raise ValueError("Adreswaarde is verplicht")
         payload[value_type] = value
-    elif object_type in {"address-groups", "application-groups", "service-groups"}:
+    elif object_type == "address-groups":
+        if form.get("group_type", "static") == "dynamic":
+            match = form.get("dynamic", "").strip()
+            if not match: raise ValueError("Dynamic match criteria is verplicht")
+            payload["dynamic"] = {"filter": match}
+        else:
+            members = split_values(form.get("members", ""))
+            if not members: raise ValueError("Voeg minstens één member toe")
+            payload["static"] = members
+    elif object_type in {"application-groups", "service-groups"}:
         members = split_values(form.get("members", ""))
-        if not members:
-            raise ValueError("Voeg minstens één member toe")
-        payload["static" if object_type == "address-groups" else "members"] = members
+        if not members: raise ValueError("Voeg minstens één member toe")
+        payload["members"] = members
     elif object_type == "services":
         protocol = form.get("protocol", "tcp").lower()
         if protocol not in {"tcp", "udp"}:
@@ -321,27 +330,41 @@ def scm_object_payload(object_type: str, form, container: dict) -> dict:
         port = form.get("port", "").strip()
         if not port:
             raise ValueError("Poort is verplicht")
-        payload["protocol"] = {protocol: {"port": port}}
+        protocol_payload = {"port": port}
+        source_port = form.get("source_port", "").strip()
+        if source_port: protocol_payload["source_port"] = source_port
+        if form.get("override") == "on":
+            protocol_payload["override"] = True
+            for form_key, payload_key in (("timeout", "timeout"), ("halfclose_timeout", "halfclose_timeout"), ("timewait_timeout", "timewait_timeout")):
+                value = form.get(form_key, "").strip()
+                if value: protocol_payload[payload_key] = int(value)
+        payload["protocol"] = {protocol: protocol_payload}
     elif object_type == "tags":
         color = form.get("color", "").strip()
-        if color:
-            payload["color"] = color
+        comments = form.get("comments", "").strip() or description
+        if color: payload["color"] = color
+        if comments: payload["comments"] = comments
     else:
         raise ValueError("Dit objecttype is momenteel alleen-lezen")
     return payload
 
 
-def validate_new_object(payload: dict, object_type: str, existing: list[dict]) -> None:
-    same_name = next((item for item in existing if item.get("name") == payload["name"]), None)
+def object_fingerprint(value: dict) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def validate_object_payload(payload: dict, object_type: str, existing: list[dict], own_id: str = "") -> None:
+    others = [item for item in existing if str(item.get("id", "")) != own_id]
+    same_name = next((item for item in others if item.get("name") == payload["name"]), None)
     if same_name:
         raise ValueError(f"Object {payload['name']} bestaat al; gebruik het bestaande object.")
     comparable_keys = {
         "addresses": ("ip_netmask", "ip_range", "ip_wildcard", "fqdn"),
-        "address-groups": ("static",), "application-groups": ("members",),
+        "address-groups": ("static", "dynamic"), "application-groups": ("members",),
         "services": ("protocol",), "service-groups": ("members",), "tags": ("color",),
     }[object_type]
     wanted = {key: payload.get(key) for key in comparable_keys if payload.get(key) is not None}
-    equivalent = next((item for item in existing if {key: item.get(key) for key in comparable_keys if item.get(key) is not None} == wanted), None)
+    equivalent = next((item for item in others if {key: item.get(key) for key in comparable_keys if item.get(key) is not None} == wanted), None)
     if equivalent:
         raise ValueError(f"Een equivalent object bestaat al als {equivalent['name']}; gebruik dat bestaande object.")
 
@@ -607,14 +630,39 @@ def object_preview(profile_id, object_type):
         container = policy_api.scm_container(folder=scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
         payload = scm_object_payload(object_type, request.form, container)
         existing = fetch_scm_objects(profile, object_type)
-        validate_new_object(payload, object_type, existing)
+        object_id = request.form.get("object_id", "").strip()
+        before = next((item for item in existing if str(item.get("id", "")) == object_id), None) if object_id else None
+        if object_id and not before: raise ValueError("Het object bestaat niet meer. Vernieuw de lijst.")
+        validate_object_payload(payload, object_type, existing, object_id)
         draft_id = secrets.token_urlsafe(18)
-        draft = {"profile_id": profile_id, "created_at": now(), "object_type": object_type, "payload": payload}
+        draft = {"profile_id": profile_id, "created_at": now(), "object_type": object_type, "operation": "update" if before else "create", "payload": payload, "before": before, "fingerprint": object_fingerprint(before) if before else ""}
         path = OBJECT_DRAFTS / f"{draft_id}.json"; path.write_text(json.dumps(draft)); path.chmod(0o600)
-        audit("object-preview", f"profile={profile['name']} type={object_type} name={payload['name']}")
-        return render_template("object_preview.html", profile=profile, object_type=object_type, object_label=SCM_OBJECT_TYPES[object_type]["label"], payload=payload, draft_id=draft_id)
+        audit("object-preview", f"profile={profile['name']} operation={draft['operation']} type={object_type} name={payload['name']}")
+        return render_template("object_preview.html", profile=profile, object_type=object_type, object_label=SCM_OBJECT_TYPES[object_type]["label"], payload=payload, before=before, operation=draft["operation"], draft_id=draft_id)
     except Exception as exc:
         flash(f"Object-preview mislukt: {exc}", "error")
+        return redirect(url_for("index", policy_profile=profile_id, policy_view="objects", object_type=object_type) + "#policy-management")
+
+
+@app.post("/objects/<int:profile_id>/<object_type>/delete-preview")
+@login_required
+def object_delete_preview(profile_id, object_type):
+    if object_type not in SCM_OBJECT_TYPES or not SCM_OBJECT_TYPES[object_type]["creatable"]: return "Not found", 404
+    with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+    if not profile: return "Not found", 404
+    try:
+        selected_ids = set(request.form.getlist("object_id"))
+        if not selected_ids: raise ValueError("Selecteer minstens één object")
+        current = fetch_scm_objects(profile, object_type)
+        selected = [item for item in current if str(item.get("id", "")) in selected_ids]
+        if len(selected) != len(selected_ids): raise ValueError("Niet alle geselecteerde objecten bestaan nog. Vernieuw de lijst.")
+        draft_id = secrets.token_urlsafe(18)
+        draft = {"profile_id": profile_id, "created_at": now(), "object_type": object_type, "operation": "delete", "objects": [{"value": item, "fingerprint": object_fingerprint(item)} for item in selected]}
+        path = OBJECT_DRAFTS / f"{draft_id}.json"; path.write_text(json.dumps(draft)); path.chmod(0o600)
+        audit("object-delete-preview", f"profile={profile['name']} type={object_type} count={len(selected)}")
+        return render_template("object_preview.html", profile=profile, object_type=object_type, object_label=SCM_OBJECT_TYPES[object_type]["label"], delete_objects=selected, operation="delete", draft_id=draft_id)
+    except Exception as exc:
+        flash(f"Delete-preview mislukt: {exc}", "error")
         return redirect(url_for("index", policy_profile=profile_id, policy_view="objects", object_type=object_type) + "#policy-management")
 
 
@@ -630,13 +678,29 @@ def object_push(draft_id):
     try:
         scm, token, _, _ = scm_client(profile)
         object_type = draft["object_type"]
-        validate_new_object(draft["payload"], object_type, fetch_scm_objects(profile, object_type))
         root = policy_api.scm_api_root(scm.scm_api_base) + "/config/objects/v1"
         container = policy_api.scm_container(folder=scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
-        policy_api.scm_upsert(f"{root}/{object_type}", token, draft["payload"], container)
+        current = fetch_scm_objects(profile, object_type)
+        operation = draft.get("operation", "create")
+        if operation == "create":
+            validate_object_payload(draft["payload"], object_type, current)
+            policy_api.scm_http_request("POST", f"{root}/{object_type}", token, payload=draft["payload"])
+        elif operation == "update":
+            before = draft["before"]; live = next((item for item in current if str(item.get("id", "")) == str(before.get("id", ""))), None)
+            if not live or object_fingerprint(live) != draft["fingerprint"]: raise RuntimeError(f"Object {before['name']} is intussen gewijzigd; Push gestopt.")
+            validate_object_payload(draft["payload"], object_type, current, str(before["id"]))
+            policy_api.scm_http_request("PUT", f"{root}/{object_type}/{before['id']}", token, payload=draft["payload"])
+        elif operation == "delete":
+            for entry in draft["objects"]:
+                before = entry["value"]; live = next((item for item in current if str(item.get("id", "")) == str(before.get("id", ""))), None)
+                if not live or object_fingerprint(live) != entry["fingerprint"]: raise RuntimeError(f"Object {before['name']} is intussen gewijzigd; Delete gestopt.")
+            for entry in draft["objects"]:
+                policy_api.scm_http_request("DELETE", f"{root}/{object_type}/{entry['value']['id']}", token, params=container)
+        else: raise RuntimeError("Onbekende objectbewerking")
         path.unlink()
-        audit("object-candidate", f"profile={profile['name']} type={object_type} name={draft['payload']['name']}")
-        flash(f"Object {draft['payload']['name']} geschreven naar SCM candidate.", "success")
+        count = len(draft.get("objects", [])) or 1
+        audit("object-candidate", f"profile={profile['name']} operation={operation} type={object_type} count={count}")
+        flash(f"Objectbewerking ({operation}) geschreven naar SCM candidate.", "success")
     except Exception as exc:
         flash(f"Object-Push gestopt: {exc}", "error")
     return redirect(url_for("index", policy_profile=profile["id"], policy_view="objects", object_type=draft["object_type"]) + "#policy-management")
