@@ -153,6 +153,7 @@ class FlowKey:
     proto: str
     dport: str
     action: str
+    rule: str = ""
 
 
 @dataclass(frozen=True)
@@ -320,7 +321,7 @@ def canonical_flow(row: dict[str, str]) -> tuple[FlowKey, list[str], list[str], 
     serial = clean(first_present(row, "serial"), "")
     repeat = max(parse_int(first_present(row, "repeat"), 1), 1)
     bytes_total = parse_int(first_present(row, "bytes"), 0)
-    key = FlowKey(src_zone, dst_zone, app, proto, dport, action)
+    key = FlowKey(src_zone, dst_zone, app, proto, dport, action, rule)
     return key, split_multi(src), split_multi(dst), repeat, bytes_total, rule, serial
 
 
@@ -512,7 +513,7 @@ def build_plan(
                 merged = merged_client_internet.get(merged_key)
                 if merged is None:
                     merged = FlowAggregate(
-                        FlowKey(agg.key.src_zone, agg.key.dst_zone, "any", "tcp", "80-443", agg.key.action)
+                        FlowKey(agg.key.src_zone, agg.key.dst_zone, "any", "tcp", "80-443", agg.key.action, agg.key.rule)
                     )
                     merged_client_internet[merged_key] = merged
                 merged.sessions += agg.sessions

@@ -224,6 +224,7 @@ class RuleCandidate:
     app: str
     service_members: tuple[str, ...]
     action: str
+    anchor_rule: str
     sources: Counter[str]
     destinations: Counter[str]
     sessions: int = 0
@@ -404,7 +405,7 @@ def merge_candidates(
     if limit:
         eligible = eligible[:limit]
 
-    merged: dict[tuple[str, str, str, str, str], RuleCandidate] = {}
+    merged: dict[tuple[str, str, str, str, str, str], RuleCandidate] = {}
     for agg in eligible:
         key = agg.key
         if is_global_ping_traceroute_app(key.app, suppressed_apps):
@@ -417,7 +418,8 @@ def merge_candidates(
             app = normalize_app(key.app)
             service_members = (service_member_for_flow(app, key.proto, key.dport),)
             bucket_service_key = service_members[0]
-        bucket_key = (key.src_zone, key.dst_zone, app, bucket_service_key, key.action)
+        anchor_rule = key.rule.strip()
+        bucket_key = (key.src_zone, key.dst_zone, app, bucket_service_key, key.action, anchor_rule)
         candidate = merged.get(bucket_key)
         if candidate is None:
             candidate = RuleCandidate(
@@ -426,6 +428,7 @@ def merge_candidates(
                 app=app,
                 service_members=service_members,
                 action=key.action,
+                anchor_rule=anchor_rule,
                 sources=Counter(),
                 destinations=Counter(),
                 transports=Counter(),
@@ -580,6 +583,11 @@ def build_xml(
     tag_names: set[str] = set()
     rule_names: set[str] = set()
     review_rows: list[dict[str, str]] = []
+    observed_anchor_rules: Counter[str] = Counter()
+    for aggregate in aggregates.values():
+        if aggregate.key.rule:
+            observed_anchor_rules[aggregate.key.rule] += aggregate.sessions
+    default_anchor_rule = observed_anchor_rules.most_common(1)[0][0] if observed_anchor_rules else ""
 
     for tag in tags:
         ensure_tag_object(tag_objects, tag, tag_names)
@@ -630,6 +638,7 @@ def build_xml(
                     "preflight_status": "not-checked",
                     "log_setting": log_setting,
                     "profile_group": profile_groups.other,
+                    "anchor_rule": default_anchor_rule,
                 }
             )
 
@@ -707,6 +716,7 @@ def build_xml(
                     "preflight_status": "not-checked",
                     "log_setting": log_setting,
                     "profile_group": profile_groups.server,
+                    "anchor_rule": default_anchor_rule,
                 }
             )
 
@@ -754,6 +764,7 @@ def build_xml(
                     "preflight_status": "not-checked",
                     "log_setting": log_setting,
                     "profile_group": profile_groups.internet,
+                    "anchor_rule": default_anchor_rule,
                 }
             )
 
@@ -857,6 +868,7 @@ def build_xml(
                 "preflight_status": "not-checked",
                 "log_setting": log_setting,
                 "profile_group": profile_group,
+                "anchor_rule": candidate.anchor_rule,
             }
         )
 
@@ -883,6 +895,7 @@ def write_review_csv(path: Path, rows: list[dict[str, str]]) -> None:
                 "config_reuse",
                 "log_setting",
                 "profile_group",
+                "anchor_rule",
             ],
         )
         writer.writeheader()
@@ -1582,6 +1595,8 @@ def preflight_scm_rules(
         device=scm.scm_device,
     )
     existing_rules = scm_fetch_rules(f"{security_base}/security-rules", token, rule_container, scm.scm_rulebase)
+    if deployment.panos_auto_push:
+        validate_anchor_rules(rows, {normalized_scm_rule_name(str(rule["name"])) for rule in existing_rules if rule.get("name")}, normalized_scm_rule_name)
     existing_name_keys = {
         normalized_scm_rule_name(str(rule["name"])): payload_rule_key(rule)
         for rule in existing_rules
@@ -1637,6 +1652,8 @@ def preflight_panos_rules(
     deployment: DeploymentConfig,
 ) -> Counter[str]:
     existing_entries = fetch_panos_rule_entries(deployment)
+    if deployment.panos_auto_push:
+        validate_anchor_rules(rows, {entry.attrib["name"] for entry in existing_entries if entry.attrib.get("name")})
     existing_name_keys = {
         entry.attrib["name"]: xml_rule_key(entry)
         for entry in existing_entries
@@ -1649,6 +1666,24 @@ def preflight_panos_rules(
         for entry in rules_root.findall("./entry")
     ] if rules_root is not None else []
     return set_preflight_statuses(rows, generated_rules, existing_name_keys, existing_rule_keys)
+
+
+def validate_anchor_rules(rows: list[dict[str, str]], existing_names: set[str], normalizer=lambda value: value) -> None:
+    missing = sorted({
+        row.get("anchor_rule", "").strip() or "<empty>"
+        for row in rows
+        if normalizer(row.get("anchor_rule", "").strip()) not in existing_names
+    })
+    if missing:
+        raise RuntimeError("Cannot position generated policies; source policy not found: " + ", ".join(missing))
+
+
+def movable_anchor_map(rows: list[dict[str, str]]) -> dict[str, str]:
+    return {
+        row["name"]: row["anchor_rule"]
+        for row in rows
+        if row.get("name") and row.get("anchor_rule") and row.get("preflight_status") != "duplicate-match-skip"
+    }
 
 
 def normalized_scm_rule_name(name: str) -> str:
@@ -1844,6 +1879,7 @@ def push_to_scm(
     scm: SCMConfig,
     zone_roles: ZoneRoleConfig,
     profile_groups: ProfileGroupConfig,
+    review_rows: list[dict[str, str]],
 ) -> None:
     token = get_scm_token(scm)
     api_root = scm_api_root(scm.scm_api_base)
@@ -1875,11 +1911,29 @@ def push_to_scm(
     for payload in payloads["rules"]:
         scm_upsert(f"{security_base}/security-rules", token, payload, rule_container, rule_params)
 
+    current_rules = scm_fetch_rules(f"{security_base}/security-rules", token, rule_container, scm.scm_rulebase)
+    rules_by_name = {
+        normalized_scm_rule_name(str(rule["name"])): rule
+        for rule in current_rules
+        if rule.get("name") and rule.get("id")
+    }
+    for generated_name, anchor_name in movable_anchor_map(review_rows).items():
+        generated = rules_by_name.get(normalized_scm_rule_name(generated_name))
+        anchor = rules_by_name.get(normalized_scm_rule_name(anchor_name))
+        if not generated or not anchor:
+            raise RuntimeError(f"Cannot move {generated_name!r} before source policy {anchor_name!r}")
+        scm_http_request(
+            "POST",
+            f"{security_base}/security-rules/{generated['id']}:move",
+            token,
+            payload={"destination": "before", "rulebase": scm.scm_rulebase, "destination_rule": anchor["id"]},
+        )
+
     # PA Policy Forge intentionally stops after writing candidate objects and
     # rules. It must never trigger an SCM candidate push/deployment job.
 
 
-def push_to_device(xml_path: Path, deployment: DeploymentConfig) -> None:
+def push_to_device(xml_path: Path, deployment: DeploymentConfig, review_rows: list[dict[str, str]]) -> None:
     if not deployment.panos_endpoint or not deployment.panos_username or not deployment.panos_password:
         raise RuntimeError("Auto-push requested but panos endpoint/username/password is incomplete")
 
@@ -1928,6 +1982,16 @@ def push_to_device(xml_path: Path, deployment: DeploymentConfig) -> None:
             require_success(
                 api_get(deployment.panos_endpoint, {"type": "op", "key": key, "cmd": cmd}, ctx),
                 "load partial config",
+            )
+        for generated_name, anchor_name in movable_anchor_map(review_rows).items():
+            xpath = f"{rules_xpath(deployment)}/entry[@name={xpath_literal(generated_name)}]"
+            require_success(
+                api_get(
+                    deployment.panos_endpoint,
+                    {"type": "config", "action": "move", "xpath": xpath, "where": "before", "dst": anchor_name, "key": key},
+                    ctx,
+                ),
+                f"move {generated_name} before {anchor_name}",
             )
     finally:
         if copied and upload_path.exists():
@@ -2189,9 +2253,9 @@ def push_prebuilt_candidate(
     print("Reused existing config: " + (", ".join(f"{kind}={count}" for kind, count in sorted(reused.items())) or "none"))
     print("Preflight existing policy check: " + ", ".join(f"{status}={count}" for status, count in sorted(statuses.items())) + f"; skipped duplicate matches={skipped}")
     if deployment.scm:
-        push_to_scm(tree, deployment, scm, zone_roles, profile_groups)
+        push_to_scm(tree, deployment, scm, zone_roles, profile_groups, review_rows)
     else:
-        push_to_device(builder.xml_output, deployment)
+        push_to_device(builder.xml_output, deployment, review_rows)
     print("Pushed prepared candidate after fresh target validation")
     return 0
 
@@ -2273,13 +2337,13 @@ def main() -> int:
     print(f"Wrote review CSV to {builder.review_csv}")
     if deployment.panos_auto_push:
         if deployment.scm:
-            push_to_scm(tree, deployment, scm, zone_roles, profile_groups)
+            push_to_scm(tree, deployment, scm, zone_roles, profile_groups, review_rows)
             print(
                 f"Auto-pushed generated config to SCM folder {scm.scm_folder} "
                 f"with objects in {scm.scm_object_folder}"
             )
         else:
-            push_to_device(builder.xml_output, deployment)
+            push_to_device(builder.xml_output, deployment, review_rows)
             print(f"Auto-pushed generated XML to {deployment.panos_endpoint}")
     return 0
 

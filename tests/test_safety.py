@@ -9,7 +9,16 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "vendor"))
 
 from vendor.paloalto_light_syslog import Flow, FlowStore, parse_panos_syslog
-from vendor.bdnd_panos_policy_builder import DeploymentConfig, ExistingConfigInventory, apply_existing_inventory
+from vendor.bdnd_bpa_policy_builder import aggregate_flows
+from vendor.bdnd_panos_policy_builder import (
+    DeploymentConfig,
+    ExistingConfigInventory,
+    ZoneRoleConfig,
+    apply_existing_inventory,
+    merge_candidates,
+    movable_anchor_map,
+    validate_anchor_rules,
+)
 
 class SafetyTests(unittest.TestCase):
     def test_scm_never_calls_candidate_push(self):
@@ -87,5 +96,21 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual([x.text for x in rule.findall("./application/member")], ["APP-SSL"])
         self.assertEqual(len(root.findall(".//address/entry")), 0)
         self.assertEqual(reused["addresses"], 2)
+
+    def test_syslog_source_rule_is_preserved_as_position_anchor(self):
+        base = {
+            "src": "10.0.0.1", "dst": "10.0.0.2", "src_zone": "trust", "dst_zone": "dmz",
+            "app": "ssl", "proto": "tcp", "dport": "443", "action": "allow", "repeat": "3", "bytes": "100",
+        }
+        aggregates = aggregate_flows([{**base, "rule": "Discovery-A"}, {**base, "rule": "Discovery-B"}], {"allow"})
+        candidates = merge_candidates(aggregates, 1, 0, ZoneRoleConfig({"trust": "client", "dmz": "server"}))
+        self.assertEqual({candidate.anchor_rule for candidate in candidates}, {"Discovery-A", "Discovery-B"})
+
+    def test_missing_position_anchor_stops_candidate_write(self):
+        rows = [{"name": "generated", "anchor_rule": "Discovery", "preflight_status": "new"}]
+        with self.assertRaisesRegex(RuntimeError, "Discovery"):
+            validate_anchor_rules(rows, {"Different-Rule"})
+        validate_anchor_rules(rows, {"Discovery"})
+        self.assertEqual(movable_anchor_map(rows), {"generated": "Discovery"})
 
 if __name__ == "__main__": unittest.main()

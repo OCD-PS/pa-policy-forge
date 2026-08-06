@@ -23,6 +23,10 @@ Self-hosted Palo Alto traffic-flow policy builder with an HTTPS web interface, U
   fields preserve the existing encrypted value; only explicitly entered replacements are saved.
 - SCM writes objects/rules but never calls `candidate:push`.
 - Panorama and standalone use import/partial-load only and never commit.
+- The source security-policy name from each syslog flow is retained as its
+  positioning anchor. Candidate rules are moved directly before that source
+  policy in SCM, Panorama, or standalone PAN-OS. A missing anchor stops the
+  candidate write instead of silently leaving generated rules at the bottom.
 - HTTP is not exposed; the appliance serves HTTPS only.
 - Runtime databases, credentials, keys, certificates, logs, and generated artifacts stay outside Git.
 
