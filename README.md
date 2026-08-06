@@ -12,6 +12,8 @@ Self-hosted Palo Alto traffic-flow policy builder with an HTTPS web interface, U
 - Reuses exact existing address/service objects and exact matching address,
   service, and application groups; same-name semantic conflicts are never overwritten.
 - Encrypts target credentials with a local key stored outside the application database.
+- Existing profiles can be edited without exposing stored credentials. Blank credential
+  fields preserve the existing encrypted value; only explicitly entered replacements are saved.
 - SCM writes objects/rules but never calls `candidate:push`.
 - Panorama and standalone use import/partial-load only and never commit.
 - HTTP is not exposed; the appliance serves HTTPS only.

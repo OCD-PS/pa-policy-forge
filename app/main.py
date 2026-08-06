@@ -227,9 +227,14 @@ def index():
         for row in profile_rows:
             profile = dict(row)
             settings = profile_settings(row)
+            profile.update(settings)
             profile["passive_serial"] = settings.get("passive_serial", "")
+            profile["zones_text"] = "\n".join(f"{zone} = {role}" for zone, role in settings.get("zones", {}).items())
+            profile["scm_scope_type"] = "snippet" if settings.get("snippet") else "device" if settings.get("device") else "folder"
             profile["flow_count"] = sum(counts.get(serial, 0) for serial in profile_serials(row))
             profiles.append(profile)
+        editing_id = request.args.get("edit_profile", type=int)
+        editing_profile = next((profile for profile in profiles if profile["id"] == editing_id), None)
         selected_id = request.args.get("flow_profile", type=int)
         selected_flow_profile = next((profile for profile in profiles if profile["id"] == selected_id), None)
         if selected_flow_profile is None and len(profiles) == 1:
@@ -241,7 +246,7 @@ def index():
             if serials:
                 placeholders = ",".join("?" for _ in serials)
                 flows = conn.execute(f"SELECT * FROM flows WHERE serial IN ({placeholders}) ORDER BY last_seen DESC LIMIT 100", serials).fetchall()
-    return render_template("app.html", profiles=profiles, selected_flow_profile=selected_flow_profile, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
+    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
 
 
 def parse_zones(text: str) -> dict[str, str]:
@@ -261,6 +266,10 @@ def parse_zones(text: str) -> dict[str, str]:
 def profile_save():
     try:
         profile_id = int(request.form.get("id") or 0)
+        active_serial = request.form.get("serial", "").strip()
+        passive_serial = request.form.get("passive_serial", "").strip()
+        if passive_serial and passive_serial == active_serial:
+            raise ValueError("Passieve serial moet verschillen van de actieve serial")
         settings = {
             "zones": parse_zones(request.form.get("zones", "")),
             "min_sessions": max(1, int(request.form.get("min_sessions", "3"))),
@@ -277,7 +286,7 @@ def profile_save():
             "device": request.form.get("device", "").strip(),
             "object_folder": request.form.get("object_folder", "").strip(),
             "log_profile": request.form.get("log_profile", "").strip(),
-            "passive_serial": request.form.get("passive_serial", "").strip(),
+            "passive_serial": passive_serial,
         }
         supplied = {k: request.form.get(k, "") for k in ("username", "password", "client_id", "client_secret", "tsg_id")}
         if request.form["target_type"] in {"panorama", "panos"} and not settings["endpoint"]:
@@ -289,9 +298,13 @@ def profile_save():
         with db() as conn:
             existing = conn.execute("SELECT secret_blob FROM profiles WHERE id=?", (profile_id,)).fetchone() if profile_id else None
             old = json.loads(fernet.decrypt(existing["secret_blob"]).decode()) if existing and existing["secret_blob"] else {}
-            merged = {**old, **{k: v for k, v in supplied.items() if v}}
-            blob = fernet.encrypt(json.dumps(merged).encode()) if merged else b""
-            values = (request.form["name"].strip(), request.form.get("enabled") == "on", request.form.get("serial", "").strip(), request.form.get("source_ip", "").strip(), request.form["target_type"], json.dumps(settings), blob, now())
+            credential_updates = {k: v for k, v in supplied.items() if v}
+            merged = {**old, **credential_updates}
+            if existing and not credential_updates:
+                blob = existing["secret_blob"]
+            else:
+                blob = fernet.encrypt(json.dumps(merged).encode()) if merged else b""
+            values = (request.form["name"].strip(), request.form.get("enabled") == "on", active_serial, request.form.get("source_ip", "").strip(), request.form["target_type"], json.dumps(settings), blob, now())
             if profile_id:
                 conn.execute("UPDATE profiles SET name=?,enabled=?,serial=?,source_ip=?,target_type=?,settings_json=?,secret_blob=?,updated_at=? WHERE id=?", (*values, profile_id))
             else:

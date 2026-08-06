@@ -115,155 +115,157 @@
 </div>
 <div class="grid grid-2">
 <div class="card">
-<h2>Nieuw profiel</h2>
+{% set ep = editing_profile %}
+<h2>{% if ep %}Profiel bewerken{% else %}Nieuw profiel{% endif %}</h2>
 <form method="post" action="{{url_for('profile_save')}}" class="form-grid">
 <input type="hidden" name="csrf" value="{{csrf_token()}}">
+<input type="hidden" name="id" value="{{ep.id if ep else ''}}">
 <div class="field">
 <label>Naam</label>
-<input name="name" placeholder="Customer firewall" required>
+<input name="name" value="{{ep.name if ep else ''}}" placeholder="Customer firewall" required>
 </div>
 <div class="field">
 <label>Actieve firewallserial</label>
-<input name="serial" placeholder="0070..." required>
+<input name="serial" value="{{ep.serial if ep else ''}}" placeholder="0070..." required>
 </div>
 <div class="field">
 <label>Passieve firewallserial (optioneel)</label>
-<input name="passive_serial" placeholder="0070...">
+<input name="passive_serial" value="{{ep.passive_serial if ep else ''}}" placeholder="0070...">
 </div>
 <div class="field">
 <label>Bron-IP (herkenning)</label>
-<input name="source_ip" placeholder="10.0.0.1">
+<input name="source_ip" value="{{ep.source_ip if ep else ''}}" placeholder="10.0.0.1">
 </div>
 <div class="field">
 <label>Target</label>
 <select name="target_type" data-target-select required>
-<option value="" selected disabled>Selecteer een target</option>
-<option value="scm">Strata Cloud Manager</option>
-<option value="panorama">Panorama</option>
-<option value="panos">Standalone PAN-OS</option>
+<option value="" {% if not ep %}selected{% endif %} disabled>Selecteer een target</option>
+<option value="scm" {% if ep and ep.target_type=='scm' %}selected{% endif %}>Strata Cloud Manager</option>
+<option value="panorama" {% if ep and ep.target_type=='panorama' %}selected{% endif %}>Panorama</option>
+<option value="panos" {% if ep and ep.target_type=='panos' %}selected{% endif %}>Standalone PAN-OS</option>
 </select>
 </div>
 <div class="field full">
 <label>Zone mappings</label>
-<textarea name="zones" placeholder="L3-Clients = client&#10;L3-Servers = server&#10;Internet = internet" required>
-</textarea>
+<textarea name="zones" placeholder="L3-Clients = client&#10;L3-Servers = server&#10;Internet = internet" required>{{ep.zones_text if ep else ''}}</textarea>
 </div>
 <div class="field">
 <label>Minimale sessies</label>
-<input type="number" name="min_sessions" min="1" value="3">
+<input type="number" name="min_sessions" min="1" value="{{ep.min_sessions if ep else 3}}">
 </div>
 <div class="field">
 <label>Tags</label>
-<input name="tags" value="AI builder">
+<input name="tags" value="{{ep.tags|join(', ') if ep else 'AI builder'}}">
 </div>
 <div class="field full form-grid" data-targets="scm" hidden>
 <div class="field">
 <label>SCM scope</label>
 <select name="scm_scope_type" data-scm-scope-select>
-<option value="folder">Folder</option>
-<option value="snippet">Snippet</option>
-<option value="device">Device</option>
+<option value="folder" {% if not ep or ep.scm_scope_type=='folder' %}selected{% endif %}>Folder</option>
+<option value="snippet" {% if ep and ep.scm_scope_type=='snippet' %}selected{% endif %}>Snippet</option>
+<option value="device" {% if ep and ep.scm_scope_type=='device' %}selected{% endif %}>Device</option>
 </select>
 </div>
 <div class="field" data-scm-scope="folder">
 <label>SCM folder</label>
-<input name="folder" placeholder="Customer-Folder" required>
+<input name="folder" value="{{ep.folder if ep else ''}}" placeholder="Customer-Folder" required>
 </div>
 <div class="field" data-scm-scope="snippet" hidden>
 <label>SCM snippet</label>
-<input name="snippet" placeholder="Customer-Snippet" required>
+<input name="snippet" value="{{ep.snippet if ep else ''}}" placeholder="Customer-Snippet" required>
 </div>
 <div class="field" data-scm-scope="device" hidden>
 <label>SCM device</label>
-<input name="device" placeholder="Device name" required>
+<input name="device" value="{{ep.device if ep else ''}}" placeholder="Device name" required>
 </div>
 <div class="field">
 <label>Rulebase</label>
 <select name="rulebase">
-<option value="pre">Pre</option>
-<option value="post">Post</option>
+<option value="pre" {% if not ep or ep.rulebase=='pre' %}selected{% endif %}>Pre</option>
+<option value="post" {% if ep and ep.rulebase=='post' %}selected{% endif %}>Post</option>
 </select>
 </div>
 <div class="field">
 <label>Log forwarding profile</label>
-<input name="log_profile">
+<input name="log_profile" value="{{ep.log_profile if ep else ''}}">
 </div>
 <div class="field">
 <label>SCM client ID</label>
-<input name="client_id" autocomplete="off">
+<input name="client_id" autocomplete="off" placeholder="{% if ep %}Leeg laten om te behouden{% endif %}">
 </div>
 <div class="field">
 <label>SCM client secret</label>
-<input type="password" name="client_secret" autocomplete="new-password">
+<input type="password" name="client_secret" autocomplete="new-password" placeholder="{% if ep %}Leeg laten om te behouden{% endif %}">
 </div>
 <div class="field">
 <label>SCM TSG ID</label>
-<input name="tsg_id" autocomplete="off">
+<input name="tsg_id" autocomplete="off" placeholder="{% if ep %}Leeg laten om te behouden{% endif %}">
 </div>
 </div>
 <div class="field full form-grid" data-targets="panorama" hidden>
 <div class="field">
 <label>Panorama endpoint</label>
-<input name="endpoint" placeholder="https://10.0.0.10" required>
+<input name="endpoint" value="{{ep.endpoint if ep else ''}}" placeholder="https://10.0.0.10" required>
 </div>
 <div class="field">
 <label>Device group</label>
-<input name="device_group" placeholder="Branches" required>
+<input name="device_group" value="{{ep.device_group if ep else ''}}" placeholder="Branches" required>
 </div>
 <div class="field">
 <label>Rulebase</label>
 <select name="rulebase">
-<option value="pre">Pre</option>
-<option value="post">Post</option>
+<option value="pre" {% if not ep or ep.rulebase=='pre' %}selected{% endif %}>Pre</option>
+<option value="post" {% if ep and ep.rulebase=='post' %}selected{% endif %}>Post</option>
 </select>
 </div>
 <div class="field">
 <label>Log forwarding profile</label>
-<input name="log_profile">
+<input name="log_profile" value="{{ep.log_profile if ep else ''}}">
 </div>
 <div class="field full">
 <label>Username</label>
-<input name="username" autocomplete="off">
+<input name="username" autocomplete="off" placeholder="{% if ep %}Leeg laten om te behouden{% endif %}">
 </div>
 <div class="field full">
 <label>Password</label>
-<input type="password" name="password" autocomplete="new-password">
+<input type="password" name="password" autocomplete="new-password" placeholder="{% if ep %}Leeg laten om te behouden{% endif %}">
 </div>
 </div>
 <div class="field full form-grid" data-targets="panos" hidden>
 <div class="field">
 <label>Firewall endpoint</label>
-<input name="endpoint" placeholder="https://10.0.0.10" required>
+<input name="endpoint" value="{{ep.endpoint if ep else ''}}" placeholder="https://10.0.0.10" required>
 </div>
 <div class="field">
 <label>VSYS</label>
-<input name="vsys" value="vsys1">
+<input name="vsys" value="{{ep.vsys if ep else 'vsys1'}}">
 </div>
 <div class="field">
 <label>Log forwarding profile</label>
-<input name="log_profile">
+<input name="log_profile" value="{{ep.log_profile if ep else ''}}">
 </div>
 <div class="field full">
 <label>Username</label>
-<input name="username" autocomplete="off">
+<input name="username" autocomplete="off" placeholder="{% if ep %}Leeg laten om te behouden{% endif %}">
 </div>
 <div class="field full">
 <label>Password</label>
-<input type="password" name="password" autocomplete="new-password">
+<input type="password" name="password" autocomplete="new-password" placeholder="{% if ep %}Leeg laten om te behouden{% endif %}">
 </div>
 </div>
 <div class="field full cluster">
 <label class="checkbox">
-<input type="checkbox" name="enabled" checked> Actief</label>
+<input type="checkbox" name="enabled" {% if not ep or ep.enabled %}checked{% endif %}> Actief</label>
 <label class="checkbox">
-<input type="checkbox" name="disabled"> Gegenereerde regels disabled</label>
+<input type="checkbox" name="disabled" {% if ep and ep.disabled %}checked{% endif %}> Gegenereerde regels disabled</label>
 <label class="checkbox">
-<input type="checkbox" name="global_ping" checked> Globale ping/traceroute</label>
+<input type="checkbox" name="global_ping" {% if not ep or ep.global_ping %}checked{% endif %}> Globale ping/traceroute</label>
 <label class="checkbox">
-<input type="checkbox" name="global_dns" checked> Globale DNS</label>
+<input type="checkbox" name="global_dns" {% if not ep or ep.global_dns %}checked{% endif %}> Globale DNS</label>
 </div>
 <div class="field full">
-<button class="btn btn-primary" type="submit">Profiel veilig opslaan</button>
+<button class="btn btn-primary" type="submit">{% if ep %}Wijzigingen veilig opslaan{% else %}Profiel veilig opslaan{% endif %}</button>
+{% if ep %}<a class="btn" href="{{url_for('index')}}#profiles">Annuleren</a>{% endif %}
 </div>
 </form>
 </div>
@@ -286,6 +288,7 @@
 </div>
 </form>
 <div class="cluster">
+<a class="btn" href="{{url_for('index',edit_profile=p.id)}}#profiles">Bewerken</a>
 <form method="post" action="{{url_for('build',profile_id=p.id)}}">
 <input type="hidden" name="csrf" value="{{csrf_token()}}">
 <input type="hidden" name="mode" value="preview">
