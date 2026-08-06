@@ -55,16 +55,18 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(flow.action, 'allow')
         self.assertEqual(flow.repeat, 1)
 
-    def test_purge_only_removes_selected_firewall(self):
+    def test_purge_removes_both_cluster_nodes_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = FlowStore(pathlib.Path(tmp) / "flows.sqlite3", retention_days=0)
             base = dict(receive_time="2026-08-05 12:00:00", src="10.0.0.1", dst="10.0.0.2", src_zone="a", dst_zone="b", src_user="", app="ssl", proto="tcp", dport="443", action="allow", rule="discovery", url_category="", repeat=1, bytes_total=1)
             store.add_flow(Flow(serial="SERIAL-A", **base))
             store.add_flow(Flow(serial="SERIAL-B", **base))
-            self.assertEqual(store.purge("SERIAL-A"), 1)
+            store.add_flow(Flow(serial="SERIAL-C", **base))
+            self.assertEqual(store.purge_serials(["SERIAL-A", "SERIAL-B"]), 2)
             with store._connect() as conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM flows WHERE serial='SERIAL-A'").fetchone()[0], 0)
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM flows WHERE serial='SERIAL-B'").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM flows WHERE serial='SERIAL-B'").fetchone()[0], 0)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM flows WHERE serial='SERIAL-C'").fetchone()[0], 1)
 
     def test_existing_objects_and_exact_groups_are_reused(self):
         root = ET.fromstring("""<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="new-a"><ip-netmask>10.0.0.1/32</ip-netmask></entry><entry name="new-b"><ip-netmask>10.0.0.2/32</ip-netmask></entry></address><address-group/><service><entry name="new-https"><protocol><tcp><port>443</port></tcp></protocol></entry></service><service-group/><rulebase><security><rules><entry name="rule-1"><source><member>new-a</member><member>new-b</member></source><destination><member>any</member></destination><application><member>ssl</member></application><service><member>new-https</member></service></entry></rules></security></rulebase></entry></vsys></entry></devices></config>""")

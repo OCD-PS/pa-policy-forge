@@ -298,10 +298,16 @@ class FlowStore:
 
     def purge(self, serial: str) -> int:
         """Remove all aggregated flows for one firewall serial."""
-        if not serial.strip():
-            raise ValueError("serial is required")
+        return self.purge_serials([serial])
+
+    def purge_serials(self, serials: Iterable[str]) -> int:
+        """Remove aggregated flows for all serials in one logical firewall profile."""
+        selected = list(dict.fromkeys(serial.strip() for serial in serials if serial and serial.strip()))
+        if not selected:
+            raise ValueError("at least one serial is required")
+        placeholders = ",".join("?" for _ in selected)
         with self.lock, self._connect() as conn:
-            cursor = conn.execute("DELETE FROM flows WHERE serial = ?", (serial.strip(),))
+            cursor = conn.execute(f"DELETE FROM flows WHERE serial IN ({placeholders})", selected)
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             return cursor.rowcount
 

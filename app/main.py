@@ -197,17 +197,51 @@ def stats() -> dict:
     return result
 
 
+def profile_settings(profile) -> dict:
+    try:
+        return json.loads(profile["settings_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+
+def profile_serials(profile) -> list[str]:
+    settings = profile_settings(profile)
+    return list(dict.fromkeys(
+        value.strip()
+        for value in (profile["serial"], settings.get("passive_serial", ""))
+        if value and value.strip()
+    ))
+
+
 @app.get("/")
 @login_required
 def index():
     with db() as conn:
-        profiles = conn.execute("SELECT * FROM profiles ORDER BY name").fetchall()
+        profile_rows = conn.execute("SELECT * FROM profiles ORDER BY name").fetchall()
         sources = conn.execute("SELECT * FROM sources ORDER BY last_seen DESC LIMIT 100").fetchall()
         runs = conn.execute("SELECT runs.*,profiles.name profile_name FROM runs JOIN profiles ON profiles.id=runs.profile_id ORDER BY runs.id DESC LIMIT 50").fetchall()
         audits = conn.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 20").fetchall()
+    profiles = []
     with flow_store._connect() as conn:
-        flows = conn.execute("SELECT * FROM flows ORDER BY last_seen DESC LIMIT 100").fetchall()
-    return render_template("app.html", profiles=profiles, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
+        counts = {row["serial"]: row["count"] for row in conn.execute("SELECT serial,COUNT(*) count FROM flows GROUP BY serial")}
+        for row in profile_rows:
+            profile = dict(row)
+            settings = profile_settings(row)
+            profile["passive_serial"] = settings.get("passive_serial", "")
+            profile["flow_count"] = sum(counts.get(serial, 0) for serial in profile_serials(row))
+            profiles.append(profile)
+        selected_id = request.args.get("flow_profile", type=int)
+        selected_flow_profile = next((profile for profile in profiles if profile["id"] == selected_id), None)
+        if selected_flow_profile is None and len(profiles) == 1:
+            selected_flow_profile = profiles[0]
+        flows = []
+        if selected_flow_profile:
+            serials = [selected_flow_profile["serial"], selected_flow_profile["passive_serial"]]
+            serials = [serial for serial in dict.fromkeys(serials) if serial]
+            if serials:
+                placeholders = ",".join("?" for _ in serials)
+                flows = conn.execute(f"SELECT * FROM flows WHERE serial IN ({placeholders}) ORDER BY last_seen DESC LIMIT 100", serials).fetchall()
+    return render_template("app.html", profiles=profiles, selected_flow_profile=selected_flow_profile, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
 
 
 def parse_zones(text: str) -> dict[str, str]:
@@ -243,6 +277,7 @@ def profile_save():
             "device": request.form.get("device", "").strip(),
             "object_folder": request.form.get("object_folder", "").strip(),
             "log_profile": request.form.get("log_profile", "").strip(),
+            "passive_serial": request.form.get("passive_serial", "").strip(),
         }
         supplied = {k: request.form.get(k, "") for k in ("username", "password", "client_id", "client_secret", "tsg_id")}
         if request.form["target_type"] in {"panorama", "panos"} and not settings["endpoint"]:
@@ -267,6 +302,25 @@ def profile_save():
     return redirect(url_for("index") + "#profiles")
 
 
+@app.post("/profiles/<int:profile_id>/passive-serial")
+@login_required
+def profile_passive_serial(profile_id):
+    passive_serial = request.form.get("passive_serial", "").strip()
+    with db() as conn:
+        profile = conn.execute("SELECT name,serial,settings_json FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        if not profile:
+            return "Not found", 404
+        if passive_serial and passive_serial == profile["serial"]:
+            flash("Passieve serial moet verschillen van de actieve serial.", "error")
+            return redirect(url_for("index") + "#profiles")
+        settings = profile_settings(profile)
+        settings["passive_serial"] = passive_serial
+        conn.execute("UPDATE profiles SET settings_json=?,updated_at=? WHERE id=?", (json.dumps(settings), now(), profile_id))
+    audit("passive-serial-updated", f"profile={profile['name']} passive_serial={passive_serial or 'cleared'}")
+    flash("Passieve firewallserial opgeslagen.", "success")
+    return redirect(url_for("index") + "#profiles")
+
+
 @app.post("/profiles/<int:profile_id>/delete")
 @login_required
 def profile_delete(profile_id):
@@ -281,14 +335,15 @@ def profile_delete(profile_id):
 @login_required
 def profile_purge_flows(profile_id):
     with db() as conn:
-        profile = conn.execute("SELECT name,serial FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        profile = conn.execute("SELECT name,serial,settings_json FROM profiles WHERE id=?", (profile_id,)).fetchone()
     if not profile:
         return "Not found", 404
     if not profile["serial"]:
         flash("Flows niet verwijderd: het profiel heeft geen firewallserial.", "error")
         return redirect(url_for("index") + "#profiles")
-    deleted = flow_store.purge(profile["serial"])
-    audit("flows-purged", f"profile={profile['name']} serial={profile['serial']} flows={deleted}")
+    serials = profile_serials(profile)
+    deleted = flow_store.purge_serials(serials)
+    audit("flows-purged", f"profile={profile['name']} serials={','.join(serials)} flows={deleted}")
     flash(f"Schone lei aangemaakt: {deleted} geaggregeerde flows verwijderd voor {profile['name']}.", "success")
     return redirect(url_for("index") + "#flows")
 
@@ -320,7 +375,10 @@ def write_config(profile, run_dir: Path, push: bool) -> dict:
 def export_profile_flows(profile, path: Path) -> int:
     fields = ["first_seen","last_seen","repeat","bytes","serial","src","dst","src_zone","dst_zone","src_user","app","proto","dport","action","rule","url_category"]
     where = ["action='allow'"]; params = []
-    if profile["serial"]: where.append("serial=?"); params.append(profile["serial"])
+    serials = profile_serials(profile)
+    if serials:
+        where.append("serial IN (" + ",".join("?" for _ in serials) + ")")
+        params.extend(serials)
     elif profile["source_ip"]:
         raise ValueError("Koppel dit profiel aan een firewallserial; bron-IP is alleen voor herkenning")
     else: raise ValueError("Koppel eerst een firewallserial aan dit profiel")

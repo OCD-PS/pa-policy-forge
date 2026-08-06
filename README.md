@@ -6,6 +6,8 @@ Self-hosted Palo Alto traffic-flow policy builder with an HTTPS web interface, U
 
 - Stores only aggregated `TRAFFIC` flows where `action=allow`; raw syslog is discarded.
 - Separates flows per firewall serial before policy generation.
+- Supports an active and optional passive serial in one logical firewall profile;
+  failover logs are shown, exported, analyzed, and purged together.
 - Fetches a fresh target inventory for every preview and candidate write.
 - Reuses exact existing address/service objects and exact matching address,
   service, and application groups; same-name semantic conflicts are never overwritten.
@@ -38,9 +40,13 @@ For offline customers, transfer the repository plus a saved container image bund
 2. Configure one or more PAN-OS firewalls to forward TRAFFIC logs to UDP 514.
 3. Confirm each serial appears under discovered firewalls.
 4. Create a profile, map zones to roles, and enter the target credentials.
+   For HA pairs, configure both the active and passive firewall serial.
 5. Generate a preview and inspect/download the review CSV and XML.
 6. Use **Naar candidate schrijven** only after review. Commit/deploy separately in SCM, Panorama, or PAN-OS.
 7. After the accepted rules are manually positioned and deployed, use **Flows purgen** on the profile to start a clean observation cycle. Profiles and run history are retained.
+
+When multiple firewall profiles exist, the Flows page first asks which logical
+firewall or HA pair to open. A single configured profile opens automatically.
 
 Flow aggregation happens continuously while syslog arrives. CPU-parallel builder work
 defaults to `max(1, detected CPUs - 2)`, reserving two logical CPUs for the web UI,

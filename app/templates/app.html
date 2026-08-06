@@ -123,8 +123,12 @@
 <input name="name" placeholder="Customer firewall" required>
 </div>
 <div class="field">
-<label>Firewallserial</label>
+<label>Actieve firewallserial</label>
 <input name="serial" placeholder="0070..." required>
+</div>
+<div class="field">
+<label>Passieve firewallserial (optioneel)</label>
+<input name="passive_serial" placeholder="0070...">
 </div>
 <div class="field">
 <label>Bron-IP (herkenning)</label>
@@ -267,10 +271,20 @@
 <div class="card-header">
 <div>
 <h2>{{p.name}}</h2>
-<p class="mono muted">{{p.serial}}</p>
+<p class="mono muted">Actief: {{p.serial}}{% if p.passive_serial %}<br>Passief: {{p.passive_serial}}{% endif %}</p>
 </div>
 <span class="badge badge-orange">{{p.target_type|upper}}</span>
 </div>
+<form method="post" action="{{url_for('profile_passive_serial',profile_id=p.id)}}" class="form-grid" style="margin:16px 0">
+<input type="hidden" name="csrf" value="{{csrf_token()}}">
+<div class="field">
+<label>Passieve firewallserial</label>
+<input name="passive_serial" value="{{p.passive_serial}}" placeholder="Leeg voor geen passieve node">
+</div>
+<div class="field" style="align-self:end">
+<button class="btn" type="submit">Passieve node opslaan</button>
+</div>
+</form>
 <div class="cluster">
 <form method="post" action="{{url_for('build',profile_id=p.id)}}">
 <input type="hidden" name="csrf" value="{{csrf_token()}}">
@@ -296,11 +310,27 @@
 </div>
 </section>
 <section id="flows" class="page-section" data-title="Flows" hidden>
+{% if profiles|length > 1 and not selected_flow_profile %}
 <div class="page-header">
 <div>
 <h1>Flows</h1>
+<p class="lede">Kies eerst het firewallprofiel waarvan je de flows wilt bekijken.</p>
 </div>
-<input class="search" data-table-filter="#flow-table" placeholder="Filter flows...">
+</div>
+<div class="grid grid-2">
+{% for p in profiles %}<a class="card" href="{{url_for('index',flow_profile=p.id)}}#flows" style="text-decoration:none;color:inherit">
+<div class="card-header"><div><h2>{{p.name}}</h2><p class="mono muted">{{p.serial}}{% if p.passive_serial %}<br>{{p.passive_serial}}{% endif %}</p></div><span class="badge badge-orange">{{p.flow_count}} flows</span></div>
+<p>Open de gecombineerde flows van dit firewallcluster.</p>
+</a>{% endfor %}
+</div>
+{% elif selected_flow_profile %}
+<div class="page-header">
+<div>
+<p class="eyebrow">{{selected_flow_profile.target_type|upper}}</p>
+<h1>{{selected_flow_profile.name}}</h1>
+<p class="lede">Actief: <span class="mono">{{selected_flow_profile.serial}}</span>{% if selected_flow_profile.passive_serial %} · Passief: <span class="mono">{{selected_flow_profile.passive_serial}}</span>{% endif %}</p>
+</div>
+<div class="cluster">{% if profiles|length > 1 %}<a class="btn" href="{{url_for('index')}}#flows">Andere firewall</a>{% endif %}<input class="search" data-table-filter="#flow-table" placeholder="Filter flows..."></div>
 </div>
 <div class="table-wrap">
 <table id="flow-table">
@@ -328,6 +358,7 @@
 </tr>{% endfor %}</tbody>
 </table>
 </div>
+{% else %}<div class="empty-state"><strong>Nog geen firewallprofiel</strong>Maak eerst een profiel onder Firewalls &amp; targets.</div>{% endif %}
 </section>
 <section id="runs" class="page-section" data-title="Policy runs" hidden>
 <div class="page-header">
