@@ -246,6 +246,7 @@ def normalize_scm_policy(rule: dict) -> dict:
         "profile_group": ", ".join((rule.get("profile_setting") or {}).get("group", [])),
         "description": str(rule.get("description", "") or ""),
         "source_user": list(rule.get("source_user", []) or ["any"]),
+        "destination_user": list(rule.get("destination_user", []) or ["any"]),
         "category": list(rule.get("category", []) or ["any"]),
         "source_hip": list(rule.get("source_hip", []) or ["any"]),
         "destination_hip": list(rule.get("destination_hip", []) or ["any"]),
@@ -253,6 +254,7 @@ def normalize_scm_policy(rule: dict) -> dict:
         "negate_destination": bool(rule.get("negate_destination", False)),
         "schedule": str(rule.get("schedule", "") or ""),
         "log_start": rule.get("log_start"), "log_end": rule.get("log_end"),
+        "rule_type": str(rule.get("rule_type", "universal") or "universal"),
     }
     for field in POLICY_LIST_FIELDS:
         value = rule.get(field, []) or []

@@ -203,21 +203,94 @@
 
   function setupPolicyManagement() {
     var rows = all("[data-policy-row]");
-    var filters = all("[data-policy-filter]");
-    function applyFilters() {
-      rows.forEach(function (row) {
-        row.hidden = filters.some(function (input) {
-          var query = input.value.toLocaleLowerCase().trim();
-          return query && !(row.dataset[input.getAttribute("data-policy-filter")] || "").includes(query);
-        });
+    var expression = document.querySelector("[data-policy-expression]");
+    var filterStatus = document.querySelector("[data-policy-filter-status]");
+    var fieldMap = {
+      "name": "name", "rule": "name", "rule-type": "ruleType", "tag/member": "tag",
+      "from/member": "from", "source/member": "source", "source-user/member": "sourceUser",
+      "hip-profiles/member": "sourceHip", "source-hip/member": "sourceHip",
+      "to/member": "to", "destination/member": "destination", "destination-user/member": "destinationUser",
+      "destination-hip/member": "destinationHip", "application/member": "application",
+      "service/member": "service", "category/member": "category", "action": "action",
+      "disabled": "disabled", "log-start": "logStart", "log-end": "logEnd",
+      "schedule": "schedule", "profile-setting/group/member": "profileGroup", "log-setting": "logSetting"
+    };
+
+    function tokenize(value) {
+      return (value.match(/\(|\)|'[^']*'|"[^"]*"|[^\s()]+/g) || []).map(function (token) {
+        if ((token[0] === "'" && token[token.length - 1] === "'") || (token[0] === '"' && token[token.length - 1] === '"')) return token.slice(1, -1);
+        return token;
       });
     }
-    filters.forEach(function (input) { input.addEventListener("input", applyFilters); });
+
+    function compileFilter(value) {
+      var tokens = tokenize(value); var index = 0;
+      function peek(word) { return (tokens[index] || "").toLowerCase() === word; }
+      function primary() {
+        if (peek("(")) { index += 1; var nested = orExpression(); if (!peek(")")) throw new Error("Ontbrekende )"); index += 1; return nested; }
+        if (peek("not")) { index += 1; var negate = primary(); return function (row) { return !negate(row); }; }
+        var field = tokens[index++];
+        if (!field) throw new Error("Onvolledige filter");
+        var operator = (tokens[index++] || "").toLowerCase();
+        var expected = tokens[index++];
+        if (!["eq", "neq", "contains"].includes(operator) || expected === undefined) throw new Error("Gebruik: veld eq 'waarde'");
+        var dataField = fieldMap[field.toLowerCase()];
+        if (!dataField) throw new Error("Onbekend veld: " + field);
+        expected = expected.toLocaleLowerCase();
+        return function (row) {
+          var values = (row.dataset[dataField] || "").split("|||");
+          var match = operator === "contains" ? values.some(function (item) { return item.includes(expected); }) : values.some(function (item) { return item === expected; });
+          return operator === "neq" ? !match : match;
+        };
+      }
+      function andExpression() { let left = primary(); while (peek("and")) { index += 1; const right = primary(); const previous = left; left = function (row) { return previous(row) && right(row); }; } return left; }
+      function orExpression() { let left = andExpression(); while (peek("or")) { index += 1; const right = andExpression(); const previous = left; left = function (row) { return previous(row) || right(row); }; } return left; }
+      var result = orExpression();
+      if (index !== tokens.length) throw new Error("Onverwacht filterdeel: " + tokens[index]);
+      return result;
+    }
+
+    function applyFilter() {
+      var query = expression ? expression.value.trim() : ""; var matcher = null;
+      try { matcher = query ? compileFilter(query) : function () { return true; }; if (filterStatus) filterStatus.textContent = ""; }
+      catch (error) { if (filterStatus) filterStatus.textContent = error.message; return; }
+      var visible = 0;
+      rows.forEach(function (row) { row.hidden = !matcher(row); if (!row.hidden) visible += 1; });
+      if (filterStatus) filterStatus.textContent = visible + " policies";
+    }
+    if (expression) expression.addEventListener("input", applyFilter);
 
     var selectVisible = document.querySelector("[data-policy-select-visible]");
     if (selectVisible) selectVisible.addEventListener("change", function () {
       rows.forEach(function (row) {
         if (!row.hidden) row.querySelector("[data-policy-select]").checked = selectVisible.checked;
+      });
+      updateActionCount();
+    });
+
+    var lastSelectedIndex = null;
+    function updateActionCount() {
+      var count = all("[data-policy-select]:checked").length;
+      var node = document.querySelector("[data-policy-action-count]");
+      if (node) node.textContent = count;
+    }
+    rows.forEach(function (row, rowIndex) {
+      var checkbox = row.querySelector("[data-policy-select]");
+      checkbox.addEventListener("click", function (event) {
+        if ((event.ctrlKey || event.shiftKey) && lastSelectedIndex !== null) {
+          var start = Math.min(lastSelectedIndex, rowIndex); var end = Math.max(lastSelectedIndex, rowIndex);
+          for (var i = start; i <= end; i += 1) rows[i].querySelector("[data-policy-select]").checked = true;
+          checkbox.checked = true;
+        }
+      });
+      checkbox.addEventListener("change", function () { lastSelectedIndex = rowIndex; updateActionCount(); });
+      row.addEventListener("click", function (event) {
+        if (event.target.closest("input,button,a,select")) return;
+        if ((event.ctrlKey || event.shiftKey) && lastSelectedIndex !== null) {
+          var start = Math.min(lastSelectedIndex, rowIndex); var end = Math.max(lastSelectedIndex, rowIndex);
+          for (var i = start; i <= end; i += 1) rows[i].querySelector("[data-policy-select]").checked = true;
+        } else checkbox.checked = !checkbox.checked;
+        lastSelectedIndex = rowIndex; updateActionCount();
       });
     });
 
@@ -231,6 +304,7 @@
     });
     var cancel = document.querySelector("[data-policy-bulk-cancel]");
     if (cancel) cancel.addEventListener("click", function () { dialog.close(); });
+    applyFilter(); updateActionCount();
   }
 
   document.addEventListener("DOMContentLoaded", function () {

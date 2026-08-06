@@ -160,7 +160,11 @@ tbody tr:hover { background: rgba(255,255,255,.02); }
 .rule-arrow { color: var(--orange); font-weight: 900; }
 .review-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 14px; }
 .review-toolbar .search { flex: 1; min-width: 220px; }
-.policy-filters { display: grid; grid-template-columns: repeat(4,minmax(150px,1fr)); gap: 8px; margin-bottom: 12px; }
+.policy-filterbar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.policy-filterbar .search { flex: 1; }
+.filter-status { min-width: 100px; color: #aaa; font-size: 12px; text-align: right; }
+#policy-management { padding-bottom: 84px; }
+.policy-actionbar { position: fixed; z-index: 12; left: calc(var(--sidebar-width, 260px) + 24px); right: 24px; bottom: 18px; display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px 16px; border: 1px solid #484848; border-left: 4px solid var(--orange); border-radius: 8px; background: rgba(20,20,20,.96); box-shadow: var(--shadow); backdrop-filter: blur(10px); }
 .bulk-dialog { width: min(1050px,calc(100vw - 32px)); max-height: calc(100vh - 32px); padding: 0; border: 1px solid #444; border-radius: 9px; background: #171717; color: #eee; box-shadow: var(--shadow); }
 .bulk-dialog::backdrop { background: rgba(0,0,0,.78); }
 .bulk-dialog-body { padding: 22px; overflow: auto; }
@@ -179,6 +183,7 @@ tbody tr:hover { background: rgba(255,255,255,.02); }
 }
 @media (max-width: 780px) {
   .app-shell { grid-template-columns: 1fr; }
+  .policy-actionbar { left: 16px; right: 16px; bottom: 12px; }
   .sidebar { position: fixed; inset: 0 auto 0 0; width: 278px; transform: translateX(-100%); transition: transform .2s ease; box-shadow: var(--shadow); }
   body.nav-open .sidebar { transform: translateX(0); }
   body.nav-open::after { content: ""; position: fixed; inset: 0; z-index: 15; background: rgba(0,0,0,.66); }

@@ -406,21 +406,13 @@
 <div class="page-header"><div><h1>Policybeheer</h1></div></div>
 <div class="grid grid-2">{% for p in profiles %}<a class="card" href="{{url_for('index',policy_profile=p.id)}}#policy-management" style="text-decoration:none;color:inherit"><h2>{{p.name}}</h2></a>{% endfor %}</div>
 {% else %}
-<div class="page-header"><div><p class="eyebrow">{{policy_profile.target_type|upper}}</p><h1>{{policy_profile.name}}</h1></div><div class="cluster"><a class="btn" href="{{url_for('index')}}#policy-management">Terug naar devices</a><button class="btn btn-primary" type="button" data-open-policy-bulk>Bulk edit</button></div></div>
+<div class="page-header"><div><p class="eyebrow">{{policy_profile.target_type|upper}}</p><h1>{{policy_profile.name}}</h1></div><div class="cluster"><a class="btn" href="{{url_for('index')}}#policy-management">Terug naar devices</a></div></div>
 {% if policy_error %}<div class="callout"><strong>Rulebase niet geladen</strong><br>{{policy_error}}</div>{% elif policies %}
-<div class="policy-filters" data-policy-filters>
-<input class="search" data-policy-filter="name" placeholder="Policynaam">
-<input class="search" data-policy-filter="from" placeholder="Source zone">
-<input class="search" data-policy-filter="source" placeholder="Source">
-<input class="search" data-policy-filter="to" placeholder="Destination zone">
-<input class="search" data-policy-filter="destination" placeholder="Destination">
-<input class="search" data-policy-filter="application" placeholder="Application">
-<input class="search" data-policy-filter="service" placeholder="Service">
-</div>
+<div class="policy-filterbar"><input class="search" data-policy-expression placeholder="Bijv. (from/member eq 'Trust') and ((application/member eq 'ssl') or (service/member eq 'HTTPS'))"><span class="filter-status" data-policy-filter-status></span></div>
 <form method="post" action="{{url_for('policy_bulk_preview',profile_id=policy_profile.id)}}" data-policy-bulk-form>
 <input type="hidden" name="csrf" value="{{csrf_token()}}">
 <div class="table-wrap"><table id="policy-table"><thead><tr><th><input type="checkbox" data-policy-select-visible></th><th>#</th><th>Naam</th><th>Source zone</th><th>Source</th><th>Destination zone</th><th>Destination</th><th>Application</th><th>Service</th><th>Action</th><th>Status</th></tr></thead><tbody>
-{% for p in policies %}<tr data-policy-row data-name="{{p.name|lower}}" data-from="{{p['from']|join(' ')|lower}}" data-source="{{p.source|join(' ')|lower}}" data-to="{{p.to|join(' ')|lower}}" data-destination="{{p.destination|join(' ')|lower}}" data-application="{{p.application|join(' ')|lower}}" data-service="{{p.service|join(' ')|lower}}">
+{% for p in policies %}<tr data-policy-row data-name="{{p.name|lower}}" data-from="{{p['from']|join('|||')|lower}}" data-source="{{p.source|join('|||')|lower}}" data-source-user="{{p.source_user|join('|||')|lower}}" data-source-hip="{{p.source_hip|join('|||')|lower}}" data-to="{{p.to|join('|||')|lower}}" data-destination="{{p.destination|join('|||')|lower}}" data-destination-user="{{p.destination_user|join('|||')|lower}}" data-destination-hip="{{p.destination_hip|join('|||')|lower}}" data-application="{{p.application|join('|||')|lower}}" data-service="{{p.service|join('|||')|lower}}" data-tag="{{p.tag|join('|||')|lower}}" data-category="{{p.category|join('|||')|lower}}" data-action="{{p.action|lower}}" data-disabled="{{'yes' if p.disabled else 'no'}}" data-log-start="{{'yes' if p.log_start else 'no'}}" data-log-end="{{'yes' if p.log_end else 'no'}}" data-schedule="{{p.schedule|lower}}" data-profile-group="{{p.profile_group|lower}}" data-log-setting="{{p.log_setting|lower}}" data-rule-type="{{p.rule_type|lower}}">
 <td><input type="checkbox" name="policy_id" value="{{p.id}}" data-policy-select></td><td>{{loop.index}}</td><td>{{p.name}}</td><td>{{p['from']|join(', ')}}</td><td>{{p.source|join(', ')}}</td><td>{{p.to|join(', ')}}</td><td>{{p.destination|join(', ')}}</td><td>{{p.application|join(', ')}}</td><td>{{p.service|join(', ')}}</td><td>{{p.action}}</td><td><span class="badge badge-{{'warning' if p.disabled else 'success'}}">{{'Disabled' if p.disabled else 'Enabled'}}</span></td></tr>{% endfor %}
 </tbody></table></div>
 <dialog class="bulk-dialog" data-policy-bulk-dialog><div class="push-dialog-brand">OCD</div><div class="bulk-dialog-body"><div class="card-header"><div><h2>Bulk edit</h2><p class="muted"><span data-policy-selected-count>0</span> policies geselecteerd</p></div></div>
@@ -428,6 +420,7 @@
 <div class="bulk-field"><strong>Overige</strong><select name="action"><option value="">Action behouden</option><option>allow</option><option>deny</option><option>drop</option><option>reset-client</option><option>reset-server</option><option>reset-both</option></select><select name="disabled"><option value="">Status behouden</option><option value="false">Enablen</option><option value="true">Disablen</option></select><input name="log_setting" placeholder="Log forwarding vervangen"><input name="profile_group" placeholder="Profile group vervangen"></div></div>
 <div class="cluster bulk-dialog-actions"><button class="btn btn-primary" type="submit">Preview wijzigingen</button><button class="btn" type="button" data-policy-bulk-cancel>Annuleren</button></div></div></dialog>
 </form>
+<div class="policy-actionbar" data-policy-actionbar><strong><span data-policy-action-count>0</span> geselecteerd</strong><button class="btn btn-primary" type="button" data-open-policy-bulk>Bulk edit</button></div>
 {% else %}<div class="empty-state"><strong>Geen security policies</strong>De geselecteerde rulebase is leeg.</div>{% endif %}
 {% endif %}
 </section>

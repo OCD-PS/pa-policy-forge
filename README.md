@@ -69,9 +69,12 @@ open only after selecting a logical firewall or HA pair.
 ## Policy management
 
 The **Policybeheer** page uses an Expedition-inspired filter, selection, and
-bulk-change workflow. SCM security rules are loaded in rulebase order and can
-be filtered independently by name, source/destination zone and address,
-application, and service. Bulk list changes are explicit add/remove operations:
+bulk-change workflow. SCM security rules are loaded in rulebase order. A single
+PAN-OS-style expression bar supports security-rule fields, `and`, `or`, `not`,
+and nested parentheses. Click a row and Ctrl- or Shift-click another row to
+select the continuous range. The selected-rule count and **Bulk edit** action
+remain available in the fixed bottom action bar. Bulk list changes are explicit
+add/remove operations:
 removing one zone or object never removes the other existing members. A preview
 shows every changed value before a separate candidate write. The candidate
 write re-fetches the live rules and stops on concurrent changes. SCM is the
