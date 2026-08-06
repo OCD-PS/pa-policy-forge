@@ -193,6 +193,8 @@ tbody tr:hover { background: rgba(255,255,255,.02); }
 body.sidebar-collapsed .object-actionbar { left: 100px; }
 .object-dialog { width: min(860px,calc(100vw - 32px)); }
 .member-editor { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: stretch; }
+.dynamic-filter-editor { display: grid; gap: 8px; }
+.dynamic-filter-editor > input { min-width: 0; }
 .member-picker-panel { position: absolute; z-index: 3; inset: 44px 0 0 auto; width: min(430px,100%); padding: 20px; border-left: 1px solid #4a4a4a; background: #151515; box-shadow: -18px 0 38px rgba(0,0,0,.45); overflow: auto; }
 .member-picker-panel[hidden] { display: none; }
 .member-results { display: grid; gap: 6px; margin-top: 12px; }
