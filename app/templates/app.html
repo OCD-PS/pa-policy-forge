@@ -217,11 +217,11 @@
 <label>Log forwarding profile</label>
 <input name="log_profile">
 </div>
-<div class="field">
+<div class="field full">
 <label>Username</label>
 <input name="username" autocomplete="off">
 </div>
-<div class="field">
+<div class="field full">
 <label>Password</label>
 <input type="password" name="password" autocomplete="new-password">
 </div>
@@ -239,11 +239,11 @@
 <label>Log forwarding profile</label>
 <input name="log_profile">
 </div>
-<div class="field">
+<div class="field full">
 <label>Username</label>
 <input name="username" autocomplete="off">
 </div>
-<div class="field">
+<div class="field full">
 <label>Password</label>
 <input type="password" name="password" autocomplete="new-password">
 </div>
@@ -275,16 +275,20 @@
 <form method="post" action="{{url_for('build',profile_id=p.id)}}">
 <input type="hidden" name="csrf" value="{{csrf_token()}}">
 <input type="hidden" name="mode" value="preview">
-<button class="btn" type="submit">Preview bouwen</button>
+<button class="btn" type="submit">Preview policy</button>
 </form>
 <form method="post" action="{{url_for('build',profile_id=p.id)}}" data-confirm="Schrijf objecten en regels naar candidate configuration? Er wordt niet gecommit of gedeployed.">
 <input type="hidden" name="csrf" value="{{csrf_token()}}">
 <input type="hidden" name="mode" value="push">
-<button class="btn btn-primary" type="submit">Naar candidate schrijven</button>
+<button class="btn btn-primary" type="submit">{% if p.target_type == 'scm' %}Schrijf naar SCM candidate{% elif p.target_type == 'panorama' %}Laad in Panorama{% else %}Laad in standalone firewall{% endif %}</button>
 </form>
 <form method="post" action="{{url_for('profile_delete',profile_id=p.id)}}" data-confirm="Profiel verwijderen? Flows en runs blijven bewaard.">
 <input type="hidden" name="csrf" value="{{csrf_token()}}">
 <button class="btn btn-danger" type="submit">Verwijderen</button>
+</form>
+<form method="post" action="{{url_for('profile_purge_flows',profile_id=p.id)}}" data-confirm="Alle geaggregeerde flows voor {{p.name}} verwijderen? Profiel en runhistoriek blijven bewaard.">
+<input type="hidden" name="csrf" value="{{csrf_token()}}">
+<button class="btn btn-danger" type="submit">Flows purgen</button>
 </form>
 </div>
 </article>{% else %}<div class="empty-state">

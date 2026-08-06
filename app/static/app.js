@@ -121,6 +121,14 @@
           group.hidden = !visible;
           all("input, select, textarea", group).forEach(function (field) { field.disabled = !visible; });
         });
+        var scopeSelect = form.querySelector("[data-scm-scope-select]");
+        if (scopeSelect && !scopeSelect.disabled) {
+          all("[data-scm-scope]", form).forEach(function (group) {
+            var visible = group.getAttribute("data-scm-scope") === scopeSelect.value;
+            group.hidden = !visible;
+            all("input", group).forEach(function (field) { field.disabled = !visible; });
+          });
+        }
       }
       select.addEventListener("change", updateTarget);
       updateTarget();

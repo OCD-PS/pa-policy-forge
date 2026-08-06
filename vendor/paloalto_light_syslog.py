@@ -33,8 +33,8 @@ LOGGER = logging.getLogger("paloalto-light-syslog")
 PANOS_TRAFFIC_INDEX = {
     "receive_time": 1,
     "serial": 2,
-    "type": 4,
-    "subtype": 5,
+    "type": 3,
+    "subtype": 4,
     "src": 7,
     "dst": 8,
     "rule": 11,
@@ -43,7 +43,7 @@ PANOS_TRAFFIC_INDEX = {
     "app": 14,
     "src_zone": 16,
     "dst_zone": 17,
-    "repeat": 22,
+    "repeat": 23,
     "dport": 25,
     "proto": 29,
     "action": 30,
@@ -294,6 +294,15 @@ class FlowStore:
         cutoff = sqlite_time(now_utc() - timedelta(days=self.retention_days))
         with self.lock, self._connect() as conn:
             cursor = conn.execute("DELETE FROM flows WHERE last_seen < ?", (cutoff,))
+            return cursor.rowcount
+
+    def purge(self, serial: str) -> int:
+        """Remove all aggregated flows for one firewall serial."""
+        if not serial.strip():
+            raise ValueError("serial is required")
+        with self.lock, self._connect() as conn:
+            cursor = conn.execute("DELETE FROM flows WHERE serial = ?", (serial.strip(),))
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             return cursor.rowcount
 
     def stats(self) -> dict[str, object]:

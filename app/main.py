@@ -277,6 +277,22 @@ def profile_delete(profile_id):
     return redirect(url_for("index") + "#profiles")
 
 
+@app.post("/profiles/<int:profile_id>/purge-flows")
+@login_required
+def profile_purge_flows(profile_id):
+    with db() as conn:
+        profile = conn.execute("SELECT name,serial FROM profiles WHERE id=?", (profile_id,)).fetchone()
+    if not profile:
+        return "Not found", 404
+    if not profile["serial"]:
+        flash("Flows niet verwijderd: het profiel heeft geen firewallserial.", "error")
+        return redirect(url_for("index") + "#profiles")
+    deleted = flow_store.purge(profile["serial"])
+    audit("flows-purged", f"profile={profile['name']} serial={profile['serial']} flows={deleted}")
+    flash(f"Schone lei aangemaakt: {deleted} geaggregeerde flows verwijderd voor {profile['name']}.", "success")
+    return redirect(url_for("index") + "#flows")
+
+
 def toml_string(value) -> str:
     return json.dumps(str(value))
 
@@ -290,7 +306,7 @@ def write_config(profile, run_dir: Path, push: bool) -> dict:
         f"disabled = {'true' if s.get('disabled') else 'false'}", "tags = [" + ",".join(toml_string(x) for x in s.get("tags", [])) + "]",
         f"global_ping_traceroute = {'true' if s.get('global_ping', True) else 'false'}", 'global_ping_traceroute_apps = ["ping","traceroute"]',
         f"global_dns = {'true' if s.get('global_dns', True) else 'false'}", 'global_dns_apps = ["dns-base"]', 'global_dns_internal_resolvers = []', 'global_dns_external_resolvers = ["1.1.1.1","9.9.9.9"]',
-        f"min_sessions = {s.get('min_sessions', 3)}", "limit = 0", "group_threshold = 10", "source_any_threshold = 5", 'include_actions = ["allow"]', f"log_setting = {toml_string(s.get('log_profile',''))}", "",
+        f"min_sessions = {s.get('min_sessions', 3)}", "limit = 0", "group_threshold = 10", "source_any_threshold = 5", f"workers = {max(1, (os.cpu_count() or 1) - 2)}", 'include_actions = ["allow"]', f"log_setting = {toml_string(s.get('log_profile',''))}", "",
         "[panorama]", f"panorama_template = {toml_string(s.get('device_group',''))}", f"panorama_rulebase = {toml_string(s.get('rulebase','pre'))}", f"panorama_log_setting = {toml_string(s.get('log_profile',''))}", "",
         "[panos]", f"panos_vsys = {toml_string(s.get('vsys','vsys1'))}", f"panos_log_setting = {toml_string(s.get('log_profile',''))}", f"panos_endpoint = {toml_string(s.get('endpoint',''))}", 'panos_username = ""', 'panos_password = ""', f"panos_auto_push = {'true' if push else 'false'}", "",
         "[scm]", 'scm_client_id = ""', 'scm_client_secret = ""', 'scm_tsg_id = ""', 'scm_token_url = "https://auth.apps.paloaltonetworks.com/oauth2/access_token"', 'scm_api_base = "https://api.strata.paloaltonetworks.com/config/security/v1"', f"scm_folder = {toml_string(s.get('folder',''))}", f"scm_snippet = {toml_string(s.get('snippet',''))}", f"scm_device = {toml_string(s.get('device',''))}", f"scm_object_folder = {toml_string(s.get('object_folder') or s.get('folder',''))}", f"scm_rulebase = {toml_string(s.get('rulebase','pre'))}", f"scm_log_forwarding_profile = {toml_string(s.get('log_profile',''))}", "",

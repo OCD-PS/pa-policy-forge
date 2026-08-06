@@ -120,9 +120,11 @@ def unique_rule_name(base_name: str, used: set[str], max_len: int = 32) -> str:
 
 def object_name_for_ip(value: str, ptr_cache: dict[str, str]) -> tuple[str, str, str]:
     ptr = ptr_cache.setdefault(value, resolve_ptr(value))
-    if ptr:
-        return suffix_name(ptr, "fqdn"), "fqdn", ptr
     host_prefix = "128" if ipaddress.ip_address(value).version == 6 else "32"
+    if ptr:
+        # PTR is useful for a readable name, but the policy observed an IP.
+        # Keep the object value exact so an existing IP object can be reused.
+        return suffix_name(ptr, "ip"), "ip-netmask", f"{value}/{host_prefix}"
     return compact_name("ip", value.replace(".", "-").replace(":", "-")), "ip-netmask", f"{value}/{host_prefix}"
 
 
@@ -299,8 +301,33 @@ class BuilderConfig:
     limit: int
     group_threshold: int
     source_any_threshold: int
+    workers: int
     include_actions: frozenset[str]
     log_setting: str | None
+
+
+@dataclass
+class ExistingConfigInventory:
+    addresses: dict[tuple[str, str], str]
+    address_groups: dict[frozenset[str], str]
+    services: dict[tuple[str, str], str]
+    service_groups: dict[frozenset[str], str]
+    application_groups: dict[frozenset[str], str]
+    address_names: set[str]
+    address_group_names: set[str]
+    service_names: set[str]
+    service_group_names: set[str]
+
+    @classmethod
+    def empty(cls) -> "ExistingConfigInventory":
+        return cls({}, {}, {}, {}, {}, set(), set(), set(), set())
+
+    def summary(self) -> str:
+        return (
+            f"addresses={len(self.address_names)}, address-groups={len(self.address_group_names)}, "
+            f"services={len(self.service_names)}, service-groups={len(self.service_group_names)}, "
+            f"application-groups={len(self.application_groups)}"
+        )
 
 
 def normalize_app(value: str) -> str:
@@ -853,6 +880,7 @@ def write_review_csv(path: Path, rows: list[dict[str, str]]) -> None:
                 "disabled",
                 "tags",
                 "preflight_status",
+                "config_reuse",
                 "log_setting",
                 "profile_group",
             ],
@@ -1064,6 +1092,300 @@ def response_items(response: Any) -> list[dict[str, Any]]:
             if nested:
                 return nested
     return [response] if response.get("id") or response.get("name") else []
+
+
+def normalized_address_value(kind: str, value: str) -> tuple[str, str]:
+    value = str(value).strip()
+    if kind == "ip-netmask":
+        try:
+            value = str(ipaddress.ip_network(value, strict=False))
+        except ValueError:
+            pass
+    elif kind == "fqdn":
+        value = value.rstrip(".").lower()
+    return kind, value
+
+
+def preferred(existing: dict[Any, str], key: Any, name: str) -> None:
+    current = existing.get(key)
+    if current is None or (len(name), name.lower()) < (len(current), current.lower()):
+        existing[key] = name
+
+
+def add_scm_inventory_items(inventory: ExistingConfigInventory, kind: str, items: list[dict[str, Any]]) -> None:
+    for item in items:
+        name = str(item.get("name", "")).strip()
+        if not name:
+            continue
+        if kind == "addresses":
+            inventory.address_names.add(name)
+            for payload_key, xml_key in (("ip_netmask", "ip-netmask"), ("ip_range", "ip-range"), ("ip_wildcard", "ip-wildcard"), ("fqdn", "fqdn")):
+                if item.get(payload_key):
+                    preferred(inventory.addresses, normalized_address_value(xml_key, str(item[payload_key])), name)
+                    break
+        elif kind == "address-groups":
+            inventory.address_group_names.add(name)
+            members = payload_members(item, "static")
+            if members:
+                preferred(inventory.address_groups, frozenset(members), name)
+        elif kind == "services":
+            inventory.service_names.add(name)
+            protocol = item.get("protocol") or {}
+            if isinstance(protocol, dict):
+                for proto in ("tcp", "udp", "sctp"):
+                    details = protocol.get(proto)
+                    if isinstance(details, dict) and details.get("port"):
+                        preferred(inventory.services, (proto, str(details["port"]).strip()), name)
+                        break
+        elif kind == "service-groups":
+            inventory.service_group_names.add(name)
+            members = payload_members(item, "members")
+            if members:
+                preferred(inventory.service_groups, frozenset(members), name)
+        elif kind == "application-groups":
+            members = payload_members(item, "members", "applications")
+            if members:
+                preferred(inventory.application_groups, frozenset(members), name)
+
+
+def scm_fetch_all(endpoint: str, token: str, container: dict[str, str]) -> list[dict[str, Any]]:
+    offset = 0
+    collected: list[dict[str, Any]] = []
+    while True:
+        params = {**container, "limit": "200", "offset": str(offset)}
+        response = scm_http_request("GET", endpoint, token, params=params)
+        page = response_items(response)
+        collected.extend(page)
+        total = response.get("total") if isinstance(response, dict) else None
+        if not page or len(page) < 200 or not isinstance(total, int) or len(collected) >= total:
+            break
+        offset += len(page)
+    return collected
+
+
+def fetch_scm_inventory(scm: SCMConfig) -> ExistingConfigInventory:
+    token = get_scm_token(scm)
+    root = scm_api_root(scm.scm_api_base) + "/config/objects/v1"
+    container = scm_container(folder=scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
+    inventory = ExistingConfigInventory.empty()
+    for kind in ("addresses", "address-groups", "services", "service-groups", "application-groups"):
+        add_scm_inventory_items(inventory, kind, scm_fetch_all(f"{root}/{kind}", token, container))
+    return inventory
+
+
+def panos_api_key(deployment: DeploymentConfig, ctx: ssl.SSLContext) -> str:
+    key_root = require_success(
+        api_get(deployment.panos_endpoint, {"type": "keygen", "user": deployment.panos_username, "password": deployment.panos_password}, ctx),
+        "keygen",
+    )
+    key = key_root.findtext(".//key")
+    if not key:
+        raise RuntimeError("keygen succeeded but did not return an API key")
+    return key
+
+
+def add_xml_inventory_section(inventory: ExistingConfigInventory, kind: str, entries: Iterable[ET.Element]) -> None:
+    for entry in entries:
+        name = entry.attrib.get("name", "").strip()
+        if not name:
+            continue
+        if kind == "addresses":
+            inventory.address_names.add(name)
+            for xml_key in ("ip-netmask", "ip-range", "ip-wildcard", "fqdn"):
+                value = entry.findtext(f"./{xml_key}")
+                if value:
+                    preferred(inventory.addresses, normalized_address_value(xml_key, value), name)
+                    break
+        elif kind == "address-groups":
+            inventory.address_group_names.add(name)
+            members = frozenset(rule_member_values(entry, "./static/member"))
+            if members:
+                preferred(inventory.address_groups, members, name)
+        elif kind == "services":
+            inventory.service_names.add(name)
+            for proto in ("tcp", "udp", "sctp"):
+                port = entry.findtext(f"./protocol/{proto}/port")
+                if port:
+                    preferred(inventory.services, (proto, port.strip()), name)
+                    break
+        elif kind == "service-groups":
+            inventory.service_group_names.add(name)
+            members = frozenset(rule_member_values(entry, "./members/member"))
+            if members:
+                preferred(inventory.service_groups, members, name)
+        elif kind == "application-groups":
+            members = frozenset(rule_member_values(entry, "./members/member"))
+            if members:
+                preferred(inventory.application_groups, members, name)
+
+
+def fetch_panos_inventory(deployment: DeploymentConfig) -> ExistingConfigInventory:
+    ctx = ssl._create_unverified_context()
+    key = panos_api_key(deployment, ctx)
+    device_name = xpath_literal("localhost.localdomain")
+    if deployment.panorama:
+        dg = xpath_literal(deployment.panorama_template)
+        bases = [
+            "/config/shared",
+            f"/config/devices/entry[@name={device_name}]/device-group/entry[@name={dg}]",
+        ]
+    else:
+        vsys = xpath_literal(deployment.panos_vsys)
+        bases = [f"/config/devices/entry[@name={device_name}]/vsys/entry[@name={vsys}]"]
+    inventory = ExistingConfigInventory.empty()
+    for base in bases:
+        for kind, node in (("addresses", "address"), ("address-groups", "address-group"), ("services", "service"), ("service-groups", "service-group"), ("application-groups", "application-group")):
+            response = require_success(
+                api_get(deployment.panos_endpoint, {"type": "config", "action": "get", "xpath": f"{base}/{node}", "key": key}, ctx),
+                f"fetch existing {kind}",
+            )
+            add_xml_inventory_section(inventory, kind, response.findall(".//entry"))
+    return inventory
+
+
+def replace_members(root: ET.Element | None, path: str, replacements: dict[str, str]) -> None:
+    if root is None:
+        return
+    for member in root.findall(path):
+        if member.text in replacements:
+            member.text = replacements[member.text]
+
+
+def collision_safe_name(name: str, semantic: str, occupied: set[str]) -> str:
+    if name not in occupied:
+        occupied.add(name)
+        return name
+    digest = hashlib.sha1(semantic.encode("utf-8")).hexdigest()[:7]
+    candidate = suffix_name(name, f"forge-{digest}")
+    counter = 2
+    while candidate in occupied:
+        candidate = suffix_name(name, f"forge-{digest}-{counter}")
+        counter += 1
+    occupied.add(candidate)
+    return candidate
+
+
+def apply_existing_inventory(
+    tree: ET.ElementTree,
+    rows: list[dict[str, str]],
+    deployment: DeploymentConfig,
+    inventory: ExistingConfigInventory,
+) -> Counter[str]:
+    addresses, address_groups, services, service_groups, rules = extract_xml_sections(tree, deployment)
+    replacements: dict[str, str] = {}
+    reused: Counter[str] = Counter()
+
+    if addresses is not None:
+        for entry in list(addresses.findall("./entry")):
+            old = entry.attrib["name"]
+            semantic = None
+            for kind in ("ip-netmask", "ip-range", "ip-wildcard", "fqdn"):
+                value = entry.findtext(f"./{kind}")
+                if value:
+                    semantic = normalized_address_value(kind, value)
+                    break
+            existing = inventory.addresses.get(semantic) if semantic else None
+            if existing:
+                replacements[old] = existing
+                addresses.remove(entry)
+                reused["addresses"] += 1
+            elif old in inventory.address_names:
+                new = collision_safe_name(old, repr(semantic), inventory.address_names)
+                entry.attrib["name"] = new
+                replacements[old] = new
+
+    if services is not None:
+        for entry in list(services.findall("./entry")):
+            old = entry.attrib["name"]
+            semantic = None
+            for proto in ("tcp", "udp", "sctp"):
+                port = entry.findtext(f"./protocol/{proto}/port")
+                if port:
+                    semantic = (proto, port.strip())
+                    break
+            existing = inventory.services.get(semantic) if semantic else None
+            if existing:
+                replacements[old] = existing
+                services.remove(entry)
+                reused["services"] += 1
+            elif old in inventory.service_names:
+                new = collision_safe_name(old, repr(semantic), inventory.service_names)
+                entry.attrib["name"] = new
+                replacements[old] = new
+
+    replace_members(address_groups, ".//static/member", replacements)
+    replace_members(service_groups, ".//members/member", replacements)
+    replace_members(rules, ".//source/member", replacements)
+    replace_members(rules, ".//destination/member", replacements)
+    replace_members(rules, ".//service/member", replacements)
+
+    group_replacements: dict[str, str] = {}
+    if address_groups is not None:
+        for entry in list(address_groups.findall("./entry")):
+            old = entry.attrib["name"]
+            members = frozenset(rule_member_values(entry, "./static/member"))
+            existing = inventory.address_groups.get(members)
+            if existing:
+                group_replacements[old] = existing
+                address_groups.remove(entry)
+                reused["address-groups"] += 1
+            elif old in inventory.address_group_names:
+                new = collision_safe_name(old, repr(sorted(members)), inventory.address_group_names)
+                entry.attrib["name"] = new
+                group_replacements[old] = new
+    if service_groups is not None:
+        for entry in list(service_groups.findall("./entry")):
+            old = entry.attrib["name"]
+            members = frozenset(rule_member_values(entry, "./members/member"))
+            existing = inventory.service_groups.get(members)
+            if existing:
+                group_replacements[old] = existing
+                service_groups.remove(entry)
+                reused["service-groups"] += 1
+            elif old in inventory.service_group_names:
+                new = collision_safe_name(old, repr(sorted(members)), inventory.service_group_names)
+                entry.attrib["name"] = new
+                group_replacements[old] = new
+    replace_members(rules, ".//source/member", group_replacements)
+    replace_members(rules, ".//destination/member", group_replacements)
+    replace_members(rules, ".//service/member", group_replacements)
+
+    if rules is not None:
+        for entry in rules.findall("./entry"):
+            for node_name in ("source", "destination"):
+                node = entry.find(f"./{node_name}")
+                members = frozenset(rule_member_values(entry, f"./{node_name}/member"))
+                existing_group = inventory.address_groups.get(members)
+                if node is not None and existing_group and members != {"any"}:
+                    for member in list(node):
+                        node.remove(member)
+                    ET.SubElement(node, "member").text = existing_group
+                    reused["address-groups"] += 1
+            service_node = entry.find("./service")
+            service_members = frozenset(rule_member_values(entry, "./service/member"))
+            existing_service_group = inventory.service_groups.get(service_members)
+            if service_node is not None and existing_service_group and service_members != {"application-default"}:
+                for member in list(service_node):
+                    service_node.remove(member)
+                ET.SubElement(service_node, "member").text = existing_service_group
+                reused["service-groups"] += 1
+            app_node = entry.find("./application")
+            if app_node is not None:
+                members = frozenset(rule_member_values(entry, "./application/member"))
+                existing = inventory.application_groups.get(members)
+                if existing:
+                    for member in list(app_node):
+                        app_node.remove(member)
+                    ET.SubElement(app_node, "member").text = existing
+                    reused["application-groups"] += 1
+            row = next((item for item in rows if item.get("name") == entry.attrib.get("name")), None)
+            if row is not None:
+                row["source"] = ",".join(rule_member_values(entry, "./source/member"))
+                row["destination"] = ",".join(rule_member_values(entry, "./destination/member"))
+                row["application"] = ",".join(rule_member_values(entry, "./application/member"))
+                row["service"] = ",".join(rule_member_values(entry, "./service/member"))
+                row["config_reuse"] = ",".join(f"{key}={value}" for key, value in sorted(reused.items())) or "none"
+    return reused
 
 
 def get_scm_token(scm: SCMConfig) -> str:
@@ -1724,6 +2046,7 @@ def load_builder_config(path: Path) -> tuple[BuilderConfig, ZoneRoleConfig, Depl
         limit=config_int(builder_raw, "limit", 100, path),
         group_threshold=config_int(builder_raw, "group_threshold", 10, path),
         source_any_threshold=config_int(builder_raw, "source_any_threshold", 5, path),
+        workers=max(1, config_int(builder_raw, "workers", max(1, (os.cpu_count() or 1) - 2), path)),
         include_actions=config_action_set(builder_raw.get("include_actions", ["allow"]), path),
         log_setting=log_setting or None,
     )
@@ -1845,7 +2168,7 @@ def main() -> int:
     missing = [str(path) for path in logs if not path.exists()]
     if missing:
         raise SystemExit(f"Missing log path(s): {', '.join(missing)}")
-    aggregates = aggregate_log_paths(logs, builder.include_actions)
+    aggregates = aggregate_log_paths(logs, builder.include_actions, workers=builder.workers)
     ptr_cache = load_ptr_cache(builder.ptr_cache_file)
     selected_log_setting = builder.log_setting
     if selected_log_setting is None:
@@ -1876,20 +2199,22 @@ def main() -> int:
         profile_groups,
         ptr_cache,
     )
-    if deployment.panos_auto_push:
-        if deployment.scm:
-            statuses = preflight_scm_rules(tree, review_rows, deployment, scm, zone_roles, profile_groups)
-        else:
-            statuses = preflight_panos_rules(tree, review_rows, deployment)
-        skipped = remove_skipped_xml_rules(tree, deployment, review_rows)
-        print(
-            "Preflight existing policy check: "
-            + ", ".join(f"{status}={count}" for status, count in sorted(statuses.items()))
-            + f"; skipped duplicate matches={skipped}"
-        )
+    if deployment.scm:
+        inventory = fetch_scm_inventory(scm)
+        reused = apply_existing_inventory(tree, review_rows, deployment, inventory)
+        statuses = preflight_scm_rules(tree, review_rows, deployment, scm, zone_roles, profile_groups)
     else:
-        for row in review_rows:
-            row.setdefault("preflight_status", "not-checked")
+        inventory = fetch_panos_inventory(deployment)
+        reused = apply_existing_inventory(tree, review_rows, deployment, inventory)
+        statuses = preflight_panos_rules(tree, review_rows, deployment)
+    skipped = remove_skipped_xml_rules(tree, deployment, review_rows)
+    print(f"Fresh target inventory: {inventory.summary()}")
+    print("Reused existing config: " + (", ".join(f"{kind}={count}" for kind, count in sorted(reused.items())) or "none"))
+    print(
+        "Preflight existing policy check: "
+        + ", ".join(f"{status}={count}" for status, count in sorted(statuses.items()))
+        + f"; skipped duplicate matches={skipped}"
+    )
     save_ptr_cache(builder.ptr_cache_file, ptr_cache)
     ET.indent(tree, space="  ")
     tree.write(builder.xml_output, encoding="utf-8", xml_declaration=True)

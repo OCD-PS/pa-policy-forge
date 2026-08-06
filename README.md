@@ -6,6 +6,9 @@ Self-hosted Palo Alto traffic-flow policy builder with an HTTPS web interface, U
 
 - Stores only aggregated `TRAFFIC` flows where `action=allow`; raw syslog is discarded.
 - Separates flows per firewall serial before policy generation.
+- Fetches a fresh target inventory for every preview and candidate write.
+- Reuses exact existing address/service objects and exact matching address,
+  service, and application groups; same-name semantic conflicts are never overwritten.
 - Encrypts target credentials with a local key stored outside the application database.
 - SCM writes objects/rules but never calls `candidate:push`.
 - Panorama and standalone use import/partial-load only and never commit.
@@ -37,3 +40,8 @@ For offline customers, transfer the repository plus a saved container image bund
 4. Create a profile, map zones to roles, and enter the target credentials.
 5. Generate a preview and inspect/download the review CSV and XML.
 6. Use **Naar candidate schrijven** only after review. Commit/deploy separately in SCM, Panorama, or PAN-OS.
+7. After the accepted rules are manually positioned and deployed, use **Flows purgen** on the profile to start a clean observation cycle. Profiles and run history are retained.
+
+Flow aggregation happens continuously while syslog arrives. CPU-parallel builder work
+defaults to `max(1, detected CPUs - 2)`, reserving two logical CPUs for the web UI,
+syslog receiver, and operating system.
