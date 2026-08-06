@@ -1221,6 +1221,8 @@ def prepare_loop():
         try:
             with db() as conn: profiles = conn.execute("SELECT * FROM profiles WHERE enabled=1 ORDER BY id").fetchall()
             for profile in profiles:
+                if not profile_serials(profile):
+                    continue
                 if fresh_prepared_run(profile): continue
                 execute_run(profile, "prepared")
                 with db() as conn:

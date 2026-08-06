@@ -20,6 +20,10 @@ class TargetAdapterTests(unittest.TestCase):
         xpath = main.panos_policy_xpath(self.profile("panorama"), "nat")
         self.assertIn("device-group/entry[@name='Branches']/pre-rulebase/nat/rules", xpath)
 
+    def test_profile_without_firewall_serial_has_no_flow_identity(self):
+        profile = {"serial": "", "settings_json": json.dumps({"passive_serial": ""})}
+        self.assertEqual(main.profile_serials(profile), [])
+
     def test_standalone_policy_xpath_uses_vsys_rulebase(self):
         xpath = main.panos_policy_xpath(self.profile("panos"), "decryption")
         self.assertIn("vsys/entry[@name='vsys2']/rulebase/decryption/rules", xpath)
