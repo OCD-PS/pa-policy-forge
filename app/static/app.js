@@ -412,6 +412,7 @@
   function setupObjectManagement() {
     var dialog = document.querySelector("[data-object-dialog]");
     var form = document.querySelector("[data-object-form]");
+    if (dialog) { var objectTabs = dialog.querySelector(".policy-tabs"); if (objectTabs && objectTabs.querySelectorAll("button:not([disabled])").length <= 1) objectTabs.remove(); }
     var rows = all("[data-object-row]");
     var checkboxes = all("[data-object-select]");
     var countNode = document.querySelector("[data-object-selected-count]");
@@ -448,6 +449,9 @@
       form.reset(); form.querySelector("[data-object-id]").value = item && item.id ? item.id : "";
       dialog.querySelector("[data-object-dialog-title]").textContent = (item ? "Edit " : "Add ") + document.querySelector(".object-list h2").textContent;
       setMembers([]); setDynamicFilter("");
+      var zoneConfig = form.querySelector("[data-zone-current-config]");
+      if (!zoneConfig && form.querySelector('[data-object-field="zone_type"]')) { zoneConfig = document.createElement("details"); zoneConfig.className = "zone-current-config field full"; zoneConfig.dataset.zoneCurrentConfig = ""; var summary = document.createElement("summary"); summary.textContent = "Volledige huidige zoneconfig"; var pre = document.createElement("pre"); pre.className = "mono"; zoneConfig.appendChild(summary); zoneConfig.appendChild(pre); form.querySelector(".form-grid").appendChild(zoneConfig); }
+      if (zoneConfig) { zoneConfig.hidden = !(item && item.network); if (item && item.network) { var visibleConfig = {}; Object.keys(item).sort().forEach(function (key) { if (!["_xml", "_raw"].includes(key)) visibleConfig[key] = item[key]; }); zoneConfig.querySelector("pre").textContent = JSON.stringify(visibleConfig, null, 2); } }
       if (item) {
         setField("name", item.name); setField("description", item.description); setField("comments", item.comments); setField("tag", item.tag);
         ["ip_netmask", "ip_range", "ip_wildcard", "fqdn"].some(function (kind) { if (item[kind]) { setField("value_type", kind); setField("value", item[kind]); return true; } return false; });
@@ -462,7 +466,7 @@
       updateGroupType(); updateTimeouts(); dialog.showModal();
     }
     var add = document.querySelector("[data-object-add]"); if (add) add.addEventListener("click", function () { openEditor(null); });
-    rows.forEach(function (row) { var button = row.querySelector("[data-object-edit]"); if (!button) return; var item = JSON.parse(row.dataset.object); button.addEventListener("click", function () { openEditor(item); }); row.addEventListener("click", function (event) { if (!event.target.closest("input,button,a")) openEditor(item); }); });
+    rows.forEach(function (row) { var button = row.querySelector("[data-object-edit]"); if (!button) return; var item = JSON.parse(row.dataset.object); if (item.network) { var zoneType = Object.keys(item.network)[0] || "onbekend"; var zoneValue = item.network[zoneType] || []; var zoneInterfaces = Array.isArray(zoneValue) ? zoneValue : zoneValue.member || []; var valueCell = row.querySelector("td.mono"); if (valueCell) valueCell.textContent = zoneType.replace("_", "-") + (zoneInterfaces.length ? " · " + zoneInterfaces.join(", ") : " · geen interfaces") + " · User-ID " + ((item.enable_user_identification === true || item.enable_user_identification === "yes") ? "aan" : "uit"); } button.addEventListener("click", function () { openEditor(item); }); row.addEventListener("click", function (event) { if (!event.target.closest("input,button,a")) openEditor(item); }); });
     var cancel = dialog.querySelector("[data-object-cancel]"); if (cancel) cancel.addEventListener("click", function () { dialog.close(); });
     form.addEventListener("submit", commitDynamicEntry);
     var pickerPanel = dialog.querySelector("[data-member-picker-panel]"); var catalogNode = dialog.querySelector("[data-object-catalog]"); var catalog = catalogNode ? JSON.parse(catalogNode.textContent || "[]") : []; var pickerMode = "members";
