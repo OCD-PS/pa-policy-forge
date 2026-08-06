@@ -141,6 +141,29 @@ class SafetyTests(unittest.TestCase):
         candidates = merge_candidates(aggregates, 1, 0, ZoneRoleConfig({"trust": "client", "dmz": "server"}))
         self.assertEqual({candidate.anchor_rule for candidate in candidates}, {"Discovery-A", "Discovery-B"})
 
+    def test_only_web_ports_are_generalized_for_client_to_internet(self):
+        base = {
+            "src": "10.0.0.1", "dst": "198.51.100.1", "src_zone": "trust",
+            "dst_zone": "internet", "action": "allow", "repeat": "3", "bytes": "100",
+            "rule": "Discovery",
+        }
+        aggregates = aggregate_flows([
+            {**base, "app": "ssl", "proto": "tcp", "dport": "443"},
+            {**base, "app": "web-browsing", "proto": "tcp", "dport": "80", "dst": "198.51.100.2"},
+            {**base, "app": "ntp-base", "proto": "udp", "dport": "123", "dst": "198.51.100.3"},
+            {**base, "app": "ssl", "proto": "tcp", "dport": "9440", "dst": "198.51.100.4"},
+        ], {"allow"})
+        candidates = merge_candidates(
+            aggregates, 1, 0, ZoneRoleConfig({"trust": "client", "internet": "internet"})
+        )
+        observed = {(candidate.app, candidate.service_members) for candidate in candidates}
+        self.assertEqual(observed, {
+            ("any", ("service-http",)),
+            ("any", ("service-https",)),
+            ("ntp-base", ("application-default",)),
+            ("ssl", ("9440_TCP",)),
+        })
+
     def test_source_rule_is_kept_for_positioning(self):
         rows = [{"name": "generated", "anchor_rule": "Discovery", "preflight_status": "new"}]
         self.assertEqual(movable_anchor_map(rows), {"generated": "Discovery"})

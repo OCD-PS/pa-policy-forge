@@ -387,6 +387,12 @@ def is_client_to_internet(src_zone: str, dst_zone: str, zone_roles: ZoneRoleConf
     return zone_roles.is_client(src_zone) and zone_roles.is_internet(dst_zone)
 
 
+def client_internet_web_service(proto: str, dport: str) -> str | None:
+    if proto.lower() != "tcp":
+        return None
+    return {"80": "service-http", "443": "service-https"}.get(dport)
+
+
 def is_global_ping_traceroute_app(app: str, apps: tuple[str, ...]) -> bool:
     return normalize_app(app) in set(apps)
 
@@ -412,10 +418,11 @@ def merge_candidates(
         key = agg.key
         if is_global_ping_traceroute_app(key.app, suppressed_apps):
             continue
-        if is_client_to_internet(key.src_zone, key.dst_zone, zone_roles):
+        web_service = client_internet_web_service(key.proto, key.dport)
+        if is_client_to_internet(key.src_zone, key.dst_zone, zone_roles) and web_service:
             app = "any"
-            service_members = ("service-http", "service-https")
-            bucket_service_key = "service-http,service-https"
+            service_members = (web_service,)
+            bucket_service_key = web_service
         else:
             app = normalize_app(key.app)
             service_members = (service_member_for_flow(app, key.proto, key.dport),)
