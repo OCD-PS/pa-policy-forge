@@ -238,8 +238,6 @@ def index():
         editing_profile = next((profile for profile in profiles if profile["id"] == editing_id), None)
         selected_id = request.args.get("flow_profile", type=int)
         selected_flow_profile = next((profile for profile in profiles if profile["id"] == selected_id), None)
-        if selected_flow_profile is None and len(profiles) == 1:
-            selected_flow_profile = profiles[0]
         flows = []
         if selected_flow_profile:
             serials = [selected_flow_profile["serial"], selected_flow_profile["passive_serial"]]

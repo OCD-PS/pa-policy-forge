@@ -49,8 +49,8 @@ For offline customers, transfer the repository plus a saved container image bund
 6. Use **Naar candidate schrijven** only after review. Commit/deploy separately in SCM, Panorama, or PAN-OS.
 7. After the accepted rules are manually positioned and deployed, use **Flows purgen** on the profile to start a clean observation cycle. Profiles and run history are retained.
 
-When multiple firewall profiles exist, the Flows page first asks which logical
-firewall or HA pair to open. A single configured profile opens automatically.
+The Flows page always starts with a device/firewall-group chooser. Flow details
+open only after selecting a logical firewall or HA pair.
 
 Flow aggregation happens continuously while syslog arrives. CPU-parallel builder work
 defaults to `max(1, detected CPUs - 2)`, reserving two logical CPUs for the web UI,

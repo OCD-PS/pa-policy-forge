@@ -306,7 +306,7 @@
 </div>
 </section>
 <section id="flows" class="page-section" data-title="Flows" hidden>
-{% if profiles|length > 1 and not selected_flow_profile %}
+{% if profiles and not selected_flow_profile %}
 <div class="page-header">
 <div>
 <h1>Flows</h1>
@@ -315,8 +315,8 @@
 </div>
 <div class="grid grid-2">
 {% for p in profiles %}<a class="card" href="{{url_for('index',flow_profile=p.id)}}#flows" style="text-decoration:none;color:inherit">
-<div class="card-header"><div><h2>{{p.name}}</h2><p class="mono muted">{{p.serial}}{% if p.passive_serial %}<br>{{p.passive_serial}}{% endif %}</p></div><span class="badge badge-orange">{{p.flow_count}} flows</span></div>
-<p>Open de gecombineerde flows van dit firewallcluster.</p>
+<div class="card-header"><div><h2>{{p.name}}</h2></div><span class="badge badge-orange">{{p.target_type|upper}}</span></div>
+<p>{{p.flow_count}} geaggregeerde flows · Open dit device/firewallcluster.</p>
 </a>{% endfor %}
 </div>
 {% elif selected_flow_profile %}
@@ -326,7 +326,7 @@
 <h1>{{selected_flow_profile.name}}</h1>
 <p class="lede">Actief: <span class="mono">{{selected_flow_profile.serial}}</span>{% if selected_flow_profile.passive_serial %} · Passief: <span class="mono">{{selected_flow_profile.passive_serial}}</span>{% endif %}</p>
 </div>
-<div class="cluster">{% if profiles|length > 1 %}<a class="btn" href="{{url_for('index')}}#flows">Andere firewall</a>{% endif %}<input class="search" data-table-filter="#flow-table" placeholder="Filter flows..."></div>
+<div class="cluster"><a class="btn" href="{{url_for('index')}}#flows">Terug naar devices</a><input class="search" data-table-filter="#flow-table" placeholder="Filter flows..."></div>
 </div>
 <div class="table-wrap">
 <table id="flow-table">
