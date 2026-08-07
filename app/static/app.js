@@ -556,6 +556,7 @@
     var form = document.querySelector(".workspace-scope-bar");
     if (!form) return;
     all("select", form).forEach(function (select) {
+      select.removeAttribute("onchange");
       select.addEventListener("change", function () {
         document.body.classList.add("workspace-context-loading");
         var status = document.createElement("div");
@@ -563,6 +564,9 @@
         status.setAttribute("role", "status");
         status.innerHTML = '<div class="progress"><div class="progress-bar progress-indeterminate"></div></div><strong>Configuratie laden…</strong><span>De gekozen context wordt behouden.</span>';
         document.body.appendChild(status);
+        var query = new URLSearchParams(new FormData(form)).toString();
+        var target = form.getAttribute("action") || window.location.pathname;
+        window.requestAnimationFrame(function () { window.location.assign(target + "?" + query); });
       });
     });
   }

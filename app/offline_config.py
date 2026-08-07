@@ -320,6 +320,43 @@ def _object_fields(entry: ET.Element) -> list[dict]:
     return fields
 
 
+def object_fingerprint(record: dict) -> str:
+    return hashlib.sha256(record["_xml"].encode()).hexdigest()
+
+
+def object_record(entry: ET.Element, owner: str, editable: bool, object_type: str) -> dict:
+    record = {
+        "id": entry.get("name", ""), "name": entry.get("name", ""),
+        "owner": owner, "editable": editable, "description": entry.findtext("./description", ""),
+        "comments": entry.findtext("./comments", ""), "tag": _members(entry, "tag"),
+        "summary": _object_summary(entry), "values": _object_values(entry),
+        "fields": _object_fields(entry), "_xml": ET.tostring(entry, encoding="unicode"),
+    }
+    for key in ("ip-netmask", "ip-range", "ip-wildcard", "fqdn", "color"):
+        value = entry.findtext(f"./{key}", "").strip()
+        if value:
+            record[key.replace("-", "_")] = value
+    if object_type == "address-groups":
+        record["static"] = _members(entry, "static")
+        dynamic = entry.findtext("./dynamic/filter", "").strip()
+        if dynamic:
+            record["dynamic"] = {"filter": dynamic}
+    elif object_type in {"application-groups", "service-groups"}:
+        record["members"] = _members(entry, "members")
+    elif object_type == "services":
+        for protocol in ("tcp", "udp"):
+            node = entry.find(f"./protocol/{protocol}")
+            if node is None:
+                continue
+            details = {}
+            for child in node:
+                value = (child.text or "").strip()
+                details[child.tag.replace("-", "_")] = value == "yes" if child.tag == "override" else value
+            record["protocol"] = {protocol: details}
+            break
+    return record
+
+
 def scoped_objects(xml_bytes: bytes, scope: str, object_type: str, parsed=None) -> tuple[ConfigSnapshot, list[dict]]:
     root, snapshot = parsed if parsed is not None else parse_snapshot(xml_bytes)
     node = OBJECT_NODES.get(object_type)
@@ -332,13 +369,64 @@ def scoped_objects(xml_bytes: bytes, scope: str, object_type: str, parsed=None) 
         if scope_root is None:
             continue
         for entry in scope_root.findall(f"./{node}/entry"):
-            records.append({
-                "name": entry.get("name", ""), "owner": owner, "editable": owner == scope,
-                "summary": _object_summary(entry), "description": entry.findtext("./description", ""),
-                "values": _object_values(entry), "fields": _object_fields(entry),
-                "_xml": ET.tostring(entry, encoding="unicode"),
-            })
+            records.append(object_record(entry, owner, owner == scope, object_type))
     return snapshot, records
+
+
+EDITABLE_OBJECT_TAGS = {
+    "addresses": {"description", "tag", "ip-netmask", "ip-range", "ip-wildcard", "fqdn"},
+    "address-groups": {"description", "tag", "static", "dynamic"},
+    "application-groups": {"description", "tag", "members"},
+    "services": {"description", "tag", "protocol"},
+    "service-groups": {"description", "tag", "members"},
+    "tags": {"comments", "color"},
+}
+
+
+def apply_object_changes(xml_bytes: bytes, scope: str, object_type: str, changes: list[dict]) -> bytes:
+    if object_type not in EDITABLE_OBJECT_TAGS:
+        raise OfflineConfigError("Dit objecttype is momenteel alleen-lezen")
+    root, snapshot = parse_snapshot(xml_bytes)
+    scope_root = _scope_root(root, snapshot, scope)
+    if scope_root is None:
+        raise OfflineConfigError("De gekozen scope bestaat niet meer")
+    node_path = OBJECT_NODES[object_type]
+    container = scope_root
+    for part in node_path.split("/"):
+        child = container.find(f"./{part}")
+        if child is None:
+            child = ET.SubElement(container, part)
+        container = child
+    for change in changes:
+        operation = change.get("operation")
+        original_name = change.get("original_name", "")
+        current = next((entry for entry in container.findall("./entry") if entry.get("name") == original_name), None)
+        if operation in {"update", "delete"}:
+            if current is None:
+                raise OfflineConfigError(f"Object {original_name} bestaat niet meer")
+            current_record = object_record(current, scope, True, object_type)
+            if object_fingerprint(current_record) != change.get("fingerprint"):
+                raise OfflineConfigError(f"Object {original_name} is intussen gewijzigd")
+        if operation == "delete":
+            container.remove(current)
+            continue
+        replacement = SafeET.fromstring(change.get("replacement_xml", ""))
+        if replacement.tag != "entry" or not replacement.get("name"):
+            raise OfflineConfigError("Ongeldig vervangend object")
+        collision = next((entry for entry in container.findall("./entry") if entry.get("name") == replacement.get("name") and entry is not current), None)
+        if collision is not None:
+            raise OfflineConfigError(f"Object {replacement.get('name')} bestaat al in {scope}")
+        if operation == "create":
+            container.append(replacement)
+            continue
+        current.set("name", replacement.get("name", original_name))
+        editable_tags = EDITABLE_OBJECT_TAGS[object_type]
+        for child in list(current):
+            if child.tag in editable_tags:
+                current.remove(child)
+        for child in list(replacement):
+            current.append(copy.deepcopy(child))
+    return normalized_config_xml(root)
 
 
 def configuration_inventory(xml_bytes: bytes, scope: str, template: str = "", parsed=None) -> dict[str, list[dict]]:

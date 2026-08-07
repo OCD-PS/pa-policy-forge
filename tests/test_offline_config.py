@@ -6,8 +6,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.offline_config import (
-    OfflineConfigError, available_scopes, available_templates, configuration_inventory, parse_snapshot,
-    policy_fingerprint, render_set_commands, replace_policy_in_snapshot,
+    OfflineConfigError, apply_object_changes, available_scopes, available_templates, configuration_inventory, parse_snapshot,
+    object_fingerprint, policy_fingerprint, render_set_commands, replace_policy_in_snapshot,
     referenced_template, scoped_objects, scoped_policies,
 )
 
@@ -81,6 +81,27 @@ class OfflineConfigTests(unittest.TestCase):
         by_name = {item["name"]: item for item in inventory["network"]}
         self.assertEqual(by_name["Interfaces"]["entries"], 1)
         self.assertEqual(by_name["Zones"]["entries"], 2)
+
+    def test_offline_object_create_update_delete_preserves_unknown_fields(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="old"><ip-netmask>192.0.2.1/32</ip-netmask><custom-field>keep</custom-field></entry></address></entry></vsys></entry></devices></config>'''
+        _, objects = scoped_objects(source, "vsys1", "addresses")
+        old = objects[0]
+        updated = apply_object_changes(source, "vsys1", "addresses", [{
+            "operation": "update", "original_name": "old", "fingerprint": object_fingerprint(old),
+            "replacement_xml": '<entry name="renamed"><ip-netmask>192.0.2.2/32</ip-netmask><description>changed</description></entry>',
+        }, {
+            "operation": "create", "original_name": "", "fingerprint": "",
+            "replacement_xml": '<entry name="new"><fqdn>example.test</fqdn></entry>',
+        }])
+        self.assertIn(b'<entry name="renamed">', updated)
+        self.assertIn(b'<custom-field>keep</custom-field>', updated)
+        self.assertIn(b'<entry name="new">', updated)
+        _, after = scoped_objects(updated, "vsys1", "addresses")
+        new = next(item for item in after if item["name"] == "new")
+        deleted = apply_object_changes(updated, "vsys1", "addresses", [{
+            "operation": "delete", "original_name": "new", "fingerprint": object_fingerprint(new),
+        }])
+        self.assertNotIn(b'<entry name="new">', deleted)
 
 
 if __name__ == "__main__":

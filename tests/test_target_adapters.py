@@ -119,6 +119,7 @@ class TargetAdapterTests(unittest.TestCase):
     def test_offline_workspace_templates_compile(self):
         main.app.jinja_env.get_template("app.html")
         main.app.jinja_env.get_template("workspace_push.html")
+        main.app.jinja_env.get_template("workspace_object_preview.html")
         main.app.jinja_env.get_template("workspace_editor.html")
         main.app.jinja_env.get_template("workspace_policy_preview.html")
 
@@ -281,7 +282,9 @@ class TargetAdapterTests(unittest.TestCase):
             self.assertIn("policy_kind=nat", policy_html)
             self.assertIn("scope=vsys1", policy_html)
             object_html = client.get(paths[1], base_url="https://forge.test").data.decode()
-            self.assertIn("data-workspace-object=", object_html)
+            self.assertIn("data-object-row", object_html)
+            self.assertIn("data-object-add", object_html)
+            self.assertIn("data-object-edit", object_html)
             index_html = client.get(paths[-1], base_url="https://forge.test").data.decode()
             self.assertIn("data-menu-toggle", index_html)
             self.assertIn("data-config-pull-progress", index_html)
@@ -361,6 +364,48 @@ class TargetAdapterTests(unittest.TestCase):
             main.workspace_config_path(main.workspace_row(workspace_id)).unlink(missing_ok=True)
             with main.db() as conn:
                 conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
+    def test_offline_object_create_preview_and_apply_creates_new_workspace(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("offline-object", 1, "", "", "panos", "{}", b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="existing"><ip-netmask>192.0.2.1/32</ip-netmask></entry></address></entry></vsys></entry></devices></config>'''
+        workspace_id = main.store_config_workspace(profile, "objects", "config.xml", xml, "upload")
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1
+            login["username"] = "test"
+            login["must_change"] = False
+            login["csrf"] = "object-csrf"
+        try:
+            preview = client.post(
+                f"/config-workspaces/{workspace_id}/objects/preview",
+                data={"csrf": "object-csrf", "scope": "vsys1", "object_type": "addresses", "name": "added", "value_type": "ip_netmask", "value": "192.0.2.2/32", "description": "new object"},
+                base_url="https://forge.test",
+            )
+            self.assertEqual(preview.status_code, 200)
+            parser = NavigationTargets(); parser.feed(preview.data.decode())
+            action = next(item for item in parser.actions if "/config-workspaces/object-drafts/" in item)
+            applied = client.post(action, data={"csrf": "object-csrf"}, base_url="https://forge.test")
+            self.assertEqual(applied.status_code, 302)
+            with main.db() as conn:
+                latest = conn.execute("SELECT * FROM config_workspaces WHERE profile_id=? ORDER BY id DESC LIMIT 1", (profile_id,)).fetchone()
+            self.assertNotEqual(latest["id"], workspace_id)
+            _, objects = main.scoped_objects(main.workspace_config_path(latest).read_bytes(), "vsys1", "addresses")
+            self.assertEqual([item["name"] for item in objects], ["existing", "added"])
+        finally:
+            with main.db() as conn:
+                workspaces = conn.execute("SELECT * FROM config_workspaces WHERE profile_id=?", (profile_id,)).fetchall()
+            for item in workspaces:
+                main.workspace_config_path(item).unlink(missing_ok=True)
+            with main.db() as conn:
+                conn.execute("DELETE FROM config_workspaces WHERE profile_id=?", (profile_id,))
                 conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
 
     def test_oversized_form_is_rejected(self):

@@ -33,7 +33,8 @@ from vendor.paloalto_light_syslog import FlowStore, parse_panos_syslog
 from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_single_replacements
 from app.offline_config import (
     OBJECT_NODES, POLICY_NODES, OfflineConfigError, available_scopes, available_templates,
-    configuration_inventory, normalized_config_xml, parse_snapshot,
+    apply_object_changes, configuration_inventory, normalized_config_xml, parse_snapshot,
+    object_fingerprint as offline_object_fingerprint,
     policy_fingerprint as offline_policy_fingerprint, render_set_commands,
     replace_policy_in_snapshot, safe_workspace_path, scoped_objects,
     scoped_policies, snapshot_sha256, referenced_template,
@@ -1066,6 +1067,10 @@ WORKSPACE_DEVICE_NAV = {
     "VM Information Sources": "vm-information-sources", "Licenses": "licenses",
     "Dynamic Updates": "dynamic-updates", "Software": "software",
 }
+WORKSPACE_EDITABLE_OBJECT_TYPES = {
+    "addresses", "address-groups", "application-groups",
+    "services", "service-groups", "tags",
+}
 
 
 @app.get("/config-workspaces/<int:workspace_id>/edit")
@@ -1109,6 +1114,7 @@ def config_workspace_editor(workspace_id):
         workspace_contexts[str(workspace_id)] = {"scope": scope, "template": template}
         session["workspace_contexts"] = dict(list(workspace_contexts.items())[-20:])
         policies = objects = []
+        workspace_object_catalog = []
         alternate_policy_count = 0
         inventory = {"network": [], "device": []}
         if workspace_view == "policies":
@@ -1119,6 +1125,19 @@ def config_workspace_editor(workspace_id):
                 alternate_policy_count = len(alternate_policies)
         elif workspace_view == "objects":
             _, objects = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
+            related_types = {
+                "address-groups": ("addresses", "address-groups"),
+                "application-groups": ("applications", "application-groups"),
+                "service-groups": ("services", "service-groups"),
+            }.get(object_type, ())
+            seen_catalog = set()
+            for related_type in related_types:
+                _, related_objects = scoped_objects(xml_bytes, scope, related_type, parsed=(parsed_root, snapshot))
+                for item in related_objects:
+                    key = (item["name"], related_type)
+                    if key not in seen_catalog:
+                        seen_catalog.add(key)
+                        workspace_object_catalog.append({"name": item["name"], "kind": related_type})
         else:
             inventory = configuration_inventory(xml_bytes, scope, template, parsed=(parsed_root, snapshot))
             for item in inventory["network"]:
@@ -1135,6 +1154,8 @@ def config_workspace_editor(workspace_id):
             rulebase=rulebase, policies=policies, edit_policy=edit_policy,
             alternate_policy_count=alternate_policy_count,
             object_type=object_type, object_nodes=OBJECT_NODES, objects=objects,
+            workspace_object_catalog=workspace_object_catalog,
+            workspace_editable_object_types=WORKSPACE_EDITABLE_OBJECT_TYPES,
             config_section=config_section,
             inventory=inventory, offline_policy_fields=OFFLINE_POLICY_FIELDS,
             workspace_policy_nav=WORKSPACE_POLICY_NAV, workspace_object_nav=WORKSPACE_OBJECT_NAV,
@@ -1222,6 +1243,112 @@ def config_workspace_policy_apply(draft_id):
         flash(f"Wijziging niet bewaard: {exc}", "error")
         workspace_id = json.loads(draft_path.read_text()).get("workspace_id") if draft_path.is_file() else None
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id)) if workspace_id else redirect(url_for("index"))
+
+
+@app.post("/config-workspaces/<int:workspace_id>/objects/preview")
+@login_required
+def config_workspace_object_preview(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    scope = request.form.get("scope", "")
+    object_type = request.form.get("object_type", "")
+    try:
+        if object_type not in WORKSPACE_EDITABLE_OBJECT_TYPES:
+            raise OfflineConfigError("Dit objecttype is momenteel alleen-lezen")
+        xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
+        _, existing = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
+        original_name = request.form.get("object_id", "").strip()
+        before = next((item for item in existing if item["name"] == original_name and item["editable"]), None) if original_name else None
+        if original_name and before is None:
+            raise OfflineConfigError("Alleen een object uit de geselecteerde scope kan worden gewijzigd")
+        payload = scm_object_payload(object_type, request.form, {})
+        validate_object_payload(payload, object_type, existing, original_name)
+        operation = "update" if before else "create"
+        draft_id = secrets.token_urlsafe(24)
+        draft = {
+            "workspace_id": workspace_id, "scope": scope, "object_type": object_type,
+            "operation": operation, "payload": payload, "before": before,
+            "changes": [{
+                "operation": operation, "original_name": original_name,
+                "fingerprint": offline_object_fingerprint(before) if before else "",
+                "replacement_xml": object_payload_xml(payload),
+            }], "created_at": now(),
+        }
+        draft_path = OBJECT_DRAFTS / f"offline-object-{draft_id}.json"
+        draft_path.write_text(json.dumps(draft)); draft_path.chmod(0o600)
+        return render_template("workspace_object_preview.html", workspace=workspace, draft=draft, draft_id=draft_id)
+    except Exception as exc:
+        flash(f"Objectwijziging niet voorbereid: {exc}", "error")
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, scope=scope, workspace_view="objects", object_type=object_type))
+
+
+@app.post("/config-workspaces/<int:workspace_id>/objects/delete-preview")
+@login_required
+def config_workspace_object_delete_preview(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    scope = request.form.get("scope", "")
+    object_type = request.form.get("object_type", "")
+    try:
+        if object_type not in WORKSPACE_EDITABLE_OBJECT_TYPES:
+            raise OfflineConfigError("Dit objecttype is momenteel alleen-lezen")
+        selected_names = list(dict.fromkeys(request.form.getlist("object_id")))
+        if not selected_names:
+            raise OfflineConfigError("Selecteer minstens één object")
+        xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
+        _, existing = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
+        selected = [item for item in existing if item["name"] in selected_names and item["editable"]]
+        if len(selected) != len(selected_names):
+            raise OfflineConfigError("Een geselecteerd object is inherited of bestaat niet meer")
+        changes = [{"operation": "delete", "original_name": item["name"], "fingerprint": offline_object_fingerprint(item)} for item in selected]
+        draft_id = secrets.token_urlsafe(24)
+        draft = {
+            "workspace_id": workspace_id, "scope": scope, "object_type": object_type,
+            "operation": "delete", "objects": selected, "changes": changes, "created_at": now(),
+        }
+        draft_path = OBJECT_DRAFTS / f"offline-object-{draft_id}.json"
+        draft_path.write_text(json.dumps(draft)); draft_path.chmod(0o600)
+        return render_template("workspace_object_preview.html", workspace=workspace, draft=draft, draft_id=draft_id)
+    except Exception as exc:
+        flash(f"Objecten niet voorbereid voor verwijderen: {exc}", "error")
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, scope=scope, workspace_view="objects", object_type=object_type))
+
+
+@app.post("/config-workspaces/object-drafts/<draft_id>/apply")
+@login_required
+def config_workspace_object_apply(draft_id):
+    if not draft_id or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in draft_id):
+        return "Not found", 404
+    draft_path = OBJECT_DRAFTS / f"offline-object-{draft_id}.json"
+    if not draft_path.is_file():
+        return "Not found", 404
+    try:
+        draft = json.loads(draft_path.read_text())
+        workspace = workspace_row(int(draft["workspace_id"]))
+        if not workspace:
+            raise OfflineConfigError("De bronworkspace bestaat niet meer")
+        new_xml = apply_object_changes(
+            workspace_config_path(workspace).read_bytes(), draft["scope"],
+            draft["object_type"], draft["changes"],
+        )
+        with db() as conn:
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+        if not profile:
+            raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
+        new_id = store_config_workspace(
+            profile, f"{workspace['name']} · object edit {now()}", workspace["original_name"], new_xml, "edit",
+        )
+        set_active_config_workspace(workspace["profile_id"], new_id)
+        draft_path.unlink(missing_ok=True)
+        audit("config-workspace-object-edited", f"source={workspace['id']} workspace={new_id} scope={draft['scope']} type={draft['object_type']} operation={draft['operation']}")
+        flash("Objectwijziging bewaard in een nieuwe workspaceversie; de bron bleef onaangeroerd.", "success")
+        return redirect(url_for("config_workspace_editor", workspace_id=new_id, scope=draft["scope"], workspace_view="objects", object_type=draft["object_type"]))
+    except Exception as exc:
+        flash(f"Objectwijziging niet bewaard: {exc}", "error")
+        workspace_id = json.loads(draft_path.read_text()).get("workspace_id") if draft_path.is_file() else None
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, workspace_view="objects")) if workspace_id else redirect(url_for("index"))
 
 
 @app.post("/profiles/<int:profile_id>/config-workspaces/upload")
