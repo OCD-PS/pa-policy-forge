@@ -121,6 +121,18 @@ class TargetAdapterTests(unittest.TestCase):
         main.app.jinja_env.get_template("workspace_push.html")
         main.app.jinja_env.get_template("workspace_object_preview.html")
 
+    def test_internal_xml_fields_are_not_serialized_into_gui_records(self):
+        record = {
+            "name": "visible", "_xml": "<entry name='secret'/>", "_raw": {"hidden": True},
+            "nested": [{"value": "shown", "_transport": "hidden"}],
+        }
+        public = main.public_ui_record(record)
+        self.assertEqual(public, {"name": "visible", "nested": [{"value": "shown"}]})
+        workspace_template = (main.BASE / "app" / "templates" / "workspace_editor.html").read_text()
+        live_template = (main.BASE / "app" / "templates" / "app.html").read_text()
+        self.assertIn("public_ui_record|tojson", workspace_template)
+        self.assertIn("public_ui_record|tojson", live_template)
+
     def test_workspace_actionbar_is_scoped_to_the_right_content_pane(self):
         css = (main.BASE / "app" / "static" / "app.css").read_text()
         self.assertIn(".workspace-editor-content .object-actionbar", css)

@@ -156,6 +156,18 @@ sys.path.insert(0, str(BASE / "vendor"))
 from vendor import bdnd_panos_policy_builder as policy_api
 
 
+def public_ui_record(value):
+    """Remove transport/internal fields before serializing records into HTML."""
+    if isinstance(value, dict):
+        return {key: public_ui_record(item) for key, item in value.items() if not str(key).startswith("_")}
+    if isinstance(value, list):
+        return [public_ui_record(item) for item in value]
+    return value
+
+
+app.jinja_env.filters["public_ui_record"] = public_ui_record
+
+
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(APP_DB, timeout=30)
     conn.row_factory = sqlite3.Row
