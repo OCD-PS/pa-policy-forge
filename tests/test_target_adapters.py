@@ -330,6 +330,37 @@ class TargetAdapterTests(unittest.TestCase):
                 conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
                 conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
 
+    def test_workspace_xml_is_parsed_once_and_reused_across_navigation(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("cache-test", 1, "", "", "panos", "{}", b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="host"><ip-netmask>192.0.2.1/32</ip-netmask></entry></address><rulebase><security><rules><entry name="allow"/></rules></security></rulebase></entry></vsys></entry></devices></config>'''
+        workspace_id = main.store_config_workspace(profile, "cache", "config.xml", xml, "upload")
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1
+            login["username"] = "test"
+            login["must_change"] = False
+        main.cached_workspace_config.cache_clear()
+        try:
+            with patch.object(main, "parse_snapshot", wraps=main.parse_snapshot) as parser:
+                policy = client.get(f"/config-workspaces/{workspace_id}/edit?workspace_view=policies", base_url="https://forge.test")
+                objects = client.get(f"/config-workspaces/{workspace_id}/edit?workspace_view=objects", base_url="https://forge.test")
+                self.assertEqual(policy.status_code, 200)
+                self.assertEqual(objects.status_code, 200)
+                self.assertEqual(parser.call_count, 1)
+        finally:
+            main.cached_workspace_config.cache_clear()
+            main.workspace_config_path(main.workspace_row(workspace_id)).unlink(missing_ok=True)
+            with main.db() as conn:
+                conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
     def test_oversized_form_is_rejected(self):
         client = main.app.test_client()
         response = client.post(

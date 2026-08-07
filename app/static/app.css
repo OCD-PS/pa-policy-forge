@@ -97,6 +97,10 @@ h3 { margin-bottom: 10px; font-size: 16px; }
 .workspace-editor-content { max-width: 1800px; margin: 0 auto; }
 .workspace-scope-bar { padding: 14px 18px; }
 .workspace-scope-bar .field { max-width: 520px; }
+.workspace-context-loading .config-tree a, .workspace-context-loading .workspace-nav a, .workspace-context-loading .workspace-subnav a { pointer-events: none; opacity: .5; }
+.workspace-loading-status { position: fixed; z-index: 80; right: 22px; bottom: 22px; width: min(360px,calc(100vw - 44px)); display: grid; gap: 7px; padding: 15px 17px; border: 1px solid #4a4a4a; border-left: 4px solid var(--orange); border-radius: 8px; background: #171717; box-shadow: var(--shadow); }
+.workspace-loading-status strong, .workspace-loading-status span { display: block; }
+.workspace-loading-status span { color: var(--muted); font-size: 12px; }
 .inherited-row { opacity: .68; }
 .inherited-row td:first-child::after { content: " inherited"; color: var(--muted); font-size: 11px; margin-left: 7px; }
 .workspace-policy-dialog { width: min(1040px, calc(100vw - 32px)); max-height: calc(100vh - 32px); overflow: auto; }

@@ -267,8 +267,8 @@ def policy_record(entry: ET.Element, kind: str, owner: str, rulebase: str, edita
     return record
 
 
-def scoped_policies(xml_bytes: bytes, scope: str, kind: str, rulebase: str = "pre") -> tuple[ConfigSnapshot, list[dict]]:
-    root, snapshot = parse_snapshot(xml_bytes)
+def scoped_policies(xml_bytes: bytes, scope: str, kind: str, rulebase: str = "pre", parsed=None) -> tuple[ConfigSnapshot, list[dict]]:
+    root, snapshot = parsed if parsed is not None else parse_snapshot(xml_bytes)
     if kind not in POLICY_NODES:
         raise OfflineConfigError(f"Onbekend policytype: {kind}")
     if snapshot.kind == "panorama" and rulebase not in {"pre", "post"}:
@@ -320,8 +320,8 @@ def _object_fields(entry: ET.Element) -> list[dict]:
     return fields
 
 
-def scoped_objects(xml_bytes: bytes, scope: str, object_type: str) -> tuple[ConfigSnapshot, list[dict]]:
-    root, snapshot = parse_snapshot(xml_bytes)
+def scoped_objects(xml_bytes: bytes, scope: str, object_type: str, parsed=None) -> tuple[ConfigSnapshot, list[dict]]:
+    root, snapshot = parsed if parsed is not None else parse_snapshot(xml_bytes)
     node = OBJECT_NODES.get(object_type)
     if not node:
         raise OfflineConfigError(f"Onbekend objecttype: {object_type}")
@@ -341,8 +341,8 @@ def scoped_objects(xml_bytes: bytes, scope: str, object_type: str) -> tuple[Conf
     return snapshot, records
 
 
-def configuration_inventory(xml_bytes: bytes, scope: str, template: str = "") -> dict[str, list[dict]]:
-    root, snapshot = parse_snapshot(xml_bytes)
+def configuration_inventory(xml_bytes: bytes, scope: str, template: str = "", parsed=None) -> dict[str, list[dict]]:
+    root, snapshot = parsed if parsed is not None else parse_snapshot(xml_bytes)
     scope_root = _scope_root(root, snapshot, scope)
     if scope_root is None:
         return {"network": [], "device": []}

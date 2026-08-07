@@ -552,6 +552,21 @@
     dialog.querySelector("[data-workspace-object-close]").addEventListener("click", function () { dialog.close(); });
   }
 
+  function setupWorkspaceContextLoading() {
+    var form = document.querySelector(".workspace-scope-bar");
+    if (!form) return;
+    all("select", form).forEach(function (select) {
+      select.addEventListener("change", function () {
+        document.body.classList.add("workspace-context-loading");
+        var status = document.createElement("div");
+        status.className = "workspace-loading-status";
+        status.setAttribute("role", "status");
+        status.innerHTML = '<div class="progress"><div class="progress-bar progress-indeterminate"></div></div><strong>Configuratie laden…</strong><span>De gekozen context wordt behouden.</span>';
+        document.body.appendChild(status);
+      });
+    });
+  }
+
   document.addEventListener("DOMContentLoaded", function () {
     setupNavigation();
     setupSidebarCollapse();
@@ -568,5 +583,6 @@
     setupOfflinePolicyTabs();
     setupConfigPullProgress();
     setupWorkspaceObjects();
+    setupWorkspaceContextLoading();
   });
 })();

@@ -23,7 +23,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
-from functools import wraps
+from functools import lru_cache, wraps
 
 from cryptography.fernet import Fernet
 from defusedxml import ElementTree as SafeET
@@ -953,6 +953,18 @@ def workspace_config_path(workspace) -> Path:
     return path
 
 
+@lru_cache(maxsize=4)
+def cached_workspace_config(stored_path: str, sha256: str):
+    path = safe_workspace_path(CONFIG_WORKSPACES, stored_path)
+    if not path.is_file():
+        raise FileNotFoundError("Workspace XML ontbreekt")
+    xml_bytes = path.read_bytes()
+    if snapshot_sha256(xml_bytes) != sha256:
+        raise OfflineConfigError("Workspace XML komt niet meer overeen met de opgeslagen checksum")
+    root, snapshot = parse_snapshot(xml_bytes)
+    return xml_bytes, root, snapshot
+
+
 def active_config_workspace_id(profile) -> int:
     try:
         return int(profile_settings(profile).get("config_workspace_id") or 0)
@@ -1048,8 +1060,7 @@ def config_workspace_editor(workspace_id):
     if not workspace:
         return "Not found", 404
     try:
-        xml_bytes = workspace_config_path(workspace).read_bytes()
-        _, snapshot = parse_snapshot(xml_bytes)
+        xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
         scopes = available_scopes(snapshot)
         if not scopes:
             raise OfflineConfigError("Geen device group of VSYS gevonden")
@@ -1086,15 +1097,15 @@ def config_workspace_editor(workspace_id):
         alternate_policy_count = 0
         inventory = {"network": [], "device": []}
         if workspace_view == "policies":
-            _, policies = scoped_policies(xml_bytes, scope, policy_kind, rulebase)
+            _, policies = scoped_policies(xml_bytes, scope, policy_kind, rulebase, parsed=(parsed_root, snapshot))
             if snapshot.kind == "panorama":
                 other_rulebase = "post" if rulebase == "pre" else "pre"
-                _, alternate_policies = scoped_policies(xml_bytes, scope, policy_kind, other_rulebase)
+                _, alternate_policies = scoped_policies(xml_bytes, scope, policy_kind, other_rulebase, parsed=(parsed_root, snapshot))
                 alternate_policy_count = len(alternate_policies)
         elif workspace_view == "objects":
-            _, objects = scoped_objects(xml_bytes, scope, object_type)
+            _, objects = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
         else:
-            inventory = configuration_inventory(xml_bytes, scope, template)
+            inventory = configuration_inventory(xml_bytes, scope, template, parsed=(parsed_root, snapshot))
             for item in inventory["network"]:
                 item["slug"] = WORKSPACE_NETWORK_NAV.get(item["name"], "")
             for item in inventory["device"]:
@@ -1126,12 +1137,12 @@ def config_workspace_policy_preview(workspace_id):
     if not workspace:
         return "Not found", 404
     try:
-        xml_bytes = workspace_config_path(workspace).read_bytes()
+        xml_bytes, parsed_root, parsed_snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
         scope = request.form.get("scope", "")
         kind = request.form.get("policy_kind", "security")
         rulebase = request.form.get("rulebase", "pre")
         name = request.form.get("policy_name", "")
-        _, policies = scoped_policies(xml_bytes, scope, kind, rulebase)
+        _, policies = scoped_policies(xml_bytes, scope, kind, rulebase, parsed=(parsed_root, parsed_snapshot))
         before = next((item for item in policies if item["name"] == name and item["editable"]), None)
         if before is None:
             raise OfflineConfigError("Alleen een policy uit de geselecteerde scope kan hier worden gewijzigd")
