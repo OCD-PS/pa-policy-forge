@@ -173,6 +173,9 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertIn('class="token-chip-list" data-offline-policy-values', workspace_template)
         self.assertIn('class="token-chip-list" data-bulk-values', live_template)
         self.assertIn('class="token-chip-list" data-single-tag-values', live_template)
+        self.assertIn('data-single-token-field="{{field}}"', live_template)
+        self.assertIn('class="token-chip-list" data-single-token-values', live_template)
+        self.assertIn('entry._addTokenValue = addSingleToken', javascript)
         self.assertIn('tokenInput.className = "token-input"', javascript)
         self.assertIn('.token-input:focus-within', css)
 
