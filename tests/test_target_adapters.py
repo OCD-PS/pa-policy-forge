@@ -149,7 +149,10 @@ class TargetAdapterTests(unittest.TestCase):
             with patch.object(main, "fetch_scm_policy_type") as fetch:
                 response = client.get(f"/?policy_profile={profile_id}", base_url="https://forge.test")
             self.assertEqual(response.status_code, 200)
-            self.assertIn(b"Kies \xc3\xa9\xc3\xa9n volledige configuratiebron", response.data)
+            self.assertIn(b">Ophalen<", response.data)
+            self.assertIn(b">Import<", response.data)
+            self.assertNotIn(b"Naam workspace", response.data)
+            self.assertNotIn(b"Bewaar de volledige candidate", response.data)
             self.assertIn(b"API snapshot", response.data)
             fetch.assert_not_called()
         finally:
