@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+import re
 from html.parser import HTMLParser
 from urllib.parse import urlsplit
 from unittest.mock import patch
@@ -151,6 +152,10 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertIn("data-single-tag-picker", live_template)
         self.assertNotIn('<label>Tags</label><input name="tags"', workspace_template)
         self.assertNotIn('<label>Tags</label><input name="tags"', live_template)
+        for template in (workspace_template, live_template):
+            self.assertRegex(template, re.compile(r"data-object-picker-add-selected.*data-member-results", re.S))
+            self.assertRegex(template, re.compile(r"data-policy-picker-add-selected.*data-policy-picker-results", re.S))
+        self.assertIn('row.addEventListener("click", toggleSelection)', javascript)
 
     def test_workspace_actionbar_is_scoped_to_the_right_content_pane(self):
         css = (main.BASE / "app" / "static" / "app.css").read_text()
