@@ -1188,6 +1188,7 @@ def config_workspace_editor(workspace_id):
         policies = objects = []
         workspace_object_catalog = []
         workspace_policy_catalog = []
+        application_state = {}
         alternate_policy_count = 0
         inventory = {"network": [], "device": []}
         if workspace_view == "policies":
@@ -1214,9 +1215,11 @@ def config_workspace_editor(workspace_id):
         elif workspace_view == "objects":
             _, objects = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
             related_types = {
-                "address-groups": ("addresses", "address-groups"),
-                "application-groups": ("applications", "application-groups"),
-                "service-groups": ("services", "service-groups"),
+                "addresses": ("tags",),
+                "address-groups": ("addresses", "address-groups", "tags"),
+                "application-groups": ("applications", "application-groups", "tags"),
+                "services": ("tags",),
+                "service-groups": ("services", "service-groups", "tags"),
             }.get(object_type, ())
             seen_catalog = set()
             for related_type in related_types:
@@ -1226,6 +1229,8 @@ def config_workspace_editor(workspace_id):
                     if key not in seen_catalog:
                         seen_catalog.add(key)
                         workspace_object_catalog.append({"name": item["name"], "kind": related_type})
+            if object_type == "application-groups":
+                application_state = cached_application_catalog(workspace_profile)
         else:
             inventory = configuration_inventory(xml_bytes, scope, template, parsed=(parsed_root, snapshot))
             for item in inventory["network"]:
@@ -1246,7 +1251,7 @@ def config_workspace_editor(workspace_id):
             edit_object_name=edit_object_name,
             workspace_object_catalog=workspace_object_catalog,
             workspace_policy_catalog=workspace_policy_catalog,
-            application_catalog_state=application_state if workspace_view == "policies" else {},
+            application_catalog_state=application_state,
             workspace_editable_object_types=WORKSPACE_EDITABLE_OBJECT_TYPES,
             workspace_structured_object_types=WORKSPACE_STRUCTURED_OBJECT_TYPES,
             config_section=config_section,

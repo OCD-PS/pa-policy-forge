@@ -133,6 +133,19 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertIn("public_ui_record|tojson", workspace_template)
         self.assertIn("public_ui_record|tojson", live_template)
 
+    def test_object_tags_and_members_share_multiselect_picker_controls(self):
+        workspace_template = (main.BASE / "app" / "templates" / "workspace_editor.html").read_text()
+        live_template = (main.BASE / "app" / "templates" / "app.html").read_text()
+        javascript = (main.BASE / "app" / "static" / "app.js").read_text()
+        for template in (workspace_template, live_template):
+            self.assertIn("data-object-tag-values", template)
+            self.assertIn("data-tag-picker-open", template)
+            self.assertIn("data-object-picker-selected-count", template)
+            self.assertIn("data-object-picker-add-selected", template)
+        self.assertIn("objectPickerSelections", javascript)
+        self.assertIn('openObjectPicker("tags")', javascript)
+        self.assertIn("loadObjectApplications", javascript)
+
     def test_workspace_actionbar_is_scoped_to_the_right_content_pane(self):
         css = (main.BASE / "app" / "static" / "app.css").read_text()
         self.assertIn(".workspace-editor-content .object-actionbar", css)
