@@ -104,6 +104,10 @@ stores the complete normalized XML with a SHA-256 fingerprint, and inventories:
 The workspace navigation is vertical and independently collapsible. Complete XML
 and best-effort set-command exports are available. A complete snapshot can also be
 uploaded through the target XML API and loaded as the new candidate configuration.
+Supported entries in the vertical tree link directly to their policy, object,
+Network, or Device view. Categories that do not yet have an editor are visibly
+disabled instead of acting like links. Internal navigation and form targets are
+covered by an authenticated route-and-fragment regression test.
 This high-impact action requires typing the workspace name and never commits the
 candidate automatically. Device groups, templates, VSYS selections, and unknown
 XML nodes remain preserved so later graphical editors can operate as scoped diffs

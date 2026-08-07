@@ -89,7 +89,7 @@
 
   function setupConfirmations() {
     document.addEventListener("click", function (event) {
-      var target = event.target.closest("[data-confirm]");
+      var target = event.target.closest("[data-confirm]:not(form)");
       if (!target) return;
       var message = target.getAttribute("data-confirm") || "Weet je zeker dat je wilt doorgaan?";
       if (!window.confirm(message)) event.preventDefault();
@@ -500,6 +500,19 @@
     updateCount(); updateGroupType(); updateTimeouts();
   }
 
+  function setupOfflinePolicyTabs() {
+    var tabs = all("[data-offline-policy-tab]");
+    var panels = all("[data-offline-policy-panel]");
+    tabs.forEach(function (tab) {
+      tab.addEventListener("click", function () {
+        tabs.forEach(function (item) { item.classList.toggle("is-active", item === tab); });
+        panels.forEach(function (panel) {
+          panel.classList.toggle("is-active", panel.dataset.offlinePolicyPanel === tab.dataset.offlinePolicyTab);
+        });
+      });
+    });
+  }
+
   document.addEventListener("DOMContentLoaded", function () {
     setupNavigation();
     setupSidebarCollapse();
@@ -513,5 +526,6 @@
     setupPushOptions();
     setupPolicyManagement();
     setupObjectManagement();
+    setupOfflinePolicyTabs();
   });
 })();

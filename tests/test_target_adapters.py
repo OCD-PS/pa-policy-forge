@@ -2,6 +2,8 @@ import json
 import os
 import tempfile
 import unittest
+from html.parser import HTMLParser
+from urllib.parse import urlsplit
 from unittest.mock import patch
 
 os.environ.setdefault("PPF_DATA_DIR", tempfile.mkdtemp(prefix="forge-adapter-test-"))
@@ -9,6 +11,23 @@ os.environ.setdefault("PPF_SYSLOG_PORT", "55141")
 os.environ.setdefault("PPF_BOOTSTRAP_PASSWORD", "unit-test-bootstrap-password")
 
 from app import main
+
+
+class NavigationTargets(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+        self.actions = []
+        self.ids = set()
+
+    def handle_starttag(self, tag, attrs):
+        values = dict(attrs)
+        if values.get("id"):
+            self.ids.add(values["id"])
+        if tag == "a" and values.get("href"):
+            self.links.append(values["href"])
+        if tag == "form" and values.get("action"):
+            self.actions.append(values["action"])
 
 
 class TargetAdapterTests(unittest.TestCase):
@@ -199,6 +218,61 @@ class TargetAdapterTests(unittest.TestCase):
                 with main.db() as conn:
                     conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
                     conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
+    def test_rendered_workspace_navigation_has_no_dead_internal_targets(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("link-audit", 1, "", "", "panos", "{}", b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        xml = b'''<config><devices><entry name="localhost.localdomain"><network><interface><ethernet><entry name="ethernet1/1"/></ethernet></interface></network><vsys><entry name="vsys1"><zone><entry name="Trust"/></zone><address><entry name="host-a"><ip-netmask>192.0.2.1/32</ip-netmask></entry></address><rulebase><security><rules><entry name="allow-a"><from><member>Trust</member></from><to><member>Trust</member></to><source><member>host-a</member></source><destination><member>any</member></destination><application><member>ping</member></application><service><member>application-default</member></service><action>allow</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'''
+        workspace_id = main.store_config_workspace(profile, "link audit", "config.xml", xml, "upload")
+        main.set_active_config_workspace(profile_id, workspace_id)
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1
+            login["username"] = "test"
+            login["must_change"] = False
+        try:
+            paths = [
+                f"/config-workspaces/{workspace_id}/edit?workspace_view=policies",
+                f"/config-workspaces/{workspace_id}/edit?workspace_view=objects",
+                f"/config-workspaces/{workspace_id}/edit?workspace_view=network",
+                f"/config-workspaces/{workspace_id}/edit?workspace_view=device",
+                f"/config-workspaces/{workspace_id}/push-preview",
+                f"/?policy_profile={profile_id}&policy_source=choose",
+            ]
+            parser = NavigationTargets()
+            for path in paths:
+                response = client.get(path, base_url="https://forge.test")
+                self.assertEqual(response.status_code, 200, path)
+                parser.feed(response.data.decode())
+                self.assertNotIn("#config-workspaces", response.data.decode())
+            for href in set(parser.links):
+                parsed = urlsplit(href)
+                if parsed.scheme or parsed.netloc or parsed.path.startswith("/static/"):
+                    continue
+                target = parsed.path or "/"
+                if parsed.query:
+                    target += "?" + parsed.query
+                response = client.get(target, base_url="https://forge.test")
+                self.assertNotIn(response.status_code, {404, 405, 500}, href)
+                if parsed.fragment and response.status_code == 200 and "text/html" in response.content_type:
+                    target_parser = NavigationTargets()
+                    target_parser.feed(response.data.decode())
+                    self.assertIn(parsed.fragment, target_parser.ids, href)
+            for action in set(parser.actions):
+                parsed = urlsplit(action)
+                response = client.open(parsed.path, method="OPTIONS", base_url="https://forge.test")
+                self.assertNotIn(response.status_code, {404, 405, 500}, action)
+        finally:
+            main.workspace_config_path(main.workspace_row(workspace_id)).unlink(missing_ok=True)
+            with main.db() as conn:
+                conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
 
     def test_oversized_form_is_rejected(self):
         client = main.app.test_client()

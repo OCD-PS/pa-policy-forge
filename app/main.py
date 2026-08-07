@@ -1000,6 +1000,32 @@ OFFLINE_POLICY_FIELDS = (
     "from", "to", "source", "destination", "source_user", "category",
     "application", "service", "tag",
 )
+WORKSPACE_POLICY_NAV = {
+    "Security": "security", "NAT": "nat", "QoS": "qos",
+    "Policy Based Forwarding": "pbf", "Decryption": "decryption",
+    "Tunnel Inspection": "tunnel-inspection", "Application Override": "application-override",
+    "Authentication": "authentication", "DoS Protection": "dos", "SD-WAN": "sdwan",
+}
+WORKSPACE_OBJECT_NAV = {
+    "Addresses": "addresses", "Address Groups": "address-groups", "Regions": "regions",
+    "Applications": "applications", "Application Groups": "application-groups",
+    "Application Filters": "application-filters", "Services": "services",
+    "Service Groups": "service-groups", "Tags": "tags",
+    "External Dynamic Lists": "external-dynamic-lists",
+    "Security Profile Groups": "security-profile-groups", "Log Forwarding": "log-forwarding",
+    "Authentication": "authentication",
+}
+WORKSPACE_NETWORK_NAV = {
+    "Interfaces": "interfaces", "Zones": "zones", "Virtual Routers": "virtual-routers",
+    "Logical Routers": "logical-routers", "IPSec Tunnels": "ipsec-tunnels",
+    "GlobalProtect Portals": "globalprotect-portals",
+    "GlobalProtect Gateways": "globalprotect-gateways", "Network Profiles": "network-profiles",
+}
+WORKSPACE_DEVICE_NAV = {
+    "Setup": "setup", "Administrators": "administrators", "Certificates": "certificates",
+    "Server Profiles": "server-profiles", "Log Settings": "log-settings",
+    "High Availability": "high-availability",
+}
 
 
 @app.get("/config-workspaces/<int:workspace_id>/edit")
@@ -1037,6 +1063,10 @@ def config_workspace_editor(workspace_id):
             _, objects = scoped_objects(xml_bytes, scope, object_type)
         else:
             inventory = configuration_inventory(xml_bytes, scope)
+            for item in inventory["network"]:
+                item["slug"] = WORKSPACE_NETWORK_NAV.get(item["name"], "")
+            for item in inventory["device"]:
+                item["slug"] = WORKSPACE_DEVICE_NAV.get(item["name"], "")
         edit_name = request.args.get("edit_policy", "")
         edit_policy = next((item for item in policies if item["name"] == edit_name and item["editable"]), None)
         return render_template(
@@ -1046,6 +1076,8 @@ def config_workspace_editor(workspace_id):
             rulebase=rulebase, policies=policies, edit_policy=edit_policy,
             object_type=object_type, object_nodes=OBJECT_NODES, objects=objects,
             inventory=inventory, offline_policy_fields=OFFLINE_POLICY_FIELDS,
+            workspace_policy_nav=WORKSPACE_POLICY_NAV, workspace_object_nav=WORKSPACE_OBJECT_NAV,
+            workspace_network_nav=WORKSPACE_NETWORK_NAV, workspace_device_nav=WORKSPACE_DEVICE_NAV,
         )
     except Exception as exc:
         flash(f"Workspace niet geopend: {exc}", "error")
@@ -1324,22 +1356,6 @@ def index():
             if serials:
                 placeholders = ",".join("?" for _ in serials)
                 flows = conn.execute(f"SELECT * FROM flows WHERE serial IN ({placeholders}) ORDER BY last_seen DESC LIMIT 100", serials).fetchall()
-    config_profiles = [profile for profile in profiles if profile["target_type"] in {"panorama", "panos"}]
-    config_profile_id = request.args.get("config_profile", type=int)
-    selected_config_profile = next((profile for profile in config_profiles if profile["id"] == config_profile_id), None)
-    config_workspaces = []
-    selected_workspace = None
-    workspace_metadata = {}
-    if selected_config_profile:
-        with db() as conn:
-            config_workspaces = conn.execute(
-                "SELECT * FROM config_workspaces WHERE profile_id=? ORDER BY id DESC",
-                (selected_config_profile["id"],),
-            ).fetchall()
-        selected_workspace_id = request.args.get("workspace", type=int)
-        selected_workspace = next((item for item in config_workspaces if item["id"] == selected_workspace_id), None)
-        if selected_workspace:
-            workspace_metadata = json.loads(selected_workspace["metadata_json"] or "{}")
     policy_profile = None; policies = []; policy_error = ""; policy_objects = []; object_catalog = []; policy_catalog = []; policy_workspaces = []
     policy_source = request.args.get("policy_source", "").strip()
     policy_view = request.args.get("policy_view", "policies")
@@ -1375,7 +1391,7 @@ def index():
                         policies = fetch_scm_policy_type(policy_profile, policy_kind)
                         policy_catalog = fetch_object_catalog(policy_profile, "policy-picker")
                 except Exception as exc: policy_error = str(exc)
-    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, config_profiles=config_profiles, selected_config_profile=selected_config_profile, config_workspaces=config_workspaces, selected_workspace=selected_workspace, workspace_metadata=workspace_metadata, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
+    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
 
 
 def parse_zones(text: str) -> dict[str, str]:
