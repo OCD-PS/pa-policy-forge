@@ -120,6 +120,12 @@ class TargetAdapterTests(unittest.TestCase):
         main.app.jinja_env.get_template("app.html")
         main.app.jinja_env.get_template("workspace_push.html")
         main.app.jinja_env.get_template("workspace_object_preview.html")
+
+    def test_workspace_actionbar_is_scoped_to_the_right_content_pane(self):
+        css = (main.BASE / "app" / "static" / "app.css").read_text()
+        self.assertIn(".workspace-editor-content .object-actionbar", css)
+        self.assertIn("position: sticky", css)
+        self.assertIn("left: auto", css)
         main.app.jinja_env.get_template("workspace_editor.html")
         main.app.jinja_env.get_template("workspace_policy_preview.html")
 
