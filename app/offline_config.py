@@ -321,6 +321,41 @@ def _object_fields(entry: ET.Element) -> list[dict]:
     return fields
 
 
+def _object_edit_fields(entry: ET.Element) -> list[dict]:
+    """Flatten an entry into safe form fields without exposing raw XML.
+
+    Index based paths deliberately address the existing tree. The object
+    fingerprint prevents applying them to a tree that changed meanwhile.
+    Nested attributes and unsupported nodes remain untouched.
+    """
+    fields: list[dict] = []
+
+    def walk(node: ET.Element, path: list[int], labels: list[str]) -> None:
+        children = list(node)
+        if children and all(child.tag == "member" for child in children):
+            fields.append({
+                "path": "/".join(str(index) for index in path),
+                "label": " / ".join(labels),
+                "kind": "members",
+                "values": [(child.text or "") for child in children],
+            })
+            return
+        if not children:
+            fields.append({
+                "path": "/".join(str(index) for index in path),
+                "label": " / ".join(labels),
+                "kind": "boolean" if (node.text or "").strip().lower() in {"yes", "no"} else "text",
+                "value": node.text or "",
+            })
+            return
+        for index, child in enumerate(children):
+            walk(child, path + [index], labels + [child.tag.replace("-", " ").title()])
+
+    for index, child in enumerate(list(entry)):
+        walk(child, [index], [child.tag.replace("-", " ").title()])
+    return fields
+
+
 def object_fingerprint(record: dict) -> str:
     return hashlib.sha256(record["_xml"].encode()).hexdigest()
 
@@ -331,7 +366,8 @@ def object_record(entry: ET.Element, owner: str, editable: bool, object_type: st
         "owner": owner, "editable": editable, "description": entry.findtext("./description", ""),
         "comments": entry.findtext("./comments", ""), "tag": _members(entry, "tag"),
         "summary": _object_summary(entry), "values": _object_values(entry),
-        "fields": _object_fields(entry), "_xml": ET.tostring(entry, encoding="unicode"),
+        "fields": _object_fields(entry), "edit_fields": _object_edit_fields(entry),
+        "_xml": ET.tostring(entry, encoding="unicode"),
     }
     for key in ("ip-netmask", "ip-range", "ip-wildcard", "fqdn", "color"):
         value = entry.findtext(f"./{key}", "").strip()
@@ -385,8 +421,8 @@ EDITABLE_OBJECT_TAGS = {
 
 
 def apply_object_changes(xml_bytes: bytes, scope: str, object_type: str, changes: list[dict]) -> bytes:
-    if object_type not in EDITABLE_OBJECT_TAGS:
-        raise OfflineConfigError("Dit objecttype is momenteel alleen-lezen")
+    if object_type not in OBJECT_NODES:
+        raise OfflineConfigError("Onbekend objecttype")
     root, snapshot = parse_snapshot(xml_bytes)
     scope_root = _scope_root(root, snapshot, scope)
     if scope_root is None:
@@ -411,7 +447,29 @@ def apply_object_changes(xml_bytes: bytes, scope: str, object_type: str, changes
         if operation == "delete":
             container.remove(current)
             continue
-        replacement = SafeET.fromstring(change.get("replacement_xml", ""))
+        if change.get("generic_updates") is not None:
+            if current is None:
+                raise OfflineConfigError("Dit objecttype kan pas worden aangemaakt zodra een PAN-OS-schema beschikbaar is")
+            replacement = copy.deepcopy(current)
+            replacement.set("name", change.get("name", original_name).strip())
+            for update in change["generic_updates"]:
+                try:
+                    indices = [int(part) for part in update["path"].split("/")]
+                    target = replacement
+                    for index in indices:
+                        target = list(target)[index]
+                except (KeyError, ValueError, IndexError):
+                    raise OfflineConfigError("Een objectveld bestaat niet meer")
+                if update.get("kind") == "members":
+                    for child in list(target):
+                        target.remove(child)
+                    for value in update.get("values", []):
+                        member = ET.SubElement(target, "member")
+                        member.text = str(value)
+                else:
+                    target.text = str(update.get("value", ""))
+        else:
+            replacement = SafeET.fromstring(change.get("replacement_xml", ""))
         if replacement.tag != "entry" or not replacement.get("name"):
             raise OfflineConfigError("Ongeldig vervangend object")
         collision = next((entry for entry in container.findall("./entry") if entry.get("name") == replacement.get("name") and entry is not current), None)
@@ -421,6 +479,11 @@ def apply_object_changes(xml_bytes: bytes, scope: str, object_type: str, changes
             container.append(replacement)
             continue
         current.set("name", replacement.get("name", original_name))
+        if object_type not in EDITABLE_OBJECT_TAGS:
+            index = list(container).index(current)
+            container.remove(current)
+            container.insert(index, replacement)
+            continue
         editable_tags = EDITABLE_OBJECT_TAGS[object_type]
         for child in list(current):
             if child.tag in editable_tags:

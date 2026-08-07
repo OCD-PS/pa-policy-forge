@@ -474,6 +474,31 @@
     function commitDynamicEntry() { if (!dynamicEntry) return; var value = dynamicEntry.value.trim(); if (!value) return; dynamicTokens = dynamicTokens.concat(dynamicExpressionTokens(value)); dynamicEntry.value = ""; syncDynamicFilter(); }
     if (dynamicEntry) dynamicEntry.addEventListener("keydown", function (event) { if ((event.key === " " && !dynamicQuoteOpen(dynamicEntry.value)) || event.key === "Enter") { event.preventDefault(); commitDynamicEntry(); } });
     function setField(name, value) { var field = form.querySelector('[data-object-field="' + name + '"]'); if (!field) return; field.value = Array.isArray(value) ? value.join(", ") : (value == null ? "" : value); }
+    var genericEditor = dialog.dataset.genericObjectEditor === "true";
+    var genericUpdates = [];
+    function syncGenericUpdates() { var target = form.querySelector("[data-generic-object-updates]"); if (target) target.value = JSON.stringify(genericUpdates); }
+    function renderGenericFields(item) {
+      var container = form.querySelector("[data-generic-object-fields]"); if (!container) return;
+      container.innerHTML = ""; genericUpdates = (item.edit_fields || []).map(function (field) { return {path:field.path, label:field.label, kind:field.kind, value:field.value || "", values:(field.values || []).slice()}; });
+      genericUpdates.forEach(function (field) {
+        var wrapper = document.createElement("div"); wrapper.className = "field full generic-object-field";
+        var label = document.createElement("label"); label.textContent = field.label; wrapper.appendChild(label);
+        if (field.kind === "boolean") {
+          var select = document.createElement("select"); ["yes", "no"].forEach(function (value) { var option = document.createElement("option"); option.value = value; option.textContent = value === "yes" ? "Yes" : "No"; select.appendChild(option); }); select.value = field.value; select.addEventListener("change", function () { field.value = select.value; syncGenericUpdates(); }); wrapper.appendChild(select);
+        } else if (field.kind === "members") {
+          var chips = document.createElement("div"); chips.className = "policy-value-editor";
+          var entryRow = document.createElement("div"); entryRow.className = "member-editor"; var input = document.createElement("input"); input.placeholder = "Waarde toevoegen"; var addButton = document.createElement("button"); addButton.type = "button"; addButton.className = "btn"; addButton.textContent = "+"; entryRow.appendChild(input); entryRow.appendChild(addButton);
+          function renderValues() { chips.innerHTML = ""; field.values.forEach(function (value) { var chip = document.createElement("span"); chip.className = "policy-value-chip"; var text = document.createElement("span"); text.textContent = value; var remove = document.createElement("button"); remove.type = "button"; remove.textContent = "−"; remove.addEventListener("click", function () { field.values = field.values.filter(function (candidate) { return candidate !== value; }); syncGenericUpdates(); renderValues(); }); chip.appendChild(text); chip.appendChild(remove); chips.appendChild(chip); }); if (!field.values.length) { var empty = document.createElement("span"); empty.className = "muted"; empty.textContent = "Geen waarden"; chips.appendChild(empty); } }
+          function addValue() { var value = input.value.trim(); if (value && !field.values.includes(value)) field.values.push(value); input.value = ""; syncGenericUpdates(); renderValues(); }
+          addButton.addEventListener("click", addValue); input.addEventListener("keydown", function (event) { if (event.key === "Enter") { event.preventDefault(); addValue(); } }); wrapper.appendChild(chips); wrapper.appendChild(entryRow); renderValues();
+        } else {
+          var inputField = field.value.length > 160 ? document.createElement("textarea") : document.createElement("input"); inputField.value = field.value; inputField.addEventListener("input", function () { field.value = inputField.value; syncGenericUpdates(); }); wrapper.appendChild(inputField);
+        }
+        container.appendChild(wrapper);
+      });
+      if (!genericUpdates.length) { var empty = document.createElement("div"); empty.className = "empty-state"; empty.textContent = "Dit object bevat geen configureerbare waarden."; container.appendChild(empty); }
+      syncGenericUpdates();
+    }
     function openEditor(item) {
       form.reset(); form.querySelector("[data-object-id]").value = item && item.id ? item.id : "";
       dialog.querySelector("[data-object-dialog-title]").textContent = (item ? "Edit " : "Add ") + document.querySelector(".object-list h2").textContent;
@@ -483,6 +508,7 @@
       if (zoneConfig) { zoneConfig.hidden = !(item && item.network); if (item && item.network) { var visibleConfig = {}; Object.keys(item).sort().forEach(function (key) { if (!["_xml", "_raw"].includes(key)) visibleConfig[key] = item[key]; }); zoneConfig.querySelector("pre").textContent = JSON.stringify(visibleConfig, null, 2); } }
       if (item) {
         setField("name", item.name); setField("description", item.description); setField("comments", item.comments); setField("tag", item.tag);
+        if (genericEditor) renderGenericFields(item);
         ["ip_netmask", "ip_range", "ip_wildcard", "fqdn"].some(function (kind) { if (item[kind]) { setField("value_type", kind); setField("value", item[kind]); return true; } return false; });
         if (item.dynamic) { if (groupType) groupType.value = "dynamic"; setDynamicFilter(typeof item.dynamic === "object" ? item.dynamic.filter : item.dynamic); } else { if (groupType) groupType.value = "static"; setMembers(item.static); setDynamicFilter(""); }
         if (item.members) setMembers(item.members);
@@ -497,7 +523,7 @@
     var add = document.querySelector("[data-object-add]"); if (add) add.addEventListener("click", function () { openEditor(null); });
     rows.forEach(function (row) { var button = row.querySelector("[data-object-edit]"); if (!button) return; var item = JSON.parse(row.dataset.object); if (item.network) { var zoneType = Object.keys(item.network)[0] || "onbekend"; var zoneValue = item.network[zoneType] || []; var zoneInterfaces = Array.isArray(zoneValue) ? zoneValue : zoneValue.member || []; var valueCell = row.querySelector("td.mono"); if (valueCell) valueCell.textContent = zoneType.replace("_", "-") + (zoneInterfaces.length ? " · " + zoneInterfaces.join(", ") : " · geen interfaces") + " · User-ID " + ((item.enable_user_identification === true || item.enable_user_identification === "yes") ? "aan" : "uit"); } button.addEventListener("click", function () { openEditor(item); }); row.addEventListener("click", function (event) { if (!event.target.closest("input,button,a")) openEditor(item); }); });
     var cancel = dialog.querySelector("[data-object-cancel]"); if (cancel) cancel.addEventListener("click", function () { dialog.close(); });
-    form.addEventListener("submit", commitDynamicEntry);
+    form.addEventListener("submit", function () { commitDynamicEntry(); syncGenericUpdates(); });
     var pickerPanel = dialog.querySelector("[data-member-picker-panel]"); var catalogNode = dialog.querySelector("[data-object-catalog]"); var catalog = catalogNode ? JSON.parse(catalogNode.textContent || "[]") : []; var pickerMode = "members";
     function renderCatalog(query) { if (!pickerPanel) return; var results = pickerPanel.querySelector("[data-member-results]"); results.innerHTML = ""; var ownName = form.querySelector('[name="name"]').value; var matches = catalog.filter(function (item) { return item.name !== ownName && (pickerMode !== "dynamic" || item.kind === "tags") && (!query || item.name.toLocaleLowerCase().includes(query)); }); matches.forEach(function (item) { var row = document.createElement("div"); row.className = "member-result"; var copy = document.createElement("div"); var strong = document.createElement("strong"); strong.textContent = item.name; var small = document.createElement("small"); small.textContent = item.kind; copy.appendChild(strong); copy.appendChild(small); var button = document.createElement("button"); button.className = "btn btn-small"; button.type = "button"; button.textContent = pickerMode === "members" && memberSet.has(item.name) ? "Toegevoegd" : "+"; button.disabled = pickerMode === "members" && memberSet.has(item.name); button.addEventListener("click", function () { if (pickerMode === "dynamic") { var quoted = "'" + item.name.replace(/'/g, "\\'") + "'"; if (!dynamicTokens.includes(quoted)) dynamicTokens.push(quoted); syncDynamicFilter(); } else { memberSet.add(item.name); memberInput.value = Array.from(memberSet).join(","); renderMembers(); } renderCatalog((pickerPanel.querySelector("[data-member-filter]").value || "").toLocaleLowerCase()); }); row.appendChild(copy); row.appendChild(button); results.appendChild(row); }); if (!matches.length) { var empty = document.createElement("div"); empty.className = "muted member-result"; empty.textContent = catalog.length ? "Geen resultaten" : "Catalogus wordt bijgewerkt; vernieuw deze pagina over enkele ogenblikken."; results.appendChild(empty); } }
     var pickerOpen = dialog.querySelector("[data-member-picker-open]"); if (pickerOpen) pickerOpen.addEventListener("click", function () { pickerMode = "members"; pickerPanel.hidden = false; renderCatalog(""); pickerPanel.querySelector("[data-member-filter]").focus(); });

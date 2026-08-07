@@ -1122,10 +1122,11 @@ WORKSPACE_DEVICE_NAV = {
     "VM Information Sources": "vm-information-sources", "Licenses": "licenses",
     "Dynamic Updates": "dynamic-updates", "Software": "software",
 }
-WORKSPACE_EDITABLE_OBJECT_TYPES = {
+WORKSPACE_STRUCTURED_OBJECT_TYPES = {
     "addresses", "address-groups", "application-groups",
     "services", "service-groups", "tags",
 }
+WORKSPACE_EDITABLE_OBJECT_TYPES = set(OBJECT_NODES)
 
 
 @app.get("/config-workspaces/<int:workspace_id>/edit")
@@ -1233,6 +1234,7 @@ def config_workspace_editor(workspace_id):
             workspace_policy_catalog=workspace_policy_catalog,
             application_catalog_state=application_state if workspace_view == "policies" else {},
             workspace_editable_object_types=WORKSPACE_EDITABLE_OBJECT_TYPES,
+            workspace_structured_object_types=WORKSPACE_STRUCTURED_OBJECT_TYPES,
             config_section=config_section,
             inventory=inventory, offline_policy_fields=OFFLINE_POLICY_FIELDS,
             workspace_policy_nav=WORKSPACE_POLICY_NAV, workspace_object_nav=WORKSPACE_OBJECT_NAV,
@@ -1414,8 +1416,39 @@ def config_workspace_object_preview(workspace_id):
         before = next((item for item in existing if item["name"] == original_name and item["editable"]), None) if original_name else None
         if original_name and before is None:
             raise OfflineConfigError("Alleen een object uit de geselecteerde scope kan worden gewijzigd")
-        payload = scm_object_payload(object_type, request.form, {})
-        validate_object_payload(payload, object_type, existing, original_name)
+        generic_updates = None
+        if object_type in WORKSPACE_STRUCTURED_OBJECT_TYPES:
+            payload = scm_object_payload(object_type, request.form, {})
+            validate_object_payload(payload, object_type, existing, original_name)
+        else:
+            if before is None:
+                raise OfflineConfigError("Maak dit objecttype voorlopig via de native PAN-OS-interface aan; bestaande objecten zijn hier volledig bewerkbaar")
+            name = request.form.get("name", "").strip()
+            if not name:
+                raise OfflineConfigError("Name is verplicht")
+            if any(item["name"] == name and item["name"] != original_name for item in existing):
+                raise OfflineConfigError(f"Object {name} bestaat al in {scope}")
+            allowed = {(field["path"], field["kind"]) for field in before.get("edit_fields", [])}
+            try:
+                submitted = json.loads(request.form.get("generic_updates", "[]"))
+            except json.JSONDecodeError as exc:
+                raise OfflineConfigError("Ongeldige objectvelden") from exc
+            if not isinstance(submitted, list) or len(submitted) > 5000:
+                raise OfflineConfigError("Ongeldige objectvelden")
+            generic_updates = []
+            for update in submitted:
+                if not isinstance(update, dict) or (update.get("path"), update.get("kind")) not in allowed:
+                    raise OfflineConfigError("Een objectveld is ongeldig of bestaat niet meer")
+                clean = {"path": update["path"], "kind": update["kind"]}
+                if update["kind"] == "members":
+                    values = update.get("values", [])
+                    if not isinstance(values, list) or len(values) > 5000:
+                        raise OfflineConfigError("Ongeldige memberlijst")
+                    clean["values"] = [str(value).strip() for value in values if str(value).strip()]
+                else:
+                    clean["value"] = str(update.get("value", ""))[:65535]
+                generic_updates.append(clean)
+            payload = {"name": name, "fields": generic_updates}
         operation = "update" if before else "create"
         draft_id = secrets.token_urlsafe(24)
         draft = {
@@ -1424,7 +1457,9 @@ def config_workspace_object_preview(workspace_id):
             "changes": [{
                 "operation": operation, "original_name": original_name,
                 "fingerprint": offline_object_fingerprint(before) if before else "",
-                "replacement_xml": object_payload_xml(payload),
+                **({"replacement_xml": object_payload_xml(payload)} if generic_updates is None else {
+                    "generic_updates": generic_updates, "name": payload["name"]
+                }),
             }], "created_at": now(),
         }
         draft_path = OBJECT_DRAFTS / f"offline-object-{draft_id}.json"

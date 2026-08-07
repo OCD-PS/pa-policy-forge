@@ -127,6 +127,27 @@ class OfflineConfigTests(unittest.TestCase):
         }])
         self.assertNotIn(b'<entry name="new">', deleted)
 
+    def test_generic_object_editor_updates_nested_fields_without_raw_xml_loss(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><region><entry name="Belgium" code="be"><address><member>192.0.2.0/24</member><member>198.51.100.0/24</member></address><enabled>yes</enabled><nested preserve="true"><label>old</label></nested></entry></region></entry></vsys></entry></devices></config>'''
+        _, objects = scoped_objects(source, "vsys1", "regions")
+        region = objects[0]
+        fields = {field["label"]: field for field in region["edit_fields"]}
+        self.assertEqual(fields["Address"]["values"], ["192.0.2.0/24", "198.51.100.0/24"])
+        updated = apply_object_changes(source, "vsys1", "regions", [{
+            "operation": "update", "original_name": "Belgium",
+            "fingerprint": object_fingerprint(region), "name": "Belgium-custom",
+            "generic_updates": [
+                {"path": fields["Address"]["path"], "kind": "members", "values": ["203.0.113.0/24"]},
+                {"path": fields["Enabled"]["path"], "kind": "boolean", "value": "no"},
+                {"path": fields["Nested / Label"]["path"], "kind": "text", "value": "new"},
+            ],
+        }])
+        self.assertIn(b'<entry name="Belgium-custom" code="be">', updated)
+        self.assertIn(b'<member>203.0.113.0/24</member>', updated)
+        self.assertIn(b'<enabled>no</enabled>', updated)
+        self.assertIn(b'<nested preserve="true">', updated)
+        self.assertIn(b'<label>new</label>', updated)
+
 
 if __name__ == "__main__":
     unittest.main()
