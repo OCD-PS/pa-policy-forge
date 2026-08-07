@@ -128,6 +128,7 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertIn("left: auto", css)
         main.app.jinja_env.get_template("workspace_editor.html")
         main.app.jinja_env.get_template("workspace_policy_preview.html")
+        main.app.jinja_env.get_template("workspace_policy_bulk_preview.html")
 
     def test_workspace_policy_editor_is_actionable_and_supports_rename(self):
         template = (main.BASE / "app" / "templates" / "workspace_editor.html").read_text()
@@ -138,6 +139,20 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertIn("data-offline-policy-kinds", template)
         self.assertIn("function setupOfflinePolicyTabs()", javascript)
         self.assertIn("_offlineAddValue", javascript)
+        self.assertIn("data-policy-bulk-form", template)
+        self.assertIn("data-open-policy-bulk", template)
+        self.assertIn("data-policy-picker-add-selected", template)
+        self.assertIn("policy-editor-dialog", template)
+        self.assertIn("offlineDialog.showModal()", javascript)
+        self.assertIn("pickerSelections", javascript)
+
+    def test_panos_application_catalog_combines_custom_and_predefined(self):
+        profile = self.profile("panorama")
+        response = "<response status='success'><result><application><entry name='ssl'/><entry name='web-browsing'/></application></result></response>"
+        with patch("app.main.fetch_panos_objects", return_value=[{"id": "custom", "name": "custom"}]), patch("app.main.panos_profile_context", return_value=({}, "https://example.invalid", "key", object())), patch("app.main.policy_api.api_get", return_value=response) as api_get:
+            items = main.fetch_application_objects(profile)
+        self.assertEqual({item["name"] for item in items}, {"custom", "ssl", "web-browsing"})
+        self.assertEqual(api_get.call_args.args[1]["xpath"], "/config/predefined/application")
 
     def test_offline_workspace_storage_keeps_full_xml_and_inventory(self):
         timestamp = main.now()
@@ -476,6 +491,43 @@ class TargetAdapterTests(unittest.TestCase):
             with main.db() as conn:
                 conn.execute("DELETE FROM config_workspaces WHERE profile_id=?", (profile_id,))
                 conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
+    def test_offline_policy_bulk_edit_applies_multiple_rules_atomically(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("offline-bulk", 1, "", "", "panos", "{}", b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase><security><rules><entry name="one"><from><member>Trust</member></from><source><member>any</member></source><destination><member>any</member></destination><application><member>ssl</member></application><service><member>application-default</member></service><action>allow</action></entry><entry name="two"><from><member>Trust</member></from><source><member>any</member></source><destination><member>any</member></destination><application><member>web-browsing</member></application><service><member>application-default</member></service><action>allow</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'''
+        workspace_id = main.store_config_workspace(profile, "bulk", "config.xml", xml, "upload")
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1; login["username"] = "test"; login["must_change"] = False; login["csrf"] = "bulk-csrf"
+        try:
+            preview = client.post(
+                f"/config-workspaces/{workspace_id}/policies/bulk-preview",
+                data={"csrf": "bulk-csrf", "scope": "vsys1", "policy_kind": "security", "rulebase": "standard", "policy_name": ["one", "two"], "tag_add": "bulk-edited", "application_add": "dns", "action": "deny"},
+                base_url="https://forge.test",
+            )
+            self.assertEqual(preview.status_code, 200)
+            parser = NavigationTargets(); parser.feed(preview.data.decode())
+            action = next(item for item in parser.actions if "/config-workspaces/policy-bulk-drafts/" in item)
+            applied = client.post(action, data={"csrf": "bulk-csrf"}, base_url="https://forge.test")
+            self.assertEqual(applied.status_code, 302)
+            with main.db() as conn:
+                latest = conn.execute("SELECT * FROM config_workspaces WHERE profile_id=? ORDER BY id DESC LIMIT 1", (profile_id,)).fetchone()
+            _, policies = main.scoped_policies(main.workspace_config_path(latest).read_bytes(), "vsys1", "security", "standard")
+            self.assertEqual(len(policies), 2)
+            self.assertTrue(all(item["action"] == "deny" for item in policies))
+            self.assertTrue(all("dns" in item["application"] and "bulk-edited" in item["tag"] for item in policies))
+        finally:
+            with main.db() as conn: workspaces = conn.execute("SELECT * FROM config_workspaces WHERE profile_id=?", (profile_id,)).fetchall()
+            for item in workspaces: main.workspace_config_path(item).unlink(missing_ok=True)
+            with main.db() as conn:
+                conn.execute("DELETE FROM config_workspaces WHERE profile_id=?", (profile_id,)); conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
 
     def test_oversized_form_is_rejected(self):
         client = main.app.test_client()

@@ -659,6 +659,24 @@ def fetch_panos_objects(profile, object_type: str) -> list[dict]:
     return collected
 
 
+def fetch_application_objects(profile) -> list[dict]:
+    """Return custom and predefined applications through one flavor-neutral catalog."""
+    if profile["target_type"] == "scm":
+        return fetch_scm_objects(profile, "applications")
+    custom = fetch_panos_objects(profile, "applications")
+    _, endpoint, key, ctx = panos_profile_context(profile)
+    response = policy_api.require_success(
+        policy_api.api_get(endpoint, {"type": "config", "action": "get", "xpath": "/config/predefined/application", "key": key}, ctx),
+        "fetch predefined applications",
+    )
+    combined = {item.get("name", ""): item for item in custom if item.get("name")}
+    for entry in response.findall("./result/application/entry"):
+        name = entry.get("name", "")
+        if name and name not in combined:
+            combined[name] = {"id": name, "name": name, "predefined": True}
+    return list(combined.values())
+
+
 def refresh_catalog_async(profile, kind: str, cache_path: Path) -> None:
     key = (int(profile["id"]), kind)
     with _catalog_refresh_lock:
@@ -666,7 +684,7 @@ def refresh_catalog_async(profile, kind: str, cache_path: Path) -> None:
         _catalog_refreshing.add(key)
     def refresh():
         try:
-            fresh = fetch_scm_objects(profile, kind)
+            fresh = fetch_application_objects(profile) if kind == "applications" else fetch_scm_objects(profile, kind)
             temporary = cache_path.with_suffix(".tmp")
             temporary.write_text(json.dumps(fresh)); temporary.chmod(0o600); temporary.replace(cache_path)
             with _catalog_refresh_lock: _catalog_errors.pop(key, None)
@@ -678,11 +696,30 @@ def refresh_catalog_async(profile, kind: str, cache_path: Path) -> None:
     threading.Thread(target=refresh, name=f"catalog-{profile['id']}-{kind}", daemon=True).start()
 
 
+def application_cache_path(profile_id: int) -> Path:
+    return OBJECT_CACHE / f"{int(profile_id)}-applications-v2.json"
+
+
+def cached_application_catalog(profile) -> dict:
+    profile_id = int(profile["id"])
+    cache_path = application_cache_path(profile_id)
+    items = []
+    if cache_path.exists():
+        try: items = json.loads(cache_path.read_text())
+        except (OSError, json.JSONDecodeError): items = []
+    stale = not cache_path.exists() or time.time() - cache_path.stat().st_mtime >= 1800
+    if stale: refresh_catalog_async(profile, "applications", cache_path)
+    with _catalog_refresh_lock:
+        refreshing = (profile_id, "applications") in _catalog_refreshing
+        error = _catalog_errors.get((profile_id, "applications"), "")
+    return {"ready": bool(items), "refreshing": refreshing, "error": error, "items": [{"name": item.get("name", ""), "kind": "applications"} for item in items if item.get("name")]}
+
+
 def fetch_object_catalog(profile, object_type: str) -> list[dict]:
     related = {"addresses": ("tags",), "services": ("tags",), "address-groups": ("addresses", "address-groups", "tags"), "service-groups": ("services", "service-groups", "tags"), "application-groups": ("applications", "application-groups", "tags"), "zones": ("zones",), "policy-picker": ("zones", "addresses", "address-groups", "applications", "application-groups", "application-filters", "services", "service-groups", "tags")}.get(object_type, ())
     catalog = []
     for kind in related:
-        cache_path = OBJECT_CACHE / f"{profile['id']}-{kind}.json"
+        cache_path = application_cache_path(profile["id"]) if kind == "applications" else OBJECT_CACHE / f"{profile['id']}-{kind}.json"
         cached = None
         if cache_path.exists():
             try: cached = json.loads(cache_path.read_text())
@@ -706,17 +743,17 @@ def fetch_object_catalog(profile, object_type: str) -> list[dict]:
 def application_catalog(profile_id):
     with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
     if not profile: return {"ready": False, "items": []}, 404
-    cache_path = OBJECT_CACHE / f"{profile_id}-applications.json"
-    items = []
-    if cache_path.exists():
-        try: items = json.loads(cache_path.read_text())
-        except (OSError, json.JSONDecodeError): items = []
-    stale = not cache_path.exists() or time.time() - cache_path.stat().st_mtime >= 1800
-    if stale: refresh_catalog_async(profile, "applications", cache_path)
-    with _catalog_refresh_lock:
-        refreshing = (profile_id, "applications") in _catalog_refreshing
-        error = _catalog_errors.get((profile_id, "applications"), "")
-    return {"ready": bool(items), "refreshing": refreshing, "error": error, "items": [{"name": item.get("name", ""), "kind": "applications"} for item in items if item.get("name")]}
+    return cached_application_catalog(profile)
+
+
+@app.get("/config-workspaces/<int:workspace_id>/catalog/applications")
+@login_required
+def workspace_application_catalog(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace: return {"ready": False, "items": []}, 404
+    with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+    if not profile: return {"ready": False, "items": []}, 404
+    return cached_application_catalog(profile)
 
 
 def scm_object_payload(object_type: str, form, container: dict) -> dict:
@@ -912,6 +949,17 @@ def update_xml_policy(policy: dict) -> str:
         if node is None and not policy[field]: continue
         if node is None: node = ET.SubElement(entry, tag)
         node.text = str(policy[field])
+    if "profile_group" in policy:
+        profile_setting = entry.find("./profile-setting")
+        group = entry.find("./profile-setting/group")
+        member = entry.find("./profile-setting/group/member")
+        if policy["profile_group"]:
+            if profile_setting is None: profile_setting = ET.SubElement(entry, "profile-setting")
+            if group is None: group = ET.SubElement(profile_setting, "group")
+            if member is None: member = ET.SubElement(group, "member")
+            member.text = str(policy["profile_group"])
+        elif group is not None:
+            profile_setting.remove(group)
     for field in ("disabled", "negate_source", "negate_destination", "log_start", "log_end"):
         if field not in policy or policy[field] is None: continue
         tag = field.replace("_", "-")
@@ -1087,6 +1135,10 @@ def config_workspace_editor(workspace_id):
     if not workspace:
         return "Not found", 404
     try:
+        with db() as conn:
+            workspace_profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+        if not workspace_profile:
+            raise OfflineConfigError("Het gekoppelde firewallprofiel bestaat niet meer")
         xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
         scopes = available_scopes(snapshot)
         if not scopes:
@@ -1139,9 +1191,13 @@ def config_workspace_editor(workspace_id):
                     if key not in seen_policy_catalog:
                         seen_policy_catalog.add(key)
                         workspace_policy_catalog.append({"name": item["name"], "kind": catalog_type})
-            zone_inventory = configuration_inventory(xml_bytes, scope, template, parsed=(parsed_root, snapshot))["network"]
+            policy_zone_template = preferred_template if snapshot.kind == "panorama" else template
+            zone_inventory = configuration_inventory(xml_bytes, scope, policy_zone_template, parsed=(parsed_root, snapshot))["network"] if (snapshot.kind != "panorama" or policy_zone_template) else []
             zones = next((item.get("names", []) for item in zone_inventory if item["name"] == "Zones"), [])
             workspace_policy_catalog.extend({"name": name, "kind": "zones"} for name in zones)
+            application_state = cached_application_catalog(workspace_profile)
+            existing_applications = {item["name"] for item in workspace_policy_catalog if item["kind"] == "applications"}
+            workspace_policy_catalog.extend(item for item in application_state["items"] if item["name"] not in existing_applications)
         elif workspace_view == "objects":
             _, objects = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
             related_types = {
@@ -1175,6 +1231,7 @@ def config_workspace_editor(workspace_id):
             object_type=object_type, object_nodes=OBJECT_NODES, objects=objects,
             workspace_object_catalog=workspace_object_catalog,
             workspace_policy_catalog=workspace_policy_catalog,
+            application_catalog_state=application_state if workspace_view == "policies" else {},
             workspace_editable_object_types=WORKSPACE_EDITABLE_OBJECT_TYPES,
             config_section=config_section,
             inventory=inventory, offline_policy_fields=OFFLINE_POLICY_FIELDS,
@@ -1212,6 +1269,7 @@ def config_workspace_policy_preview(workspace_id):
         updated["action"] = request.form.get("action", "").strip()
         updated["description"] = request.form.get("description", "").strip()
         updated["log_setting"] = request.form.get("log_setting", "").strip()
+        updated["profile_group"] = request.form.get("profile_group", "").strip()
         updated["schedule"] = request.form.get("schedule", "").strip()
         updated["disabled"] = request.form.get("disabled") == "yes"
         replacement_xml = update_xml_policy(updated)
@@ -1232,6 +1290,76 @@ def config_workspace_policy_preview(workspace_id):
     except Exception as exc:
         flash(f"Wijziging niet voorbereid: {exc}", "error")
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
+
+
+@app.post("/config-workspaces/<int:workspace_id>/policies/bulk-preview")
+@login_required
+def config_workspace_policy_bulk_preview(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace: return "Not found", 404
+    try:
+        xml_bytes, parsed_root, parsed_snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
+        scope = request.form.get("scope", "")
+        kind = request.form.get("policy_kind", "security")
+        rulebase = request.form.get("rulebase", "pre")
+        selected_names = set(request.form.getlist("policy_name"))
+        if not selected_names:
+            raise OfflineConfigError("Selecteer minstens één policy")
+        _, policies = scoped_policies(xml_bytes, scope, kind, rulebase, parsed=(parsed_root, parsed_snapshot))
+        selected = [item for item in policies if item["editable"] and item["name"] in selected_names]
+        if len(selected) != len(selected_names):
+            raise OfflineConfigError("Niet alle geselecteerde policies behoren nog tot deze scope")
+        operations = {field: {"add": split_values(request.form.get(f"{field}_add", "")), "remove": split_values(request.form.get(f"{field}_remove", ""))} for field in OFFLINE_POLICY_FIELDS}
+        for field in ("action", "log_setting", "profile_group"):
+            operations[field] = request.form.get(field) or None
+        operations["description_append"] = request.form.get("description_append", "").strip()
+        disabled = request.form.get("disabled", "")
+        operations["disabled"] = disabled == "true" if disabled in {"true", "false"} else None
+        changes = []
+        for before in selected:
+            after = apply_bulk_operations(before, operations)
+            if after != before:
+                changes.append({
+                    "policy_name": before["name"], "fingerprint": offline_policy_fingerprint(before),
+                    "before": before, "after": after, "replacement_xml": update_xml_policy(after),
+                })
+        if not changes:
+            raise OfflineConfigError("De gekozen bulkbewerking veroorzaakt geen wijzigingen")
+        draft_id = secrets.token_urlsafe(24)
+        draft = {"workspace_id": workspace_id, "scope": scope, "kind": kind, "rulebase": rulebase, "changes": changes, "created_at": now()}
+        draft_path = POLICY_DRAFTS / f"offline-bulk-{draft_id}.json"
+        draft_path.write_text(json.dumps(draft)); draft_path.chmod(0o600)
+        return render_template("workspace_policy_bulk_preview.html", workspace=workspace, draft_id=draft_id, draft=draft)
+    except Exception as exc:
+        flash(f"Bulk-preview mislukt: {exc}", "error")
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, scope=request.form.get("scope", ""), workspace_view="policies", policy_kind=request.form.get("policy_kind", "security"), rulebase=request.form.get("rulebase", "pre")))
+
+
+@app.post("/config-workspaces/policy-bulk-drafts/<draft_id>/apply")
+@login_required
+def config_workspace_policy_bulk_apply(draft_id):
+    if not draft_id or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in draft_id): return "Not found", 404
+    draft_path = POLICY_DRAFTS / f"offline-bulk-{draft_id}.json"
+    if not draft_path.is_file(): return "Not found", 404
+    try:
+        draft = json.loads(draft_path.read_text())
+        workspace = workspace_row(int(draft["workspace_id"]))
+        if not workspace: raise OfflineConfigError("De bronworkspace bestaat niet meer")
+        new_xml = workspace_config_path(workspace).read_bytes()
+        for change in draft["changes"]:
+            new_xml = replace_policy_in_snapshot(new_xml, draft["scope"], draft["kind"], draft["rulebase"], change["policy_name"], change["fingerprint"], change["replacement_xml"])
+        with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+        if not profile: raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
+        new_id = store_config_workspace(profile, f"{workspace['name']} · bulk edit {now()}", workspace["original_name"], new_xml, "edit")
+        set_active_config_workspace(workspace["profile_id"], new_id)
+        audit("config-workspace-policy-bulk-edited", f"source={workspace['id']} workspace={new_id} scope={draft['scope']} rules={len(draft['changes'])}")
+        draft_path.unlink(missing_ok=True)
+        flash(f"{len(draft['changes'])} policies gewijzigd in een nieuwe workspaceversie.", "success")
+        return redirect(url_for("config_workspace_editor", workspace_id=new_id, scope=draft["scope"], workspace_view="policies", policy_kind=draft["kind"], rulebase=draft["rulebase"]))
+    except Exception as exc:
+        flash(f"Bulk-wijziging niet bewaard: {exc}", "error")
+        workspace_id = json.loads(draft_path.read_text()).get("workspace_id") if draft_path.is_file() else None
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id)) if workspace_id else redirect(url_for("index"))
 
 
 @app.post("/config-workspaces/policy-drafts/<draft_id>/apply")

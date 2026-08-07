@@ -259,6 +259,7 @@ def policy_record(entry: ET.Element, kind: str, owner: str, rulebase: str, edita
         "description": entry.findtext("./description", ""),
         "disabled": entry.findtext("./disabled", "no") == "yes",
         "log_setting": entry.findtext("./log-setting", ""),
+        "profile_group": entry.findtext("./profile-setting/group/member", ""),
         "schedule": entry.findtext("./schedule", ""),
         "_xml": ET.tostring(entry, encoding="unicode"),
     }
