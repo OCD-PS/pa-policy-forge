@@ -46,10 +46,11 @@ Ports:
 - `443/tcp`: HTTPS GUI
 - `514/udp`: PAN-OS syslog
 
-The initial login is `admin` / `admin`. PA Policy Forge forces an immediate
-password change before any other page is accessible. Direct Docker Compose
-deployments may override the initial password through
-`PPF_BOOTSTRAP_PASSWORD`; the mandatory password change still applies.
+The default login is `admin` / `admin`. For the current lab workflow PA Policy
+Forge does not force a password change. Direct Docker Compose deployments may
+override the initial password through `PPF_BOOTSTRAP_PASSWORD`. Change this
+behavior before using the application in a customer or otherwise untrusted
+environment.
 
 The installer also pins the published container ports to the appliance's
 primary address through `PPF_BIND_ADDRESS`. Override `PPF_BIND_ADDRESS` and
@@ -62,7 +63,7 @@ For offline customers, transfer the repository plus a saved container image bund
 
 ## First workflow
 
-1. Log in and change the bootstrap password.
+1. Log in with the configured bootstrap account.
 2. Configure one or more PAN-OS firewalls to forward TRAFFIC logs to UDP 514.
 3. Confirm each serial appears under discovered firewalls.
 4. Create a profile, map zones to roles, and enter the target credentials.

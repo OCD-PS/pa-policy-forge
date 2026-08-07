@@ -206,7 +206,7 @@ def init_db() -> None:
             bootstrap_password = os.getenv("PPF_BOOTSTRAP_PASSWORD", "admin") or "admin"
             if bootstrap_password != "admin" and (len(bootstrap_password) < 12 or password_is_blocked(bootstrap_password)):
                 raise RuntimeError("Set PPF_BOOTSTRAP_PASSWORD to admin or a unique value of at least 12 characters")
-            conn.execute("INSERT INTO users(username,password_hash,must_change) VALUES(?,?,1)",
+            conn.execute("INSERT INTO users(username,password_hash,must_change) VALUES(?,?,0)",
                          ("admin", password_hash(bootstrap_password)))
 
 
@@ -282,8 +282,6 @@ def login_required(fn):
     def inner(*args, **kwargs):
         if not session.get("user_id"):
             return redirect(url_for("login"))
-        if session.get("must_change") and request.endpoint not in {"change_password", "logout", "static"}:
-            return redirect(url_for("change_password"))
         return fn(*args, **kwargs)
     return inner
 
@@ -306,9 +304,9 @@ def login():
         password_valid = password_ok(request.form.get("password", ""), user["password_hash"] if user else _dummy_password_hash)
         if user and password_valid:
             clear_login_failures(client, username)
-            session.clear(); session.permanent = True; session["user_id"] = user["id"]; session["username"] = user["username"]; session["must_change"] = bool(user["must_change"]); csrf()
+            session.clear(); session.permanent = True; session["user_id"] = user["id"]; session["username"] = user["username"]; session["must_change"] = False; csrf()
             audit("login")
-            return redirect(url_for("change_password" if user["must_change"] else "index"))
+            return redirect(url_for("index"))
         login_rate_limited(client, username, record_failure=True)
         flash("Ongeldige gebruikersnaam of wachtwoord.", "error")
     return render_template("login.html")
