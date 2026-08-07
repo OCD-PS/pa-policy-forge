@@ -1222,6 +1222,7 @@ def config_workspace_editor(workspace_id):
                 item["slug"] = WORKSPACE_DEVICE_NAV.get(item["name"], "")
         edit_name = request.args.get("edit_policy", "")
         edit_policy = next((item for item in policies if item["name"] == edit_name and item["editable"]), None)
+        edit_object_name = request.args.get("edit_object", "")
         return render_template(
             "workspace_editor.html", workspace=workspace, snapshot=snapshot,
             scopes=scopes, scope=scope, templates=templates, template=template,
@@ -1230,6 +1231,7 @@ def config_workspace_editor(workspace_id):
             rulebase=rulebase, policies=policies, edit_policy=edit_policy,
             alternate_policy_count=alternate_policy_count,
             object_type=object_type, object_nodes=OBJECT_NODES, objects=objects,
+            edit_object_name=edit_object_name,
             workspace_object_catalog=workspace_object_catalog,
             workspace_policy_catalog=workspace_policy_catalog,
             application_catalog_state=application_state if workspace_view == "policies" else {},

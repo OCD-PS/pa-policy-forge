@@ -522,6 +522,12 @@
     }
     var add = document.querySelector("[data-object-add]"); if (add) add.addEventListener("click", function () { openEditor(null); });
     rows.forEach(function (row) { var button = row.querySelector("[data-object-edit]"); if (!button) return; var item = JSON.parse(row.dataset.object); if (item.network) { var zoneType = Object.keys(item.network)[0] || "onbekend"; var zoneValue = item.network[zoneType] || []; var zoneInterfaces = Array.isArray(zoneValue) ? zoneValue : zoneValue.member || []; var valueCell = row.querySelector("td.mono"); if (valueCell) valueCell.textContent = zoneType.replace("_", "-") + (zoneInterfaces.length ? " · " + zoneInterfaces.join(", ") : " · geen interfaces") + " · User-ID " + ((item.enable_user_identification === true || item.enable_user_identification === "yes") ? "aan" : "uit"); } button.addEventListener("click", function () { openEditor(item); }); row.addEventListener("click", function (event) { if (!event.target.closest("input,button,a")) openEditor(item); }); });
+    var objectList = document.querySelector(".object-list[data-edit-object]");
+    var requestedObject = objectList ? objectList.dataset.editObject : "";
+    if (requestedObject) {
+      var requestedRow = rows.find(function (row) { var item = JSON.parse(row.dataset.object); return item.editable && item.name === requestedObject; });
+      if (requestedRow) openEditor(JSON.parse(requestedRow.dataset.object));
+    }
     var cancel = dialog.querySelector("[data-object-cancel]"); if (cancel) cancel.addEventListener("click", function () { dialog.close(); });
     form.addEventListener("submit", function () { commitDynamicEntry(); syncGenericUpdates(); });
     var pickerPanel = dialog.querySelector("[data-member-picker-panel]"); var catalogNode = dialog.querySelector("[data-object-catalog]"); var catalog = catalogNode ? JSON.parse(catalogNode.textContent || "[]") : []; var pickerMode = "members";
