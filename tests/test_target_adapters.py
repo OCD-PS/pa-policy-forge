@@ -145,6 +145,12 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertIn("objectPickerSelections", javascript)
         self.assertIn('openObjectPicker("tags")', javascript)
         self.assertIn("loadObjectApplications", javascript)
+        self.assertIn("function parseTagTokens", javascript)
+        self.assertIn("tagQuoteOpen", javascript)
+        self.assertIn("data-single-tag-values", live_template)
+        self.assertIn("data-single-tag-picker", live_template)
+        self.assertNotIn('<label>Tags</label><input name="tags"', workspace_template)
+        self.assertNotIn('<label>Tags</label><input name="tags"', live_template)
 
     def test_workspace_actionbar_is_scoped_to_the_right_content_pane(self):
         css = (main.BASE / "app" / "static" / "app.css").read_text()

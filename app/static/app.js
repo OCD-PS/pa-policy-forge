@@ -5,6 +5,19 @@
     return Array.prototype.slice.call((root || document).querySelectorAll(selector));
   }
 
+  function parseTagTokens(value) {
+    var tokens = []; var pattern = /'([^']*)'|"([^"]*)"|[^\s,]+/g; var match;
+    while ((match = pattern.exec(String(value || ""))) !== null) {
+      var token = (match[1] !== undefined ? match[1] : match[2] !== undefined ? match[2] : match[0]).trim();
+      if (token && !tokens.includes(token)) tokens.push(token);
+    }
+    return tokens;
+  }
+
+  function tagQuoteOpen(value) {
+    return ((String(value).match(/'/g) || []).length % 2 === 1) || ((String(value).match(/"/g) || []).length % 2 === 1);
+  }
+
   function activateSection(id, updateHash) {
     if (!id) return;
     var section = document.getElementById(id);
@@ -328,6 +341,12 @@
 
     var singleDialog = document.querySelector("[data-policy-single-dialog]");
     if (singleDialog) {
+      var singleTagInput = singleDialog.querySelector("[data-single-tag-input]"); var singleTagEntry = singleDialog.querySelector("[data-single-tag-entry]"); var singleTagSet = new Set();
+      function renderSingleTags() { var container = singleDialog.querySelector("[data-single-tag-values]"); if (!container) return; container.innerHTML = ""; singleTagSet.forEach(function (value) { var chip = document.createElement("span"); chip.className = "policy-value-chip"; var label = document.createElement("span"); label.textContent = value; var remove = document.createElement("button"); remove.type = "button"; remove.textContent = "−"; remove.addEventListener("click", function () { singleTagSet.delete(value); singleTagInput.value = Array.from(singleTagSet).join(","); renderSingleTags(); }); chip.appendChild(label); chip.appendChild(remove); container.appendChild(chip); }); if (!singleTagSet.size) { var empty = document.createElement("span"); empty.className = "muted small"; empty.textContent = "Geen tags"; container.appendChild(empty); } }
+      function addSingleTags(value) { parseTagTokens(value).forEach(function (tag) { singleTagSet.add(tag); }); if (singleTagInput) singleTagInput.value = Array.from(singleTagSet).join(","); if (singleTagEntry) singleTagEntry.value = ""; renderSingleTags(); }
+      if (singleTagEntry) { singleTagEntry._addTagValue = function (value) { addSingleTags(value); }; singleTagEntry.addEventListener("keydown", function (event) { if (event.key === "Enter" || event.key === "," || (event.key === " " && !tagQuoteOpen(singleTagEntry.value))) { event.preventDefault(); addSingleTags(singleTagEntry.value); } }); }
+      var singleTagAdd = singleDialog.querySelector("[data-single-tag-add]"); if (singleTagAdd) singleTagAdd.addEventListener("click", function () { addSingleTags(singleTagEntry.value); });
+      var singleForm = singleDialog.querySelector("[data-policy-single-form]"); if (singleForm) singleForm.addEventListener("submit", function () { if (singleTagEntry && singleTagEntry.value.trim()) addSingleTags(singleTagEntry.value); });
       rows.forEach(function (row) {
         var button = row.querySelector("[data-policy-edit]");
         if (!button) return;
@@ -341,6 +360,7 @@
             if (field.dataset.singleField === "disabled") value = value ? "true" : "false";
             field.value = value === undefined || value === null ? "" : value;
           });
+          singleTagSet = new Set(Array.isArray(policy.tag) ? policy.tag : []); if (singleTagInput) singleTagInput.value = Array.from(singleTagSet).join(","); renderSingleTags();
           all("[data-single-tab]", singleDialog).forEach(function (tab, index) { tab.classList.toggle("is-active", index === 0); });
           all("[data-single-panel]", singleDialog).forEach(function (panel, index) { panel.classList.toggle("is-active", index === 0); });
           singleDialog.showModal();
@@ -360,13 +380,15 @@
       var policyCatalog = JSON.parse(policyCatalogNode.textContent || "[]"); var pickerTarget = null; var pickerSelections = new Set();
       var bulkFormForCatalog = document.querySelector("[data-policy-bulk-form]"); var catalogProfileMatch = bulkFormForCatalog ? bulkFormForCatalog.action.match(/\/policies\/(\d+)\/preview/) : null; var workspaceApplicationState = document.querySelector("[data-workspace-application-catalog]"); var applicationPolls = 0;
       var pickerKinds = {from:["zones"],to:["zones"],source:["addresses","address-groups"],destination:["addresses","address-groups"],application:["applications","application-groups","application-filters"],service:["services","service-groups"],tag:["tags"],source_user:["$current"],destination_user:["$current"],source_hip:["$current"],destination_hip:["$current"],category:["$current"],schedule:["$current"],log_setting:["$current"],profile_group:["$current"]};
-      function addPickedValue(name) { if (!pickerTarget) return; if (pickerTarget.hasAttribute("data-bulk-entry")) { pickerTarget.value = name; pickerTarget.closest("[data-bulk-field]").querySelector("[data-bulk-add-button]").click(); } else { var values = pickerTarget.value.split(",").map(function (value) { return value.trim(); }).filter(Boolean); if (!values.includes(name)) values.push(name); pickerTarget.value = values.join(", "); } }
+      function addPickedValue(name) { if (!pickerTarget) return; if (typeof pickerTarget._addTagValue === "function") { pickerTarget._addTagValue(name); } else if (pickerTarget.hasAttribute("data-bulk-entry")) { pickerTarget.value = name; pickerTarget.closest("[data-bulk-field]").querySelector("[data-bulk-add-button]").click(); } else { var values = pickerTarget.value.split(",").map(function (value) { return value.trim(); }).filter(Boolean); if (!values.includes(name)) values.push(name); pickerTarget.value = values.join(", "); } }
       function updatePickerCount() { var count = valuePicker.querySelector("[data-policy-picker-selected-count]"); if (count) count.textContent = pickerSelections.size; }
       function renderPolicyPicker(query) { var field = pickerTarget ? pickerTarget.dataset.pickerField : ""; var kinds = pickerKinds[field] || []; var candidates = policyCatalog.filter(function (item) { return kinds.includes(item.kind); }); if (kinds.includes("$current")) { var datasetKeys = {source_user:"sourceUser",destination_user:"destinationUser",source_hip:"sourceHip",destination_hip:"destinationHip",profile_group:"profileGroup",log_setting:"logSetting"}; var key = datasetKeys[field] || field; var seen = new Set(); rows.forEach(function (policyRow) { (policyRow.dataset[key] || "").split("|||").filter(Boolean).forEach(function (name) { if (!seen.has(name)) { seen.add(name); candidates.push({name:name,kind:"huidige rulebase"}); } }); }); } var results = valuePicker.querySelector("[data-policy-picker-results]"); results.innerHTML = ""; candidates.filter(function (item) { return !query || item.name.toLocaleLowerCase().includes(query); }).forEach(function (item) { var row = document.createElement("div"); row.className = "member-result" + (pickerSelections.has(item.name) ? " is-selected" : ""); var copy = document.createElement("div"); var strong = document.createElement("strong"); strong.textContent = item.name; var small = document.createElement("small"); small.textContent = item.kind; copy.appendChild(strong); copy.appendChild(small); var button = document.createElement("button"); button.className = "btn btn-small"; button.type = "button"; button.textContent = pickerSelections.has(item.name) ? "Geselecteerd" : "Selecteer"; button.addEventListener("click", function () { if (pickerSelections.has(item.name)) pickerSelections.delete(item.name); else pickerSelections.add(item.name); updatePickerCount(); renderPolicyPicker(query); }); row.appendChild(copy); row.appendChild(button); results.appendChild(row); }); if (!results.children.length) { var empty = document.createElement("div"); empty.className = "muted member-result"; empty.textContent = "Geen bestaande waarden gevonden; freeform blijft mogelijk"; results.appendChild(empty); } updatePickerCount(); }
       function showApplicationError(message) { if (!message || !pickerTarget || pickerTarget.dataset.pickerField !== "application") return; var results = valuePicker.querySelector("[data-policy-picker-results]"); var warning = document.createElement("div"); warning.className = "callout member-result"; warning.textContent = "Applicatiecatalogus niet bijgewerkt: " + message; results.prepend(warning); }
       function showApplicationStatus(data) { var status = valuePicker.querySelector("[data-policy-picker-status]"); if (!status) return; status.textContent = data.error ? "Applicatiecatalogus kon niet worden bijgewerkt." : data.ready ? data.items.length + " applicaties beschikbaar." : data.refreshing ? "Application database wordt geladen…" : "Geen application database beschikbaar."; }
       function loadApplications() { var catalogUrl = catalogProfileMatch ? "/profiles/" + catalogProfileMatch[1] + "/catalog/applications" : workspaceApplicationState ? workspaceApplicationState.dataset.workspaceApplicationCatalog : ""; if (!catalogUrl) return; var initialStatus = valuePicker.querySelector("[data-policy-picker-status]"); if (initialStatus) initialStatus.textContent = "Application database wordt geladen…"; fetch(catalogUrl, {headers:{"Accept":"application/json"}}).then(function (response) { if (!response.ok) throw new Error("HTTP " + response.status); return response.json(); }).then(function (data) { var existing = new Set(policyCatalog.filter(function (item) { return item.kind === "applications"; }).map(function (item) { return item.name; })); (data.items || []).forEach(function (item) { if (!existing.has(item.name)) policyCatalog.push(item); }); showApplicationStatus(data); if (pickerTarget && pickerTarget.dataset.pickerField === "application") { renderPolicyPicker((valuePicker.querySelector("[data-policy-picker-filter]").value || "").toLocaleLowerCase()); showApplicationError(data.error); } if (!data.ready && data.refreshing && applicationPolls < 40) { applicationPolls += 1; setTimeout(loadApplications, 3000); } }).catch(function (error) { showApplicationError(error.message); }); }
-      all("[data-picker-field]").forEach(function (input) { if (!pickerKinds[input.dataset.pickerField]) return; input.addEventListener("focus", function () { pickerTarget = input; pickerSelections.clear(); var pickerStatus = valuePicker.querySelector("[data-policy-picker-status]"); if (pickerStatus) pickerStatus.textContent = ""; var activeDialog = input.closest("dialog"); if (activeDialog && valuePicker.parentElement !== activeDialog) activeDialog.appendChild(valuePicker); valuePicker.hidden = false; valuePicker.querySelector("[data-policy-picker-title]").textContent = "Bestaande waarden voor " + input.dataset.pickerField; var filter = valuePicker.querySelector("[data-policy-picker-filter]"); filter.value = ""; renderPolicyPicker(""); if (input.dataset.pickerField === "application") { applicationPolls = 0; loadApplications(); } }); });
+      function openPolicyValuePicker(input, fieldName) { pickerTarget = input; pickerTarget.dataset.pickerField = fieldName || input.dataset.pickerField; pickerSelections.clear(); var pickerStatus = valuePicker.querySelector("[data-policy-picker-status]"); if (pickerStatus) pickerStatus.textContent = ""; var activeDialog = input.closest("dialog"); if (activeDialog && valuePicker.parentElement !== activeDialog) activeDialog.appendChild(valuePicker); valuePicker.hidden = false; valuePicker.querySelector("[data-policy-picker-title]").textContent = "Bestaande waarden voor " + pickerTarget.dataset.pickerField; var filter = valuePicker.querySelector("[data-policy-picker-filter]"); filter.value = ""; renderPolicyPicker(""); if (pickerTarget.dataset.pickerField === "application") { applicationPolls = 0; loadApplications(); } }
+      all("[data-picker-field]").forEach(function (input) { if (!pickerKinds[input.dataset.pickerField]) return; input.addEventListener("focus", function () { openPolicyValuePicker(input); }); });
+      var singleTagPicker = document.querySelector("[data-single-tag-picker]"); if (singleTagPicker && singleTagEntry) singleTagPicker.addEventListener("click", function () { openPolicyValuePicker(singleTagEntry, "tag"); });
       valuePicker.querySelector("[data-policy-picker-filter]").addEventListener("input", function (event) { renderPolicyPicker(event.target.value.toLocaleLowerCase().trim()); });
       valuePicker.querySelector("[data-policy-picker-close]").addEventListener("click", function () { valuePicker.hidden = true; });
       var addSelected = valuePicker.querySelector("[data-policy-picker-add-selected]"); if (addSelected) addSelected.addEventListener("click", function () { pickerSelections.forEach(addPickedValue); pickerSelections.clear(); updatePickerCount(); valuePicker.hidden = true; });
@@ -375,7 +397,7 @@
     var dialog = document.querySelector("[data-policy-bulk-dialog]");
     var opener = document.querySelector("[data-open-policy-bulk]");
     function selectedRows() { return rows.filter(function (row) { var checkbox = row.querySelector("[data-policy-select]"); return checkbox && checkbox.checked; }); }
-    function splitEntry(value) { return value.split(",").map(function (item) { return item.trim(); }).filter(Boolean); }
+    function splitEntry(value, field) { return field === "tag" ? parseTagTokens(value) : value.split(",").map(function (item) { return item.trim(); }).filter(Boolean); }
     function renderBulkField(fieldNode, values, removed, added) {
       var container = fieldNode.querySelector("[data-bulk-values]"); container.innerHTML = "";
       values.forEach(function (value) {
@@ -419,14 +441,15 @@
     all("[data-bulk-field]", dialog).forEach(function (fieldNode) {
       var input = fieldNode.querySelector("[data-bulk-entry]"); var hidden = fieldNode.querySelector("[data-bulk-add]"); var button = fieldNode.querySelector("[data-bulk-add-button]");
       function addValue() {
-        var additions = splitEntry(input.value); if (!additions.length) return;
+        var additions = splitEntry(input.value, fieldNode.dataset.bulkField); if (!additions.length) return;
         additions.forEach(function (value) { fieldNode._addedValues.add(value); });
         hidden.value = Array.from(fieldNode._addedValues).join(","); input.value = "";
         renderBulkField(fieldNode, fieldNode._currentValues, fieldNode._removedValues, fieldNode._addedValues);
       }
       button.addEventListener("click", addValue);
-      input.addEventListener("keydown", function (event) { if (event.key === "Enter") { event.preventDefault(); addValue(); } });
+      input.addEventListener("keydown", function (event) { var tagDelimiter = fieldNode.dataset.bulkField === "tag" && (event.key === "," || (event.key === " " && !tagQuoteOpen(input.value))); if (event.key === "Enter" || tagDelimiter) { event.preventDefault(); addValue(); } });
     });
+    var policyBulkForm = document.querySelector("[data-policy-bulk-form]"); if (policyBulkForm) policyBulkForm.addEventListener("submit", function () { var tagField = dialog && dialog.querySelector('[data-bulk-field="tag"]'); var tagEntry = tagField && tagField.querySelector("[data-bulk-entry]"); if (tagEntry && tagEntry.value.trim()) tagField.querySelector("[data-bulk-add-button]").click(); });
     all("[data-policy-tab]", dialog).forEach(function (tab) {
       tab.addEventListener("click", function () {
         all("[data-policy-tab]", dialog).forEach(function (item) { item.classList.toggle("is-active", item === tab); });
@@ -532,7 +555,7 @@
       if (requestedRow) openEditor(JSON.parse(requestedRow.dataset.object));
     }
     var cancel = dialog.querySelector("[data-object-cancel]"); if (cancel) cancel.addEventListener("click", function () { dialog.close(); });
-    form.addEventListener("submit", function () { commitDynamicEntry(); syncGenericUpdates(); });
+    form.addEventListener("submit", function () { addFreeformTag(); commitDynamicEntry(); syncGenericUpdates(); });
     var pickerPanel = dialog.querySelector("[data-member-picker-panel]"); var catalogNode = dialog.querySelector("[data-object-catalog]"); var catalog = catalogNode ? JSON.parse(catalogNode.textContent || "[]") : []; var pickerMode = "members"; var objectPickerSelections = new Set();
     var objectApplicationCatalog = dialog.querySelector("[data-object-application-catalog]"); var objectApplicationsLoaded = false;
     function loadObjectApplications() { if (!objectApplicationCatalog || objectApplicationsLoaded) return; objectApplicationsLoaded = true; fetch(objectApplicationCatalog.dataset.objectApplicationCatalog, {headers:{"Accept":"application/json"}}).then(function (response) { if (!response.ok) throw new Error("HTTP " + response.status); return response.json(); }).then(function (data) { var known = new Set(catalog.map(function (item) { return item.kind + "\u0000" + item.name; })); (data.items || []).forEach(function (item) { var key = "applications\u0000" + item.name; if (!known.has(key)) { known.add(key); catalog.push({name:item.name,kind:"applications"}); } }); if (pickerMode === "members" && pickerPanel && !pickerPanel.hidden) renderCatalog((pickerPanel.querySelector("[data-member-filter]").value || "").toLocaleLowerCase()); if (!data.ready && data.refreshing) { objectApplicationsLoaded = false; setTimeout(loadObjectApplications, 3000); } }).catch(function () { objectApplicationsLoaded = false; }); }
@@ -543,8 +566,8 @@
     var pickerOpen = dialog.querySelector("[data-member-picker-open]"); if (pickerOpen) pickerOpen.addEventListener("click", function () { openObjectPicker("members"); });
     var tagPickerOpen = dialog.querySelector("[data-tag-picker-open]"); if (tagPickerOpen) tagPickerOpen.addEventListener("click", function () { openObjectPicker("tags"); });
     var tagEntry = dialog.querySelector("[data-object-tag-entry]"); var tagAdd = dialog.querySelector("[data-object-tag-add]");
-    function addFreeformTag() { if (!tagEntry) return; var value = tagEntry.value.trim(); if (!value) return; tagSet.add(value); if (tagInput) tagInput.value = Array.from(tagSet).join(","); tagEntry.value = ""; renderTags(); }
-    if (tagEntry) tagEntry.addEventListener("keydown", function (event) { if (event.key === "Enter") { event.preventDefault(); addFreeformTag(); } });
+    function addFreeformTag() { if (!tagEntry) return; var values = parseTagTokens(tagEntry.value); if (!values.length) return; values.forEach(function (value) { tagSet.add(value); }); if (tagInput) tagInput.value = Array.from(tagSet).join(","); tagEntry.value = ""; renderTags(); }
+    if (tagEntry) tagEntry.addEventListener("keydown", function (event) { if (event.key === "Enter" || event.key === "," || (event.key === " " && !tagQuoteOpen(tagEntry.value))) { event.preventDefault(); addFreeformTag(); } });
     if (tagAdd) tagAdd.addEventListener("click", addFreeformTag);
     if (dynamicEntry && pickerPanel) dynamicEntry.addEventListener("focus", function () { openObjectPicker("dynamic"); });
     var addObjectPickerSelected = dialog.querySelector("[data-object-picker-add-selected]"); if (addObjectPickerSelected) addObjectPickerSelected.addEventListener("click", function () { objectPickerSelections.forEach(function (name) { if (pickerMode === "dynamic") { var quoted = "'" + name.replace(/'/g, "\\'") + "'"; if (!dynamicTokens.includes(quoted)) dynamicTokens.push(quoted); } else if (pickerMode === "tags") { tagSet.add(name); } else { memberSet.add(name); } }); if (pickerMode === "dynamic") syncDynamicFilter(); else if (pickerMode === "tags") { if (tagInput) tagInput.value = Array.from(tagSet).join(","); renderTags(); } else { if (memberInput) memberInput.value = Array.from(memberSet).join(","); renderMembers(); } objectPickerSelections.clear(); updateObjectPickerCount(); pickerPanel.hidden = true; });
@@ -576,13 +599,14 @@
         values.forEach(function (value) { var chip = document.createElement("span"); chip.className = "policy-value-chip"; var label = document.createElement("span"); label.textContent = value; var remove = document.createElement("button"); remove.type = "button"; remove.textContent = "−"; remove.addEventListener("click", function () { values.delete(value); hidden.value = Array.from(values).join(","); render(); }); chip.appendChild(label); chip.appendChild(remove); container.appendChild(chip); });
         if (!values.size) { var empty = document.createElement("span"); empty.className = "muted"; empty.textContent = "Geen waarden"; container.appendChild(empty); }
       }
-      function addValue(value) { value = (value || "").trim(); if (!value) return; values.add(value); hidden.value = Array.from(values).join(","); entry.value = ""; render(); }
+      function addValue(value) { var additions = field.dataset.offlinePolicyField === "tag" ? parseTagTokens(value) : [(value || "").trim()].filter(Boolean); if (!additions.length) return; additions.forEach(function (item) { values.add(item); }); hidden.value = Array.from(values).join(","); entry.value = ""; render(); }
       field._offlineAddValue = addValue;
       field._offlineValues = values;
       field.querySelector("[data-offline-policy-add]").addEventListener("click", function () { addValue(entry.value); });
-      entry.addEventListener("keydown", function (event) { if (event.key === "Enter") { event.preventDefault(); addValue(entry.value); } });
+      entry.addEventListener("keydown", function (event) { var tagDelimiter = field.dataset.offlinePolicyField === "tag" && (event.key === "," || (event.key === " " && !tagQuoteOpen(entry.value))); if (event.key === "Enter" || tagDelimiter) { event.preventDefault(); addValue(entry.value); } });
       render();
     });
+    var offlineForm = offlineDialog && offlineDialog.querySelector("form"); if (offlineForm) offlineForm.addEventListener("submit", function () { var tagField = fields.find(function (field) { return field.dataset.offlinePolicyField === "tag"; }); var tagEntry = tagField && tagField.querySelector("[data-offline-policy-entry]"); if (tagEntry && tagEntry.value.trim()) tagField._offlineAddValue(tagEntry.value); });
     var picker = document.querySelector("[data-offline-policy-picker]");
     var catalogNode = document.querySelector("[data-offline-policy-catalog]");
     if (picker && catalogNode && fields.length) {
