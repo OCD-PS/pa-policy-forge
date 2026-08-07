@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 import hashlib
 import html
 import hmac
@@ -893,6 +894,8 @@ def target_policy_payload(policy: dict, container: dict, policy_kind: str) -> di
 
 def update_xml_policy(policy: dict) -> str:
     entry = SafeET.fromstring(policy["_xml"])
+    if policy.get("name"):
+        entry.set("name", policy["name"])
     list_fields = set(POLICY_LIST_FIELDS)
     for field in list_fields:
         if field not in policy: continue
@@ -918,7 +921,7 @@ def update_xml_policy(policy: dict) -> str:
     return ET.tostring(entry, encoding="unicode")
 
 
-def write_target_policy(profile, policy_kind: str, policy: dict) -> None:
+def write_target_policy(profile, policy_kind: str, policy: dict, original_name: str | None = None) -> None:
     if profile["target_type"] == "scm":
         scm, token, _, container = scm_client(profile)
         service, endpoint_name, _ = SCM_POLICY_TYPES[policy_kind]
@@ -926,8 +929,12 @@ def write_target_policy(profile, policy_kind: str, policy: dict) -> None:
         policy_api.scm_http_request("PUT", f"{endpoint}/{policy['id']}", token, payload=target_policy_payload(policy, container, policy_kind), params={"position": scm.scm_rulebase})
         return
     _, endpoint, key, ctx = panos_profile_context(profile)
-    xpath = f"{panos_policy_xpath(profile, policy_kind)}/entry[@name={policy_api.xpath_literal(policy['name'])}]"
-    policy_api.require_success(panos_api_post(endpoint, {"type": "config", "action": "edit", "xpath": xpath, "element": update_xml_policy(policy), "key": key}, ctx), f"edit {policy_kind} rule {policy['name']}")
+    current_name = original_name or policy["name"]
+    xpath = f"{panos_policy_xpath(profile, policy_kind)}/entry[@name={policy_api.xpath_literal(current_name)}]"
+    editable_policy = {**policy, "name": current_name}
+    policy_api.require_success(panos_api_post(endpoint, {"type": "config", "action": "edit", "xpath": xpath, "element": update_xml_policy(editable_policy), "key": key}, ctx), f"edit {policy_kind} rule {current_name}")
+    if current_name != policy["name"]:
+        policy_api.require_success(panos_api_post(endpoint, {"type": "config", "action": "rename", "xpath": xpath, "newname": policy["name"], "key": key}, ctx), f"rename {policy_kind} rule {current_name}")
 
 
 def workspace_row(workspace_id: int):
@@ -1023,8 +1030,8 @@ def config_workspace_select(workspace_id):
 
 
 OFFLINE_POLICY_FIELDS = (
-    "from", "to", "source", "destination", "source_user", "category",
-    "application", "service", "tag",
+    "from", "to", "source", "destination", "source_user", "destination_user",
+    "source_hip", "destination_hip", "category", "application", "service", "tag",
 )
 WORKSPACE_POLICY_NAV = {
     "Security": "security", "NAT": "nat", "QoS": "qos",
@@ -1115,6 +1122,7 @@ def config_workspace_editor(workspace_id):
         session["workspace_contexts"] = dict(list(workspace_contexts.items())[-20:])
         policies = objects = []
         workspace_object_catalog = []
+        workspace_policy_catalog = []
         alternate_policy_count = 0
         inventory = {"network": [], "device": []}
         if workspace_view == "policies":
@@ -1123,6 +1131,17 @@ def config_workspace_editor(workspace_id):
                 other_rulebase = "post" if rulebase == "pre" else "pre"
                 _, alternate_policies = scoped_policies(xml_bytes, scope, policy_kind, other_rulebase, parsed=(parsed_root, snapshot))
                 alternate_policy_count = len(alternate_policies)
+            seen_policy_catalog = set()
+            for catalog_type in ("addresses", "address-groups", "applications", "application-groups", "application-filters", "services", "service-groups", "tags", "security-profile-groups", "log-forwarding"):
+                _, catalog_objects = scoped_objects(xml_bytes, scope, catalog_type, parsed=(parsed_root, snapshot))
+                for item in catalog_objects:
+                    key = (item["name"], catalog_type)
+                    if key not in seen_policy_catalog:
+                        seen_policy_catalog.add(key)
+                        workspace_policy_catalog.append({"name": item["name"], "kind": catalog_type})
+            zone_inventory = configuration_inventory(xml_bytes, scope, template, parsed=(parsed_root, snapshot))["network"]
+            zones = next((item.get("names", []) for item in zone_inventory if item["name"] == "Zones"), [])
+            workspace_policy_catalog.extend({"name": name, "kind": "zones"} for name in zones)
         elif workspace_view == "objects":
             _, objects = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
             related_types = {
@@ -1155,6 +1174,7 @@ def config_workspace_editor(workspace_id):
             alternate_policy_count=alternate_policy_count,
             object_type=object_type, object_nodes=OBJECT_NODES, objects=objects,
             workspace_object_catalog=workspace_object_catalog,
+            workspace_policy_catalog=workspace_policy_catalog,
             workspace_editable_object_types=WORKSPACE_EDITABLE_OBJECT_TYPES,
             config_section=config_section,
             inventory=inventory, offline_policy_fields=OFFLINE_POLICY_FIELDS,
@@ -1183,6 +1203,10 @@ def config_workspace_policy_preview(workspace_id):
         if before is None:
             raise OfflineConfigError("Alleen een policy uit de geselecteerde scope kan hier worden gewijzigd")
         updated = copy.deepcopy(before)
+        updated_name = request.form.get("name", "").strip()
+        if not updated_name:
+            raise OfflineConfigError("Policy name is verplicht")
+        updated["name"] = updated_name
         for field in OFFLINE_POLICY_FIELDS:
             updated[field] = split_values(request.form.get(field, ""))
         updated["action"] = request.form.get("action", "").strip()
@@ -1804,7 +1828,12 @@ def policy_single_preview(profile_id):
         current = fetch_scm_policy_type(profile, policy_kind)
         policy = next((item for item in current if item["id"] == policy_id), None)
         if not policy: raise ValueError("De policy bestaat niet meer. Vernieuw de rulebase.")
-        replacements = {}
+        new_name = request.form.get("name", "").strip()
+        if not new_name:
+            raise ValueError("Policy name is verplicht")
+        if any(item["id"] != policy_id and item.get("name") == new_name for item in current):
+            raise ValueError(f"Policy {new_name} bestaat al in deze rulebase")
+        replacements = {"name": new_name}
         for field in POLICY_LIST_FIELDS:
             if request.form.get(f"{field}_present") == "1":
                 values = split_values(request.form.get(field, ""))
@@ -1938,7 +1967,7 @@ def policy_bulk_push(draft_id):
             if not live or policy_fingerprint(live) != change["fingerprint"]:
                 raise RuntimeError(f"Policy {change['before']['name']} is intussen gewijzigd; Push gestopt.")
         for change in draft["changes"]:
-            write_target_policy(profile, policy_kind, change["after"])
+            write_target_policy(profile, policy_kind, change["after"], change["before"].get("name"))
         path.unlink()
         audit("policy-bulk-candidate", f"profile={profile['name']} rules={len(draft['changes'])}")
         flash(f"{len(draft['changes'])} {SCM_POLICY_TYPES[policy_kind][2]} policies bijgewerkt in {profile['target_type'].upper()} candidate.", "success")

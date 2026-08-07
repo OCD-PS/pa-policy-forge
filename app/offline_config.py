@@ -45,7 +45,7 @@ OBJECT_NODES = {
 }
 POLICY_LIST_FIELDS = (
     "from", "to", "source", "destination", "source-user", "category",
-    "application", "service", "tag",
+    "application", "service", "tag", "destination-user", "source-hip", "destination-hip",
 )
 
 
@@ -253,7 +253,7 @@ def _members(entry: ET.Element, field: str) -> list[str]:
 
 def policy_record(entry: ET.Element, kind: str, owner: str, rulebase: str, editable: bool) -> dict:
     record = {
-        "name": entry.get("name", ""), "kind": kind, "owner": owner,
+        "id": entry.get("name", ""), "name": entry.get("name", ""), "kind": kind, "owner": owner,
         "rulebase": rulebase, "editable": editable,
         "action": entry.findtext("./action", ""),
         "description": entry.findtext("./description", ""),
@@ -508,8 +508,11 @@ def replace_policy_in_snapshot(xml_bytes: bytes, scope: str, kind: str, rulebase
     if policy_fingerprint(current_record) != expected_fingerprint:
         raise OfflineConfigError("De policy is intussen gewijzigd; pas de wijziging opnieuw toe")
     replacement = SafeET.fromstring(replacement_xml)
-    if replacement.tag != "entry" or replacement.get("name") != name:
+    if replacement.tag != "entry" or not replacement.get("name"):
         raise OfflineConfigError("Ongeldige vervangende policy")
+    collision = next((entry for entry in rules.findall("./entry") if entry is not current and entry.get("name") == replacement.get("name")), None)
+    if collision is not None:
+        raise OfflineConfigError(f"Policy {replacement.get('name')} bestaat al in deze rulebase")
     index = list(rules).index(current)
     rules.remove(current)
     rules.insert(index, replacement)

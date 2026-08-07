@@ -513,6 +513,40 @@
         });
       });
     });
+    var fields = all("[data-offline-policy-field]");
+    fields.forEach(function (field) {
+      var hidden = field.querySelector("[data-offline-policy-input]");
+      var entry = field.querySelector("[data-offline-policy-entry]");
+      var values = new Set((hidden.value || "").split(",").map(function (value) { return value.trim(); }).filter(Boolean));
+      function render() {
+        var container = field.querySelector("[data-offline-policy-values]"); container.innerHTML = "";
+        values.forEach(function (value) { var chip = document.createElement("span"); chip.className = "policy-value-chip"; var label = document.createElement("span"); label.textContent = value; var remove = document.createElement("button"); remove.type = "button"; remove.textContent = "−"; remove.addEventListener("click", function () { values.delete(value); hidden.value = Array.from(values).join(","); render(); }); chip.appendChild(label); chip.appendChild(remove); container.appendChild(chip); });
+        if (!values.size) { var empty = document.createElement("span"); empty.className = "muted"; empty.textContent = "Geen waarden"; container.appendChild(empty); }
+      }
+      function addValue(value) { value = (value || "").trim(); if (!value) return; values.add(value); hidden.value = Array.from(values).join(","); entry.value = ""; render(); }
+      field._offlineAddValue = addValue;
+      field._offlineValues = values;
+      field.querySelector("[data-offline-policy-add]").addEventListener("click", function () { addValue(entry.value); });
+      entry.addEventListener("keydown", function (event) { if (event.key === "Enter") { event.preventDefault(); addValue(entry.value); } });
+      render();
+    });
+    var picker = document.querySelector("[data-offline-policy-picker]");
+    var catalogNode = document.querySelector("[data-offline-policy-catalog]");
+    if (picker && catalogNode) {
+      var catalog = JSON.parse(catalogNode.textContent || "[]"); var activeField = null;
+      function renderPicker(query) {
+        var results = picker.querySelector("[data-offline-policy-picker-results]"); results.innerHTML = "";
+        var entry = activeField && activeField.querySelector("[data-offline-policy-entry]");
+        var kinds = entry ? (entry.dataset.offlinePolicyKinds || "").split(/\s+/).filter(Boolean) : [];
+        var candidates = catalog.filter(function (item) { return kinds.includes(item.kind); });
+        if (kinds.includes("current")) { var seen = new Set(candidates.map(function (item) { return item.name; })); fields.forEach(function (field) { field._offlineValues.forEach(function (name) { if (!seen.has(name)) { seen.add(name); candidates.push({name:name,kind:"huidige configuratie"}); } }); }); }
+        candidates.filter(function (item) { return !query || item.name.toLocaleLowerCase().includes(query); }).forEach(function (item) { var row = document.createElement("div"); row.className = "member-result"; var copy = document.createElement("div"); var strong = document.createElement("strong"); strong.textContent = item.name; var small = document.createElement("small"); small.textContent = item.kind; copy.appendChild(strong); copy.appendChild(small); var button = document.createElement("button"); button.type = "button"; button.className = "btn btn-small"; button.textContent = "+"; button.addEventListener("click", function () { activeField._offlineAddValue(item.name); renderPicker(query); }); row.appendChild(copy); row.appendChild(button); results.appendChild(row); });
+        if (!results.children.length) { var empty = document.createElement("div"); empty.className = "muted member-result"; empty.textContent = "Geen bestaande waarden gevonden; freeform blijft beschikbaar."; results.appendChild(empty); }
+      }
+      fields.forEach(function (field) { var entry = field.querySelector("[data-offline-policy-entry]"); entry.addEventListener("focus", function () { activeField = field; picker.hidden = false; var filter = picker.querySelector("[data-offline-policy-picker-filter]"); filter.value = ""; renderPicker(""); }); });
+      picker.querySelector("[data-offline-policy-picker-filter]").addEventListener("input", function (event) { renderPicker(event.target.value.toLocaleLowerCase().trim()); });
+      picker.querySelector("[data-offline-policy-picker-close]").addEventListener("click", function () { picker.hidden = true; });
+    }
   }
 
   function setupConfigPullProgress() {

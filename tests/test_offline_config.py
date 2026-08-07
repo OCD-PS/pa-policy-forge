@@ -76,6 +76,30 @@ class OfflineConfigTests(unittest.TestCase):
         with self.assertRaises(OfflineConfigError):
             replace_policy_in_snapshot(INHERITED, "Child", "security", "pre", "child-rule", "wrong", replacement)
 
+    def test_policy_replacement_can_rename_but_rejects_a_duplicate_name(self):
+        _, policies = scoped_policies(INHERITED, "Child", "security", "pre")
+        child = policies[-1]
+        renamed = child["_xml"].replace('name="child-rule"', 'name="renamed-rule"')
+        updated = replace_policy_in_snapshot(
+            INHERITED, "Child", "security", "pre", "child-rule",
+            policy_fingerprint(child), renamed,
+        )
+        self.assertIn(b'<entry name="renamed-rule">', updated)
+        self.assertNotIn(b'<entry name="child-rule">', updated)
+
+        duplicate_source = INHERITED.replace(
+            b'<entry name="child-rule">',
+            b'<entry name="existing-rule"/><entry name="child-rule">',
+        )
+        _, duplicate_policies = scoped_policies(duplicate_source, "Child", "security", "pre")
+        original = next(item for item in duplicate_policies if item["name"] == "child-rule")
+        duplicate = original["_xml"].replace('name="child-rule"', 'name="existing-rule"')
+        with self.assertRaises(OfflineConfigError):
+            replace_policy_in_snapshot(
+                duplicate_source, "Child", "security", "pre", "child-rule",
+                policy_fingerprint(original), duplicate,
+            )
+
     def test_standalone_network_inventory_uses_device_and_vsys_contexts(self):
         inventory = configuration_inventory(PANOS, "vsys1")
         by_name = {item["name"]: item for item in inventory["network"]}

@@ -129,6 +129,16 @@ class TargetAdapterTests(unittest.TestCase):
         main.app.jinja_env.get_template("workspace_editor.html")
         main.app.jinja_env.get_template("workspace_policy_preview.html")
 
+    def test_workspace_policy_editor_is_actionable_and_supports_rename(self):
+        template = (main.BASE / "app" / "templates" / "workspace_editor.html").read_text()
+        javascript = (main.BASE / "app" / "static" / "app.js").read_text()
+        self.assertIn('name="name" value="{{edit_policy.name}}" required', template)
+        self.assertIn("data-offline-policy-field", template)
+        self.assertIn("data-offline-policy-picker", template)
+        self.assertIn("data-offline-policy-kinds", template)
+        self.assertIn("function setupOfflinePolicyTabs()", javascript)
+        self.assertIn("_offlineAddValue", javascript)
+
     def test_offline_workspace_storage_keeps_full_xml_and_inventory(self):
         timestamp = main.now()
         with main.db() as conn:
@@ -414,6 +424,59 @@ class TargetAdapterTests(unittest.TestCase):
                 conn.execute("DELETE FROM config_workspaces WHERE profile_id=?", (profile_id,))
                 conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
 
+    def test_offline_policy_rename_and_fields_are_applied_to_a_new_workspace(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("offline-policy", 1, "", "", "panos", "{}", b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase><security><rules><entry name="old-name"><from><member>Trust</member></from><to><member>Internet</member></to><source><member>any</member></source><destination><member>any</member></destination><application><member>web-browsing</member></application><service><member>application-default</member></service><action>allow</action><unknown>keep</unknown></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'''
+        workspace_id = main.store_config_workspace(profile, "policy", "config.xml", xml, "upload")
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1
+            login["username"] = "test"
+            login["must_change"] = False
+            login["csrf"] = "policy-csrf"
+        try:
+            editor = client.get(
+                f"/config-workspaces/{workspace_id}/edit?workspace_view=policies&scope=vsys1&policy_kind=security&rulebase=pre&edit_policy=old-name",
+                base_url="https://forge.test",
+            )
+            self.assertEqual(editor.status_code, 200)
+            self.assertIn(b'name="name" value="old-name" required', editor.data)
+            preview = client.post(
+                f"/config-workspaces/{workspace_id}/policies/preview",
+                data={"csrf": "policy-csrf", "scope": "vsys1", "policy_kind": "security", "rulebase": "pre", "policy_name": "old-name", "name": "renamed-policy", "from": "Trust", "to": "Internet", "source": "any", "destination": "any", "source_user": "any", "destination_user": "any", "source_hip": "any", "destination_hip": "any", "category": "any", "application": "ssl", "service": "application-default", "tag": "edited", "action": "allow", "description": "renamed"},
+                base_url="https://forge.test",
+            )
+            with client.session_transaction(base_url="https://forge.test") as current_session:
+                preview_flashes = list(current_session.get("_flashes", []))
+            self.assertEqual(preview.status_code, 200, preview_flashes)
+            parser = NavigationTargets(); parser.feed(preview.data.decode())
+            action = next(item for item in parser.actions if "/config-workspaces/policy-drafts/" in item)
+            applied = client.post(action, data={"csrf": "policy-csrf"}, base_url="https://forge.test")
+            self.assertEqual(applied.status_code, 302)
+            with main.db() as conn:
+                latest = conn.execute("SELECT * FROM config_workspaces WHERE profile_id=? ORDER BY id DESC LIMIT 1", (profile_id,)).fetchone()
+            self.assertNotEqual(latest["id"], workspace_id)
+            result = main.workspace_config_path(latest).read_bytes()
+            self.assertIn(b'<entry name="renamed-policy">', result)
+            self.assertNotIn(b'<entry name="old-name">', result)
+            self.assertIn(b'<member>ssl</member>', result)
+            self.assertIn(b'<unknown>keep</unknown>', result)
+        finally:
+            with main.db() as conn:
+                workspaces = conn.execute("SELECT * FROM config_workspaces WHERE profile_id=?", (profile_id,)).fetchall()
+            for item in workspaces:
+                main.workspace_config_path(item).unlink(missing_ok=True)
+            with main.db() as conn:
+                conn.execute("DELETE FROM config_workspaces WHERE profile_id=?", (profile_id,))
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
     def test_oversized_form_is_rejected(self):
         client = main.app.test_client()
         response = client.post(
@@ -480,6 +543,17 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertEqual(params["type"], "config")
         self.assertEqual(params["action"], "edit")
         self.assertNotIn("commit", params.values())
+
+    def test_panos_policy_rename_edits_then_renames_the_existing_entry(self):
+        profile = self.profile("panos")
+        policy = main.xml_entry_to_policy(main.ET.fromstring("<entry name='old-name'><from><member>Trust</member></from></entry>"), "security")
+        policy["name"] = "new-name"
+        with patch("app.main.panos_profile_context", return_value=({}, "https://example.invalid", "key", object())), patch("app.main.panos_api_post", return_value="<response status='success'><result/></response>") as request, patch("app.main.policy_api.require_success"):
+            main.write_target_policy(profile, "security", policy, "old-name")
+        self.assertEqual([call.args[1]["action"] for call in request.call_args_list], ["edit", "rename"])
+        self.assertIn("old-name", request.call_args_list[0].args[1]["xpath"])
+        self.assertIn('name="old-name"', request.call_args_list[0].args[1]["element"])
+        self.assertEqual(request.call_args_list[1].args[1]["newname"], "new-name")
 
     def test_panorama_new_objects_default_to_shared(self):
         profile = self.profile("panorama")
