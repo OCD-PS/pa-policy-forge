@@ -291,6 +291,45 @@ class TargetAdapterTests(unittest.TestCase):
                 conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
                 conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
 
+    def test_workspace_remembers_device_group_and_template_when_links_omit_them(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("context-memory", 1, "", "", "panorama", "{}", b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        xml = b'''<config><devices><entry name="localhost.localdomain"><device-group><entry name="First"/><entry name="Second"><reference-template>Template-B</reference-template></entry></device-group><template><entry name="Template-A"/><entry name="Template-B"/></template></entry></devices></config>'''
+        workspace_id = main.store_config_workspace(profile, "context", "config.xml", xml, "upload")
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1
+            login["username"] = "test"
+            login["must_change"] = False
+        try:
+            first = client.get(
+                f"/config-workspaces/{workspace_id}/edit?scope=Second&template=Template-B&workspace_view=network",
+                base_url="https://forge.test",
+            )
+            self.assertEqual(first.status_code, 200)
+            remembered = client.get(
+                f"/config-workspaces/{workspace_id}/edit?workspace_view=policies&rulebase=post",
+                base_url="https://forge.test",
+            )
+            self.assertEqual(remembered.status_code, 200)
+            self.assertIn(b'<option value="Second" selected>', remembered.data)
+            network = client.get(
+                f"/config-workspaces/{workspace_id}/edit?workspace_view=device",
+                base_url="https://forge.test",
+            )
+            self.assertIn(b'<option value="Template-B" selected>', network.data)
+        finally:
+            main.workspace_config_path(main.workspace_row(workspace_id)).unlink(missing_ok=True)
+            with main.db() as conn:
+                conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
     def test_oversized_form_is_rejected(self):
         client = main.app.test_client()
         response = client.post(

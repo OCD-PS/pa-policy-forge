@@ -1053,9 +1053,14 @@ def config_workspace_editor(workspace_id):
         scopes = available_scopes(snapshot)
         if not scopes:
             raise OfflineConfigError("Geen device group of VSYS gevonden")
-        scope = request.args.get("scope", "").strip() or scopes[0]
-        if scope not in scopes:
+        workspace_contexts = dict(session.get("workspace_contexts") or {})
+        saved_context = dict(workspace_contexts.get(str(workspace_id)) or {})
+        requested_scope = request.args.get("scope", "").strip()
+        if requested_scope and requested_scope not in scopes:
             raise OfflineConfigError("De gekozen scope bestaat niet")
+        scope = requested_scope or saved_context.get("scope", "")
+        if scope not in scopes:
+            scope = scopes[0]
         workspace_view = request.args.get("workspace_view", "policies")
         if workspace_view not in {"policies", "objects", "network", "device"}:
             workspace_view = "policies"
@@ -1072,9 +1077,11 @@ def config_workspace_editor(workspace_id):
         templates = available_templates(snapshot)
         requested_template = request.args.get("template", "").strip()
         preferred_template = referenced_template(snapshot, scope)
-        template = requested_template or preferred_template or (templates[0] if templates else "")
+        template = requested_template or saved_context.get("template", "") or preferred_template or (templates[0] if templates else "")
         if template and template not in templates:
-            template = templates[0] if templates else ""
+            template = preferred_template or (templates[0] if templates else "")
+        workspace_contexts[str(workspace_id)] = {"scope": scope, "template": template}
+        session["workspace_contexts"] = dict(list(workspace_contexts.items())[-20:])
         policies = objects = []
         alternate_policy_count = 0
         inventory = {"network": [], "device": []}
