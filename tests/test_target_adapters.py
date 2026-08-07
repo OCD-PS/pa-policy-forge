@@ -179,6 +179,24 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertIn('tokenInput.className = "token-input"', javascript)
         self.assertIn('.token-input:focus-within', css)
 
+    def test_bulk_and_single_edit_commit_every_pending_multivalue_field(self):
+        javascript = (main.BASE / "app" / "static" / "app.js").read_text()
+        self.assertIn("fieldNode._addBulkValue = addValue", javascript)
+        self.assertIn("if (entry && entry.value.trim()) fieldNode._addBulkValue()", javascript)
+        self.assertIn("if (entry && entry.value.trim()) field._offlineAddValue(entry.value)", javascript)
+
+    def test_security_profiles_are_read_only_in_xml_workspaces(self):
+        profile_types = {
+            "hip-profiles", "antivirus", "anti-spyware", "vulnerability-protection",
+            "url-filtering", "file-blocking", "wildfire-analysis", "dos-protection",
+            "security-profile-groups", "log-forwarding", "authentication",
+        }
+        self.assertTrue(profile_types.isdisjoint(main.WORKSPACE_EDITABLE_OBJECT_TYPES))
+        template = (main.BASE / "app" / "templates" / "workspace_editor.html").read_text()
+        self.assertIn("object.editable and object_type in workspace_editable_object_types", template)
+        self.assertIn("data-object-detail", template)
+        self.assertIn("data-object-detail-dialog", template)
+
     def test_workspace_actionbar_is_scoped_to_the_right_content_pane(self):
         css = (main.BASE / "app" / "static" / "app.css").read_text()
         self.assertIn(".workspace-editor-content .object-actionbar", css)

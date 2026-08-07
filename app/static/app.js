@@ -456,10 +456,11 @@
         hidden.value = Array.from(fieldNode._addedValues).join(","); input.value = "";
         renderBulkField(fieldNode, fieldNode._currentValues, fieldNode._removedValues, fieldNode._addedValues);
       }
+      fieldNode._addBulkValue = addValue;
       button.addEventListener("click", addValue);
       input.addEventListener("keydown", function (event) { var tagDelimiter = fieldNode.dataset.bulkField === "tag" && (event.key === "," || (event.key === " " && !tagQuoteOpen(input.value))); if (event.key === "Enter" || tagDelimiter) { event.preventDefault(); addValue(); } });
     });
-    var policyBulkForm = document.querySelector("[data-policy-bulk-form]"); if (policyBulkForm) policyBulkForm.addEventListener("submit", function () { var tagField = dialog && dialog.querySelector('[data-bulk-field="tag"]'); var tagEntry = tagField && tagField.querySelector("[data-bulk-entry]"); if (tagEntry && tagEntry.value.trim()) tagField.querySelector("[data-bulk-add-button]").click(); });
+    var policyBulkForm = document.querySelector("[data-policy-bulk-form]"); if (policyBulkForm) policyBulkForm.addEventListener("submit", function () { all("[data-bulk-field]", dialog).forEach(function (fieldNode) { var entry = fieldNode.querySelector("[data-bulk-entry]"); if (entry && entry.value.trim()) fieldNode._addBulkValue(); }); });
     all("[data-policy-tab]", dialog).forEach(function (tab) {
       tab.addEventListener("click", function () {
         all("[data-policy-tab]", dialog).forEach(function (item) { item.classList.toggle("is-active", item === tab); });
@@ -616,7 +617,7 @@
       entry.addEventListener("keydown", function (event) { var tagDelimiter = field.dataset.offlinePolicyField === "tag" && (event.key === "," || (event.key === " " && !tagQuoteOpen(entry.value))); if (event.key === "Enter" || tagDelimiter) { event.preventDefault(); addValue(entry.value); } });
       render();
     });
-    var offlineForm = offlineDialog && offlineDialog.querySelector("form"); if (offlineForm) offlineForm.addEventListener("submit", function () { var tagField = fields.find(function (field) { return field.dataset.offlinePolicyField === "tag"; }); var tagEntry = tagField && tagField.querySelector("[data-offline-policy-entry]"); if (tagEntry && tagEntry.value.trim()) tagField._offlineAddValue(tagEntry.value); });
+    var offlineForm = offlineDialog && offlineDialog.querySelector("form"); if (offlineForm) offlineForm.addEventListener("submit", function () { fields.forEach(function (field) { var entry = field.querySelector("[data-offline-policy-entry]"); if (entry && entry.value.trim()) field._offlineAddValue(entry.value); }); });
     var picker = document.querySelector("[data-offline-policy-picker]");
     var catalogNode = document.querySelector("[data-offline-policy-catalog]");
     if (picker && catalogNode && fields.length) {

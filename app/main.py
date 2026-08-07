@@ -1138,7 +1138,12 @@ WORKSPACE_STRUCTURED_OBJECT_TYPES = {
     "addresses", "address-groups", "application-groups",
     "services", "service-groups", "tags",
 }
-WORKSPACE_EDITABLE_OBJECT_TYPES = set(OBJECT_NODES)
+WORKSPACE_READ_ONLY_OBJECT_TYPES = {
+    "hip-profiles", "antivirus", "anti-spyware", "vulnerability-protection",
+    "url-filtering", "file-blocking", "wildfire-analysis", "dos-protection",
+    "security-profile-groups", "log-forwarding", "authentication",
+}
+WORKSPACE_EDITABLE_OBJECT_TYPES = set(OBJECT_NODES) - WORKSPACE_READ_ONLY_OBJECT_TYPES
 
 
 @app.get("/config-workspaces/<int:workspace_id>/edit")
