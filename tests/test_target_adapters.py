@@ -157,6 +157,25 @@ class TargetAdapterTests(unittest.TestCase):
             self.assertRegex(template, re.compile(r"data-policy-picker-add-selected.*data-policy-picker-results", re.S))
         self.assertIn('row.addEventListener("click", toggleSelection)', javascript)
 
+    def test_multivalue_controls_use_one_integrated_token_input(self):
+        workspace_template = (main.BASE / "app" / "templates" / "workspace_editor.html").read_text()
+        live_template = (main.BASE / "app" / "templates" / "app.html").read_text()
+        javascript = (main.BASE / "app" / "static" / "app.js").read_text()
+        css = (main.BASE / "app" / "static" / "app.css").read_text()
+        for template in (workspace_template, live_template):
+            self.assertIn('class="token-input"', template)
+            self.assertIn('class="token-chip-list" data-object-tag-values', template)
+            self.assertIn('class="token-chip-list" data-member-values', template)
+            self.assertNotIn('class="policy-value-entry"', template)
+            self.assertNotIn('class="member-editor"', template)
+            self.assertNotIn('class="dynamic-filter-editor"', template)
+        self.assertIn('class="token-chip-list" data-bulk-values', workspace_template)
+        self.assertIn('class="token-chip-list" data-offline-policy-values', workspace_template)
+        self.assertIn('class="token-chip-list" data-bulk-values', live_template)
+        self.assertIn('class="token-chip-list" data-single-tag-values', live_template)
+        self.assertIn('tokenInput.className = "token-input"', javascript)
+        self.assertIn('.token-input:focus-within', css)
+
     def test_workspace_actionbar_is_scoped_to_the_right_content_pane(self):
         css = (main.BASE / "app" / "static" / "app.css").read_text()
         self.assertIn(".workspace-editor-content .object-actionbar", css)

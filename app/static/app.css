@@ -266,6 +266,12 @@ body.sidebar-collapsed .object-actionbar { left: 100px; }
 .bulk-field strong { color: var(--orange-2); }
 .policy-value-editor { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 7px; min-height: 54px; padding: 9px; border: 1px solid #393939; border-radius: 6px; background: #181818; }
 .policy-value-editor.compact { min-height: 0; padding: 0; border: 0; background: transparent; }
+.token-input { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; min-height: 46px; padding: 7px 8px; border: 1px solid #393939; border-radius: 6px; background: #181818; transition: border-color .15s ease, box-shadow .15s ease; }
+.token-input:focus-within { border-color: var(--orange); box-shadow: 0 0 0 1px rgba(255,121,0,.22); }
+.token-chip-list { display: contents; }
+.token-input > input { flex: 1 1 180px; min-width: 140px; width: auto; padding: 6px 4px; border: 0; background: transparent; box-shadow: none; }
+.token-input > input:focus { border: 0; outline: 0; box-shadow: none; }
+.token-input > .btn { flex: 0 0 auto; min-width: 42px; }
 .policy-value-chip { display: inline-flex; align-items: center; overflow: hidden; height: 28px; border: 1px solid #555; border-radius: 4px; background: #292929; color: #eee; }
 .policy-value-chip > span { padding: 0 8px; }
 .policy-value-chip button { align-self: stretch; min-width: 28px; border: 0; border-left: 1px solid #555; background: #202020; color: var(--orange-2); cursor: pointer; font-size: 18px; line-height: 1; }
