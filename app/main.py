@@ -1076,9 +1076,14 @@ def config_workspace_editor(workspace_id):
         if template and template not in templates:
             template = templates[0] if templates else ""
         policies = objects = []
+        alternate_policy_count = 0
         inventory = {"network": [], "device": []}
         if workspace_view == "policies":
             _, policies = scoped_policies(xml_bytes, scope, policy_kind, rulebase)
+            if snapshot.kind == "panorama":
+                other_rulebase = "post" if rulebase == "pre" else "pre"
+                _, alternate_policies = scoped_policies(xml_bytes, scope, policy_kind, other_rulebase)
+                alternate_policy_count = len(alternate_policies)
         elif workspace_view == "objects":
             _, objects = scoped_objects(xml_bytes, scope, object_type)
         else:
@@ -1095,6 +1100,7 @@ def config_workspace_editor(workspace_id):
             preferred_template=preferred_template, workspace_view=workspace_view,
             policy_kind=policy_kind, policy_nodes=POLICY_NODES,
             rulebase=rulebase, policies=policies, edit_policy=edit_policy,
+            alternate_policy_count=alternate_policy_count,
             object_type=object_type, object_nodes=OBJECT_NODES, objects=objects,
             config_section=config_section,
             inventory=inventory, offline_policy_fields=OFFLINE_POLICY_FIELDS,
