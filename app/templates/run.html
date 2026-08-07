@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Run #{{run.id}} · PA Policy Forge</title>
-<link rel="stylesheet" href="{{url_for('static',filename='app.css')}}">
+<link rel="stylesheet" href="{{url_for('static',filename='app.css',v=asset_version)}}">
 </head>
 <body>
 <main class="content" style="margin:auto">
@@ -41,6 +41,6 @@
 <div class="card" style="margin-top:22px"><h2>Uitvoer</h2><pre style="white-space:pre-wrap">{{run.output}}</pre></div>
 {% endif %}
 </main>
-<script src="{{url_for('static',filename='app.js')}}"></script>
+<script src="{{url_for('static',filename='app.js',v=asset_version)}}"></script>
 </body>
 </html>

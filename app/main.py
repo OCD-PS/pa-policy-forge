@@ -60,6 +60,21 @@ BLOCKED_PASSWORD_SHA256 = {
 }
 
 app = Flask(__name__)
+
+
+def build_asset_version() -> str:
+    digest = hashlib.sha256()
+    static_root = Path(app.static_folder or BASE / "app" / "static")
+    for name in ("app.css", "app.js", "favicon.svg"):
+        path = static_root / name
+        if path.is_file():
+            digest.update(name.encode())
+            digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
+
+
+ASSET_VERSION = build_asset_version()
+app.jinja_env.globals["asset_version"] = ASSET_VERSION
 DATA.mkdir(parents=True, exist_ok=True)
 RUNS.mkdir(parents=True, exist_ok=True)
 SECRETS.mkdir(parents=True, exist_ok=True)

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Bulk-preview · PA Policy Forge</title>
-<link rel="stylesheet" href="{{url_for('static',filename='app.css')}}">
+<link rel="stylesheet" href="{{url_for('static',filename='app.css',v=asset_version)}}">
 </head>
 <body><main class="content" style="margin:auto">
 <div class="page-header"><div><p class="eyebrow">{{policy_label}} · {{profile.target_type|upper}}</p><h1>Bulk-preview · {{profile.name}}</h1></div>
@@ -15,4 +15,4 @@
 <tr><td>{{change.before.name}}</td><td>{{field}}</td><td>{{change.before[field]|join(', ') if change.before[field] is sequence and change.before[field] is not string else change.before[field]}}</td><td>{{change.after[field]|join(', ') if change.after[field] is sequence and change.after[field] is not string else change.after[field]}}</td></tr>
 {% endfor %}{% endfor %}
 </tbody></table></div>
-</main><script src="{{url_for('static',filename='app.js')}}"></script></body></html>
+</main><script src="{{url_for('static',filename='app.js',v=asset_version)}}"></script></body></html>

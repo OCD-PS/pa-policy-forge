@@ -285,6 +285,8 @@ class TargetAdapterTests(unittest.TestCase):
             index_html = client.get(paths[-1], base_url="https://forge.test").data.decode()
             self.assertIn("data-menu-toggle", index_html)
             self.assertIn("data-config-pull-progress", index_html)
+            self.assertIn("app.css?v=", index_html)
+            self.assertIn("app.js?v=", index_html)
         finally:
             main.workspace_config_path(main.workspace_row(workspace_id)).unlink(missing_ok=True)
             with main.db() as conn:

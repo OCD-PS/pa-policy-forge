@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>PA Policy Forge</title>
-<link rel="icon" href="{{url_for('static',filename='favicon.svg')}}" type="image/svg+xml">
-<link rel="stylesheet" href="{{url_for('static',filename='app.css')}}">
+<link rel="icon" href="{{url_for('static',filename='favicon.svg',v=asset_version)}}" type="image/svg+xml">
+<link rel="stylesheet" href="{{url_for('static',filename='app.css',v=asset_version)}}">
 </head>
 <body>
 <div class="app-shell">
@@ -506,7 +506,7 @@
 </div>
 </main>
 </div>
-<script src="{{url_for('static',filename='app.js')}}">
+<script src="{{url_for('static',filename='app.js',v=asset_version)}}">
 </script>
 </body>
 </html>
