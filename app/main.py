@@ -1745,7 +1745,7 @@ def index():
             if serials:
                 placeholders = ",".join("?" for _ in serials)
                 flows = conn.execute(f"SELECT * FROM flows WHERE serial IN ({placeholders}) ORDER BY last_seen DESC LIMIT 100", serials).fetchall()
-    policy_profile = None; policies = []; policy_error = ""; policy_objects = []; object_catalog = []; policy_catalog = []; policy_workspaces = []
+    policy_profile = None; policies = []; policy_error = ""; policy_objects = []; object_catalog = []; policy_catalog = []; policy_workspaces = []; live_application_state = {}
     policy_source = request.args.get("policy_source", "").strip()
     policy_view = request.args.get("policy_view", "policies")
     if policy_view not in {"policies", "objects", "network"}: policy_view = "policies"
@@ -1774,13 +1774,20 @@ def index():
                 try:
                     if policy_view in {"objects", "network"}:
                         if policy_view == "network": object_type = "zones"
-                        policy_objects = fetch_scm_objects(policy_profile, object_type)
+                        if object_type == "applications":
+                            live_application_state = cached_application_catalog(policy_profile)
+                            policy_objects = [
+                                {"id": item["name"], "name": item["name"], "predefined": True}
+                                for item in live_application_state["items"]
+                            ]
+                        else:
+                            policy_objects = fetch_scm_objects(policy_profile, object_type)
                         object_catalog = fetch_object_catalog(policy_profile, object_type)
                     else:
                         policies = fetch_scm_policy_type(policy_profile, policy_kind)
                         policy_catalog = fetch_object_catalog(policy_profile, "policy-picker")
                 except Exception as exc: policy_error = str(exc)
-    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
+    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, live_application_state=live_application_state, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
 
 
 def parse_zones(text: str) -> dict[str, str]:
