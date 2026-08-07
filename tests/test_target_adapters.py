@@ -277,6 +277,14 @@ class TargetAdapterTests(unittest.TestCase):
                 parsed = urlsplit(action)
                 response = client.open(parsed.path, method="OPTIONS", base_url="https://forge.test")
                 self.assertNotIn(response.status_code, {404, 405, 500}, action)
+            policy_html = client.get(paths[0], base_url="https://forge.test").data.decode()
+            self.assertIn("policy_kind=nat", policy_html)
+            self.assertIn("scope=vsys1", policy_html)
+            object_html = client.get(paths[1], base_url="https://forge.test").data.decode()
+            self.assertIn("data-workspace-object=", object_html)
+            index_html = client.get(paths[-1], base_url="https://forge.test").data.decode()
+            self.assertIn("data-menu-toggle", index_html)
+            self.assertIn("data-config-pull-progress", index_html)
         finally:
             main.workspace_config_path(main.workspace_row(workspace_id)).unlink(missing_ok=True)
             with main.db() as conn:

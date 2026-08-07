@@ -32,11 +32,11 @@ from flask import Flask, Response, flash, has_request_context, redirect, render_
 from vendor.paloalto_light_syslog import FlowStore, parse_panos_syslog
 from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_single_replacements
 from app.offline_config import (
-    OBJECT_NODES, POLICY_NODES, OfflineConfigError, available_scopes,
+    OBJECT_NODES, POLICY_NODES, OfflineConfigError, available_scopes, available_templates,
     configuration_inventory, normalized_config_xml, parse_snapshot,
     policy_fingerprint as offline_policy_fingerprint, render_set_commands,
     replace_policy_in_snapshot, safe_workspace_path, scoped_objects,
-    scoped_policies, snapshot_sha256,
+    scoped_policies, snapshot_sha256, referenced_template,
 )
 
 BASE = Path(__file__).resolve().parent.parent
@@ -1006,23 +1006,38 @@ WORKSPACE_POLICY_NAV = {
 }
 WORKSPACE_OBJECT_NAV = {
     "Addresses": "addresses", "Address Groups": "address-groups", "Regions": "regions",
+    "Dynamic User Groups": "dynamic-user-groups",
     "Applications": "applications", "Application Groups": "application-groups",
     "Application Filters": "application-filters", "Services": "services",
     "Service Groups": "service-groups", "Tags": "tags",
+    "HIP Objects": "hip-objects", "HIP Profiles": "hip-profiles",
     "External Dynamic Lists": "external-dynamic-lists",
+    "Custom URL Categories": "custom-url-categories",
+    "↳ Antivirus": "antivirus", "↳ Anti-Spyware": "anti-spyware",
+    "↳ Vulnerability Protection": "vulnerability-protection",
+    "↳ URL Filtering": "url-filtering", "↳ File Blocking": "file-blocking",
+    "↳ WildFire Analysis": "wildfire-analysis", "↳ DoS Protection": "dos-protection",
     "Security Profile Groups": "security-profile-groups", "Log Forwarding": "log-forwarding",
     "Authentication": "authentication",
 }
 WORKSPACE_NETWORK_NAV = {
-    "Interfaces": "interfaces", "Zones": "zones", "Virtual Routers": "virtual-routers",
+    "Interfaces": "interfaces", "Zones": "zones", "VLANs": "vlans", "Virtual Wires": "virtual-wires",
+    "Virtual Routers": "virtual-routers",
     "Logical Routers": "logical-routers", "IPSec Tunnels": "ipsec-tunnels",
+    "Routing Profiles": "routing-profiles", "GRE Tunnels": "gre-tunnels",
     "GlobalProtect Portals": "globalprotect-portals",
-    "GlobalProtect Gateways": "globalprotect-gateways", "Network Profiles": "network-profiles",
+    "GlobalProtect Gateways": "globalprotect-gateways", "DHCP": "dhcp", "DNS Proxy": "dns-proxy",
+    "QoS": "qos", "LLDP": "lldp", "Network Profiles": "network-profiles",
 }
 WORKSPACE_DEVICE_NAV = {
-    "Setup": "setup", "Administrators": "administrators", "Certificates": "certificates",
+    "Setup": "setup", "Administrators": "administrators", "Admin Roles": "admin-roles",
+    "Authentication Profile": "authentication-profile", "Authentication Sequence": "authentication-sequence",
+    "Certificates": "certificates", "Certificate Management": "certificate-management",
+    "Local User Database": "local-user-database",
     "Server Profiles": "server-profiles", "Log Settings": "log-settings",
-    "High Availability": "high-availability",
+    "High Availability": "high-availability", "User Identification": "user-identification",
+    "VM Information Sources": "vm-information-sources", "Licenses": "licenses",
+    "Dynamic Updates": "dynamic-updates", "Software": "software",
 }
 
 
@@ -1053,6 +1068,13 @@ def config_workspace_editor(workspace_id):
         object_type = request.args.get("object_type", "addresses")
         if object_type not in OBJECT_NODES:
             object_type = "addresses"
+        config_section = request.args.get("config_section", "").strip()
+        templates = available_templates(snapshot)
+        requested_template = request.args.get("template", "").strip()
+        preferred_template = referenced_template(snapshot, scope)
+        template = requested_template or preferred_template or (templates[0] if templates else "")
+        if template and template not in templates:
+            template = templates[0] if templates else ""
         policies = objects = []
         inventory = {"network": [], "device": []}
         if workspace_view == "policies":
@@ -1060,7 +1082,7 @@ def config_workspace_editor(workspace_id):
         elif workspace_view == "objects":
             _, objects = scoped_objects(xml_bytes, scope, object_type)
         else:
-            inventory = configuration_inventory(xml_bytes, scope)
+            inventory = configuration_inventory(xml_bytes, scope, template)
             for item in inventory["network"]:
                 item["slug"] = WORKSPACE_NETWORK_NAV.get(item["name"], "")
             for item in inventory["device"]:
@@ -1069,10 +1091,12 @@ def config_workspace_editor(workspace_id):
         edit_policy = next((item for item in policies if item["name"] == edit_name and item["editable"]), None)
         return render_template(
             "workspace_editor.html", workspace=workspace, snapshot=snapshot,
-            scopes=scopes, scope=scope, workspace_view=workspace_view,
+            scopes=scopes, scope=scope, templates=templates, template=template,
+            preferred_template=preferred_template, workspace_view=workspace_view,
             policy_kind=policy_kind, policy_nodes=POLICY_NODES,
             rulebase=rulebase, policies=policies, edit_policy=edit_policy,
             object_type=object_type, object_nodes=OBJECT_NODES, objects=objects,
+            config_section=config_section,
             inventory=inventory, offline_policy_fields=OFFLINE_POLICY_FIELDS,
             workspace_policy_nav=WORKSPACE_POLICY_NAV, workspace_object_nav=WORKSPACE_OBJECT_NAV,
             workspace_network_nav=WORKSPACE_NETWORK_NAV, workspace_device_nav=WORKSPACE_DEVICE_NAV,

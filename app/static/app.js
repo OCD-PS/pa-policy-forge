@@ -41,7 +41,9 @@
     var hash = window.location.hash.replace(/^#/, "");
     var preferred = hash || (document.querySelector("[data-section].active") || {}).dataset?.section;
     if (preferred) activateSection(preferred, false);
-
+    all("[data-menu-toggle]").forEach(function (button) {
+      button.addEventListener("click", function () { document.body.classList.toggle("nav-open"); });
+    });
   }
 
   function setupSidebarCollapse() {
@@ -513,6 +515,43 @@
     });
   }
 
+  function setupConfigPullProgress() {
+    all("form[data-config-pull]").forEach(function (form) {
+      form.addEventListener("submit", function () {
+        var button = form.querySelector('button[type="submit"]');
+        var status = form.querySelector("[data-config-pull-status]");
+        var progress = form.querySelector("[data-config-pull-progress]");
+        if (button) { button.disabled = true; button.textContent = "Configuratie ophalen…"; }
+        if (status) { status.hidden = false; status.textContent = "Verbinden en volledige candidateconfiguratie ophalen…"; }
+        if (progress) progress.hidden = false;
+      });
+    });
+  }
+
+  function setupWorkspaceObjects() {
+    var dialog = document.querySelector("[data-workspace-object-dialog]");
+    if (!dialog) return;
+    all("[data-workspace-object]").forEach(function (button) {
+      button.addEventListener("click", function () {
+        var item = JSON.parse(button.getAttribute("data-workspace-object"));
+        dialog.querySelector("[data-workspace-object-title]").textContent = item.name;
+        dialog.querySelector("[data-workspace-object-owner]").textContent = item.owner + (item.editable ? " · lokale scope" : " · inherited, alleen-lezen");
+        var fields = dialog.querySelector("[data-workspace-object-fields]");
+        fields.innerHTML = "";
+        (item.fields || []).forEach(function (field) {
+          var wrapper = document.createElement("div"); wrapper.className = "field";
+          var label = document.createElement("label"); label.textContent = field.name.replace(/-/g, " ");
+          var values = document.createElement("div"); values.className = "policy-value-editor";
+          (field.values || []).forEach(function (value) { var chip = document.createElement("span"); chip.className = "policy-value-chip"; var text = document.createElement("span"); text.textContent = value; chip.appendChild(text); values.appendChild(chip); });
+          wrapper.appendChild(label); wrapper.appendChild(values); fields.appendChild(wrapper);
+        });
+        if (!fields.children.length) fields.textContent = "Geen configureerbare velden gevonden.";
+        dialog.showModal();
+      });
+    });
+    dialog.querySelector("[data-workspace-object-close]").addEventListener("click", function () { dialog.close(); });
+  }
+
   document.addEventListener("DOMContentLoaded", function () {
     setupNavigation();
     setupSidebarCollapse();
@@ -527,5 +566,7 @@
     setupPolicyManagement();
     setupObjectManagement();
     setupOfflinePolicyTabs();
+    setupConfigPullProgress();
+    setupWorkspaceObjects();
   });
 })();

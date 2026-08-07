@@ -6,9 +6,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.offline_config import (
-    OfflineConfigError, available_scopes, configuration_inventory, parse_snapshot,
+    OfflineConfigError, available_scopes, available_templates, configuration_inventory, parse_snapshot,
     policy_fingerprint, render_set_commands, replace_policy_in_snapshot,
-    scoped_objects, scoped_policies,
+    referenced_template, scoped_objects, scoped_policies,
 )
 
 
@@ -29,6 +29,8 @@ class OfflineConfigTests(unittest.TestCase):
         self.assertEqual(child["reference_template"], "Branch-Stack")
         self.assertEqual(snapshot.templates, ["Base", "Branch"])
         self.assertEqual(snapshot.template_stacks[0]["templates"], ["Branch", "Base"])
+        self.assertEqual(available_templates(snapshot), ["Base", "Branch", "Branch-Stack"])
+        self.assertEqual(referenced_template(snapshot, "Child"), "Branch-Stack")
 
     def test_standalone_inventory_lists_all_vsys(self):
         _, snapshot = parse_snapshot(PANOS, expected_kind="panos")

@@ -17,7 +17,7 @@ class OfflineConfigError(ValueError):
 
 PANORAMA_TREE = [
     ("Policies", ["Security", "NAT", "QoS", "Policy Based Forwarding", "Decryption", "Tunnel Inspection", "Application Override", "Authentication", "DoS Protection", "SD-WAN"]),
-    ("Objects", ["Addresses", "Address Groups", "Regions", "Dynamic User Groups", "Applications", "Application Groups", "Application Filters", "Services", "Service Groups", "Tags", "GlobalProtect", "External Dynamic Lists", "Custom Objects", "Security Profiles", "Security Profile Groups", "Log Forwarding", "Authentication", "Decryption"]),
+    ("Objects", ["Addresses", "Address Groups", "Regions", "Dynamic User Groups", "Applications", "Application Groups", "Application Filters", "Services", "Service Groups", "Tags", "HIP Objects", "HIP Profiles", "External Dynamic Lists", "Custom URL Categories", "Security Profiles", "↳ Antivirus", "↳ Anti-Spyware", "↳ Vulnerability Protection", "↳ URL Filtering", "↳ File Blocking", "↳ WildFire Analysis", "↳ DoS Protection", "Security Profile Groups", "Log Forwarding", "Authentication", "Decryption"]),
     ("Network", ["Interfaces", "Zones", "VLANs", "Virtual Wires", "Virtual Routers", "Logical Routers", "Routing Profiles", "IPSec Tunnels", "GRE Tunnels", "GlobalProtect Portals", "GlobalProtect Gateways", "DHCP", "DNS Proxy", "QoS", "LLDP", "Network Profiles"]),
     ("Device", ["Setup", "Administrators", "Admin Roles", "Authentication Profile", "Authentication Sequence", "Certificates", "Certificate Management", "Local User Database", "Server Profiles", "Log Settings", "High Availability", "User Identification", "VM Information Sources", "Licenses", "Dynamic Updates", "Software"]),
 ]
@@ -30,9 +30,16 @@ POLICY_NODES = {
 }
 OBJECT_NODES = {
     "addresses": "address", "address-groups": "address-group", "regions": "region",
+    "dynamic-user-groups": "dynamic-user-group",
     "applications": "application", "application-groups": "application-group",
     "application-filters": "application-filter", "services": "service",
     "service-groups": "service-group", "tags": "tag", "external-dynamic-lists": "external-list",
+    "hip-objects": "hip-objects", "hip-profiles": "hip-profiles",
+    "custom-url-categories": "profiles/custom-url-category",
+    "antivirus": "profiles/virus", "anti-spyware": "profiles/spyware",
+    "vulnerability-protection": "profiles/vulnerability", "url-filtering": "profiles/url-filtering",
+    "file-blocking": "profiles/file-blocking", "wildfire-analysis": "profiles/wildfire-analysis",
+    "dos-protection": "profiles/dos-protection",
     "schedules": "schedule", "security-profile-groups": "profile-group",
     "log-forwarding": "log-settings", "authentication": "authentication-profile",
 }
@@ -210,6 +217,28 @@ def available_scopes(snapshot: ConfigSnapshot) -> list[str]:
     return snapshot.vsys
 
 
+def available_templates(snapshot: ConfigSnapshot) -> list[str]:
+    if snapshot.kind != "panorama":
+        return snapshot.vsys
+    return snapshot.templates + [item["name"] for item in snapshot.template_stacks]
+
+
+def referenced_template(snapshot: ConfigSnapshot, device_group: str) -> str:
+    if snapshot.kind != "panorama" or device_group == "Shared":
+        return ""
+    current = device_group
+    groups = {item["name"]: item for item in snapshot.device_groups}
+    seen = set()
+    while current and current not in seen:
+        seen.add(current)
+        item = groups.get(current) or {}
+        if item.get("reference_template"):
+            return item["reference_template"]
+        parent = item.get("parent") or "Shared"
+        current = "" if parent == "Shared" else parent
+    return ""
+
+
 def _scope_root(root: ET.Element, snapshot: ConfigSnapshot, scope: str) -> ET.Element | None:
     if scope == "Shared":
         return root.find("./shared")
@@ -267,6 +296,30 @@ def _object_summary(entry: ET.Element) -> str:
     return ""
 
 
+def _object_values(entry: ET.Element) -> list[str]:
+    values = []
+    for path in ("./ip-netmask", "./ip-range", "./ip-wildcard", "./fqdn", "./color", "./filter"):
+        value = entry.findtext(path, "").strip()
+        if value:
+            values.append(value)
+    values.extend(node.text or "" for node in entry.findall(".//member") if node.text)
+    return list(dict.fromkeys(values))
+
+
+def _object_fields(entry: ET.Element) -> list[dict]:
+    fields = []
+    for child in entry:
+        values = [node.text or "" for node in child.findall(".//member") if node.text]
+        text = (child.text or "").strip()
+        if values:
+            fields.append({"name": child.tag, "values": values})
+        elif text:
+            fields.append({"name": child.tag, "values": [text]})
+        elif list(child):
+            fields.append({"name": child.tag, "values": [ET.tostring(child, encoding="unicode")]})
+    return fields
+
+
 def scoped_objects(xml_bytes: bytes, scope: str, object_type: str) -> tuple[ConfigSnapshot, list[dict]]:
     root, snapshot = parse_snapshot(xml_bytes)
     node = OBJECT_NODES.get(object_type)
@@ -282,12 +335,13 @@ def scoped_objects(xml_bytes: bytes, scope: str, object_type: str) -> tuple[Conf
             records.append({
                 "name": entry.get("name", ""), "owner": owner, "editable": owner == scope,
                 "summary": _object_summary(entry), "description": entry.findtext("./description", ""),
+                "values": _object_values(entry), "fields": _object_fields(entry),
                 "_xml": ET.tostring(entry, encoding="unicode"),
             })
     return snapshot, records
 
 
-def configuration_inventory(xml_bytes: bytes, scope: str) -> dict[str, list[dict]]:
+def configuration_inventory(xml_bytes: bytes, scope: str, template: str = "") -> dict[str, list[dict]]:
     root, snapshot = parse_snapshot(xml_bytes)
     scope_root = _scope_root(root, snapshot, scope)
     if scope_root is None:
@@ -299,25 +353,50 @@ def configuration_inventory(xml_bytes: bytes, scope: str) -> dict[str, list[dict
     # live at device level. Panorama network settings belong to templates; until
     # template editing lands we inventory the full snapshot without pretending
     # that a device-group owns those nodes.
-    network_root = device_root if snapshot.kind == "panos" else root
+    if snapshot.kind == "panorama":
+        template_root = next((entry for entry in root.findall("./devices/entry/template/entry") if entry.get("name") == template), None)
+        template_roots = [template_root] if template_root is not None else []
+        if template_root is None:
+            stack = next((entry for entry in root.findall("./devices/entry/template-stack/entry") if entry.get("name") == template), None)
+            template_names = [member.text or "" for member in stack.findall("./templates/member")] if stack is not None else []
+            by_name = {entry.get("name", ""): entry for entry in root.findall("./devices/entry/template/entry")}
+            template_roots = [by_name[name] for name in template_names if name in by_name]
+        network_root = template_roots or [root]
+        device_inventory_root = network_root
+    else:
+        network_root = [device_root]
+        device_inventory_root = [root]
     network_paths = {
-        "Interfaces": ".//network/interface", "Virtual Routers": ".//virtual-router",
+        "Interfaces": ".//network/interface", "VLANs": ".//network/vlan",
+        "Virtual Wires": ".//network/virtual-wire", "Virtual Routers": ".//virtual-router",
         "Logical Routers": ".//logical-router", "IPSec Tunnels": ".//tunnel/ipsec",
+        "Routing Profiles": ".//network/routing-profile", "GRE Tunnels": ".//tunnel/gre",
         "GlobalProtect Portals": ".//global-protect/global-protect-portal",
         "GlobalProtect Gateways": ".//global-protect/global-protect-gateway",
+        "DHCP": ".//network/dhcp", "DNS Proxy": ".//network/dns-proxy",
+        "QoS": ".//network/qos", "LLDP": ".//network/lldp",
         "Network Profiles": ".//network/profiles",
     }
     device_paths = {
         "Setup": ".//deviceconfig", "Administrators": ".//mgt-config/users",
-        "Certificates": ".//certificate", "Server Profiles": ".//server-profile",
+        "Admin Roles": ".//mgt-config/admin-roles", "Authentication Profile": ".//authentication-profile",
+        "Authentication Sequence": ".//authentication-sequence", "Certificates": ".//certificate",
+        "Certificate Management": ".//ssl-decrypt", "Local User Database": ".//local-user-database",
+        "Server Profiles": ".//server-profile",
         "Log Settings": ".//log-settings", "High Availability": ".//high-availability",
+        "User Identification": ".//user-id-collector", "VM Information Sources": ".//vm-info-source",
+        "Licenses": ".//license", "Dynamic Updates": ".//content-updates", "Software": ".//software",
     }
+    def inventory_item(name: str, sources: list[ET.Element], path: str) -> dict:
+        entries = [entry for source in sources for entry in source.findall(path + "//entry")]
+        names = list(dict.fromkeys(entry.get("name", "") for entry in entries if entry.get("name")))
+        return {"name": name, "present": any(source.find(path) is not None for source in sources), "entries": len(entries), "names": names[:250]}
     return {
         "network": (
-            [{"name": "Zones", "present": scope_root.find(".//zone") is not None, "entries": len(scope_root.findall(".//zone/entry"))}]
-            + [{"name": name, "present": network_root.find(path) is not None, "entries": len(network_root.findall(path + "//entry"))} for name, path in network_paths.items()]
+            [inventory_item("Zones", network_root if snapshot.kind == "panorama" else [scope_root], ".//zone")]
+            + [inventory_item(name, network_root, path) for name, path in network_paths.items()]
         ),
-        "device": [{"name": name, "present": root.find(path) is not None, "entries": len(root.findall(path + "//entry"))} for name, path in device_paths.items()],
+        "device": [inventory_item(name, device_inventory_root, path) for name, path in device_paths.items()],
     }
 
 
