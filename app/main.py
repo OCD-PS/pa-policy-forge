@@ -691,7 +691,9 @@ def fetch_scm_configuration_records(profile, view: str, section: str) -> list[di
         try:
             items = policy_api.scm_fetch_all(f"{root}/{endpoint_name}", token, container)
         except Exception as exc:
-            failures.append(f"{endpoint_name}: {type(exc).__name__}")
+            message = str(exc)
+            status = message.split("HTTP ", 1)[1].split(":", 1)[0] if "HTTP " in message else type(exc).__name__
+            failures.append(f"{endpoint_name}: {status}")
             continue
         for item in items:
             raw = copy.deepcopy(item)

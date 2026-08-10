@@ -130,7 +130,9 @@ large certificate blobs are not exposed to the browser and remain untouched.
 SCM exposes matching Network and Device navigation through its native
 `/config/network/v1` and `/config/device/v1` resources. Edits are previewed and
 written to the selected folder, snippet, or device candidate; the existing profile
-**Push** operation remains the explicit deployment step.
+**Push** operation remains the explicit deployment step. The SCM service account
+must have access to the corresponding Network or Device API family; an HTTP status
+is shown when that tenant role does not permit the requested configuration family.
 
 ## Policy management
 
