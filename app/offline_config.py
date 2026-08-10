@@ -90,6 +90,106 @@ PROTECTED_CONFIG_TAGS = {
     "phash", "password", "passwd", "private-key", "private-key-data",
     "secret", "auth-key", "authentication-key", "passphrase",
 }
+
+# Presentation metadata only.  The XML remains the source of truth and fields
+# unknown to this map are kept in an "Other" tab, so a newer PAN-OS release
+# can still round-trip without losing configuration.
+PANOS_CONFIG_UI_TABS = {
+    "interfaces": ("Ethernet Interface", "Config", "IPv4", "IPv6", "Advanced", "LLDP", "SD-WAN", "Other"),
+    "zones": ("General", "Network", "User Identification", "Device Identification", "Other"),
+    "vlans": ("General", "Interfaces", "Other"),
+    "virtual-wires": ("General", "Interfaces", "Other"),
+    "virtual-routers": ("Router Settings", "Static Routes", "Redistribution", "RIP", "OSPF", "OSPFv3", "BGP", "Multicast", "ECMP", "Other"),
+    "logical-routers": ("General", "Interfaces", "Static Routes", "Routing Profiles", "RIPv2", "OSPF", "OSPFv3", "BGP", "Multicast", "BFD", "Other"),
+    "ipsec-tunnels": ("General", "Proxy IDs", "Tunnel Monitor", "Other"),
+    "gre-tunnels": ("General", "Tunnel Monitor", "Other"),
+    "globalprotect-portals": ("General", "Authentication", "Agent", "Satellite", "Other"),
+    "globalprotect-gateways": ("General", "Authentication", "Agent", "Client Settings", "Satellite", "Other"),
+    "dhcp": ("General", "IPv4", "IPv6", "Other"),
+    "dns-proxy": ("General", "Static Entries", "Cache", "Other"),
+    "qos": ("General", "Clear Text", "Tunnel Traffic", "Other"),
+    "lldp": ("General", "Other"),
+    "network-profiles": ("General", "Other"),
+}
+
+
+def _panos_ui_group(section: str, label: str, original: str) -> str:
+    value = f"{label} {original}".lower()
+    if section == "interfaces":
+        if "ipv6" in value: return "IPv6"
+        if any(token in value for token in ("layer3 / ip", "dhcp-client", "dhcp client", "arp /", "ip / entry")): return "IPv4"
+        if "lldp" in value: return "LLDP"
+        if "sdwan" in value or "sd-wan" in value: return "SD-WAN"
+        if any(token in value for token in ("virtual-system", "virtual system", "security-zone", "security zone", "virtual-router", "virtual router", "vlan")): return "Config"
+        if any(token in value for token in ("link-state", "link state", "link-speed", "link speed", "link-duplex", "link duplex", "mtu", "mss", "lacp", "poe", "ndp")): return "Advanced"
+        return "Ethernet Interface"
+    if section == "zones":
+        if "user-identification" in value or "user identification" in value or "userid" in value: return "User Identification"
+        if "device-identification" in value or "device identification" in value: return "Device Identification"
+        if any(token in value for token in ("network", "layer3", "layer2", "tap", "virtual-wire", "external")): return "Network"
+        return "General"
+    if section in {"vlans", "virtual-wires"}:
+        return "Interfaces" if "interface" in value else "General"
+    if section in {"virtual-routers", "logical-routers"}:
+        if "static-route" in value or "static route" in value: return "Static Routes"
+        if "redistribution" in value: return "Redistribution"
+        if "ospfv3" in value: return "OSPFv3"
+        if "ospf" in value: return "OSPF"
+        if "rip" in value: return "RIPv2" if section == "logical-routers" else "RIP"
+        if "bgp" in value: return "BGP"
+        if "multicast" in value: return "Multicast"
+        if "ecmp" in value: return "ECMP"
+        if "bfd" in value: return "BFD"
+        if "routing-profile" in value or "routing profile" in value or "filter" in value: return "Routing Profiles"
+        if "interface" in value: return "Interfaces"
+        return "General" if section == "logical-routers" else "Router Settings"
+    if section == "ipsec-tunnels":
+        if "proxy-id" in value or "proxy id" in value: return "Proxy IDs"
+        if "monitor" in value: return "Tunnel Monitor"
+    if section == "gre-tunnels" and "monitor" in value: return "Tunnel Monitor"
+    if section in {"globalprotect-portals", "globalprotect-gateways"}:
+        if "authentication" in value: return "Authentication"
+        if "client" in value: return "Client Settings"
+        if "satellite" in value: return "Satellite"
+        if "agent" in value: return "Agent"
+    if section == "dhcp":
+        if "ipv6" in value: return "IPv6"
+        if "ipv4" in value or "server" in value or "relay" in value: return "IPv4"
+    if section == "dns-proxy":
+        if "static" in value: return "Static Entries"
+        if "cache" in value: return "Cache"
+    return "General"
+
+
+def panos_ui_decorate_record(record: dict, section: str) -> dict:
+    """Add PAN-OS-like UI metadata without changing writable locators."""
+    tabs = PANOS_CONFIG_UI_TABS.get(section, ("General", "Other"))
+    used = []
+    for field in record.get("edit_fields", []):
+        group = _panos_ui_group(section, field.get("label", ""), field.get("group", ""))
+        if group not in tabs: group = "Other"
+        field["group"] = group
+        field["technical_label"] = field.get("label", "")
+        # PAN-OS labels show the leaf name; the full XML path remains available
+        # as unobtrusive context below the control.
+        field["label"] = field.get("label", "").split(" / ")[-1] or "Value"
+        if group not in used: used.append(group)
+        normalized = field["label"].lower()
+        if normalized in {"link state", "link speed", "link duplex"}:
+            field["options"] = {
+                "link state": ["auto", "up", "down"],
+                "link speed": ["auto", "10", "100", "1000", "10000", "25000", "40000", "100000"],
+                "link duplex": ["auto", "full", "half"],
+            }[normalized]
+    primary = {
+        "interfaces": "Ethernet Interface", "zones": "General", "vlans": "General",
+        "virtual-wires": "General", "virtual-routers": "Router Settings",
+        "logical-routers": "General",
+    }.get(section, "General")
+    record["ui_tabs"] = [tab for tab in tabs if tab in used or (record.get("is_entry") and tab == primary)]
+    kind = str(record.get("kind", "")).strip()
+    record["ui_family"] = (kind.split(" / ", 1)[0] if kind else section.replace("-", " ")).replace(" Interfaces", "")
+    return record
 POLICY_LIST_FIELDS = (
     "from", "to", "source", "destination", "source-user", "category",
     "application", "service", "tag", "destination-user", "source-hip", "destination-hip",
@@ -610,6 +710,12 @@ def _config_edit_fields(entry: ET.Element, skip_nested_entries: bool = False) ->
         children = list(node)
         label = " / ".join(labels)
         group = labels[0] if labels else "General"
+        if node is not entry and node.tag == "entry" and "name" in node.attrib:
+            fields.append({
+                "path": "/".join(map(str, path)), "label": label or "Name",
+                "group": group, "kind": "attribute", "attribute": "name",
+                "value": node.get("name", ""),
+            })
         if _protected_config_tag(node.tag):
             fields.append({"path": "/".join(map(str, path)), "label": label, "group": group, "kind": "protected"})
             return
@@ -707,12 +813,13 @@ def configuration_records(
                         summary_values.append(str(field["value"]).strip())
                     if len(summary_values) >= 3:
                         break
-                records.append({
+                record = {
                     "id": locator, "locator": locator, "name": name, "owner": owner,
                     "kind": kind, "is_entry": entry.tag == "entry", "editable": True,
                     "summary": " · ".join(summary_values[:3]), "edit_fields": fields,
                     "fingerprint": hashlib.sha256(xml.encode()).hexdigest(), "_xml": xml,
-                })
+                }
+                records.append(panos_ui_decorate_record(record, section))
     return snapshot, records
 
 
@@ -767,6 +874,8 @@ def apply_configuration_changes(xml_bytes: bytes, changes: list[dict]) -> bytes:
                     clean = str(value).strip()
                     if clean:
                         member = ET.SubElement(target, "member"); member.text = clean
+            elif key[1] == "attribute":
+                target.set("name", str(update.get("value", ""))[:65535])
             else:
                 target.text = str(update.get("value", ""))[:65535]
         if change.get("operation") == "create":

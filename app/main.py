@@ -39,6 +39,7 @@ from app.offline_config import (
     normalized_config_xml, parse_snapshot,
     object_fingerprint as offline_object_fingerprint,
     policy_fingerprint as offline_policy_fingerprint, render_set_commands,
+    panos_ui_decorate_record,
     replace_policy_in_snapshot, safe_workspace_path, scoped_objects,
     scoped_policies, snapshot_sha256, referenced_template,
 )
@@ -709,13 +710,14 @@ def fetch_scm_configuration_records(profile, view: str, section: str) -> list[di
                 if field["kind"] == "members": summary.extend(field.get("values", [])[:2])
                 elif field["kind"] != "protected" and str(field.get("value", "")).strip(): summary.append(str(field["value"]).strip())
                 if len(summary) >= 3: break
-            records.append({
+            record = {
                 "id": item_id, "locator": f"{endpoint_name}:{item_id}", "endpoint": endpoint_name,
                 "name": name, "owner": next((container[key] for key in ("folder", "snippet", "device") if container.get(key)), "SCM"),
                 "kind": endpoint_name.replace("-", " ").title(), "is_entry": True, "editable": True,
                 "summary": " · ".join(summary[:3]), "edit_fields": fields,
                 "fingerprint": _scm_config_fingerprint(raw), "_raw": raw,
-            })
+            }
+            records.append(panos_ui_decorate_record(record, section))
     if not records and failures:
         raise RuntimeError("; ".join(failures))
     return records

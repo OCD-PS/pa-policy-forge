@@ -126,6 +126,26 @@ class OfflineConfigTests(unittest.TestCase):
         self.assertIn(b"<future-node>", updated)
         self.assertIn(b"<value>preserve</value>", updated)
 
+    def test_interface_editor_uses_panos_tabs_and_edits_nested_ip_entry(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><network><interface><ethernet><entry name="ethernet1/1"><layer3><ip><entry name="192.0.2.1/24"/></ip></layer3><link-state>auto</link-state><lldp><enable>yes</enable></lldp></entry></ethernet></interface></network><vsys><entry name="vsys1"/></vsys></entry></devices></config>'''
+        _, records = configuration_records(source, "vsys1", "", "network", "interfaces")
+        interface = records[0]
+        self.assertEqual(interface["ui_family"], "Ethernet")
+        self.assertEqual(interface["ui_tabs"], ["Ethernet Interface", "IPv4", "Advanced", "LLDP"])
+        address = next(field for field in interface["edit_fields"] if field["kind"] == "attribute")
+        self.assertEqual(address["group"], "IPv4")
+        updated = apply_configuration_changes(source, [{
+            "operation": "update", "locator": interface["locator"],
+            "fingerprint": interface["fingerprint"], "name": interface["name"],
+            "updates": [{"path": address["path"], "kind": "attribute", "value": "198.51.100.1/24"}],
+        }])
+        self.assertIn(b'<entry name="198.51.100.1/24"', updated)
+
+    def test_zone_editor_uses_network_and_identification_tabs(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><network/><vsys><entry name="vsys1"><zone><entry name="Trust"><network><layer3><member>ethernet1/1</member></layer3></network><enable-user-identification>yes</enable-user-identification><enable-device-identification>yes</enable-device-identification></entry></zone></entry></vsys></entry></devices></config>'''
+        _, records = configuration_records(source, "vsys1", "", "network", "zones")
+        self.assertEqual(records[0]["ui_tabs"], ["General", "Network", "User Identification", "Device Identification"])
+
     def test_panorama_template_stack_records_keep_concrete_owner(self):
         source = b'''<config><devices><entry name="localhost.localdomain"><device-group><entry name="Branch-DG"/></device-group><template><entry name="Base"><config><devices><entry name="localhost.localdomain"><network><interface><ethernet><entry name="ethernet1/1"><comment>base</comment></entry></ethernet></interface></network></entry></devices></config></entry><entry name="Branch"><config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><zone><entry name="Clients"><network><layer3><member>ethernet1/1</member></layer3></network></entry></zone></entry></vsys></entry></devices></config></entry></template><template-stack><entry name="Branch-Stack"><templates><member>Branch</member><member>Base</member></templates></entry></template-stack></entry></devices></config>'''
         _, interfaces = configuration_records(source, "Branch-DG", "Branch-Stack", "network", "interfaces")

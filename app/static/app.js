@@ -664,6 +664,37 @@
     var tabsRoot = dialog.querySelector("[data-config-field-tabs]");
     var currentFields = [];
 
+    // Turn the shared generic dialog markup into the compact PAN-OS editor.
+    var brand = dialog.querySelector(":scope > .push-dialog-brand"); if (brand) brand.remove();
+    form.classList.remove("bulk-dialog-body"); form.classList.add("config-dialog-layout");
+    var header = form.querySelector(".card-header"); if (header) {
+      header.classList.remove("card-header"); header.classList.add("config-dialog-header");
+      var titleBox = header.querySelector("div");
+      if (titleBox) { var eyebrow = document.createElement("p"); eyebrow.className = "eyebrow"; eyebrow.textContent = "OCD · PAN-OS configuratie"; titleBox.insertBefore(eyebrow, titleBox.firstChild); }
+      var close = document.createElement("button"); close.type = "button"; close.className = "config-dialog-close"; close.dataset.configCancel = ""; close.setAttribute("aria-label", "Sluiten"); close.textContent = "×"; header.appendChild(close);
+    }
+    fieldsRoot.classList.add("config-dialog-scroll");
+    var actions = form.querySelector(".bulk-dialog-actions"); if (actions) actions.classList.add("config-dialog-footer");
+
+    function setupFamilyTabs() {
+      var rows = all("[data-config-record-row]");
+      if (!rows.length) return;
+      rows.forEach(function (row) { try { row.dataset.configFamily = JSON.parse(row.getAttribute("data-config-record")).ui_family || "Other"; } catch (error) { row.dataset.configFamily = "Other"; } });
+      var families = [];
+      rows.forEach(function (row) { var family = row.dataset.configFamily || "Other"; if (!families.includes(family)) families.push(family); });
+      if (families.length < 2) return;
+      var table = rows[0].closest(".config-record-list"); var filter = table && table.querySelector(".policy-filterbar"); if (!filter) return;
+      var root = document.createElement("div"); root.className = "config-family-tabs"; root.setAttribute("aria-label", "Configuratietypes"); filter.parentNode.insertBefore(root, filter);
+      ["All"].concat(families).forEach(function (family, index) {
+        var button = document.createElement("button"); button.type = "button"; button.className = "btn btn-small" + (!index ? " is-active" : ""); button.textContent = family;
+        button.addEventListener("click", function () {
+          all("button", root).forEach(function (item) { item.classList.toggle("is-active", item === button); });
+          rows.forEach(function (row) { row.hidden = family !== "All" && row.dataset.configFamily !== family; });
+        });
+        root.appendChild(button);
+      });
+    }
+
     function tokenEditor(field, wrapper) {
       var values = (field.values || []).slice();
       var box = document.createElement("div"); box.className = "token-input config-token-input";
@@ -700,7 +731,7 @@
       dialog.querySelector("[data-config-dialog-owner]").textContent = item.owner;
       var duplicate = dialog.querySelector("[data-config-duplicate]"); if (duplicate) duplicate.hidden = !item.is_entry;
       tabsRoot.innerHTML = ""; fieldsRoot.innerHTML = "";
-      var groups = [];
+      var groups = (item.ui_tabs || []).slice();
       currentFields.forEach(function (field) { var group = field.group || "General"; if (!groups.includes(group)) groups.push(group); });
       if (!groups.length) groups.push("General");
       groups.forEach(function (group, index) {
@@ -718,8 +749,18 @@
             var booleanValues = field.kind === "bool" ? ["true", "false"] : ["yes", "no"];
             var select = document.createElement("select"); booleanValues.forEach(function (value) { var option = document.createElement("option"); option.value = value; option.textContent = value; option.selected = String(field.value).trim().toLowerCase() === value; select.appendChild(option); }); field._input = select; wrapper.appendChild(select);
           } else {
-            var input = field.kind === "json" || String(field.value || "").length > 180 ? document.createElement("textarea") : document.createElement("input"); input.value = field.value || ""; if (input.tagName === "TEXTAREA") input.rows = field.kind === "json" ? 10 : 4; field._input = input; wrapper.appendChild(input);
+            var input;
+            if (field.options && field.options.length) {
+              input = document.createElement("select");
+              var current = String(field.value == null ? "" : field.value);
+              var options = field.options.slice(); if (current && !options.includes(current)) options.unshift(current);
+              options.forEach(function (value) { var option = document.createElement("option"); option.value = value; option.textContent = value; option.selected = value === current; input.appendChild(option); });
+            } else {
+              input = field.kind === "json" || String(field.value || "").length > 180 ? document.createElement("textarea") : document.createElement("input"); input.value = field.value || ""; if (input.tagName === "TEXTAREA") input.rows = field.kind === "json" ? 8 : 4;
+            }
+            field._input = input; wrapper.appendChild(input);
           }
+          if (field.technical_label && field.technical_label !== field.label) { var path = document.createElement("small"); path.className = "config-field-path"; path.textContent = field.technical_label; wrapper.appendChild(path); }
           grid.appendChild(wrapper);
         });
         if (item.is_entry && index === 0) {
@@ -733,10 +774,12 @@
         panel.appendChild(grid); fieldsRoot.appendChild(panel);
       });
       activateGroup(groups[0]); dialog.showModal();
+      var first = dialog.querySelector("input:not([type=hidden]), select, textarea"); if (first) first.focus({preventScroll:true});
     }
 
     all("[data-config-record-edit]").forEach(function (button) { button.addEventListener("click", function () { renderRecord(JSON.parse(button.closest("[data-config-record-row]").getAttribute("data-config-record"))); }); });
-    dialog.querySelector("[data-config-cancel]").addEventListener("click", function () { dialog.close(); });
+    all("[data-config-cancel]", dialog).forEach(function (button) { button.addEventListener("click", function () { dialog.close(); }); });
+    dialog.addEventListener("click", function (event) { if (event.target === dialog) dialog.close(); });
     form.addEventListener("submit", function () {
       currentFields.forEach(function (field) { if (field._commit) field._commit(); });
       var updates = currentFields.filter(function (field) {
@@ -754,6 +797,7 @@
     var remove = document.querySelector("[data-config-delete]");
     function updateSelection() { var selected = checks.filter(function (check) { return check.checked; }).length; if (count) count.textContent = selected; if (remove) remove.disabled = selected === 0; }
     checks.forEach(function (check) { check.addEventListener("change", updateSelection); }); updateSelection();
+    setupFamilyTabs();
   }
 
   function setupWorkspaceObjects() {
