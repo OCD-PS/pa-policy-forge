@@ -34,7 +34,9 @@ from vendor.paloalto_light_syslog import FlowStore, parse_panos_syslog
 from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_single_replacements
 from app.offline_config import (
     OBJECT_NODES, POLICY_NODES, OfflineConfigError, available_scopes, available_templates,
-    apply_object_changes, configuration_inventory, normalized_config_xml, parse_snapshot,
+    apply_configuration_changes, apply_object_changes, configuration_inventory,
+    configuration_records as scoped_configuration_records,
+    normalized_config_xml, parse_snapshot,
     object_fingerprint as offline_object_fingerprint,
     policy_fingerprint as offline_policy_fingerprint, render_set_commands,
     replace_policy_in_snapshot, safe_workspace_path, scoped_objects,
@@ -117,6 +119,21 @@ SCM_OBJECT_TYPES = {
     "service-groups": {"label": "Service Groups", "creatable": True},
     "tags": {"label": "Tags", "creatable": True},
     "zones": {"label": "Zones", "creatable": True, "network": True},
+}
+SCM_CONFIGURATION_SECTIONS = {
+    "network": {
+        "interfaces": ("Interfaces", ("aggregate-ethernet-interfaces", "ethernet-interfaces", "layer2-subinterfaces", "layer3-subinterfaces", "loopback-interfaces", "tunnel-interfaces", "vlan-interfaces")),
+        "zones": ("Zones", ("zones",)),
+        "logical-routers": ("Logical Routers", ("logical-routers",)),
+        "ipsec-tunnels": ("IPSec Tunnels", ("ipsec-tunnels",)),
+        "dhcp": ("DHCP", ("dhcp-interfaces",)),
+        "dns-proxy": ("DNS Proxy", ("dns-proxies",)),
+        "network-profiles": ("Network Profiles", ("interface-management-profiles", "zone-protection-profiles")),
+    },
+    "device": {
+        "setup": ("Setup", ("general-settings", "management-interface", "motd-banner-settings", "service-settings", "session-settings", "session-timeouts", "tcp-settings", "vpn-settings")),
+        "high-availability": ("High Availability", ("ha-configurations", "ha-devices")),
+    },
 }
 _catalog_refreshing: set[tuple[int, str]] = set()
 _catalog_refresh_lock = threading.Lock()
@@ -615,6 +632,110 @@ def fetch_scm_objects(profile, object_type: str) -> list[dict]:
     root = policy_api.scm_api_root(scm.scm_api_base) + f"/config/{service}/v1"
     container = policy_api.scm_container(folder=scm.scm_folder if object_type == "zones" else scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
     return policy_api.scm_fetch_all(f"{root}/{object_type}", token, container)
+
+
+def _scm_config_protected(key: str) -> bool:
+    normalized = key.lower().replace("_", "-")
+    return normalized in {"password", "phash", "private-key", "secret", "auth-key", "client-secret"} or "password" in normalized or "private-key" in normalized
+
+
+def _scm_config_fields(payload: dict) -> list[dict]:
+    fields = []
+
+    def walk(value, path: list[str], labels: list[str]):
+        key = path[-1] if path else "general"
+        label = " / ".join(labels) or "General"
+        group = labels[0] if labels else "General"
+        encoded_path = json.dumps(path, separators=(",", ":"))
+        if _scm_config_protected(key):
+            fields.append({"path": encoded_path, "label": label, "group": group, "kind": "protected"}); return
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                walk(child_value, path + [str(child_key)], labels + [str(child_key).replace("_", " ").title()])
+        elif isinstance(value, list):
+            if all(not isinstance(item, (dict, list)) for item in value):
+                fields.append({"path": encoded_path, "label": label, "group": group, "kind": "members", "values": [str(item) for item in value]})
+            else:
+                fields.append({"path": encoded_path, "label": label, "group": group, "kind": "json", "value": json.dumps(value, indent=2, sort_keys=True)})
+        elif isinstance(value, bool):
+            fields.append({"path": encoded_path, "label": label, "group": group, "kind": "bool", "value": value})
+        elif value is None:
+            fields.append({"path": encoded_path, "label": label, "group": group, "kind": "text", "value": ""})
+        else:
+            text = str(value)
+            if len(text) > 8192:
+                fields.append({"path": encoded_path, "label": label, "group": group, "kind": "protected"})
+            else:
+                fields.append({"path": encoded_path, "label": label, "group": group, "kind": "text", "value": text})
+
+    for key, value in payload.items():
+        if key in {"id", "name", "folder", "snippet", "device", "created_at", "updated_at"}:
+            continue
+        walk(value, [str(key)], [str(key).replace("_", " ").title()])
+    return fields
+
+
+def _scm_config_fingerprint(payload: dict) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def fetch_scm_configuration_records(profile, view: str, section: str) -> list[dict]:
+    spec = SCM_CONFIGURATION_SECTIONS.get(view, {}).get(section)
+    if not spec:
+        return []
+    scm, token, _, container = scm_client(profile)
+    root = policy_api.scm_api_root(scm.scm_api_base) + f"/config/{view}/v1"
+    records = []
+    failures = []
+    for endpoint_name in spec[1]:
+        try:
+            items = policy_api.scm_fetch_all(f"{root}/{endpoint_name}", token, container)
+        except Exception as exc:
+            failures.append(f"{endpoint_name}: {type(exc).__name__}")
+            continue
+        for item in items:
+            raw = copy.deepcopy(item)
+            item_id = str(item.get("id", ""))
+            name = str(item.get("name") or item.get("display_name") or item_id or spec[0])
+            fields = _scm_config_fields(raw)
+            summary = []
+            for field in fields:
+                if field["kind"] == "members": summary.extend(field.get("values", [])[:2])
+                elif field["kind"] != "protected" and str(field.get("value", "")).strip(): summary.append(str(field["value"]).strip())
+                if len(summary) >= 3: break
+            records.append({
+                "id": item_id, "locator": f"{endpoint_name}:{item_id}", "endpoint": endpoint_name,
+                "name": name, "owner": next((container[key] for key in ("folder", "snippet", "device") if container.get(key)), "SCM"),
+                "kind": endpoint_name.replace("-", " ").title(), "is_entry": True, "editable": True,
+                "summary": " · ".join(summary[:3]), "edit_fields": fields,
+                "fingerprint": _scm_config_fingerprint(raw), "_raw": raw,
+            })
+    if not records and failures:
+        raise RuntimeError("; ".join(failures))
+    return records
+
+
+def _scm_config_payload(raw: dict, updates: list[dict], name: str) -> dict:
+    payload = copy.deepcopy(raw)
+    allowed = {(field["path"], field["kind"]) for field in _scm_config_fields(raw) if field["kind"] != "protected"}
+    for update in updates:
+        key = (str(update.get("path", "")), str(update.get("kind", "")))
+        if key not in allowed:
+            raise ValueError("Een SCM-configuratieveld bestaat niet meer of is beschermd")
+        path = json.loads(key[0])
+        target = payload
+        for part in path[:-1]: target = target[part]
+        if key[1] == "members": target[path[-1]] = [str(value) for value in update.get("values", [])]
+        elif key[1] == "bool": target[path[-1]] = str(update.get("value", "")).lower() == "true"
+        elif key[1] == "json": target[path[-1]] = json.loads(str(update.get("value", "[]")))
+        else:
+            old = target.get(path[-1])
+            value = str(update.get("value", ""))
+            if isinstance(old, int) and value.strip(): target[path[-1]] = int(value)
+            elif isinstance(old, float) and value.strip(): target[path[-1]] = float(value)
+            else: target[path[-1]] = value
+    if "name" in payload: payload["name"] = name
+    return payload
 
 
 def managed_view(object_type: str) -> str:
@@ -1196,6 +1317,7 @@ def config_workspace_editor(workspace_id):
         application_state = {}
         alternate_policy_count = 0
         inventory = {"network": [], "device": []}
+        config_records = []
         if workspace_view == "policies":
             _, policies = scoped_policies(xml_bytes, scope, policy_kind, rulebase, parsed=(parsed_root, snapshot))
             if snapshot.kind == "panorama":
@@ -1242,6 +1364,11 @@ def config_workspace_editor(workspace_id):
                 item["slug"] = WORKSPACE_NETWORK_NAV.get(item["name"], "")
             for item in inventory["device"]:
                 item["slug"] = WORKSPACE_DEVICE_NAV.get(item["name"], "")
+            if config_section:
+                _, config_records = scoped_configuration_records(
+                    xml_bytes, scope, template, workspace_view, config_section,
+                    parsed=(parsed_root, snapshot),
+                )
         edit_name = request.args.get("edit_policy", "")
         edit_policy = next((item for item in policies if item["name"] == edit_name and item["editable"]), None)
         edit_object_name = request.args.get("edit_object", "")
@@ -1260,7 +1387,8 @@ def config_workspace_editor(workspace_id):
             workspace_editable_object_types=WORKSPACE_EDITABLE_OBJECT_TYPES,
             workspace_structured_object_types=WORKSPACE_STRUCTURED_OBJECT_TYPES,
             config_section=config_section,
-            inventory=inventory, offline_policy_fields=OFFLINE_POLICY_FIELDS,
+            inventory=inventory, config_records=config_records,
+            offline_policy_fields=OFFLINE_POLICY_FIELDS,
             workspace_policy_nav=WORKSPACE_POLICY_NAV, workspace_object_nav=WORKSPACE_OBJECT_NAV,
             workspace_network_nav=WORKSPACE_NETWORK_NAV, workspace_device_nav=WORKSPACE_DEVICE_NAV,
         )
@@ -1562,6 +1690,146 @@ def config_workspace_object_apply(draft_id):
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, workspace_view="objects")) if workspace_id else redirect(url_for("index"))
 
 
+def _workspace_config_redirect(workspace_id: int, draft: dict):
+    return redirect(url_for(
+        "config_workspace_editor", workspace_id=workspace_id,
+        scope=draft.get("scope", ""), template=draft.get("template", ""),
+        workspace_view=draft.get("view", "network"),
+        config_section=draft.get("section", ""),
+    ))
+
+
+@app.post("/config-workspaces/<int:workspace_id>/configuration/preview")
+@login_required
+def config_workspace_configuration_preview(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    context = {
+        "workspace_id": workspace_id, "scope": request.form.get("scope", ""),
+        "template": request.form.get("template", ""),
+        "view": request.form.get("workspace_view", "network"),
+        "section": request.form.get("config_section", ""),
+    }
+    try:
+        if context["view"] not in {"network", "device"}:
+            raise OfflineConfigError("Ongeldige configuratieweergave")
+        xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
+        _, records = scoped_configuration_records(
+            xml_bytes, context["scope"], context["template"], context["view"], context["section"],
+            parsed=(parsed_root, snapshot),
+        )
+        locator = request.form.get("locator", "")
+        before = next((item for item in records if item["locator"] == locator), None)
+        if before is None:
+            raise OfflineConfigError("Het configuratie-item bestaat niet meer in deze context")
+        try:
+            submitted = json.loads(request.form.get("generic_updates", "[]"))
+        except json.JSONDecodeError as exc:
+            raise OfflineConfigError("Ongeldige configuratievelden") from exc
+        allowed = {(field["path"], field["kind"]) for field in before["edit_fields"] if field["kind"] != "protected"}
+        if not isinstance(submitted, list) or len(submitted) > 10000:
+            raise OfflineConfigError("Ongeldige configuratievelden")
+        updates = []
+        for update in submitted:
+            if not isinstance(update, dict) or (update.get("path"), update.get("kind")) not in allowed:
+                raise OfflineConfigError("Een configuratieveld bestaat niet meer of is beschermd")
+            clean = {"path": update["path"], "kind": update["kind"]}
+            if update["kind"] == "members":
+                values = update.get("values", [])
+                if not isinstance(values, list) or len(values) > 10000:
+                    raise OfflineConfigError("Ongeldige memberlijst")
+                clean["values"] = [str(value).strip() for value in values if str(value).strip()]
+            else:
+                clean["value"] = str(update.get("value", ""))[:65535]
+            updates.append(clean)
+        name = request.form.get("name", "").strip() if before["is_entry"] else before["name"]
+        if before["is_entry"] and not name:
+            raise OfflineConfigError("Name is verplicht")
+        operation = request.form.get("operation", "update")
+        if operation not in {"update", "create"}:
+            raise OfflineConfigError("Ongeldige configuratiebewerking")
+        if operation == "create" and not before["is_entry"]:
+            raise OfflineConfigError("Dit configuratieblok kan niet worden gedupliceerd")
+        change = {
+            "operation": operation, "locator": locator,
+            "fingerprint": before["fingerprint"], "name": name, "updates": updates,
+        }
+        new_xml = apply_configuration_changes(xml_bytes, [change])
+        if new_xml == normalized_config_xml(parsed_root):
+            raise OfflineConfigError("Er zijn geen wijzigingen om te bewaren")
+        draft_id = secrets.token_urlsafe(24)
+        draft = {**context, "operation": operation, "before": public_ui_record(before), "changes": [change], "created_at": now()}
+        draft_path = OBJECT_DRAFTS / f"offline-config-{draft_id}.json"
+        draft_path.write_text(json.dumps(draft)); draft_path.chmod(0o600)
+        return render_template("workspace_config_preview.html", workspace=workspace, draft=draft, draft_id=draft_id)
+    except Exception as exc:
+        flash(f"Configuratiewijziging niet voorbereid: {exc}", "error")
+        return _workspace_config_redirect(workspace_id, context)
+
+
+@app.post("/config-workspaces/<int:workspace_id>/configuration/delete-preview")
+@login_required
+def config_workspace_configuration_delete_preview(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    context = {
+        "workspace_id": workspace_id, "scope": request.form.get("scope", ""),
+        "template": request.form.get("template", ""),
+        "view": request.form.get("workspace_view", "network"),
+        "section": request.form.get("config_section", ""),
+    }
+    try:
+        xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
+        _, records = scoped_configuration_records(xml_bytes, context["scope"], context["template"], context["view"], context["section"], parsed=(parsed_root, snapshot))
+        selected_locators = list(dict.fromkeys(request.form.getlist("locator")))
+        selected = [item for item in records if item["locator"] in selected_locators and item["is_entry"]]
+        if not selected_locators or len(selected) != len(selected_locators):
+            raise OfflineConfigError("Selecteer minstens één benoemd configuratie-item")
+        changes = [{"operation": "delete", "locator": item["locator"], "fingerprint": item["fingerprint"]} for item in selected]
+        draft_id = secrets.token_urlsafe(24)
+        draft = {**context, "operation": "delete", "before_items": [public_ui_record(item) for item in selected], "changes": changes, "created_at": now()}
+        draft_path = OBJECT_DRAFTS / f"offline-config-{draft_id}.json"
+        draft_path.write_text(json.dumps(draft)); draft_path.chmod(0o600)
+        return render_template("workspace_config_preview.html", workspace=workspace, draft=draft, draft_id=draft_id)
+    except Exception as exc:
+        flash(f"Configuratie-items niet voorbereid voor verwijderen: {exc}", "error")
+        return _workspace_config_redirect(workspace_id, context)
+
+
+@app.post("/config-workspaces/configuration-drafts/<draft_id>/apply")
+@login_required
+def config_workspace_configuration_apply(draft_id):
+    if not draft_id or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in draft_id):
+        return "Not found", 404
+    draft_path = OBJECT_DRAFTS / f"offline-config-{draft_id}.json"
+    if not draft_path.is_file():
+        return "Not found", 404
+    draft = json.loads(draft_path.read_text())
+    try:
+        workspace = workspace_row(int(draft["workspace_id"]))
+        if not workspace:
+            raise OfflineConfigError("De bronworkspace bestaat niet meer")
+        new_xml = apply_configuration_changes(workspace_config_path(workspace).read_bytes(), draft["changes"])
+        with db() as conn:
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+        if not profile:
+            raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
+        new_id = store_config_workspace(
+            profile, f"{workspace['name']} · {draft['view']} edit {now()}",
+            workspace["original_name"], new_xml, "edit",
+        )
+        set_active_config_workspace(workspace["profile_id"], new_id)
+        draft_path.unlink(missing_ok=True)
+        audit("config-workspace-configuration-edited", f"source={workspace['id']} workspace={new_id} view={draft['view']} section={draft['section']} operation={draft['operation']}")
+        flash("Configuratiewijziging bewaard in een nieuwe workspaceversie; de bron bleef onaangeroerd.", "success")
+        return _workspace_config_redirect(new_id, draft)
+    except Exception as exc:
+        flash(f"Configuratiewijziging niet bewaard: {exc}", "error")
+        return _workspace_config_redirect(int(draft.get("workspace_id", 0)), draft)
+
+
 @app.post("/profiles/<int:profile_id>/config-workspaces/upload")
 @login_required
 def config_workspace_upload(profile_id):
@@ -1755,10 +2023,13 @@ def index():
             if serials:
                 placeholders = ",".join("?" for _ in serials)
                 flows = conn.execute(f"SELECT * FROM flows WHERE serial IN ({placeholders}) ORDER BY last_seen DESC LIMIT 100", serials).fetchall()
-    policy_profile = None; policies = []; policy_error = ""; policy_objects = []; object_catalog = []; policy_catalog = []; policy_workspaces = []; live_application_state = {}
+    policy_profile = None; policies = []; policy_error = ""; policy_objects = []; object_catalog = []; policy_catalog = []; policy_workspaces = []; live_application_state = {}; scm_config_records = []
     policy_source = request.args.get("policy_source", "").strip()
     policy_view = request.args.get("policy_view", "policies")
-    if policy_view not in {"policies", "objects", "network"}: policy_view = "policies"
+    if policy_view not in {"policies", "objects", "network", "device"}: policy_view = "policies"
+    config_section = request.args.get("config_section", "").strip()
+    if policy_view in {"network", "device"} and config_section not in SCM_CONFIGURATION_SECTIONS.get(policy_view, {}):
+        config_section = next(iter(SCM_CONFIGURATION_SECTIONS.get(policy_view, {})), "")
     policy_kind = request.args.get("policy_kind", "security")
     object_type = request.args.get("object_type", "addresses")
     if object_type not in SCM_OBJECT_TYPES: object_type = "addresses"
@@ -1782,8 +2053,9 @@ def index():
                 policy_source = "live"
             if policy_source == "live":
                 try:
-                    if policy_view in {"objects", "network"}:
-                        if policy_view == "network": object_type = "zones"
+                    if policy_view in {"network", "device"}:
+                        scm_config_records = fetch_scm_configuration_records(policy_profile, policy_view, config_section)
+                    elif policy_view == "objects":
                         if object_type == "applications":
                             live_application_state = cached_application_catalog(policy_profile)
                             policy_objects = [
@@ -1797,7 +2069,7 @@ def index():
                         policies = fetch_scm_policy_type(policy_profile, policy_kind)
                         policy_catalog = fetch_object_catalog(policy_profile, "policy-picker")
                 except Exception as exc: policy_error = str(exc)
-    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, live_application_state=live_application_state, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
+    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, live_application_state=live_application_state, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, config_section=config_section, scm_configuration_sections=SCM_CONFIGURATION_SECTIONS, config_records=scm_config_records, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
 
 
 def parse_zones(text: str) -> dict[str, str]:
@@ -2142,6 +2414,94 @@ def object_push(draft_id):
     except Exception as exc:
         flash(f"Object-Push gestopt: {exc}", "error")
     return redirect(url_for("index", policy_profile=profile["id"], policy_view=managed_view(draft["object_type"]), object_type=draft["object_type"]) + "#policy-management")
+
+
+def _scm_config_redirect(profile_id: int, view: str, section: str):
+    return redirect(url_for("index", policy_profile=profile_id, policy_view=view, config_section=section) + "#policy-management")
+
+
+@app.post("/scm-configuration/<int:profile_id>/<view>/<section>/preview")
+@login_required
+def scm_configuration_preview(profile_id, view, section):
+    with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+    if not profile or profile["target_type"] != "scm" or section not in SCM_CONFIGURATION_SECTIONS.get(view, {}): return "Not found", 404
+    try:
+        records = fetch_scm_configuration_records(profile, view, section)
+        before = next((item for item in records if item["locator"] == request.form.get("locator", "")), None)
+        if before is None: raise ValueError("Het SCM-configuratie-item bestaat niet meer")
+        submitted = json.loads(request.form.get("generic_updates", "[]"))
+        allowed = {(field["path"], field["kind"]) for field in before["edit_fields"] if field["kind"] != "protected"}
+        if not isinstance(submitted, list) or len(submitted) > 10000: raise ValueError("Ongeldige SCM-configuratievelden")
+        updates = []
+        for update in submitted:
+            if not isinstance(update, dict) or (update.get("path"), update.get("kind")) not in allowed: raise ValueError("Een SCM-configuratieveld bestaat niet meer of is beschermd")
+            clean = {"path": update["path"], "kind": update["kind"]}
+            if update["kind"] == "members": clean["values"] = [str(value).strip() for value in update.get("values", []) if str(value).strip()]
+            else: clean["value"] = str(update.get("value", ""))[:65535]
+            updates.append(clean)
+        operation = request.form.get("operation", "update")
+        if operation not in {"update", "create"}: raise ValueError("Ongeldige SCM-configuratiebewerking")
+        name = request.form.get("name", "").strip()
+        if not name: raise ValueError("Name is verplicht")
+        payload = _scm_config_payload(before["_raw"], updates, name)
+        if operation == "create": payload.pop("id", None)
+        elif _scm_config_fingerprint(payload) == before["fingerprint"]: raise ValueError("Er zijn geen wijzigingen om te bewaren")
+        draft_id = secrets.token_urlsafe(18)
+        draft = {"profile_id": profile_id, "view": view, "section": section, "operation": operation, "endpoint": before["endpoint"], "before_id": before["id"], "before_name": before["name"], "fingerprint": before["fingerprint"], "name": name, "payload": payload, "created_at": now()}
+        path = OBJECT_DRAFTS / f"scm-config-{draft_id}.json"; path.write_text(json.dumps(draft)); path.chmod(0o600)
+        return render_template("scm_config_preview.html", profile=profile, draft=draft, draft_id=draft_id)
+    except Exception as exc:
+        flash(f"SCM-configuratiepreview mislukt: {exc}", "error")
+        return _scm_config_redirect(profile_id, view, section)
+
+
+@app.post("/scm-configuration/<int:profile_id>/<view>/<section>/delete-preview")
+@login_required
+def scm_configuration_delete_preview(profile_id, view, section):
+    with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+    if not profile or profile["target_type"] != "scm" or section not in SCM_CONFIGURATION_SECTIONS.get(view, {}): return "Not found", 404
+    try:
+        locators = set(request.form.getlist("locator")); records = fetch_scm_configuration_records(profile, view, section)
+        selected = [item for item in records if item["locator"] in locators]
+        if not locators or len(selected) != len(locators): raise ValueError("Selecteer minstens één bestaand SCM-configuratie-item")
+        draft_id = secrets.token_urlsafe(18)
+        draft = {"profile_id": profile_id, "view": view, "section": section, "operation": "delete", "items": [{"endpoint": item["endpoint"], "id": item["id"], "name": item["name"], "fingerprint": item["fingerprint"]} for item in selected], "created_at": now()}
+        path = OBJECT_DRAFTS / f"scm-config-{draft_id}.json"; path.write_text(json.dumps(draft)); path.chmod(0o600)
+        return render_template("scm_config_preview.html", profile=profile, draft=draft, draft_id=draft_id)
+    except Exception as exc:
+        flash(f"SCM-deletepreview mislukt: {exc}", "error")
+        return _scm_config_redirect(profile_id, view, section)
+
+
+@app.post("/scm-configuration/drafts/<draft_id>/push")
+@login_required
+def scm_configuration_push(draft_id):
+    if not draft_id or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in draft_id): return "Not found", 404
+    path = OBJECT_DRAFTS / f"scm-config-{draft_id}.json"
+    if not path.is_file(): return "Not found", 404
+    draft = json.loads(path.read_text())
+    with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (draft["profile_id"],)).fetchone()
+    if not profile or profile["target_type"] != "scm": return "Not found", 404
+    try:
+        current = fetch_scm_configuration_records(profile, draft["view"], draft["section"])
+        scm, token, _, container = scm_client(profile)
+        root = policy_api.scm_api_root(scm.scm_api_base) + f"/config/{draft['view']}/v1"
+        if draft["operation"] in {"update", "create"}:
+            before = next((item for item in current if item["endpoint"] == draft["endpoint"] and item["id"] == draft["before_id"]), None)
+            if not before or before["fingerprint"] != draft["fingerprint"]: raise RuntimeError(f"Configuratie-item {draft['before_name']} is intussen gewijzigd; Push gestopt.")
+            if draft["operation"] == "update": policy_api.scm_http_request("PUT", f"{root}/{draft['endpoint']}/{draft['before_id']}", token, payload=draft["payload"])
+            else: policy_api.scm_http_request("POST", f"{root}/{draft['endpoint']}", token, payload=draft["payload"])
+        else:
+            for item in draft["items"]:
+                before = next((record for record in current if record["endpoint"] == item["endpoint"] and record["id"] == item["id"]), None)
+                if not before or before["fingerprint"] != item["fingerprint"]: raise RuntimeError(f"Configuratie-item {item['name']} is intussen gewijzigd; Delete gestopt.")
+            for item in draft["items"]: policy_api.scm_http_request("DELETE", f"{root}/{item['endpoint']}/{item['id']}", token, params=container)
+        path.unlink(missing_ok=True); invalidate_profile_caches(profile["id"])
+        audit("scm-configuration-candidate", f"profile={profile['name']} view={draft['view']} section={draft['section']} operation={draft['operation']}")
+        flash("SCM-configuratiebewerking naar candidate geschreven. Gebruik Push om ze uit te rollen.", "success")
+    except Exception as exc:
+        flash(f"SCM-configuratie-Push gestopt: {exc}", "error")
+    return _scm_config_redirect(profile["id"], draft["view"], draft["section"])
 
 
 @app.post("/policies/drafts/<draft_id>/push")

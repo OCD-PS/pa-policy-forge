@@ -106,9 +106,10 @@ The workspace navigation is vertical and independently collapsible. Complete XML
 and best-effort set-command exports are available. A complete snapshot can also be
 uploaded through the target XML API and loaded as the new candidate configuration.
 Supported entries in the vertical tree link directly to their policy, object,
-Network, or Device view. Categories that do not yet have an editor are visibly
-disabled instead of acting like links. Internal navigation and form targets are
-covered by an authenticated route-and-fragment regression test.
+Network, or Device view. Network and Device records open in an orange PAN-OS-style
+editor with grouped tabs, typed booleans, multi-value chips, rename, duplicate,
+delete, and a mandatory preview. Internal navigation and form targets are covered
+by authenticated route-and-fragment regression tests.
 This high-impact action requires typing the workspace name and never commits the
 candidate automatically. Device groups, templates, VSYS selections, and unknown
 XML nodes remain preserved so later graphical editors can operate as scoped diffs
@@ -120,8 +121,16 @@ visible but read-only. Standalone workspaces use the selected VSYS while retaini
 device-level Network configuration. A local policy edit has a before/after preview
 and creates a new immutable workspace version: only the exact selected rule node is
 replaced, unknown XML is preserved, and a fingerprint prevents applying a draft to
-a changed source snapshot. Network and Device currently provide XML inventories;
-their node-specific editors and Panorama template ownership are the next layer.
+a changed source snapshot. Network and Device edits use the same immutable
+workspace flow. Panorama records retain their concrete owner template, including
+records shown through a template stack; standalone zones remain VSYS-scoped while
+interfaces and routing remain device-scoped. Passwords, private keys, hashes, and
+large certificate blobs are not exposed to the browser and remain untouched.
+
+SCM exposes matching Network and Device navigation through its native
+`/config/network/v1` and `/config/device/v1` resources. Edits are previewed and
+written to the selected folder, snippet, or device candidate; the existing profile
+**Push** operation remains the explicit deployment step.
 
 ## Policy management
 

@@ -656,6 +656,106 @@
     });
   }
 
+  function setupWorkspaceConfigurationEditor() {
+    var dialog = document.querySelector("[data-config-dialog]");
+    if (!dialog) return;
+    var form = dialog.querySelector("[data-config-form]");
+    var fieldsRoot = dialog.querySelector("[data-config-fields]");
+    var tabsRoot = dialog.querySelector("[data-config-field-tabs]");
+    var currentFields = [];
+
+    function tokenEditor(field, wrapper) {
+      var values = (field.values || []).slice();
+      var box = document.createElement("div"); box.className = "token-input config-token-input";
+      var chips = document.createElement("div"); chips.className = "token-chip-list";
+      var input = document.createElement("input"); input.placeholder = "Waarde zoeken of freeform toevoegen";
+      var add = document.createElement("button"); add.type = "button"; add.className = "btn"; add.textContent = "+";
+      function render() {
+        chips.innerHTML = "";
+        values.forEach(function (value) {
+          var chip = document.createElement("span"); chip.className = "policy-value-chip";
+          var text = document.createElement("span"); text.textContent = value;
+          var remove = document.createElement("button"); remove.type = "button"; remove.textContent = "−"; remove.setAttribute("aria-label", value + " verwijderen");
+          remove.addEventListener("click", function () { values = values.filter(function (item) { return item !== value; }); field._values = values; render(); });
+          chip.appendChild(text); chip.appendChild(remove); chips.appendChild(chip);
+        });
+      }
+      function append() { parseTagTokens(input.value).forEach(function (value) { if (!values.includes(value)) values.push(value); }); input.value = ""; field._values = values; render(); }
+      add.addEventListener("click", append);
+      input.addEventListener("keydown", function (event) { if (event.key === "Enter" && !tagQuoteOpen(input.value)) { event.preventDefault(); append(); } });
+      field._commit = append; field._values = values;
+      box.appendChild(chips); box.appendChild(input); box.appendChild(add); wrapper.appendChild(box); render();
+    }
+
+    function activateGroup(group) {
+      all("button", tabsRoot).forEach(function (button) { button.classList.toggle("is-active", button.dataset.configGroup === group); });
+      all("[data-config-group-panel]", fieldsRoot).forEach(function (panel) { panel.classList.toggle("is-active", panel.dataset.configGroupPanel === group); });
+    }
+
+    function renderRecord(item) {
+      currentFields = item.edit_fields || [];
+      form.querySelector("[data-config-locator]").value = item.locator;
+      dialog.querySelector("[data-config-dialog-title]").textContent = "Edit " + item.name;
+      dialog.querySelector("[data-config-dialog-kind]").textContent = item.kind;
+      dialog.querySelector("[data-config-dialog-owner]").textContent = item.owner;
+      var duplicate = dialog.querySelector("[data-config-duplicate]"); if (duplicate) duplicate.hidden = !item.is_entry;
+      tabsRoot.innerHTML = ""; fieldsRoot.innerHTML = "";
+      var groups = [];
+      currentFields.forEach(function (field) { var group = field.group || "General"; if (!groups.includes(group)) groups.push(group); });
+      if (!groups.length) groups.push("General");
+      groups.forEach(function (group, index) {
+        var tab = document.createElement("button"); tab.type = "button"; tab.dataset.configGroup = group; tab.textContent = group; if (!index) tab.classList.add("is-active");
+        tab.addEventListener("click", function () { activateGroup(group); }); tabsRoot.appendChild(tab);
+        var panel = document.createElement("div"); panel.className = "policy-tab-panel config-field-panel" + (!index ? " is-active" : ""); panel.dataset.configGroupPanel = group;
+        var grid = document.createElement("div"); grid.className = "form-grid";
+        currentFields.filter(function (field) { return (field.group || "General") === group; }).forEach(function (field) {
+          var wrapper = document.createElement("div"); wrapper.className = "field full config-generic-field";
+          var label = document.createElement("label"); label.textContent = field.label; wrapper.appendChild(label);
+          if (field.kind === "protected") {
+            var protectedText = document.createElement("div"); protectedText.className = "callout"; protectedText.textContent = "Beschermde waarde · blijft ongewijzigd"; wrapper.appendChild(protectedText);
+          } else if (field.kind === "members") tokenEditor(field, wrapper);
+          else if (field.kind === "boolean" || field.kind === "bool") {
+            var booleanValues = field.kind === "bool" ? ["true", "false"] : ["yes", "no"];
+            var select = document.createElement("select"); booleanValues.forEach(function (value) { var option = document.createElement("option"); option.value = value; option.textContent = value; option.selected = String(field.value).trim().toLowerCase() === value; select.appendChild(option); }); field._input = select; wrapper.appendChild(select);
+          } else {
+            var input = field.kind === "json" || String(field.value || "").length > 180 ? document.createElement("textarea") : document.createElement("input"); input.value = field.value || ""; if (input.tagName === "TEXTAREA") input.rows = field.kind === "json" ? 10 : 4; field._input = input; wrapper.appendChild(input);
+          }
+          grid.appendChild(wrapper);
+        });
+        if (item.is_entry && index === 0) {
+          var nameField = document.createElement("div"); nameField.className = "field full config-generic-field config-name-field";
+          var nameLabel = document.createElement("label"); nameLabel.textContent = "Name";
+          var nameInput = document.createElement("input"); nameInput.name = "name"; nameInput.required = true; nameInput.value = item.name;
+          nameField.appendChild(nameLabel); nameField.appendChild(nameInput); grid.insertBefore(nameField, grid.firstChild);
+        } else if (!item.is_entry && index === 0) {
+          var hiddenName = document.createElement("input"); hiddenName.type = "hidden"; hiddenName.name = "name"; hiddenName.value = item.name; grid.appendChild(hiddenName);
+        }
+        panel.appendChild(grid); fieldsRoot.appendChild(panel);
+      });
+      activateGroup(groups[0]); dialog.showModal();
+    }
+
+    all("[data-config-record-edit]").forEach(function (button) { button.addEventListener("click", function () { renderRecord(JSON.parse(button.closest("[data-config-record-row]").getAttribute("data-config-record"))); }); });
+    dialog.querySelector("[data-config-cancel]").addEventListener("click", function () { dialog.close(); });
+    form.addEventListener("submit", function () {
+      currentFields.forEach(function (field) { if (field._commit) field._commit(); });
+      var updates = currentFields.filter(function (field) {
+        if (field.kind === "protected") return false;
+        if (field.kind === "members") return JSON.stringify(field._values || []) !== JSON.stringify(field.values || []);
+        return String(field._input ? field._input.value : field.value || "") !== String(field.value == null ? "" : field.value);
+      }).map(function (field) {
+        return field.kind === "members" ? {path:field.path,kind:field.kind,values:field._values || []} : {path:field.path,kind:field.kind,value:field._input ? field._input.value : field.value || ""};
+      });
+      form.querySelector("[data-config-updates]").value = JSON.stringify(updates);
+    });
+
+    var checks = all("[data-config-record-select]");
+    var count = document.querySelector("[data-config-selected-count]");
+    var remove = document.querySelector("[data-config-delete]");
+    function updateSelection() { var selected = checks.filter(function (check) { return check.checked; }).length; if (count) count.textContent = selected; if (remove) remove.disabled = selected === 0; }
+    checks.forEach(function (check) { check.addEventListener("change", updateSelection); }); updateSelection();
+  }
+
   function setupWorkspaceObjects() {
     var dialog = document.querySelector("[data-workspace-object-dialog]");
     if (!dialog) return;
@@ -713,6 +813,7 @@
     setupPolicyManagement();
     setupObjectManagement();
     setupOfflinePolicyTabs();
+    setupWorkspaceConfigurationEditor();
     setupConfigPullProgress();
     setupWorkspaceObjects();
     setupWorkspaceContextLoading();

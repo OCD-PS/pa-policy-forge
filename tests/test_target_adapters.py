@@ -222,6 +222,42 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertIn("offlineDialog.showModal()", javascript)
         self.assertIn("pickerSelections", javascript)
 
+    def test_scm_configuration_fields_preserve_types_and_hide_secrets(self):
+        raw = {
+            "id": "abc", "name": "ethernet1/1", "folder": "Branch",
+            "enabled": True, "mtu": 1500, "members": ["one", "two"],
+            "nested": {"mode": "auto", "password": "must-not-render"},
+            "complex": [{"name": "child", "value": 1}],
+        }
+        fields = main._scm_config_fields(raw)
+        self.assertNotIn("must-not-render", repr(fields))
+        kinds = {field["label"]: field["kind"] for field in fields}
+        self.assertEqual(kinds["Enabled"], "bool")
+        self.assertEqual(kinds["Members"], "members")
+        self.assertEqual(kinds["Complex"], "json")
+        self.assertEqual(kinds["Nested / Password"], "protected")
+        updates = [
+            {"path": next(field["path"] for field in fields if field["label"] == "Enabled"), "kind": "bool", "value": "false"},
+            {"path": next(field["path"] for field in fields if field["label"] == "Mtu"), "kind": "text", "value": "1400"},
+            {"path": next(field["path"] for field in fields if field["label"] == "Members"), "kind": "members", "values": ["three"]},
+        ]
+        payload = main._scm_config_payload(raw, updates, "ethernet1/2")
+        self.assertEqual(payload["name"], "ethernet1/2")
+        self.assertIs(payload["enabled"], False)
+        self.assertEqual(payload["mtu"], 1400)
+        self.assertEqual(payload["members"], ["three"])
+        self.assertEqual(payload["nested"]["password"], "must-not-render")
+
+    def test_scm_network_and_device_editor_routes_compile(self):
+        template = (main.BASE / "app" / "templates" / "app.html").read_text()
+        javascript = (main.BASE / "app" / "static" / "app.js").read_text()
+        self.assertIn("scm_configuration_preview", template)
+        self.assertIn("scm_configuration_delete_preview", template)
+        self.assertIn("policy_view='device'", template)
+        self.assertIn("data-config-record-edit", template)
+        self.assertIn("setupWorkspaceConfigurationEditor", javascript)
+        main.app.jinja_env.get_template("scm_config_preview.html")
+
     def test_panos_application_catalog_combines_custom_and_predefined(self):
         profile = self.profile("panorama")
         response = "<response status='success'><result><application><entry name='ssl'/><entry name='web-browsing'/></application></result></response>"

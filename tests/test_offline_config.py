@@ -6,7 +6,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.offline_config import (
-    OfflineConfigError, apply_object_changes, available_scopes, available_templates, configuration_inventory, parse_snapshot,
+    OfflineConfigError, apply_configuration_changes, apply_object_changes, available_scopes, available_templates,
+    configuration_inventory, configuration_records, parse_snapshot,
     object_fingerprint, policy_fingerprint, render_set_commands, replace_policy_in_snapshot,
     referenced_template, scoped_objects, scoped_policies,
 )
@@ -105,6 +106,57 @@ class OfflineConfigTests(unittest.TestCase):
         by_name = {item["name"]: item for item in inventory["network"]}
         self.assertEqual(by_name["Interfaces"]["entries"], 1)
         self.assertEqual(by_name["Zones"]["entries"], 2)
+
+    def test_network_records_are_editable_and_preserve_unknown_xml(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><network><interface><ethernet><entry name="ethernet1/1" custom="keep"><layer3><ip><entry name="192.0.2.1/24"/></ip></layer3><comment>old</comment><link-state>auto</link-state><future-node><value>preserve</value></future-node></entry></ethernet></interface></network><vsys><entry name="vsys1"><zone><entry name="Trust"><network><layer3><member>ethernet1/1</member></layer3></network></entry></zone></entry></vsys></entry></devices></config>'''
+        _, records = configuration_records(source, "vsys1", "", "network", "interfaces")
+        self.assertEqual([record["name"] for record in records], ["ethernet1/1"])
+        interface = records[0]
+        fields = {field["label"]: field for field in interface["edit_fields"]}
+        updated = apply_configuration_changes(source, [{
+            "operation": "update", "locator": interface["locator"],
+            "fingerprint": interface["fingerprint"], "name": "ethernet1/2",
+            "updates": [
+                {"path": fields["Comment"]["path"], "kind": "text", "value": "changed"},
+                {"path": fields["Link State"]["path"], "kind": "text", "value": "up"},
+            ],
+        }])
+        self.assertIn(b'<entry name="ethernet1/2" custom="keep">', updated)
+        self.assertIn(b"<comment>changed</comment>", updated)
+        self.assertIn(b"<future-node>", updated)
+        self.assertIn(b"<value>preserve</value>", updated)
+
+    def test_panorama_template_stack_records_keep_concrete_owner(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><device-group><entry name="Branch-DG"/></device-group><template><entry name="Base"><config><devices><entry name="localhost.localdomain"><network><interface><ethernet><entry name="ethernet1/1"><comment>base</comment></entry></ethernet></interface></network></entry></devices></config></entry><entry name="Branch"><config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><zone><entry name="Clients"><network><layer3><member>ethernet1/1</member></layer3></network></entry></zone></entry></vsys></entry></devices></config></entry></template><template-stack><entry name="Branch-Stack"><templates><member>Branch</member><member>Base</member></templates></entry></template-stack></entry></devices></config>'''
+        _, interfaces = configuration_records(source, "Branch-DG", "Branch-Stack", "network", "interfaces")
+        _, zones = configuration_records(source, "Branch-DG", "Branch-Stack", "network", "zones")
+        self.assertEqual([(item["name"], item["owner"]) for item in interfaces], [("ethernet1/1", "Base")])
+        self.assertEqual([(item["name"], item["owner"]) for item in zones], [("Clients", "Branch")])
+
+    def test_configuration_records_can_duplicate_and_delete_multiple_siblings(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><network><interface><ethernet><entry name="ethernet1/1"><comment>one</comment></entry><entry name="ethernet1/2"><comment>two</comment></entry><entry name="ethernet1/3"><comment>three</comment></entry></ethernet></interface></network><vsys><entry name="vsys1"/></vsys></entry></devices></config>'''
+        _, records = configuration_records(source, "vsys1", "", "network", "interfaces")
+        first = records[0]
+        duplicated = apply_configuration_changes(source, [{
+            "operation": "create", "locator": first["locator"], "fingerprint": first["fingerprint"],
+            "name": "ethernet1/4", "updates": [],
+        }])
+        self.assertIn(b'<entry name="ethernet1/4">', duplicated)
+        _, after = configuration_records(duplicated, "vsys1", "", "network", "interfaces")
+        removed = apply_configuration_changes(duplicated, [
+            {"operation": "delete", "locator": item["locator"], "fingerprint": item["fingerprint"]}
+            for item in after if item["name"] in {"ethernet1/2", "ethernet1/3"}
+        ])
+        self.assertNotIn(b'<entry name="ethernet1/2">', removed)
+        self.assertNotIn(b'<entry name="ethernet1/3">', removed)
+        self.assertIn(b'<entry name="ethernet1/4">', removed)
+
+    def test_protected_device_values_never_reach_editor_fields(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><deviceconfig><system><hostname>fw-a</hostname><password>secret-value</password></system></deviceconfig><mgt-config><users><entry name="admin"><phash>hash-value</phash></entry></users></mgt-config><vsys><entry name="vsys1"/></vsys></entry></devices></config>'''
+        _, setup = configuration_records(source, "vsys1", "", "device", "setup")
+        protected = [field for field in setup[0]["edit_fields"] if field["kind"] == "protected"]
+        self.assertTrue(protected)
+        self.assertNotIn("secret-value", repr(setup[0]["edit_fields"]))
 
     def test_offline_object_create_update_delete_preserves_unknown_fields(self):
         source = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="old"><ip-netmask>192.0.2.1/32</ip-netmask><custom-field>keep</custom-field></entry></address></entry></vsys></entry></devices></config>'''

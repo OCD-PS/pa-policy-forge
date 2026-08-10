@@ -43,6 +43,53 @@ OBJECT_NODES = {
     "schedules": "schedule", "security-profile-groups": "profile-group",
     "log-forwarding": "log-settings", "authentication": "authentication-profile",
 }
+
+# Network and Device are represented by the same generic XML record model.  The
+# paths intentionally stop at the PAN-OS configuration container; records below
+# that container are discovered dynamically so newer PAN-OS fields survive a
+# round-trip without requiring an application release.
+CONFIG_SECTION_PATHS = {
+    "network": {
+        "interfaces": (".//network/interface",),
+        "zones": (".//zone",),
+        "vlans": (".//network/vlan",),
+        "virtual-wires": (".//network/virtual-wire",),
+        "virtual-routers": (".//network/virtual-router", ".//virtual-router"),
+        "logical-routers": (".//network/logical-router", ".//logical-router"),
+        "ipsec-tunnels": (".//network/tunnel/ipsec", ".//tunnel/ipsec"),
+        "routing-profiles": (".//network/routing-profile",),
+        "gre-tunnels": (".//network/tunnel/gre", ".//tunnel/gre"),
+        "globalprotect-portals": (".//global-protect/global-protect-portal",),
+        "globalprotect-gateways": (".//global-protect/global-protect-gateway",),
+        "dhcp": (".//network/dhcp",),
+        "dns-proxy": (".//network/dns-proxy",),
+        "qos": (".//network/qos",),
+        "lldp": (".//network/lldp",),
+        "network-profiles": (".//network/profiles",),
+    },
+    "device": {
+        "setup": (".//deviceconfig",),
+        "administrators": (".//mgt-config/users",),
+        "admin-roles": (".//mgt-config/admin-roles",),
+        "authentication-profile": (".//authentication-profile",),
+        "authentication-sequence": (".//authentication-sequence",),
+        "certificates": (".//certificate",),
+        "certificate-management": (".//ssl-decrypt",),
+        "local-user-database": (".//local-user-database",),
+        "server-profiles": (".//server-profile",),
+        "log-settings": (".//log-settings",),
+        "high-availability": (".//high-availability",),
+        "user-identification": (".//user-id-collector",),
+        "vm-information-sources": (".//vm-info-source",),
+        # Operational software and license pages are intentionally not mapped
+        # to candidate XML writes.  They are not ordinary configuration nodes.
+    },
+}
+
+PROTECTED_CONFIG_TAGS = {
+    "phash", "password", "passwd", "private-key", "private-key-data",
+    "secret", "auth-key", "authentication-key", "passphrase",
+}
 POLICY_LIST_FIELDS = (
     "from", "to", "source", "destination", "source-user", "category",
     "application", "service", "tag", "destination-user", "source-hip", "destination-hip",
@@ -490,6 +537,252 @@ def apply_object_changes(xml_bytes: bytes, scope: str, object_type: str, changes
                 current.remove(child)
         for child in list(replacement):
             current.append(copy.deepcopy(child))
+    return normalized_config_xml(root)
+
+
+def _config_roots(root: ET.Element, snapshot: ConfigSnapshot, scope: str, template: str) -> list[tuple[str, ET.Element]]:
+    """Return concrete configuration owners for a Network/Device view."""
+    if snapshot.kind != "panorama":
+        return [(scope, root)]
+    templates = {
+        entry.get("name", ""): entry
+        for entry in root.findall("./devices/entry/template/entry")
+        if entry.get("name")
+    }
+    if template in templates:
+        return [(template, templates[template])]
+    stack = next((
+        entry for entry in root.findall("./devices/entry/template-stack/entry")
+        if entry.get("name") == template
+    ), None)
+    if stack is None:
+        return []
+    names = [member.text or "" for member in stack.findall("./templates/member")]
+    return [(name, templates[name]) for name in names if name in templates]
+
+
+def _indexed_element(root: ET.Element, locator: str) -> ET.Element:
+    node = root
+    if not locator:
+        return node
+    try:
+        for part in locator.split("/"):
+            node = list(node)[int(part)]
+    except (ValueError, IndexError):
+        raise OfflineConfigError("Het configuratie-item bestaat niet meer")
+    return node
+
+
+def _element_parents(root: ET.Element) -> dict[int, tuple[ET.Element, int]]:
+    return {
+        id(child): (parent, index)
+        for parent in root.iter()
+        for index, child in enumerate(list(parent))
+    }
+
+
+def _element_locator(root: ET.Element, target: ET.Element, parents: dict[int, tuple[ET.Element, int]]) -> str:
+    indices: list[int] = []
+    current = target
+    while current is not root:
+        parent_info = parents.get(id(current))
+        if parent_info is None:
+            raise OfflineConfigError("Het configuratie-item bevindt zich niet in de geladen configuratie")
+        current, index = parent_info
+        indices.append(index)
+    return "/".join(str(index) for index in reversed(indices))
+
+
+def _protected_config_tag(tag: str) -> bool:
+    normalized = tag.lower()
+    return (
+        normalized in PROTECTED_CONFIG_TAGS
+        or "password" in normalized
+        or "private-key" in normalized
+        or normalized.endswith("-secret")
+    )
+
+
+def _config_edit_fields(entry: ET.Element, skip_nested_entries: bool = False) -> list[dict]:
+    fields: list[dict] = []
+
+    def walk(node: ET.Element, path: list[int], labels: list[str]) -> None:
+        children = list(node)
+        label = " / ".join(labels)
+        group = labels[0] if labels else "General"
+        if _protected_config_tag(node.tag):
+            fields.append({"path": "/".join(map(str, path)), "label": label, "group": group, "kind": "protected"})
+            return
+        if children and all(child.tag == "member" for child in children):
+            fields.append({
+                "path": "/".join(map(str, path)), "label": label,
+                "group": group, "kind": "members",
+                "values": [(child.text or "") for child in children],
+            })
+            return
+        if not children:
+            value = node.text or ""
+            # Certificate blobs and similar large opaque values remain preserved
+            # but are not copied into the browser DOM.
+            if len(value) > 8192:
+                fields.append({"path": "/".join(map(str, path)), "label": label, "group": group, "kind": "protected"})
+                return
+            fields.append({
+                "path": "/".join(map(str, path)), "label": label,
+                "group": group,
+                "kind": "boolean" if value.strip().lower() in {"yes", "no"} else "text",
+                "value": value,
+            })
+            return
+        for index, child in enumerate(children):
+            if skip_nested_entries and child.tag == "entry":
+                continue
+            walk(child, path + [index], labels + [child.tag.replace("-", " ").title()])
+
+    for index, child in enumerate(list(entry)):
+        walk(child, [index], [child.tag.replace("-", " ").title()])
+    return fields
+
+
+def _top_level_entries(section: ET.Element) -> list[tuple[ET.Element, list[str]]]:
+    records: list[tuple[ET.Element, list[str]]] = []
+
+    def walk(node: ET.Element, labels: list[str], inside_entry: bool) -> None:
+        for child in list(node):
+            next_labels = labels + [child.tag.replace("-", " ").title()]
+            if child.tag == "entry" and not inside_entry:
+                records.append((child, labels))
+                continue
+            walk(child, next_labels, inside_entry or child.tag == "entry")
+
+    walk(section, [], False)
+    return records
+
+
+def _has_nonentry_leaf(node: ET.Element) -> bool:
+    for child in list(node):
+        if child.tag == "entry":
+            continue
+        if not list(child) or _has_nonentry_leaf(child):
+            return True
+    return False
+
+
+def configuration_records(
+    xml_bytes: bytes, scope: str, template: str, view: str, section: str, parsed=None,
+) -> tuple[ConfigSnapshot, list[dict]]:
+    root, snapshot = parsed if parsed is not None else parse_snapshot(xml_bytes)
+    paths = CONFIG_SECTION_PATHS.get(view, {}).get(section)
+    if not paths:
+        return snapshot, []
+    parents = _element_parents(root)
+    records: list[dict] = []
+    seen_sections: set[int] = set()
+    for owner, source in _config_roots(root, snapshot, scope, template):
+        search_source = source
+        if view == "network" and section == "zones" and snapshot.kind != "panorama":
+            scoped_root = _scope_root(root, snapshot, scope)
+            search_source = scoped_root if scoped_root is not None else source
+        sections: list[ET.Element] = []
+        for path in paths:
+            for node in search_source.findall(path):
+                if id(node) not in seen_sections:
+                    seen_sections.add(id(node)); sections.append(node)
+        for section_node in sections:
+            entries = _top_level_entries(section_node)
+            targets = list(entries)
+            if not entries or _has_nonentry_leaf(section_node):
+                targets.insert(0, (section_node, []))
+            for entry, labels in targets:
+                locator = _element_locator(root, entry, parents)
+                xml = ET.tostring(entry, encoding="unicode")
+                name = entry.get("name") or section.replace("-", " ").title()
+                kind = " / ".join(labels) if labels else section_node.tag.replace("-", " ").title()
+                fields = _config_edit_fields(entry, skip_nested_entries=entry is section_node and bool(entries))
+                summary_values = []
+                for field in fields:
+                    if field["kind"] == "members":
+                        summary_values.extend(field.get("values", [])[:3])
+                    elif field["kind"] != "protected" and str(field.get("value", "")).strip():
+                        summary_values.append(str(field["value"]).strip())
+                    if len(summary_values) >= 3:
+                        break
+                records.append({
+                    "id": locator, "locator": locator, "name": name, "owner": owner,
+                    "kind": kind, "is_entry": entry.tag == "entry", "editable": True,
+                    "summary": " · ".join(summary_values[:3]), "edit_fields": fields,
+                    "fingerprint": hashlib.sha256(xml.encode()).hexdigest(), "_xml": xml,
+                })
+    return snapshot, records
+
+
+def apply_configuration_changes(xml_bytes: bytes, changes: list[dict]) -> bytes:
+    root, _ = parse_snapshot(xml_bytes)
+    # Delete descending index paths so removing one sibling cannot retarget the
+    # locator of a later sibling. Updates/duplicates then use stable locators.
+    deletes = sorted(
+        (item for item in changes if item.get("operation") == "delete"),
+        key=lambda item: [int(part) for part in item.get("locator", "").split("/") if part],
+        reverse=True,
+    )
+    ordered = deletes + [item for item in changes if item.get("operation") != "delete"]
+    for change in ordered:
+        locator = change.get("locator", "")
+        current = _indexed_element(root, locator)
+        current_xml = ET.tostring(current, encoding="unicode")
+        if hashlib.sha256(current_xml.encode()).hexdigest() != change.get("fingerprint"):
+            raise OfflineConfigError("Het configuratie-item is intussen gewijzigd")
+        if change.get("operation") == "delete":
+            if current.tag != "entry" or not locator:
+                raise OfflineConfigError("Alleen benoemde configuratie-items kunnen worden verwijderd")
+            parent_locator = "/".join(locator.split("/")[:-1])
+            _indexed_element(root, parent_locator).remove(current)
+            continue
+        replacement = copy.deepcopy(current)
+        new_name = str(change.get("name", "")).strip()
+        if replacement.tag == "entry":
+            if not new_name:
+                raise OfflineConfigError("Name is verplicht")
+            parent_locator = "/".join(locator.split("/")[:-1])
+            parent = _indexed_element(root, parent_locator)
+            if any(sibling is not current and sibling.tag == "entry" and sibling.get("name") == new_name for sibling in list(parent)):
+                raise OfflineConfigError(f"Configuratie-item {new_name} bestaat al")
+            replacement.set("name", new_name)
+        allowed = {(field["path"], field["kind"]) for field in _config_edit_fields(current) if field["kind"] != "protected"}
+        updates = change.get("updates", [])
+        if not isinstance(updates, list) or len(updates) > 10000:
+            raise OfflineConfigError("Ongeldige configuratievelden")
+        for update in updates:
+            key = (str(update.get("path", "")), str(update.get("kind", "")))
+            if key not in allowed:
+                raise OfflineConfigError("Een configuratieveld bestaat niet meer of is beschermd")
+            target = _indexed_element(replacement, key[0])
+            if key[1] == "members":
+                values = update.get("values", [])
+                if not isinstance(values, list) or len(values) > 10000:
+                    raise OfflineConfigError("Ongeldige memberlijst")
+                for child in list(target):
+                    target.remove(child)
+                for value in values:
+                    clean = str(value).strip()
+                    if clean:
+                        member = ET.SubElement(target, "member"); member.text = clean
+            else:
+                target.text = str(update.get("value", ""))[:65535]
+        if change.get("operation") == "create":
+            if current.tag != "entry" or not locator:
+                raise OfflineConfigError("Alleen een benoemd configuratie-item kan als basis worden gebruikt")
+            parent = _indexed_element(root, "/".join(locator.split("/")[:-1]))
+            if any(sibling.tag == "entry" and sibling.get("name") == new_name for sibling in list(parent)):
+                raise OfflineConfigError(f"Configuratie-item {new_name} bestaat al")
+            index = list(parent).index(current)
+            parent.insert(index + 1, replacement)
+        elif locator:
+            parent = _indexed_element(root, "/".join(locator.split("/")[:-1]))
+            index = list(parent).index(current)
+            parent.remove(current); parent.insert(index, replacement)
+        else:
+            root = replacement
     return normalized_config_xml(root)
 
 
