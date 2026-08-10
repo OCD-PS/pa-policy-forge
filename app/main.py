@@ -1707,6 +1707,21 @@ def _workspace_config_redirect(workspace_id: int, draft: dict):
     ))
 
 
+def _store_workspace_configuration_version(workspace, context: dict, changes: list[dict]) -> int:
+    new_xml = apply_configuration_changes(workspace_config_path(workspace).read_bytes(), changes)
+    with db() as conn:
+        profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+    if not profile:
+        raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
+    new_id = store_config_workspace(
+        profile, f"{workspace['name']} · {context['view']} edit {now()}",
+        workspace["original_name"], new_xml, "edit",
+    )
+    set_active_config_workspace(workspace["profile_id"], new_id)
+    audit("config-workspace-configuration-edited", f"source={workspace['id']} workspace={new_id} view={context['view']} section={context['section']} operation={context.get('operation','update')}")
+    return new_id
+
+
 @app.post("/config-workspaces/<int:workspace_id>/configuration/preview")
 @login_required
 def config_workspace_configuration_preview(workspace_id):
@@ -1766,6 +1781,11 @@ def config_workspace_configuration_preview(workspace_id):
         new_xml = apply_configuration_changes(xml_bytes, [change])
         if new_xml == normalized_config_xml(parsed_root):
             raise OfflineConfigError("Er zijn geen wijzigingen om te bewaren")
+        if request.form.get("direct_save") == "yes":
+            direct_context = {**context, "operation": operation}
+            new_id = _store_workspace_configuration_version(workspace, direct_context, [change])
+            flash("Configuratie rechtstreeks bewaard in een nieuwe workspaceversie.", "success")
+            return _workspace_config_redirect(new_id, direct_context)
         draft_id = secrets.token_urlsafe(24)
         draft = {**context, "operation": operation, "before": public_ui_record(before), "changes": [change], "created_at": now()}
         draft_path = OBJECT_DRAFTS / f"offline-config-{draft_id}.json"
@@ -1796,6 +1816,11 @@ def config_workspace_configuration_delete_preview(workspace_id):
         if not selected_locators or len(selected) != len(selected_locators):
             raise OfflineConfigError("Selecteer minstens één benoemd configuratie-item")
         changes = [{"operation": "delete", "locator": item["locator"], "fingerprint": item["fingerprint"]} for item in selected]
+        if request.form.get("direct_save") == "yes":
+            direct_context = {**context, "operation": "delete"}
+            new_id = _store_workspace_configuration_version(workspace, direct_context, changes)
+            flash("Geselecteerde configuratie-items rechtstreeks verwijderd in een nieuwe workspaceversie.", "success")
+            return _workspace_config_redirect(new_id, direct_context)
         draft_id = secrets.token_urlsafe(24)
         draft = {**context, "operation": "delete", "before_items": [public_ui_record(item) for item in selected], "changes": changes, "created_at": now()}
         draft_path = OBJECT_DRAFTS / f"offline-config-{draft_id}.json"
@@ -1819,18 +1844,8 @@ def config_workspace_configuration_apply(draft_id):
         workspace = workspace_row(int(draft["workspace_id"]))
         if not workspace:
             raise OfflineConfigError("De bronworkspace bestaat niet meer")
-        new_xml = apply_configuration_changes(workspace_config_path(workspace).read_bytes(), draft["changes"])
-        with db() as conn:
-            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
-        if not profile:
-            raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
-        new_id = store_config_workspace(
-            profile, f"{workspace['name']} · {draft['view']} edit {now()}",
-            workspace["original_name"], new_xml, "edit",
-        )
-        set_active_config_workspace(workspace["profile_id"], new_id)
+        new_id = _store_workspace_configuration_version(workspace, draft, draft["changes"])
         draft_path.unlink(missing_ok=True)
-        audit("config-workspace-configuration-edited", f"source={workspace['id']} workspace={new_id} view={draft['view']} section={draft['section']} operation={draft['operation']}")
         flash("Configuratiewijziging bewaard in een nieuwe workspaceversie; de bron bleef onaangeroerd.", "success")
         return _workspace_config_redirect(new_id, draft)
     except Exception as exc:
@@ -2428,6 +2443,27 @@ def _scm_config_redirect(profile_id: int, view: str, section: str):
     return redirect(url_for("index", policy_profile=profile_id, policy_view=view, config_section=section) + "#policy-management")
 
 
+def _write_scm_configuration_draft(profile, draft: dict) -> None:
+    current = fetch_scm_configuration_records(profile, draft["view"], draft["section"])
+    scm, token, _, container = scm_client(profile)
+    root = policy_api.scm_api_root(scm.scm_api_base) + f"/config/{draft['view']}/v1"
+    if draft["operation"] in {"update", "create"}:
+        before = next((item for item in current if item["endpoint"] == draft["endpoint"] and item["id"] == draft["before_id"]), None)
+        if not before or before["fingerprint"] != draft["fingerprint"]:
+            raise RuntimeError(f"Configuratie-item {draft['before_name']} is intussen gewijzigd; Save gestopt.")
+        if draft["operation"] == "update":
+            policy_api.scm_http_request("PUT", f"{root}/{draft['endpoint']}/{draft['before_id']}", token, payload=draft["payload"])
+        else:
+            policy_api.scm_http_request("POST", f"{root}/{draft['endpoint']}", token, payload=draft["payload"])
+    else:
+        for item in draft["items"]:
+            before = next((record for record in current if record["endpoint"] == item["endpoint"] and record["id"] == item["id"]), None)
+            if not before or before["fingerprint"] != item["fingerprint"]:
+                raise RuntimeError(f"Configuratie-item {item['name']} is intussen gewijzigd; Delete gestopt.")
+        for item in draft["items"]:
+            policy_api.scm_http_request("DELETE", f"{root}/{item['endpoint']}/{item['id']}", token, params=container)
+
+
 @app.post("/scm-configuration/<int:profile_id>/<view>/<section>/preview")
 @login_required
 def scm_configuration_preview(profile_id, view, section):
@@ -2456,6 +2492,12 @@ def scm_configuration_preview(profile_id, view, section):
         elif _scm_config_fingerprint(payload) == before["fingerprint"]: raise ValueError("Er zijn geen wijzigingen om te bewaren")
         draft_id = secrets.token_urlsafe(18)
         draft = {"profile_id": profile_id, "view": view, "section": section, "operation": operation, "endpoint": before["endpoint"], "before_id": before["id"], "before_name": before["name"], "fingerprint": before["fingerprint"], "name": name, "payload": payload, "created_at": now()}
+        if request.form.get("direct_save") == "yes":
+            _write_scm_configuration_draft(profile, draft)
+            invalidate_profile_caches(profile["id"])
+            audit("scm-configuration-candidate", f"profile={profile['name']} view={view} section={section} operation={operation}")
+            flash("Configuratie rechtstreeks naar de SCM candidate bewaard.", "success")
+            return _scm_config_redirect(profile_id, view, section)
         path = OBJECT_DRAFTS / f"scm-config-{draft_id}.json"; path.write_text(json.dumps(draft)); path.chmod(0o600)
         return render_template("scm_config_preview.html", profile=profile, draft=draft, draft_id=draft_id)
     except Exception as exc:
@@ -2474,6 +2516,12 @@ def scm_configuration_delete_preview(profile_id, view, section):
         if not locators or len(selected) != len(locators): raise ValueError("Selecteer minstens één bestaand SCM-configuratie-item")
         draft_id = secrets.token_urlsafe(18)
         draft = {"profile_id": profile_id, "view": view, "section": section, "operation": "delete", "items": [{"endpoint": item["endpoint"], "id": item["id"], "name": item["name"], "fingerprint": item["fingerprint"]} for item in selected], "created_at": now()}
+        if request.form.get("direct_save") == "yes":
+            _write_scm_configuration_draft(profile, draft)
+            invalidate_profile_caches(profile["id"])
+            audit("scm-configuration-candidate", f"profile={profile['name']} view={view} section={section} operation=delete")
+            flash("Configuratie-items rechtstreeks uit de SCM candidate verwijderd.", "success")
+            return _scm_config_redirect(profile_id, view, section)
         path = OBJECT_DRAFTS / f"scm-config-{draft_id}.json"; path.write_text(json.dumps(draft)); path.chmod(0o600)
         return render_template("scm_config_preview.html", profile=profile, draft=draft, draft_id=draft_id)
     except Exception as exc:
@@ -2491,19 +2539,7 @@ def scm_configuration_push(draft_id):
     with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (draft["profile_id"],)).fetchone()
     if not profile or profile["target_type"] != "scm": return "Not found", 404
     try:
-        current = fetch_scm_configuration_records(profile, draft["view"], draft["section"])
-        scm, token, _, container = scm_client(profile)
-        root = policy_api.scm_api_root(scm.scm_api_base) + f"/config/{draft['view']}/v1"
-        if draft["operation"] in {"update", "create"}:
-            before = next((item for item in current if item["endpoint"] == draft["endpoint"] and item["id"] == draft["before_id"]), None)
-            if not before or before["fingerprint"] != draft["fingerprint"]: raise RuntimeError(f"Configuratie-item {draft['before_name']} is intussen gewijzigd; Push gestopt.")
-            if draft["operation"] == "update": policy_api.scm_http_request("PUT", f"{root}/{draft['endpoint']}/{draft['before_id']}", token, payload=draft["payload"])
-            else: policy_api.scm_http_request("POST", f"{root}/{draft['endpoint']}", token, payload=draft["payload"])
-        else:
-            for item in draft["items"]:
-                before = next((record for record in current if record["endpoint"] == item["endpoint"] and record["id"] == item["id"]), None)
-                if not before or before["fingerprint"] != item["fingerprint"]: raise RuntimeError(f"Configuratie-item {item['name']} is intussen gewijzigd; Delete gestopt.")
-            for item in draft["items"]: policy_api.scm_http_request("DELETE", f"{root}/{item['endpoint']}/{item['id']}", token, params=container)
+        _write_scm_configuration_draft(profile, draft)
         path.unlink(missing_ok=True); invalidate_profile_caches(profile["id"])
         audit("scm-configuration-candidate", f"profile={profile['name']} view={draft['view']} section={draft['section']} operation={draft['operation']}")
         flash("SCM-configuratiebewerking naar candidate geschreven. Gebruik Push om ze uit te rollen.", "success")

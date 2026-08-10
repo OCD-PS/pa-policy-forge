@@ -663,6 +663,7 @@
     var fieldsRoot = dialog.querySelector("[data-config-fields]");
     var tabsRoot = dialog.querySelector("[data-config-field-tabs]");
     var currentFields = [];
+    if (!form.querySelector('input[name="direct_save"]')) { var directSave = document.createElement("input"); directSave.type = "hidden"; directSave.name = "direct_save"; directSave.value = "yes"; form.appendChild(directSave); }
 
     // Turn the shared generic dialog markup into the compact PAN-OS editor.
     var brand = dialog.querySelector(":scope > .push-dialog-brand"); if (brand) brand.remove();
@@ -732,9 +733,8 @@
       dialog.querySelector("[data-config-dialog-title]").textContent = (createMode ? "Add " + item.kind : "Edit " + item.name);
       dialog.querySelector("[data-config-dialog-kind]").textContent = item.kind;
       dialog.querySelector("[data-config-dialog-owner]").textContent = item.owner;
-      var duplicate = dialog.querySelector("[data-config-duplicate]"); if (duplicate) duplicate.hidden = createMode || !item.is_entry;
       var primary = form.querySelector('button.btn-primary[name="operation"]');
-      if (primary) { primary.value = createMode ? "create" : "update"; primary.textContent = createMode ? "Preview nieuw item" : "Preview wijzigingen"; }
+      if (primary) { primary.value = createMode ? "create" : "update"; primary.textContent = "Save"; }
       tabsRoot.innerHTML = ""; fieldsRoot.innerHTML = "";
       var groups = (item.ui_tabs || []).slice();
       currentFields.forEach(function (field) { var group = field.group || "General"; if (!groups.includes(group)) groups.push(group); });
@@ -800,6 +800,8 @@
     var checks = all("[data-config-record-select]");
     var count = document.querySelector("[data-config-selected-count]");
     var remove = document.querySelector("[data-config-delete]");
+    var deleteForm = remove && remove.closest("form");
+    if (deleteForm && !deleteForm.querySelector('input[name="direct_save"]')) { var directDelete = document.createElement("input"); directDelete.type = "hidden"; directDelete.name = "direct_save"; directDelete.value = "yes"; deleteForm.appendChild(directDelete); }
     function updateSelection() { var selected = checks.filter(function (check) { return check.checked; }).length; if (count) count.textContent = selected; if (remove) remove.disabled = selected === 0; }
     checks.forEach(function (check) { check.addEventListener("change", updateSelection); }); updateSelection();
     setupFamilyTabs();

@@ -1,5 +1,6 @@
 import json
 import os
+import pathlib
 import tempfile
 import unittest
 import re
@@ -309,6 +310,81 @@ class TargetAdapterTests(unittest.TestCase):
             with main.db() as conn:
                 conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
                 conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
+    def test_network_configuration_save_directly_creates_workspace_version(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("direct-network-save", 1, "", "", "panos", "{}", b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        xml = b'''<config><devices><entry name="localhost.localdomain"><network><interface><ethernet><entry name="ethernet1/1"><comment>old</comment></entry></ethernet></interface></network><vsys><entry name="vsys1"/></vsys></entry></devices></config>'''
+        workspace_id = main.store_config_workspace(profile, "direct", "config.xml", xml, "upload")
+        _, records = main.scoped_configuration_records(xml, "vsys1", "", "network", "interfaces")
+        interface = records[0]
+        comment = next(field for field in interface["edit_fields"] if field["label"] == "Comment")
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1
+            login["username"] = "test"
+            login["must_change"] = False
+            login["csrf"] = "direct-save-csrf"
+        try:
+            response = client.post(
+                f"/config-workspaces/{workspace_id}/configuration/preview",
+                data={
+                    "csrf": "direct-save-csrf", "direct_save": "yes", "scope": "vsys1",
+                    "workspace_view": "network", "config_section": "interfaces",
+                    "locator": interface["locator"], "operation": "update", "name": interface["name"],
+                    "generic_updates": json.dumps([{"path": comment["path"], "kind": "text", "value": "saved"}]),
+                },
+                base_url="https://forge.test",
+            )
+            self.assertEqual(response.status_code, 302)
+            self.assertNotIn("configuration-drafts", response.headers["Location"])
+            with main.db() as conn:
+                latest = conn.execute("SELECT * FROM config_workspaces WHERE profile_id=? ORDER BY id DESC LIMIT 1", (profile_id,)).fetchone()
+            self.assertNotEqual(latest["id"], workspace_id)
+            self.assertIn(b"<comment>saved</comment>", main.workspace_config_path(latest).read_bytes())
+        finally:
+            with main.db() as conn:
+                workspaces = conn.execute("SELECT * FROM config_workspaces WHERE profile_id=?", (profile_id,)).fetchall()
+            for item in workspaces:
+                main.workspace_config_path(item).unlink(missing_ok=True)
+            with main.db() as conn:
+                conn.execute("DELETE FROM config_workspaces WHERE profile_id=?", (profile_id,))
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
+    def test_configuration_editors_use_direct_save_without_duplicate_button(self):
+        for template_name in ("workspace_editor.html", "app.html"):
+            template = (pathlib.Path(main.__file__).parent / "templates" / template_name).read_text()
+            self.assertNotIn("Dupliceer als nieuw", template)
+            self.assertNotIn("data-config-duplicate", template)
+        workspace_template = (pathlib.Path(main.__file__).parent / "templates" / "workspace_editor.html").read_text()
+        scm_template = (pathlib.Path(main.__file__).parent / "templates" / "app.html").read_text()
+        self.assertIn('name="direct_save" value="yes"', workspace_template)
+        self.assertIn('name="direct_save" value="yes"', scm_template)
+
+    def test_scm_direct_save_writer_updates_candidate_after_fingerprint_check(self):
+        profile = {"id": 42, "target_type": "scm"}
+        draft = {
+            "view": "network", "section": "zones", "operation": "update",
+            "endpoint": "zones", "before_id": "zone-id", "before_name": "Trust",
+            "fingerprint": "same", "payload": {"name": "Trust", "enable_user_identification": True},
+        }
+        current = [{"endpoint": "zones", "id": "zone-id", "fingerprint": "same"}]
+        scm = SimpleNamespace(scm_api_base="https://api.example.invalid")
+        with patch.object(main, "fetch_scm_configuration_records", return_value=current), \
+             patch.object(main, "scm_client", return_value=(scm, "token", None, {"folder": "Branch"})), \
+             patch.object(main.policy_api, "scm_api_root", return_value="https://api.example.invalid"), \
+             patch.object(main.policy_api, "scm_http_request") as request_mock:
+            main._write_scm_configuration_draft(profile, draft)
+        request_mock.assert_called_once_with(
+            "PUT", "https://api.example.invalid/config/network/v1/zones/zone-id",
+            "token", payload=draft["payload"],
+        )
 
     def test_panorama_policy_management_chooses_config_source_before_live_fetch(self):
         timestamp = main.now()
