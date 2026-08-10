@@ -233,6 +233,7 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertIn('item.generic', javascript)
         self.assertIn('Toestaan en een URL Filtering-log genereren.', javascript)
         self.assertIn('/catalog/url-categories', javascript)
+        self.assertIn('schemaRequiredTypes', javascript)
 
     def test_scm_url_category_catalog_returns_selectable_custom_categories(self):
         timestamp = main.now()
