@@ -120,6 +120,15 @@ SCM_OBJECT_TYPES = {
     "service-groups": {"label": "Service Groups", "creatable": True},
     "tags": {"label": "Tags", "creatable": True},
     "zones": {"label": "Zones", "creatable": True, "network": True},
+    "custom-url-categories": {"label": "Custom URL Categories", "creatable": True, "editable": True, "generic": True, "service": "security", "endpoint": "url-categories"},
+    "antivirus": {"label": "Antivirus / WildFire", "creatable": True, "editable": True, "generic": True, "service": "security", "endpoint": "wildfire-anti-virus-profiles"},
+    "anti-spyware": {"label": "Anti-Spyware", "creatable": True, "editable": True, "generic": True, "service": "security", "endpoint": "anti-spyware-profiles"},
+    "dns-security": {"label": "DNS Security", "creatable": True, "editable": True, "generic": True, "service": "security", "endpoint": "dns-security-profiles"},
+    "vulnerability-protection": {"label": "Vulnerability Protection", "creatable": True, "editable": True, "generic": True, "service": "security", "endpoint": "vulnerability-protection-profiles"},
+    "url-filtering": {"label": "URL Filtering", "creatable": True, "editable": True, "generic": True, "service": "security", "endpoint": "url-access-profiles"},
+    "file-blocking": {"label": "File Blocking", "creatable": True, "editable": True, "generic": True, "service": "security", "endpoint": "file-blocking-profiles"},
+    "wildfire-analysis": {"label": "WildFire Analysis", "creatable": True, "editable": True, "generic": True, "service": "security", "endpoint": "wildfire-anti-virus-profiles"},
+    "security-profile-groups": {"label": "Security Profile Groups", "creatable": True, "editable": True, "generic": True, "service": "security", "endpoint": "profile-groups"},
 }
 SCM_CONFIGURATION_SECTIONS = {
     "network": {
@@ -629,10 +638,32 @@ def fetch_scm_objects(profile, object_type: str) -> list[dict]:
         raise ValueError("Onbekend objecttype")
     if profile["target_type"] != "scm": return fetch_panos_objects(profile, object_type)
     scm, token, _, _ = scm_client(profile)
-    service = "network" if object_type == "zones" else "objects"
+    metadata = SCM_OBJECT_TYPES[object_type]
+    service = metadata.get("service") or ("network" if object_type == "zones" else "objects")
+    endpoint_name = metadata.get("endpoint", object_type)
     root = policy_api.scm_api_root(scm.scm_api_base) + f"/config/{service}/v1"
     container = policy_api.scm_container(folder=scm.scm_folder if object_type == "zones" else scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
-    return policy_api.scm_fetch_all(f"{root}/{object_type}", token, container)
+    items = policy_api.scm_fetch_all(f"{root}/{endpoint_name}", token, container)
+    if not metadata.get("generic"):
+        return items
+    records = []
+    for item in items:
+        raw = copy.deepcopy(item)
+        record = copy.deepcopy(item)
+        fields = _scm_config_fields(raw)
+        if object_type == "url-filtering":
+            for field in fields:
+                top = str(field.get("label", "")).split(" / ", 1)[0].strip().lower()
+                if top in URL_PROFILE_ACTIONS: field["group"] = "Categories"
+                elif top == "credential enforcement": field["group"] = "User Credential Detection"
+                elif "inline" in top or top.startswith("mlav"): field["group"] = "Inline Categorization"
+                elif top.startswith("log http") or "header" in top: field["group"] = "HTTP Header Insertion"
+                else: field["group"] = "General"
+        record["edit_fields"] = fields
+        record["generic"] = True
+        record["_raw"] = raw
+        records.append(record)
+    return records
 
 
 def _scm_config_protected(key: str) -> bool:
@@ -744,6 +775,36 @@ def _scm_config_payload(raw: dict, updates: list[dict], name: str) -> dict:
             else: target[path[-1]] = value
     if "name" in payload: payload["name"] = name
     return payload
+
+
+URL_PROFILE_ACTIONS = {"allow", "alert", "block", "continue", "override", "redirect", "none"}
+
+
+def normalize_url_profile_updates(fields: list[dict], updates: list[dict]) -> list[dict]:
+    """Move a URL category to one site-access action atomically.
+
+    The editor submits every visible member list. When a category is newly
+    added to an action, remove it from the other top-level action lists so the
+    resulting PAN-OS/SCM profile cannot contain contradictory assignments.
+    Credential-enforcement lists are deliberately excluded.
+    """
+    by_key = {(field.get("path"), field.get("kind")): field for field in fields}
+    action_updates = {}
+    moved = []
+    for update in updates:
+        field = by_key.get((update.get("path"), update.get("kind")))
+        action = str((field or {}).get("label", "")).strip().lower()
+        if action not in URL_PROFILE_ACTIONS or update.get("kind") != "members":
+            continue
+        action_updates[action] = update
+        old_values = set(str(value) for value in (field.get("values") or []))
+        new_values = [str(value) for value in update.get("values", [])]
+        moved.extend((value, action) for value in new_values if value not in old_values)
+    for value, target_action in moved:
+        for action, update in action_updates.items():
+            if action != target_action:
+                update["values"] = [candidate for candidate in update.get("values", []) if candidate != value]
+    return updates
 
 
 def managed_view(object_type: str) -> str:
@@ -897,6 +958,36 @@ def workspace_application_catalog(workspace_id):
     return cached_application_catalog(profile)
 
 
+@app.get("/config-workspaces/<int:workspace_id>/catalog/url-categories")
+@login_required
+def workspace_url_category_catalog(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace: return {"items": []}, 404
+    scope = request.args.get("scope", "").strip()
+    try:
+        xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
+        if scope not in available_scopes(snapshot): raise OfflineConfigError("De gekozen scope bestaat niet")
+        items = []
+        for object_type in ("custom-url-categories", "external-dynamic-lists"):
+            _, objects = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
+            items.extend({"name": item["name"], "kind": object_type} for item in objects)
+        return {"items": sorted(items, key=lambda item: (item["name"].lower(), item["kind"]))}
+    except Exception as exc:
+        return {"items": [], "error": str(exc)}, 400
+
+
+@app.get("/profiles/<int:profile_id>/catalog/url-categories")
+@login_required
+def scm_url_category_catalog(profile_id):
+    with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+    if not profile or profile["target_type"] != "scm": return {"items": []}, 404
+    try:
+        items = fetch_scm_objects(profile, "custom-url-categories")
+        return {"items": [{"name": item["name"], "kind": "custom-url-categories"} for item in items if item.get("name")]}
+    except Exception as exc:
+        return {"items": [], "error": str(exc)}, 400
+
+
 def scm_object_payload(object_type: str, form, container: dict) -> dict:
     name = form.get("name", "").strip()
     if not name:
@@ -958,7 +1049,7 @@ def scm_object_payload(object_type: str, form, container: dict) -> dict:
             value = form.get(form_key, "").strip()
             if value: payload[payload_key] = value
     else:
-        raise ValueError("Dit objecttype is momenteel alleen-lezen")
+        raise ValueError("Dit objecttype gebruikt een andere configuratie-editor")
     return payload
 
 
@@ -1267,12 +1358,7 @@ WORKSPACE_STRUCTURED_OBJECT_TYPES = {
     "addresses", "address-groups", "application-groups",
     "services", "service-groups", "tags",
 }
-WORKSPACE_READ_ONLY_OBJECT_TYPES = {
-    "hip-profiles", "antivirus", "anti-spyware", "vulnerability-protection",
-    "url-filtering", "file-blocking", "wildfire-analysis", "dos-protection",
-    "security-profile-groups", "log-forwarding", "authentication",
-}
-WORKSPACE_EDITABLE_OBJECT_TYPES = set(OBJECT_NODES) - WORKSPACE_READ_ONLY_OBJECT_TYPES
+WORKSPACE_EDITABLE_OBJECT_TYPES = set(OBJECT_NODES)
 
 
 @app.get("/config-workspaces/<int:workspace_id>/edit")
@@ -1569,7 +1655,7 @@ def config_workspace_object_preview(workspace_id):
     object_type = request.form.get("object_type", "")
     try:
         if object_type not in WORKSPACE_EDITABLE_OBJECT_TYPES:
-            raise OfflineConfigError("Dit objecttype is momenteel alleen-lezen")
+            raise OfflineConfigError("Dit objecttype heeft geen configureerbare candidate-mapping")
         xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
         _, existing = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
         original_name = request.form.get("object_id", "").strip()
@@ -1588,7 +1674,8 @@ def config_workspace_object_preview(workspace_id):
                 raise OfflineConfigError("Name is verplicht")
             if any(item["name"] == name and item["name"] != original_name for item in existing):
                 raise OfflineConfigError(f"Object {name} bestaat al in {scope}")
-            allowed = {(field["path"], field["kind"]) for field in before.get("edit_fields", [])}
+            editable_fields = [field for field in before.get("edit_fields", []) if field.get("kind") != "protected"]
+            allowed = {(field["path"], field["kind"]) for field in editable_fields}
             try:
                 submitted = json.loads(request.form.get("generic_updates", "[]"))
             except json.JSONDecodeError as exc:
@@ -1608,6 +1695,8 @@ def config_workspace_object_preview(workspace_id):
                 else:
                     clean["value"] = str(update.get("value", ""))[:65535]
                 generic_updates.append(clean)
+            if object_type == "url-filtering":
+                generic_updates = normalize_url_profile_updates(editable_fields, generic_updates)
             payload = {"name": name, "fields": generic_updates}
         operation = "update" if before else "create"
         draft_id = secrets.token_urlsafe(24)
@@ -1640,7 +1729,7 @@ def config_workspace_object_delete_preview(workspace_id):
     object_type = request.form.get("object_type", "")
     try:
         if object_type not in WORKSPACE_EDITABLE_OBJECT_TYPES:
-            raise OfflineConfigError("Dit objecttype is momenteel alleen-lezen")
+            raise OfflineConfigError("Dit objecttype heeft geen configureerbare candidate-mapping")
         selected_names = list(dict.fromkeys(request.form.getlist("object_id")))
         if not selected_names:
             raise OfflineConfigError("Selecteer minstens één object")
@@ -2349,20 +2438,43 @@ def policy_single_preview(profile_id):
 @app.post("/objects/<int:profile_id>/<object_type>/preview")
 @login_required
 def object_preview(profile_id, object_type):
-    if object_type not in SCM_OBJECT_TYPES or not SCM_OBJECT_TYPES[object_type]["creatable"]: return "Not found", 404
+    if object_type not in SCM_OBJECT_TYPES or not SCM_OBJECT_TYPES[object_type].get("editable", SCM_OBJECT_TYPES[object_type].get("creatable", False)): return "Not found", 404
     with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
     if not profile: return "Not found", 404
     try:
+        metadata = SCM_OBJECT_TYPES[object_type]
         container = {}
         if profile["target_type"] == "scm":
             scm, _, _, _ = scm_client(profile)
             container = policy_api.scm_container(folder=scm.scm_folder if object_type == "zones" else scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
-        payload = scm_object_payload(object_type, request.form, container)
         existing = fetch_scm_objects(profile, object_type)
         object_id = request.form.get("object_id", "").strip()
         before = next((item for item in existing if str(item.get("id", "")) == object_id), None) if object_id else None
         if object_id and not before: raise ValueError("Het object bestaat niet meer. Vernieuw de lijst.")
-        validate_object_payload(payload, object_type, existing, object_id)
+        if metadata.get("generic"):
+            if profile["target_type"] != "scm": raise ValueError("Gebruik de XML-workspace voor dit target")
+            if before is None: raise ValueError("Open eerst een bestaand profiel; aanmaken zonder geldig target-schema is nog niet veilig")
+            name = request.form.get("name", "").strip()
+            if not name: raise ValueError("Naam is verplicht")
+            if any(item.get("name") == name and str(item.get("id", "")) != object_id for item in existing): raise ValueError(f"Object {name} bestaat al")
+            try: submitted = json.loads(request.form.get("generic_updates", "[]"))
+            except json.JSONDecodeError as exc: raise ValueError("Ongeldige profielvelden") from exc
+            editable_fields = [field for field in before.get("edit_fields", []) if field.get("kind") != "protected"]
+            allowed = {(field["path"], field["kind"]) for field in editable_fields}
+            if not isinstance(submitted, list) or len(submitted) > 10000: raise ValueError("Ongeldige profielvelden")
+            updates = []
+            for update in submitted:
+                if not isinstance(update, dict) or (update.get("path"), update.get("kind")) not in allowed: raise ValueError("Een profielveld bestaat niet meer of is beschermd")
+                clean = {"path": update["path"], "kind": update["kind"]}
+                if update["kind"] == "members": clean["values"] = [str(value).strip() for value in update.get("values", []) if str(value).strip()]
+                else: clean["value"] = str(update.get("value", ""))[:65535]
+                updates.append(clean)
+            if object_type == "url-filtering": updates = normalize_url_profile_updates(editable_fields, updates)
+            payload = _scm_config_payload(before["_raw"], updates, name)
+            if _scm_config_fingerprint(payload) == _scm_config_fingerprint(before["_raw"]): raise ValueError("Er zijn geen wijzigingen om te bewaren")
+        else:
+            payload = scm_object_payload(object_type, request.form, container)
+            validate_object_payload(payload, object_type, existing, object_id)
         draft_id = secrets.token_urlsafe(18)
         draft = {"profile_id": profile_id, "created_at": now(), "object_type": object_type, "operation": "update" if before else "create", "payload": payload, "before": before, "fingerprint": object_fingerprint(before) if before else "", "scope_xpath": before.get("_scope_xpath", "") if before else ""}
         path = OBJECT_DRAFTS / f"{draft_id}.json"; path.write_text(json.dumps(draft)); path.chmod(0o600)
@@ -2376,7 +2488,7 @@ def object_preview(profile_id, object_type):
 @app.post("/objects/<int:profile_id>/<object_type>/delete-preview")
 @login_required
 def object_delete_preview(profile_id, object_type):
-    if object_type not in SCM_OBJECT_TYPES or not SCM_OBJECT_TYPES[object_type]["creatable"]: return "Not found", 404
+    if object_type not in SCM_OBJECT_TYPES or not SCM_OBJECT_TYPES[object_type].get("editable", SCM_OBJECT_TYPES[object_type].get("creatable", False)): return "Not found", 404
     with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
     if not profile: return "Not found", 404
     try:
@@ -2406,14 +2518,19 @@ def object_push(draft_id):
     if not profile: return "Not found", 404
     try:
         object_type = draft["object_type"]
+        metadata = SCM_OBJECT_TYPES[object_type]
         current = fetch_scm_objects(profile, object_type)
         operation = draft.get("operation", "create")
         if operation == "create":
+            if metadata.get("generic"): raise RuntimeError("Aanmaken zonder gevalideerd target-schema is niet toegestaan")
             validate_object_payload(draft["payload"], object_type, current)
         elif operation == "update":
             before = draft["before"]; live = next((item for item in current if str(item.get("id", "")) == str(before.get("id", ""))), None)
             if not live or object_fingerprint(live) != draft["fingerprint"]: raise RuntimeError(f"Object {before['name']} is intussen gewijzigd; Push gestopt.")
-            validate_object_payload(draft["payload"], object_type, current, str(before["id"]))
+            if metadata.get("generic"):
+                if any(item.get("name") == draft["payload"].get("name") and str(item.get("id", "")) != str(before["id"]) for item in current): raise RuntimeError(f"Object {draft['payload'].get('name')} bestaat al")
+            else:
+                validate_object_payload(draft["payload"], object_type, current, str(before["id"]))
         elif operation == "delete":
             for entry in draft["objects"]:
                 before = entry["value"]; live = next((item for item in current if str(item.get("id", "")) == str(before.get("id", ""))), None)
@@ -2421,13 +2538,14 @@ def object_push(draft_id):
         else: raise RuntimeError("Onbekende objectbewerking")
         if profile["target_type"] == "scm":
             scm, token, _, _ = scm_client(profile)
-            service = "network" if object_type == "zones" else "objects"
+            service = metadata.get("service") or ("network" if object_type == "zones" else "objects")
+            endpoint_name = metadata.get("endpoint", object_type)
             root = policy_api.scm_api_root(scm.scm_api_base) + f"/config/{service}/v1"
             container = policy_api.scm_container(folder=scm.scm_folder if object_type == "zones" else scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
-            if operation == "create": policy_api.scm_http_request("POST", f"{root}/{object_type}", token, payload=draft["payload"])
-            elif operation == "update": policy_api.scm_http_request("PUT", f"{root}/{object_type}/{draft['before']['id']}", token, payload=draft["payload"])
+            if operation == "create": policy_api.scm_http_request("POST", f"{root}/{endpoint_name}", token, payload=draft["payload"])
+            elif operation == "update": policy_api.scm_http_request("PUT", f"{root}/{endpoint_name}/{draft['before']['id']}", token, payload=draft["payload"])
             else:
-                for entry in draft["objects"]: policy_api.scm_http_request("DELETE", f"{root}/{object_type}/{entry['value']['id']}", token, params=container)
+                for entry in draft["objects"]: policy_api.scm_http_request("DELETE", f"{root}/{endpoint_name}/{entry['value']['id']}", token, params=container)
         else:
             write_panos_object_draft(profile, draft)
         path.unlink()

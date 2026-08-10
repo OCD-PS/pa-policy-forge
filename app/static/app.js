@@ -513,26 +513,48 @@
     function setField(name, value) { var field = form.querySelector('[data-object-field="' + name + '"]'); if (!field) return; field.value = Array.isArray(value) ? value.join(", ") : (value == null ? "" : value); }
     var genericEditor = dialog.dataset.genericObjectEditor === "true";
     var genericUpdates = [];
+    var genericCatalogList = null; var genericCatalogLoaded = false;
+    function loadGenericUrlCatalog() {
+      if (genericCatalogLoaded) return; genericCatalogLoaded = true;
+      var title = (document.querySelector(".object-list h2") || {}).textContent || ""; if (!/URL Filtering/i.test(title)) return;
+      var action = form.getAttribute("action") || ""; var url = ""; var workspaceMatch = action.match(/\/config-workspaces\/(\d+)\/objects\/preview/); var scmMatch = action.match(/\/objects\/(\d+)\/url-filtering\/preview/);
+      if (workspaceMatch) { var scope = form.querySelector('[name="scope"]'); url = "/config-workspaces/" + workspaceMatch[1] + "/catalog/url-categories?scope=" + encodeURIComponent(scope ? scope.value : ""); }
+      else if (scmMatch) url = "/profiles/" + scmMatch[1] + "/catalog/url-categories";
+      if (!url) return;
+      genericCatalogList = document.createElement("datalist"); genericCatalogList.id = "url-category-catalog-" + Math.random().toString(36).slice(2); form.appendChild(genericCatalogList);
+      fetch(url, {headers:{"Accept":"application/json"}}).then(function (response) { if (!response.ok) throw new Error("HTTP " + response.status); return response.json(); }).then(function (data) { genericCatalogList.innerHTML = ""; (data.items || []).forEach(function (item) { var option = document.createElement("option"); option.value = item.name; option.label = item.kind || "URL category"; genericCatalogList.appendChild(option); }); }).catch(function () { genericCatalogList.remove(); genericCatalogList = null; });
+    }
     function syncGenericUpdates() { var target = form.querySelector("[data-generic-object-updates]"); if (target) target.value = JSON.stringify(genericUpdates); }
     function renderGenericFields(item) {
-      var container = form.querySelector("[data-generic-object-fields]"); if (!container) return;
-      container.innerHTML = ""; genericUpdates = (item.edit_fields || []).map(function (field) { return {path:field.path, label:field.label, kind:field.kind, value:field.value || "", values:(field.values || []).slice()}; });
+      var container = form.querySelector("[data-generic-object-fields]");
+      if (!container) { var hidden = document.createElement("input"); hidden.type = "hidden"; hidden.name = "generic_updates"; hidden.dataset.genericObjectUpdates = ""; form.appendChild(hidden); container = document.createElement("div"); container.className = "generic-object-fields full"; container.dataset.genericObjectFields = ""; form.querySelector(".form-grid").appendChild(container); }
+      var tabs = dialog.querySelector(".policy-tabs"); if (!tabs) { tabs = document.createElement("div"); tabs.className = "policy-tabs"; form.querySelector(".form-grid").before(tabs); }
+      tabs.innerHTML = ""; container.innerHTML = "";
+      var editable = (item.edit_fields || []).filter(function (field) { return field.kind !== "protected"; });
+      genericUpdates = editable.map(function (field) { return {path:field.path, label:field.label, group:field.group || "General", kind:field.kind, value:field.value == null ? "" : field.value, values:(field.values || []).slice()}; });
+      var groups = [];
+      genericUpdates.forEach(function (field) { if (!groups.includes(field.group)) groups.push(field.group); });
+      if ((item.edit_fields || []).some(function (field) { return field.kind === "protected"; })) groups.push("Protected");
+      function activateGroup(group) { all("button", tabs).forEach(function (button) { button.classList.toggle("is-active", button.dataset.genericGroup === group); }); all("[data-generic-group]", container).forEach(function (node) { node.hidden = node.dataset.genericGroup !== group; }); }
+      groups.forEach(function (group, index) { var button = document.createElement("button"); button.type = "button"; button.dataset.genericGroup = group; button.textContent = group; if (!index) button.classList.add("is-active"); button.addEventListener("click", function () { activateGroup(group); }); tabs.appendChild(button); });
       genericUpdates.forEach(function (field) {
-        var wrapper = document.createElement("div"); wrapper.className = "field full generic-object-field";
+        var wrapper = document.createElement("div"); wrapper.className = "field full generic-object-field"; wrapper.dataset.genericGroup = field.group; wrapper.hidden = groups.length && field.group !== groups[0];
         var label = document.createElement("label"); label.textContent = field.label; wrapper.appendChild(label);
-        if (field.kind === "boolean") {
-          var select = document.createElement("select"); ["yes", "no"].forEach(function (value) { var option = document.createElement("option"); option.value = value; option.textContent = value === "yes" ? "Yes" : "No"; select.appendChild(option); }); select.value = field.value; select.addEventListener("change", function () { field.value = select.value; syncGenericUpdates(); }); wrapper.appendChild(select);
+        var action = field.label.toLocaleLowerCase(); if (["allow", "alert", "block", "continue", "override", "redirect", "none"].includes(action)) { var help = document.createElement("small"); help.textContent = action === "allow" ? "Toestaan zonder URL Filtering-log." : action === "alert" ? "Toestaan en een URL Filtering-log genereren." : "Site Access action: " + action + ". Een categorie kan maar aan één actie tegelijk gekoppeld zijn."; wrapper.appendChild(help); }
+        if (field.kind === "boolean" || field.kind === "bool") {
+          var scmBool = field.kind === "bool"; var select = document.createElement("select"); (scmBool ? ["true", "false"] : ["yes", "no"]).forEach(function (value) { var option = document.createElement("option"); option.value = value; option.textContent = value === "yes" || value === "true" ? "Yes" : "No"; select.appendChild(option); }); select.value = String(field.value); select.addEventListener("change", function () { field.value = select.value; syncGenericUpdates(); }); wrapper.appendChild(select);
         } else if (field.kind === "members") {
           var tokenInput = document.createElement("div"); tokenInput.className = "token-input"; var chips = document.createElement("div"); chips.className = "token-chip-list";
-          var input = document.createElement("input"); input.placeholder = "Waarde toevoegen"; var addButton = document.createElement("button"); addButton.type = "button"; addButton.className = "btn"; addButton.textContent = "+"; tokenInput.appendChild(chips); tokenInput.appendChild(input); tokenInput.appendChild(addButton);
+          var input = document.createElement("input"); input.placeholder = "Zoeken of freeform toevoegen"; if (genericCatalogList) input.setAttribute("list", genericCatalogList.id); var addButton = document.createElement("button"); addButton.type = "button"; addButton.className = "btn"; addButton.textContent = "+"; tokenInput.appendChild(chips); tokenInput.appendChild(input); tokenInput.appendChild(addButton);
           function renderValues() { chips.innerHTML = ""; field.values.forEach(function (value) { var chip = document.createElement("span"); chip.className = "policy-value-chip"; var text = document.createElement("span"); text.textContent = value; var remove = document.createElement("button"); remove.type = "button"; remove.textContent = "−"; remove.addEventListener("click", function () { field.values = field.values.filter(function (candidate) { return candidate !== value; }); syncGenericUpdates(); renderValues(); }); chip.appendChild(text); chip.appendChild(remove); chips.appendChild(chip); }); if (!field.values.length) { var empty = document.createElement("span"); empty.className = "muted"; empty.textContent = "Geen waarden"; chips.appendChild(empty); } }
           function addValue() { var value = input.value.trim(); if (value && !field.values.includes(value)) field.values.push(value); input.value = ""; syncGenericUpdates(); renderValues(); }
           addButton.addEventListener("click", addValue); input.addEventListener("keydown", function (event) { if (event.key === "Enter") { event.preventDefault(); addValue(); } }); wrapper.appendChild(tokenInput); renderValues();
         } else {
-          var inputField = field.value.length > 160 ? document.createElement("textarea") : document.createElement("input"); inputField.value = field.value; inputField.addEventListener("input", function () { field.value = inputField.value; syncGenericUpdates(); }); wrapper.appendChild(inputField);
+          var textValue = typeof field.value === "string" ? field.value : JSON.stringify(field.value, null, 2); var inputField = field.kind === "json" || textValue.length > 160 ? document.createElement("textarea") : document.createElement("input"); inputField.value = textValue; inputField.addEventListener("input", function () { field.value = inputField.value; syncGenericUpdates(); }); wrapper.appendChild(inputField);
         }
         container.appendChild(wrapper);
       });
+      if (groups.includes("Protected")) { var protectedNotice = document.createElement("div"); protectedNotice.className = "callout"; protectedNotice.dataset.genericGroup = "Protected"; protectedNotice.hidden = groups[0] !== "Protected"; protectedNotice.innerHTML = "<strong>Beschermde waarden</strong><br>Wachtwoorden, private keys en grote certificaatdata blijven behouden maar worden nooit naar de browser gekopieerd."; container.appendChild(protectedNotice); }
       if (!genericUpdates.length) { var empty = document.createElement("div"); empty.className = "empty-state"; empty.textContent = "Dit object bevat geen configureerbare waarden."; container.appendChild(empty); }
       syncGenericUpdates();
     }
@@ -545,7 +567,7 @@
       if (zoneConfig) { zoneConfig.hidden = !(item && item.network); if (item && item.network) { var visibleConfig = {}; Object.keys(item).sort().forEach(function (key) { if (!["_xml", "_raw"].includes(key)) visibleConfig[key] = item[key]; }); zoneConfig.querySelector("pre").textContent = JSON.stringify(visibleConfig, null, 2); } }
       if (item) {
         setField("name", item.name); setField("description", item.description); setField("comments", item.comments); setTags(item.tag);
-        if (genericEditor) renderGenericFields(item);
+        if (genericEditor || item.generic) { loadGenericUrlCatalog(); var descriptionField = form.querySelector('[data-object-field="description"]'); if (descriptionField) descriptionField.closest(".field").hidden = true; renderGenericFields(item); }
         ["ip_netmask", "ip_range", "ip_wildcard", "fqdn"].some(function (kind) { if (item[kind]) { setField("value_type", kind); setField("value", item[kind]); return true; } return false; });
         if (item.dynamic) { if (groupType) groupType.value = "dynamic"; setDynamicFilter(typeof item.dynamic === "object" ? item.dynamic.filter : item.dynamic); } else { if (groupType) groupType.value = "static"; setMembers(item.static); setDynamicFilter(""); }
         if (item.members) setMembers(item.members);
@@ -557,7 +579,7 @@
       }
       updateGroupType(); updateTimeouts(); dialog.showModal();
     }
-    var add = document.querySelector("[data-object-add]"); if (add) add.addEventListener("click", function () { openEditor(null); });
+    var add = document.querySelector("[data-object-add]"); var genericRows = rows.filter(function (row) { try { return JSON.parse(row.dataset.object).generic; } catch (_) { return false; } }); if (add && genericRows.length) add.hidden = true; if (add) add.addEventListener("click", function () { openEditor(null); });
     rows.forEach(function (row) { var button = row.querySelector("[data-object-edit]"); if (!button) return; var item = JSON.parse(row.dataset.object); if (item.network) { var zoneType = Object.keys(item.network)[0] || "onbekend"; var zoneValue = item.network[zoneType] || []; var zoneInterfaces = Array.isArray(zoneValue) ? zoneValue : zoneValue.member || []; var valueCell = row.querySelector("td.mono"); if (valueCell) valueCell.textContent = zoneType.replace("_", "-") + (zoneInterfaces.length ? " · " + zoneInterfaces.join(", ") : " · geen interfaces") + " · User-ID " + ((item.enable_user_identification === true || item.enable_user_identification === "yes") ? "aan" : "uit"); } button.addEventListener("click", function () { openEditor(item); }); row.addEventListener("click", function (event) { if (!event.target.closest("input,button,a")) openEditor(item); }); });
     var objectList = document.querySelector(".object-list[data-edit-object]");
     var requestedObject = objectList ? objectList.dataset.editObject : "";
@@ -828,7 +850,7 @@
       button.addEventListener("click", function () {
         var item = JSON.parse(button.getAttribute("data-workspace-object"));
         dialog.querySelector("[data-workspace-object-title]").textContent = item.name;
-        dialog.querySelector("[data-workspace-object-owner]").textContent = item.owner + (item.editable ? " · lokale scope" : " · inherited, alleen-lezen");
+        dialog.querySelector("[data-workspace-object-owner]").textContent = item.owner + (item.editable ? " · lokale scope" : " · inherited · aanpassen in de owning scope");
         var fields = dialog.querySelector("[data-workspace-object-fields]");
         fields.innerHTML = "";
         (item.fields || []).forEach(function (field) {

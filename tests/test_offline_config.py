@@ -228,6 +228,19 @@ class OfflineConfigTests(unittest.TestCase):
         self.assertIn(b'<nested preserve="true">', updated)
         self.assertIn(b'<label>new</label>', updated)
 
+    def test_security_profile_fields_are_structured_and_secrets_stay_protected(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><profiles><url-filtering><entry name="OCD-URL"><allow><member>business-and-economy</member></allow><block><member>malware</member></block><credential-enforcement><mode><group-mapping>Employees</group-mapping></mode></credential-enforcement></entry></url-filtering></profiles><authentication-profile><entry name="LDAP"><server-profile>LDAP-BDND</server-profile><password>never-render-this</password></entry></authentication-profile></entry></vsys></entry></devices></config>'''
+        _, profiles = scoped_objects(source, "vsys1", "url-filtering")
+        fields = profiles[0]["edit_fields"]
+        self.assertEqual({field["group"] for field in fields}, {"Categories", "User Credential Detection"})
+        self.assertEqual(next(field for field in fields if field["label"] == "Allow")["kind"], "members")
+        self.assertNotIn("<allow>", repr(profiles[0]["fields"]))
+        _, authentication = scoped_objects(source, "vsys1", "authentication")
+        protected = next(field for field in authentication[0]["edit_fields"] if field["label"] == "Password")
+        self.assertEqual(protected["kind"], "protected")
+        self.assertNotIn("never-render-this", repr(authentication[0]["edit_fields"]))
+        self.assertNotIn("never-render-this", repr(authentication[0]["fields"]))
+
     def test_network_editor_exposes_add_flow_for_every_configuration_list(self):
         javascript = (ROOT / "app" / "static" / "app.js").read_text()
         self.assertIn('add.textContent = "+ Add"', javascript)

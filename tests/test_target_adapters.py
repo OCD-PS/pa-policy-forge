@@ -187,17 +187,108 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertIn("if (entry && entry.value.trim()) fieldNode._addBulkValue()", javascript)
         self.assertIn("if (entry && entry.value.trim()) field._offlineAddValue(entry.value)", javascript)
 
-    def test_security_profiles_are_read_only_in_xml_workspaces(self):
+    def test_security_profiles_are_editable_in_xml_workspaces(self):
         profile_types = {
             "hip-profiles", "antivirus", "anti-spyware", "vulnerability-protection",
             "url-filtering", "file-blocking", "wildfire-analysis", "dos-protection",
             "security-profile-groups", "log-forwarding", "authentication",
         }
-        self.assertTrue(profile_types.isdisjoint(main.WORKSPACE_EDITABLE_OBJECT_TYPES))
+        self.assertTrue(profile_types.issubset(main.WORKSPACE_EDITABLE_OBJECT_TYPES))
+        self.assertEqual(main.WORKSPACE_EDITABLE_OBJECT_TYPES, set(main.OBJECT_NODES))
         template = (main.BASE / "app" / "templates" / "workspace_editor.html").read_text()
         self.assertIn("object.editable and object_type in workspace_editable_object_types", template)
-        self.assertIn("data-object-detail", template)
-        self.assertIn("data-object-detail-dialog", template)
+        self.assertIn("data-generic-object-editor", template)
+
+    def test_url_profile_category_move_is_atomic(self):
+        fields = [
+            {"path": "0", "kind": "members", "label": "Allow", "values": []},
+            {"path": "1", "kind": "members", "label": "Block", "values": ["OCD-ALLOW", "malware"]},
+            {"path": "2", "kind": "members", "label": "Credential Enforcement / Allow", "values": ["OCD-ALLOW"]},
+        ]
+        updates = [
+            {"path": "0", "kind": "members", "values": ["OCD-ALLOW"]},
+            {"path": "1", "kind": "members", "values": ["OCD-ALLOW", "malware"]},
+            {"path": "2", "kind": "members", "values": ["OCD-ALLOW"]},
+        ]
+        normalized = main.normalize_url_profile_updates(fields, updates)
+        self.assertEqual(normalized[0]["values"], ["OCD-ALLOW"])
+        self.assertEqual(normalized[1]["values"], ["malware"])
+        self.assertEqual(normalized[2]["values"], ["OCD-ALLOW"])
+
+    def test_scm_security_profile_endpoints_use_structured_generic_editor(self):
+        expected = {
+            "url-filtering": "url-access-profiles",
+            "anti-spyware": "anti-spyware-profiles",
+            "vulnerability-protection": "vulnerability-protection-profiles",
+            "file-blocking": "file-blocking-profiles",
+            "security-profile-groups": "profile-groups",
+        }
+        for object_type, endpoint in expected.items():
+            metadata = main.SCM_OBJECT_TYPES[object_type]
+            self.assertEqual(metadata["service"], "security")
+            self.assertEqual(metadata["endpoint"], endpoint)
+            self.assertTrue(metadata["generic"])
+            self.assertTrue(metadata["editable"])
+        javascript = (main.BASE / "app" / "static" / "app.js").read_text()
+        self.assertIn('item.generic', javascript)
+        self.assertIn('Toestaan en een URL Filtering-log genereren.', javascript)
+        self.assertIn('/catalog/url-categories', javascript)
+
+    def test_scm_url_category_catalog_returns_selectable_custom_categories(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("scm-category-catalog", 1, "", "", "scm", "{}", b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1; login["username"] = "test"; login["must_change"] = False
+        try:
+            with patch.object(main, "fetch_scm_objects", return_value=[{"name": "OCD-ALLOW"}, {"name": "OCD-BLOCK"}]):
+                response = client.get(f"/profiles/{profile_id}/catalog/url-categories", base_url="https://forge.test")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual([item["name"] for item in response.json["items"]], ["OCD-ALLOW", "OCD-BLOCK"])
+        finally:
+            with main.db() as conn: conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
+    def test_scm_url_profile_edit_builds_candidate_without_raw_xml(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("scm-profile-edit", 1, "", "", "scm", "{}", b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+        raw = {"id": "profile-id", "name": "OCD-URL", "allow": [], "alert": [], "block": ["OCD-ALLOW", "malware"], "folder": "Branch"}
+        record = {**raw, "edit_fields": main._scm_config_fields(raw), "generic": True, "_raw": raw}
+        fields = {field["label"]: field for field in record["edit_fields"]}
+        updates = [
+            {"path": fields["Allow"]["path"], "kind": "members", "values": ["OCD-ALLOW"]},
+            {"path": fields["Block"]["path"], "kind": "members", "values": ["OCD-ALLOW", "malware"]},
+        ]
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1; login["username"] = "test"; login["must_change"] = False; login["csrf"] = "profile-csrf"
+        draft_path = main.OBJECT_DRAFTS / "generic-profile-draft.json"
+        try:
+            with patch.object(main, "fetch_scm_objects", return_value=[record]), \
+                 patch.object(main, "scm_client", return_value=(SimpleNamespace(scm_folder="Branch", scm_object_folder="Branch", scm_snippet="", scm_device=""), "token", None, {})), \
+                 patch.object(main.secrets, "token_urlsafe", return_value="generic-profile-draft"):
+                response = client.post(
+                    f"/objects/{profile_id}/url-filtering/preview",
+                    data={"csrf": "profile-csrf", "object_id": "profile-id", "name": "OCD-URL", "generic_updates": json.dumps(updates)},
+                    base_url="https://forge.test",
+                )
+            self.assertEqual(response.status_code, 200, response.data.decode())
+            draft = json.loads(draft_path.read_text())
+            self.assertEqual(draft["payload"]["allow"], ["OCD-ALLOW"])
+            self.assertEqual(draft["payload"]["block"], ["malware"])
+            self.assertNotIn("_raw", response.data.decode())
+        finally:
+            draft_path.unlink(missing_ok=True)
+            with main.db() as conn: conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
 
     def test_workspace_actionbar_is_scoped_to_the_right_content_pane(self):
         css = (main.BASE / "app" / "static" / "app.css").read_text()

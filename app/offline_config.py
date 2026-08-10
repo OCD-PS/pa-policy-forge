@@ -514,6 +514,9 @@ def _object_values(entry: ET.Element) -> list[str]:
 def _object_fields(entry: ET.Element) -> list[dict]:
     fields = []
     for child in entry:
+        if _protected_config_tag(child.tag):
+            fields.append({"name": child.tag, "values": ["Protected value"]})
+            continue
         values = [node.text or "" for node in child.findall(".//member") if node.text]
         text = (child.text or "").strip()
         if values:
@@ -521,11 +524,11 @@ def _object_fields(entry: ET.Element) -> list[dict]:
         elif text:
             fields.append({"name": child.tag, "values": [text]})
         elif list(child):
-            fields.append({"name": child.tag, "values": [ET.tostring(child, encoding="unicode")]})
+            fields.append({"name": child.tag, "values": ["Structured configuration"]})
     return fields
 
 
-def _object_edit_fields(entry: ET.Element) -> list[dict]:
+def _object_edit_fields(entry: ET.Element, object_type: str = "") -> list[dict]:
     """Flatten an entry into safe form fields without exposing raw XML.
 
     Index based paths deliberately address the existing tree. The object
@@ -536,20 +539,47 @@ def _object_edit_fields(entry: ET.Element) -> list[dict]:
 
     def walk(node: ET.Element, path: list[int], labels: list[str]) -> None:
         children = list(node)
+        label = " / ".join(labels)
+        group = labels[0] if labels else "General"
+        if object_type == "url-filtering":
+            top = labels[0].strip().lower() if labels else ""
+            if top in {"allow", "alert", "block", "continue", "override", "redirect", "none"}:
+                group = "Categories"
+            elif top == "credential enforcement":
+                group = "User Credential Detection"
+            elif "inline" in top or top.startswith("mlav"):
+                group = "Inline Categorization"
+            elif top.startswith("log http") or "header" in top:
+                group = "HTTP Header Insertion"
+            else:
+                group = "General"
+        if _protected_config_tag(node.tag):
+            fields.append({
+                "path": "/".join(str(index) for index in path),
+                "label": label, "group": group, "kind": "protected",
+            })
+            return
         if children and all(child.tag == "member" for child in children):
             fields.append({
                 "path": "/".join(str(index) for index in path),
-                "label": " / ".join(labels),
+                "label": label, "group": group,
                 "kind": "members",
                 "values": [(child.text or "") for child in children],
             })
             return
         if not children:
+            value = node.text or ""
+            if len(value) > 8192:
+                fields.append({
+                    "path": "/".join(str(index) for index in path),
+                    "label": label, "group": group, "kind": "protected",
+                })
+                return
             fields.append({
                 "path": "/".join(str(index) for index in path),
-                "label": " / ".join(labels),
-                "kind": "boolean" if (node.text or "").strip().lower() in {"yes", "no"} else "text",
-                "value": node.text or "",
+                "label": label, "group": group,
+                "kind": "boolean" if value.strip().lower() in {"yes", "no"} else "text",
+                "value": value,
             })
             return
         for index, child in enumerate(children):
@@ -570,7 +600,7 @@ def object_record(entry: ET.Element, owner: str, editable: bool, object_type: st
         "owner": owner, "editable": editable, "description": entry.findtext("./description", ""),
         "comments": entry.findtext("./comments", ""), "tag": _members(entry, "tag"),
         "summary": _object_summary(entry), "values": _object_values(entry),
-        "fields": _object_fields(entry), "edit_fields": _object_edit_fields(entry),
+        "fields": _object_fields(entry), "edit_fields": _object_edit_fields(entry, object_type),
         "_xml": ET.tostring(entry, encoding="unicode"),
     }
     for key in ("ip-netmask", "ip-range", "ip-wildcard", "fqdn", "color"):
@@ -656,7 +686,14 @@ def apply_object_changes(xml_bytes: bytes, scope: str, object_type: str, changes
                 raise OfflineConfigError("Dit objecttype kan pas worden aangemaakt zodra een PAN-OS-schema beschikbaar is")
             replacement = copy.deepcopy(current)
             replacement.set("name", change.get("name", original_name).strip())
+            allowed = {
+                (field["path"], field["kind"])
+                for field in _object_edit_fields(current, object_type)
+                if field.get("kind") != "protected"
+            }
             for update in change["generic_updates"]:
+                if (update.get("path"), update.get("kind")) not in allowed:
+                    raise OfflineConfigError("Een objectveld bestaat niet meer of is beschermd")
                 try:
                     indices = [int(part) for part in update["path"].split("/")]
                     target = replacement
