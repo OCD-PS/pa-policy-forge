@@ -146,6 +146,14 @@ class OfflineConfigTests(unittest.TestCase):
         _, records = configuration_records(source, "vsys1", "", "network", "zones")
         self.assertEqual(records[0]["ui_tabs"], ["General", "Network", "User Identification", "Device Identification"])
 
+    def test_device_editors_use_panos_tabs_and_named_items_remain_creatable(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><deviceconfig><system><hostname>fw-a</hostname><timezone>Europe/Brussels</timezone><service><dns-setting><servers><primary>192.0.2.53</primary></servers></dns-setting></service><session><timeout>3600</timeout></session></system></deviceconfig><mgt-config><users><entry name="operator"><authentication-profile>LDAP</authentication-profile><permissions><role-based><superuser>no</superuser></role-based></permissions></entry></users></mgt-config><vsys><entry name="vsys1"/></vsys></entry></devices></config>'''
+        _, setup = configuration_records(source, "vsys1", "", "device", "setup")
+        _, administrators = configuration_records(source, "vsys1", "", "device", "administrators")
+        self.assertEqual(setup[0]["ui_tabs"], ["Management", "Services", "Session"])
+        self.assertEqual(administrators[0]["ui_tabs"], ["General", "Authentication", "Administrator Type"])
+        self.assertTrue(administrators[0]["is_entry"])
+
     def test_panorama_template_stack_records_keep_concrete_owner(self):
         source = b'''<config><devices><entry name="localhost.localdomain"><device-group><entry name="Branch-DG"/></device-group><template><entry name="Base"><config><devices><entry name="localhost.localdomain"><network><interface><ethernet><entry name="ethernet1/1"><comment>base</comment></entry></ethernet></interface></network></entry></devices></config></entry><entry name="Branch"><config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><zone><entry name="Clients"><network><layer3><member>ethernet1/1</member></layer3></network></entry></zone></entry></vsys></entry></devices></config></entry></template><template-stack><entry name="Branch-Stack"><templates><member>Branch</member><member>Base</member></templates></entry></template-stack></entry></devices></config>'''
         _, interfaces = configuration_records(source, "Branch-DG", "Branch-Stack", "network", "interfaces")
@@ -219,6 +227,14 @@ class OfflineConfigTests(unittest.TestCase):
         self.assertIn(b'<enabled>no</enabled>', updated)
         self.assertIn(b'<nested preserve="true">', updated)
         self.assertIn(b'<label>new</label>', updated)
+
+    def test_network_editor_exposes_add_flow_for_every_configuration_list(self):
+        javascript = (ROOT / "app" / "static" / "app.js").read_text()
+        self.assertIn('add.textContent = "+ Add"', javascript)
+        self.assertIn('renderRecord(JSON.parse(base.getAttribute("data-config-record")), true)', javascript)
+        self.assertIn('primary.value = createMode ? "create" : "update"', javascript)
+        self.assertIn('nameInput.value = createMode ? "" : item.name', javascript)
+        self.assertIn('if (actionbar && !creatableRows.length) actionbar.hidden = true', javascript)
 
 
 if __name__ == "__main__":

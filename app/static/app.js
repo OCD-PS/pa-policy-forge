@@ -679,20 +679,23 @@
     function setupFamilyTabs() {
       var rows = all("[data-config-record-row]");
       if (!rows.length) return;
-      rows.forEach(function (row) { try { row.dataset.configFamily = JSON.parse(row.getAttribute("data-config-record")).ui_family || "Other"; } catch (error) { row.dataset.configFamily = "Other"; } });
+      rows.forEach(function (row) { try { var record = JSON.parse(row.getAttribute("data-config-record")); row.dataset.configFamily = record.ui_family || "Other"; row.dataset.configCreatable = record.is_entry ? "true" : "false"; } catch (error) { row.dataset.configFamily = "Other"; row.dataset.configCreatable = "false"; } });
       var families = [];
-      rows.forEach(function (row) { var family = row.dataset.configFamily || "Other"; if (!families.includes(family)) families.push(family); });
+      rows.filter(function (row) { return row.dataset.configCreatable === "true"; }).forEach(function (row) { var family = row.dataset.configFamily || "Other"; if (!families.includes(family)) families.push(family); });
+      rows.filter(function (row) { return row.dataset.configCreatable !== "true"; }).forEach(function (row) { var family = row.dataset.configFamily || "Other"; if (!families.includes(family)) families.push(family); });
       if (families.length < 2) return;
       var table = rows[0].closest(".config-record-list"); var filter = table && table.querySelector(".policy-filterbar"); if (!filter) return;
       var root = document.createElement("div"); root.className = "config-family-tabs"; root.setAttribute("aria-label", "Configuratietypes"); filter.parentNode.insertBefore(root, filter);
-      ["All"].concat(families).forEach(function (family, index) {
-        var button = document.createElement("button"); button.type = "button"; button.className = "btn btn-small" + (!index ? " is-active" : ""); button.textContent = family;
+      ["All"].concat(families).forEach(function (family) {
+        var initiallyActive = family === families[0];
+        var button = document.createElement("button"); button.type = "button"; button.className = "btn btn-small" + (initiallyActive ? " is-active" : ""); button.textContent = family;
         button.addEventListener("click", function () {
           all("button", root).forEach(function (item) { item.classList.toggle("is-active", item === button); });
           rows.forEach(function (row) { row.hidden = family !== "All" && row.dataset.configFamily !== family; });
         });
         root.appendChild(button);
       });
+      rows.forEach(function (row) { row.hidden = row.dataset.configFamily !== families[0]; });
     }
 
     function tokenEditor(field, wrapper) {
@@ -723,13 +726,15 @@
       all("[data-config-group-panel]", fieldsRoot).forEach(function (panel) { panel.classList.toggle("is-active", panel.dataset.configGroupPanel === group); });
     }
 
-    function renderRecord(item) {
+    function renderRecord(item, createMode) {
       currentFields = item.edit_fields || [];
       form.querySelector("[data-config-locator]").value = item.locator;
-      dialog.querySelector("[data-config-dialog-title]").textContent = "Edit " + item.name;
+      dialog.querySelector("[data-config-dialog-title]").textContent = (createMode ? "Add " + item.kind : "Edit " + item.name);
       dialog.querySelector("[data-config-dialog-kind]").textContent = item.kind;
       dialog.querySelector("[data-config-dialog-owner]").textContent = item.owner;
-      var duplicate = dialog.querySelector("[data-config-duplicate]"); if (duplicate) duplicate.hidden = !item.is_entry;
+      var duplicate = dialog.querySelector("[data-config-duplicate]"); if (duplicate) duplicate.hidden = createMode || !item.is_entry;
+      var primary = form.querySelector('button.btn-primary[name="operation"]');
+      if (primary) { primary.value = createMode ? "create" : "update"; primary.textContent = createMode ? "Preview nieuw item" : "Preview wijzigingen"; }
       tabsRoot.innerHTML = ""; fieldsRoot.innerHTML = "";
       var groups = (item.ui_tabs || []).slice();
       currentFields.forEach(function (field) { var group = field.group || "General"; if (!groups.includes(group)) groups.push(group); });
@@ -766,7 +771,7 @@
         if (item.is_entry && index === 0) {
           var nameField = document.createElement("div"); nameField.className = "field full config-generic-field config-name-field";
           var nameLabel = document.createElement("label"); nameLabel.textContent = "Name";
-          var nameInput = document.createElement("input"); nameInput.name = "name"; nameInput.required = true; nameInput.value = item.name;
+          var nameInput = document.createElement("input"); nameInput.name = "name"; nameInput.required = true; nameInput.value = createMode ? "" : item.name; nameInput.placeholder = createMode ? "Nieuwe unieke naam" : "";
           nameField.appendChild(nameLabel); nameField.appendChild(nameInput); grid.insertBefore(nameField, grid.firstChild);
         } else if (!item.is_entry && index === 0) {
           var hiddenName = document.createElement("input"); hiddenName.type = "hidden"; hiddenName.name = "name"; hiddenName.value = item.name; grid.appendChild(hiddenName);
@@ -777,7 +782,7 @@
       var first = dialog.querySelector("input:not([type=hidden]), select, textarea"); if (first) first.focus({preventScroll:true});
     }
 
-    all("[data-config-record-edit]").forEach(function (button) { button.addEventListener("click", function () { renderRecord(JSON.parse(button.closest("[data-config-record-row]").getAttribute("data-config-record"))); }); });
+    all("[data-config-record-edit]").forEach(function (button) { button.addEventListener("click", function () { renderRecord(JSON.parse(button.closest("[data-config-record-row]").getAttribute("data-config-record")), false); }); });
     all("[data-config-cancel]", dialog).forEach(function (button) { button.addEventListener("click", function () { dialog.close(); }); });
     dialog.addEventListener("click", function (event) { if (event.target === dialog) dialog.close(); });
     form.addEventListener("submit", function () {
@@ -798,6 +803,20 @@
     function updateSelection() { var selected = checks.filter(function (check) { return check.checked; }).length; if (count) count.textContent = selected; if (remove) remove.disabled = selected === 0; }
     checks.forEach(function (check) { check.addEventListener("change", updateSelection); }); updateSelection();
     setupFamilyTabs();
+    var actionbar = remove && remove.closest(".object-actionbar");
+    var creatableRows = all("[data-config-record-row]").filter(function (row) { return row.dataset.configCreatable === "true"; });
+    if (actionbar && !creatableRows.length) actionbar.hidden = true;
+    if (actionbar && creatableRows.length) {
+      var add = document.createElement("button"); add.type = "button"; add.className = "btn btn-primary"; add.textContent = "+ Add"; add.dataset.configAdd = "";
+      add.addEventListener("click", function () {
+        var rows = all("[data-config-record-row]");
+        var checked = rows.find(function (row) { var check = row.querySelector("[data-config-record-select]"); return row.dataset.configCreatable === "true" && check && check.checked; });
+        var base = checked || rows.find(function (row) { return row.dataset.configCreatable === "true" && !row.hidden && row.style.display !== "none"; }) || rows.find(function (row) { return row.dataset.configCreatable === "true"; });
+        if (!base) return;
+        renderRecord(JSON.parse(base.getAttribute("data-config-record")), true);
+      });
+      actionbar.insertBefore(add, remove);
+    }
   }
 
   function setupWorkspaceObjects() {

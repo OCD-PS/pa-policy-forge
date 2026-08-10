@@ -110,6 +110,19 @@ PANOS_CONFIG_UI_TABS = {
     "qos": ("General", "Clear Text", "Tunnel Traffic", "Other"),
     "lldp": ("General", "Other"),
     "network-profiles": ("General", "Other"),
+    "setup": ("General", "Management", "Services", "Operations", "Session", "Content-ID", "WildFire", "Telemetry", "Other"),
+    "administrators": ("General", "Authentication", "Administrator Type", "Other"),
+    "admin-roles": ("General", "Web UI", "XML API", "Command Line", "Other"),
+    "authentication-profile": ("Authentication", "Advanced", "Factors", "Other"),
+    "authentication-sequence": ("General", "Authentication Profiles", "Other"),
+    "certificates": ("General", "Certificate Attributes", "Other"),
+    "certificate-management": ("General", "SSL/TLS", "Decryption", "Other"),
+    "local-user-database": ("General", "Authentication", "Other"),
+    "server-profiles": ("General", "Servers", "Authentication", "Other"),
+    "log-settings": ("General", "Filter", "Forwarding", "Other"),
+    "high-availability": ("General", "Election Settings", "Control Link", "Data Link", "Active/Active", "Monitoring", "Other"),
+    "user-identification": ("General", "Server Monitoring", "Include/Exclude Networks", "Other"),
+    "vm-information-sources": ("General", "Source", "Authentication", "Other"),
 }
 
 
@@ -158,6 +171,50 @@ def _panos_ui_group(section: str, label: str, original: str) -> str:
     if section == "dns-proxy":
         if "static" in value: return "Static Entries"
         if "cache" in value: return "Cache"
+    if section == "setup":
+        if any(token in value for token in ("management", "hostname", "domain", "timezone", "locale", "geo-location")): return "Management"
+        if any(token in value for token in ("service", "dns", "ntp", "proxy", "update-server", "server-verification")): return "Services"
+        if any(token in value for token in ("operation", "config-lock", "shutdown", "reboot", "audit-comment")): return "Operations"
+        if "session" in value or "timeout" in value or "tcp" in value: return "Session"
+        if "content" in value or "application" in value: return "Content-ID"
+        if "wildfire" in value: return "WildFire"
+        if "telemetry" in value: return "Telemetry"
+        return "General"
+    if section == "administrators":
+        if any(token in value for token in ("authentication", "password", "certificate", "public-key")): return "Authentication"
+        if any(token in value for token in ("role", "superuser", "device-admin", "vsys")): return "Administrator Type"
+    if section == "admin-roles":
+        if "webui" in value or "web ui" in value: return "Web UI"
+        if "xml" in value or "restapi" in value or "rest api" in value: return "XML API"
+        if "cli" in value or "command" in value: return "Command Line"
+    if section == "authentication-profile":
+        if "factor" in value or "mfa" in value: return "Factors"
+        if any(token in value for token in ("allow-list", "allow list", "username-modifier", "user-domain", "advanced")): return "Advanced"
+        return "Authentication"
+    if section == "authentication-sequence" and "profile" in value: return "Authentication Profiles"
+    if section == "certificates" and any(token in value for token in ("issuer", "subject", "algorithm", "expiry", "common-name", "common name", "san")): return "Certificate Attributes"
+    if section == "certificate-management":
+        if "decrypt" in value: return "Decryption"
+        if "ssl" in value or "tls" in value: return "SSL/TLS"
+    if section == "local-user-database" and any(token in value for token in ("password", "authentication")): return "Authentication"
+    if section == "server-profiles":
+        if any(token in value for token in ("authentication", "username", "password", "certificate")): return "Authentication"
+        if "server" in value or "address" in value or "port" in value: return "Servers"
+    if section == "log-settings":
+        if "filter" in value or "match-list" in value or "match list" in value: return "Filter"
+        if any(token in value for token in ("forward", "syslog", "email", "snmp", "http")): return "Forwarding"
+    if section == "high-availability":
+        if "election" in value or "priority" in value: return "Election Settings"
+        if any(token in value for token in ("control-link", "control link", "ha1")): return "Control Link"
+        if any(token in value for token in ("data-link", "data link", "ha2", "ha3")): return "Data Link"
+        if "active-active" in value or "active/active" in value: return "Active/Active"
+        if "monitor" in value or "path-group" in value or "link-group" in value: return "Monitoring"
+    if section == "user-identification":
+        if "server-monitor" in value or "server monitor" in value: return "Server Monitoring"
+        if any(token in value for token in ("include", "exclude", "network")): return "Include/Exclude Networks"
+    if section == "vm-information-sources":
+        if any(token in value for token in ("authentication", "username", "password")): return "Authentication"
+        if any(token in value for token in ("host", "source", "port")): return "Source"
     return "General"
 
 
