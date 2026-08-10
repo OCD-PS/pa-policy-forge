@@ -689,7 +689,11 @@ def fetch_scm_configuration_records(profile, view: str, section: str) -> list[di
     failures = []
     for endpoint_name in spec[1]:
         try:
-            items = policy_api.scm_fetch_all(f"{root}/{endpoint_name}", token, container)
+            if view == "device":
+                response = policy_api.scm_http_request("GET", f"{root}/{endpoint_name}", token, params=container)
+                items = policy_api.response_items(response)
+            else:
+                items = policy_api.scm_fetch_all(f"{root}/{endpoint_name}", token, container)
         except Exception as exc:
             message = str(exc)
             status = message.split("HTTP ", 1)[1].split(":", 1)[0] if "HTTP " in message else type(exc).__name__

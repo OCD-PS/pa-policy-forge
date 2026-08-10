@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 import re
+from types import SimpleNamespace
 from html.parser import HTMLParser
 from urllib.parse import urlsplit
 from unittest.mock import patch
@@ -257,6 +258,17 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertIn("data-config-record-edit", template)
         self.assertIn("setupWorkspaceConfigurationEditor", javascript)
         main.app.jinja_env.get_template("scm_config_preview.html")
+
+    def test_scm_device_lists_do_not_send_network_pagination_parameters(self):
+        profile = self.profile("scm", folder="Branch")
+        scm = SimpleNamespace(scm_api_base="https://api.strata.paloaltonetworks.com/config/security/v1")
+        response = {"data": [{"id": "one", "folder": "Branch", "general": {"timezone": "UTC"}}]}
+        with patch.object(main, "scm_client", return_value=(scm, "token", "unused", {"folder": "Branch"})), patch.object(main.policy_api, "scm_http_request", return_value=response) as request_mock, patch.object(main.policy_api, "scm_fetch_all") as paged_mock:
+            records = main.fetch_scm_configuration_records(profile, "device", "setup")
+        self.assertEqual(len(records), 8)
+        self.assertEqual(request_mock.call_count, 8)
+        self.assertTrue(all(call.kwargs.get("params") == {"folder": "Branch"} for call in request_mock.call_args_list))
+        paged_mock.assert_not_called()
 
     def test_panos_application_catalog_combines_custom_and_predefined(self):
         profile = self.profile("panorama")

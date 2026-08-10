@@ -133,6 +133,8 @@ written to the selected folder, snippet, or device candidate; the existing profi
 **Push** operation remains the explicit deployment step. The SCM service account
 must have access to the corresponding Network or Device API family; an HTTP status
 is shown when that tenant role does not permit the requested configuration family.
+SCM Device list calls use only the documented location attribution and do not add
+the pagination parameters used by Network and Object list APIs.
 
 ## Policy management
 
