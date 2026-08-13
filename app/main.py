@@ -32,6 +32,10 @@ from flask import Flask, Response, flash, has_request_context, redirect, render_
 
 from vendor.paloalto_light_syslog import FlowStore, parse_panos_syslog
 from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_single_replacements
+from app.migration import (
+    MigrationError, MigrationModel, PARSERS, merge_model_into_panos_xml,
+    panos_fragment, parse_vendor, reconcile_model, scm_items,
+)
 from app.offline_config import (
     OBJECT_NODES, POLICY_NODES, OfflineConfigError, available_scopes, available_templates,
     apply_configuration_changes, apply_object_changes, configuration_inventory,
@@ -88,6 +92,8 @@ OBJECT_DRAFTS.mkdir(parents=True, exist_ok=True)
 OBJECT_CACHE.mkdir(parents=True, exist_ok=True)
 CONFIG_WORKSPACES = DATA / "config-workspaces"
 CONFIG_WORKSPACES.mkdir(parents=True, exist_ok=True)
+MIGRATION_SOURCES = DATA / "migration-sources"
+MIGRATION_SOURCES.mkdir(parents=True, exist_ok=True)
 
 SCM_POLICY_TYPES = {
     "security": ("security", "security-rules", "Security"),
@@ -256,6 +262,18 @@ def init_db() -> None:
           sha256 TEXT NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}',
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
           FOREIGN KEY(profile_id) REFERENCES profiles(id)
+        );
+        CREATE TABLE IF NOT EXISTS migration_projects (
+          id INTEGER PRIMARY KEY, name TEXT NOT NULL, target_profile_id INTEGER NOT NULL,
+          base_workspace_id INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          FOREIGN KEY(target_profile_id) REFERENCES profiles(id),
+          FOREIGN KEY(base_workspace_id) REFERENCES config_workspaces(id)
+        );
+        CREATE TABLE IF NOT EXISTS migration_sources (
+          id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, vendor TEXT NOT NULL,
+          source_name TEXT NOT NULL, model_path TEXT NOT NULL, fingerprint TEXT NOT NULL,
+          counts_json TEXT NOT NULL DEFAULT '{}', warnings_json TEXT NOT NULL DEFAULT '[]',
+          created_at TEXT NOT NULL, FOREIGN KEY(project_id) REFERENCES migration_projects(id)
         );
         """)
         if not conn.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
@@ -1249,6 +1267,172 @@ def store_config_workspace(profile, name: str, original_name: str, xml_bytes: by
     return workspace_id
 
 
+def migration_project_row(project_id: int):
+    with db() as conn:
+        return conn.execute(
+            "SELECT migration_projects.*,profiles.name profile_name,profiles.target_type,profiles.settings_json "
+            "FROM migration_projects JOIN profiles ON profiles.id=migration_projects.target_profile_id "
+            "WHERE migration_projects.id=?", (project_id,),
+        ).fetchone()
+
+
+def migration_source_row(source_id: int):
+    with db() as conn:
+        return conn.execute("SELECT * FROM migration_sources WHERE id=?", (source_id,)).fetchone()
+
+
+def migration_model(source) -> MigrationModel:
+    path = safe_workspace_path(MIGRATION_SOURCES, source["model_path"])
+    raw = path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if not hmac.compare_digest(digest, source["fingerprint"]):
+        raise MigrationError("De migratiebron is gewijzigd of beschadigd")
+    return MigrationModel.from_dict(json.loads(raw.decode()))
+
+
+def store_migration_source(project_id: int, vendor: str, source_name: str, model: MigrationModel) -> int:
+    raw = json.dumps(model.as_dict(), sort_keys=True, separators=(",", ":")).encode()
+    token = secrets.token_hex(16)
+    path = MIGRATION_SOURCES / f"{token}.json"
+    path.write_bytes(raw); path.chmod(0o600)
+    try:
+        with db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO migration_sources(project_id,vendor,source_name,model_path,fingerprint,counts_json,warnings_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (project_id, vendor, source_name[:255], str(path), hashlib.sha256(raw).hexdigest(), json.dumps(model.counts()), json.dumps(model.warnings + model.unsupported), now()),
+            )
+            source_id = int(cursor.lastrowid)
+            conn.execute("UPDATE migration_projects SET updated_at=? WHERE id=?", (now(), project_id))
+        return source_id
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def selected_migration_model(project_id: int, source_ids: list[int]) -> MigrationModel:
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM migration_sources WHERE project_id=? AND id IN ({','.join('?' for _ in source_ids)}) ORDER BY id",
+            (project_id, *source_ids),
+        ).fetchall() if source_ids else []
+    if len(rows) != len(set(source_ids)):
+        raise MigrationError("Niet alle geselecteerde bronnen behoren tot dit project")
+    merged = MigrationModel("merged", " + ".join(row["source_name"] for row in rows))
+    for row in rows:
+        model = migration_model(row)
+        for field in ("addresses", "address_groups", "services", "service_groups", "security_rules", "nat_rules", "interfaces", "zones", "warnings", "unsupported"):
+            getattr(merged, field).extend(getattr(model, field))
+    # Preserve the first definition and make conflicts visible instead of silently overwriting them.
+    for field in ("addresses", "address_groups", "services", "service_groups", "security_rules", "nat_rules"):
+        values, seen = [], {}
+        for item in getattr(merged, field):
+            if item.name in seen:
+                if json.dumps(item.__dict__, sort_keys=True) != json.dumps(seen[item.name].__dict__, sort_keys=True):
+                    merged.warnings.append(f"Mergeconflict voor {field}: {item.name}; eerste definitie behouden")
+                continue
+            seen[item.name] = item; values.append(item)
+        setattr(merged, field, values)
+    return merged
+
+
+def migration_scm_container(profile, object_type: str) -> tuple[object, str, dict]:
+    scm, token, _, _ = scm_client(profile)
+    container = policy_api.scm_container(
+        folder=scm.scm_folder if object_type == "zones" else scm.scm_object_folder,
+        snippet=scm.scm_snippet, device=scm.scm_device,
+    )
+    return scm, token, container
+
+
+def migration_target_inventory(profile) -> dict[str, list[dict]]:
+    return {
+        "addresses": fetch_scm_objects(profile, "addresses"),
+        "address-groups": fetch_scm_objects(profile, "address-groups"),
+        "services": fetch_scm_objects(profile, "services"),
+        "service-groups": fetch_scm_objects(profile, "service-groups"),
+        "policy:security": fetch_scm_policy_type(profile, "security"),
+        "policy:nat": fetch_scm_policy_type(profile, "nat"),
+    }
+
+
+def apply_scm_migration(profile, model: MigrationModel) -> int:
+    count = 0
+    for item in scm_items(model):
+        kind = item["kind"]
+        if kind.startswith("policy:"):
+            policy_kind = kind.split(":", 1)[1]
+            if policy_kind in SCM_UNAVAILABLE_POLICY_TYPES: raise MigrationError(f"{policy_kind} is niet beschikbaar in SCM")
+            service, endpoint_name, _ = SCM_POLICY_TYPES[policy_kind]
+            scm, token, container = migration_scm_container(profile, "policies")
+            payload = {**item["payload"], **container}
+            endpoint = policy_api.scm_api_root(scm.scm_api_base) + f"/config/{service}/v1/{endpoint_name}"
+            policy_api.scm_http_request("POST", endpoint, token, payload=payload, params={"position": scm.scm_rulebase})
+        else:
+            metadata = SCM_OBJECT_TYPES[kind]
+            scm, token, container = migration_scm_container(profile, kind)
+            payload = {**item["payload"], **container}
+            service = metadata.get("service") or "objects"
+            endpoint_name = metadata.get("endpoint", kind)
+            endpoint = policy_api.scm_api_root(scm.scm_api_base) + f"/config/{service}/v1/{endpoint_name}"
+            policy_api.scm_http_request("POST", endpoint, token, payload=payload)
+        count += 1
+    invalidate_profile_caches(profile["id"])
+    return count
+
+
+def apply_xml_migration(profile, model: MigrationModel) -> int:
+    settings = profile_settings(profile)
+    panorama = profile["target_type"] == "panorama"
+    scope = settings.get("device_group", "") if panorama else settings.get("vsys", "vsys1")
+    if not scope: raise MigrationError("Doelscope ontbreekt")
+    fragment = SafeET.fromstring(panos_fragment(model, scope, panorama, settings.get("rulebase", "pre")))
+    _, endpoint, key, ctx = panos_profile_context(profile)
+    if panorama:
+        source = fragment.find(f"./devices/entry/device-group/entry[@name='{scope}']")
+        base = f"/config/devices/entry[@name='localhost.localdomain']/device-group/entry[@name={policy_api.xpath_literal(scope)}]"
+    else:
+        source = fragment.find(f"./devices/entry/vsys/entry[@name='{scope}']")
+        base = f"/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name={policy_api.xpath_literal(scope)}]"
+    if source is None: raise MigrationError("Gegenereerde doelscope ontbreekt")
+    count = 0
+    for child in source:
+        if child.tag.endswith("rulebase") or child.tag == "rulebase":
+            for policy_type in child:
+                rules = policy_type.find("rules")
+                if rules is None: continue
+                target_rulebase = child.tag if panorama else "rulebase"
+                xpath = f"{base}/{target_rulebase}/{policy_type.tag}/rules"
+                for entry in rules.findall("entry"):
+                    policy_api.require_success(panos_api_post(endpoint, {"type":"config","action":"set","xpath":xpath,"element":ET.tostring(entry,encoding="unicode"),"key":key}, ctx), f"import {policy_type.tag} {entry.get('name')}"); count += 1
+        elif child.tag in {"address", "address-group", "service", "service-group", "tag"}:
+            xpath = f"{base}/{child.tag}"
+            for entry in child.findall("entry"):
+                policy_api.require_success(panos_api_post(endpoint, {"type":"config","action":"set","xpath":xpath,"element":ET.tostring(entry,encoding="unicode"),"key":key}, ctx), f"import {child.tag} {entry.get('name')}"); count += 1
+    return count
+
+
+def create_merged_workspace(profile, project, model: MigrationModel) -> tuple[int, dict]:
+    base_id = int(project["base_workspace_id"] or 0)
+    if not base_id:
+        raise MigrationError("Kies eerst een volledige base-configuratie voor Panorama/PAN-OS")
+    workspace = workspace_row(base_id)
+    if not workspace or int(workspace["profile_id"]) != int(profile["id"]):
+        raise MigrationError("De gekozen base-workspace hoort niet bij het targetprofiel")
+    settings = profile_settings(profile)
+    panorama = profile["target_type"] == "panorama"
+    scope = settings.get("device_group", "") if panorama else settings.get("vsys", "vsys1")
+    if not scope:
+        raise MigrationError("Doelscope ontbreekt")
+    merged_xml, plan = merge_model_into_panos_xml(
+        workspace_config_path(workspace).read_bytes(), model, scope, panorama, settings.get("rulebase", "pre")
+    )
+    workspace_id = store_config_workspace(
+        profile, f"{project['name']} · merged {now()}", workspace["original_name"], merged_xml, "migration-merge"
+    )
+    set_active_config_workspace(profile["id"], workspace_id)
+    return workspace_id, plan
+
+
 def workspace_config_path(workspace) -> Path:
     path = safe_workspace_path(CONFIG_WORKSPACES, workspace["config_path"])
     if not path.is_file():
@@ -1351,8 +1535,7 @@ WORKSPACE_DEVICE_NAV = {
     "Local User Database": "local-user-database",
     "Server Profiles": "server-profiles", "Log Settings": "log-settings",
     "High Availability": "high-availability", "User Identification": "user-identification",
-    "VM Information Sources": "vm-information-sources", "Licenses": "licenses",
-    "Dynamic Updates": "dynamic-updates", "Software": "software",
+    "VM Information Sources": "vm-information-sources",
 }
 WORKSPACE_STRUCTURED_OBJECT_TYPES = {
     "addresses", "address-groups", "application-groups",
@@ -2182,6 +2365,150 @@ def index():
                         policy_catalog = fetch_object_catalog(policy_profile, "policy-picker")
                 except Exception as exc: policy_error = str(exc)
     return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, live_application_state=live_application_state, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, config_section=config_section, scm_configuration_sections=SCM_CONFIGURATION_SECTIONS, config_records=scm_config_records, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
+
+
+@app.get("/migration")
+@login_required
+def migration_home():
+    with db() as conn:
+        projects = conn.execute(
+            "SELECT migration_projects.*,profiles.name profile_name,profiles.target_type "
+            "FROM migration_projects JOIN profiles ON profiles.id=migration_projects.target_profile_id ORDER BY migration_projects.updated_at DESC"
+        ).fetchall()
+        profiles = conn.execute("SELECT id,name,target_type FROM profiles ORDER BY name").fetchall()
+    return render_template("migration.html", projects=projects, profiles=profiles, parsers=PARSERS, project=None)
+
+
+@app.post("/migration/projects")
+@login_required
+def migration_project_create():
+    try:
+        name = request.form.get("name", "").strip()
+        profile_id = int(request.form.get("target_profile_id", "0"))
+        if not name: raise MigrationError("Projectnaam is verplicht")
+        with db() as conn:
+            if not conn.execute("SELECT 1 FROM profiles WHERE id=?", (profile_id,)).fetchone(): raise MigrationError("Targetprofiel bestaat niet")
+            cursor = conn.execute("INSERT INTO migration_projects(name,target_profile_id,created_at,updated_at) VALUES(?,?,?,?)", (name[:120], profile_id, now(), now()))
+            project_id = int(cursor.lastrowid)
+        audit("migration-project-created", f"project={project_id} profile={profile_id}")
+        return redirect(url_for("migration_project", project_id=project_id))
+    except Exception as exc:
+        flash(f"Migratieproject niet aangemaakt: {exc}", "error")
+        return redirect(url_for("migration_home"))
+
+
+@app.get("/migration/projects/<int:project_id>")
+@login_required
+def migration_project(project_id):
+    project = migration_project_row(project_id)
+    if not project: return "Not found", 404
+    with db() as conn:
+        source_rows = conn.execute("SELECT * FROM migration_sources WHERE project_id=? ORDER BY id", (project_id,)).fetchall()
+        profiles = conn.execute("SELECT id,name,target_type FROM profiles ORDER BY name").fetchall()
+        workspaces = conn.execute("SELECT id,name,source,created_at FROM config_workspaces WHERE profile_id=? ORDER BY id DESC", (project["target_profile_id"],)).fetchall()
+    sources = []
+    for row in source_rows:
+        source = dict(row); source["counts"] = json.loads(row["counts_json"]); source["messages"] = json.loads(row["warnings_json"]); sources.append(source)
+    return render_template("migration.html", projects=[], profiles=profiles, parsers=PARSERS, project=project, sources=sources, workspaces=workspaces)
+
+
+@app.post("/migration/projects/<int:project_id>/source")
+@login_required
+def migration_source_upload(project_id):
+    project = migration_project_row(project_id)
+    if not project: return "Not found", 404
+    try:
+        vendor = request.form.get("vendor", "")
+        uploaded = request.files.get("config_file")
+        if not uploaded or not uploaded.filename: raise MigrationError("Kies een configuratiebestand")
+        content = uploaded.stream.read(100 * 1024 * 1024 + 1)
+        model = parse_vendor(vendor, content, uploaded.filename)
+        source_id = store_migration_source(project_id, vendor, uploaded.filename, model)
+        audit("migration-source-imported", f"project={project_id} source={source_id} vendor={vendor} counts={model.counts()}")
+        flash(f"{PARSERS[vendor].label} geïmporteerd: {sum(model.counts()[key] for key in ('addresses','address_groups','services','service_groups','security_rules','nat_rules'))} mergeerbare items.", "success")
+    except Exception as exc:
+        flash(f"Vendorconfiguratie niet geïmporteerd: {exc}", "error")
+    return redirect(url_for("migration_project", project_id=project_id))
+
+
+@app.post("/migration/projects/<int:project_id>/base")
+@login_required
+def migration_base_select(project_id):
+    project = migration_project_row(project_id)
+    if not project: return "Not found", 404
+    try:
+        workspace_id = int(request.form.get("base_workspace_id", "0"))
+        with db() as conn:
+            if workspace_id and not conn.execute("SELECT 1 FROM config_workspaces WHERE id=? AND profile_id=?", (workspace_id, project["target_profile_id"])).fetchone(): raise MigrationError("Base-workspace hoort niet bij het target")
+            conn.execute("UPDATE migration_projects SET base_workspace_id=?,updated_at=? WHERE id=?", (workspace_id or None, now(), project_id))
+        audit("migration-base-selected", f"project={project_id} workspace={workspace_id}")
+        flash("Base configuration bijgewerkt.", "success")
+    except Exception as exc: flash(f"Base configuration niet gekozen: {exc}", "error")
+    return redirect(url_for("migration_project", project_id=project_id))
+
+
+@app.post("/migration/projects/<int:project_id>/preview")
+@login_required
+def migration_merge_preview(project_id):
+    project = migration_project_row(project_id)
+    if not project: return "Not found", 404
+    try:
+        source_ids = [int(value) for value in request.form.getlist("source_id")]
+        model = selected_migration_model(project_id, source_ids)
+        selected_kinds = set(request.form.getlist("kind"))
+        if not selected_kinds: raise MigrationError("Selecteer minstens één configuratietype")
+        for attr in ("addresses", "address_groups", "services", "service_groups", "security_rules", "nat_rules"):
+            if attr not in selected_kinds: setattr(model, attr, [])
+        with db() as conn:
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (project["target_profile_id"],)).fetchone()
+        if not profile: raise MigrationError("Targetprofiel bestaat niet meer")
+        if profile["target_type"] == "scm":
+            model, plan = reconcile_model(model, migration_target_inventory(profile))
+        else:
+            base_id = int(project["base_workspace_id"] or 0)
+            workspace = workspace_row(base_id) if base_id else None
+            if not workspace or int(workspace["profile_id"]) != int(profile["id"]):
+                raise MigrationError("Kies eerst een volledige base-configuratie voor Panorama/PAN-OS")
+            settings = profile_settings(profile); panorama = profile["target_type"] == "panorama"
+            scope = settings.get("device_group", "") if panorama else settings.get("vsys", "vsys1")
+            _, plan = merge_model_into_panos_xml(
+                workspace_config_path(workspace).read_bytes(), model, scope, panorama, settings.get("rulebase", "pre")
+            )
+        draft_id = secrets.token_urlsafe(18)
+        draft = {"project_id": project_id, "target_profile_id": project["target_profile_id"], "source_ids": source_ids, "model": model.as_dict(), "fingerprint": model.fingerprint(), "plan": plan, "created_at": now()}
+        path = OBJECT_DRAFTS / f"migration-{draft_id}.json"; path.write_text(json.dumps(draft)); path.chmod(0o600)
+        return render_template("migration_preview.html", project=project, model=model, counts=model.counts(), plan=plan, draft_id=draft_id)
+    except Exception as exc:
+        flash(f"Merge-preview mislukt: {exc}", "error")
+        return redirect(url_for("migration_project", project_id=project_id))
+
+
+@app.post("/migration/drafts/<draft_id>/apply")
+@login_required
+def migration_merge_apply(draft_id):
+    if not draft_id or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in draft_id): return "Not found", 404
+    path = OBJECT_DRAFTS / f"migration-{draft_id}.json"
+    if not path.is_file(): return "Not found", 404
+    draft = json.loads(path.read_text()); project = migration_project_row(int(draft["project_id"]))
+    if not project: return "Not found", 404
+    try:
+        model = MigrationModel.from_dict(draft["model"])
+        if not hmac.compare_digest(model.fingerprint(), draft["fingerprint"]): raise MigrationError("Merge-draft is gewijzigd")
+        with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (draft["target_profile_id"],)).fetchone()
+        if not profile: raise MigrationError("Targetprofiel bestaat niet meer")
+        if profile["target_type"] == "scm":
+            model, plan = reconcile_model(model, migration_target_inventory(profile))
+            count = apply_scm_migration(profile, model)
+            outcome = f"{count} configuratie-items naar SCM candidate geschreven"
+        else:
+            workspace_id, plan = create_merged_workspace(profile, project, model)
+            count = int(plan["create"])
+            outcome = f"Werkruimte #{workspace_id} met {count} nieuwe configuratie-items gemaakt en geselecteerd"
+        path.unlink(missing_ok=True)
+        audit("migration-candidate", f"project={project['id']} profile={profile['name']} target={profile['target_type']} count={count}")
+        flash(f"{outcome}; er is niet gecommit of gedeployed.", "success")
+    except Exception as exc: flash(f"Merge naar candidate gestopt: {exc}", "error")
+    return redirect(url_for("migration_project", project_id=project["id"]))
 
 
 def parse_zones(text: str) -> dict[str, str]:

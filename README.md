@@ -136,6 +136,19 @@ is shown when that tenant role does not permit the requested configuration famil
 SCM Device list calls use only the documented location attribution and do not add
 the pagination parameters used by Network and Object list APIs.
 
+## Migration workspace
+
+The separate **Migratie** workspace keeps the existing Policybeheer workflow intact while
+adding an Expedition-inspired source/base/merge flow. Supported first-wave adapters are
+Cisco ASA, Cisco IOS/ACL, Check Point JSON/XML, Fortinet FortiGate, Juniper SRX, and a
+conservative generic JSON/XML adapter.
+
+Every import is normalized before target mapping. SCM uses its native REST object and
+policy endpoints; Panorama and standalone PAN-OS merge into a new full XML workspace.
+Equivalent addresses and services are reused and policy references are rewritten. A name
+collision with different content stops the merge for review. Nothing commits or deploys
+automatically.
+
 ## Policy management
 
 The **Policybeheer** page uses an Expedition-inspired filter, selection, and
