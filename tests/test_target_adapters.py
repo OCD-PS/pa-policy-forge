@@ -968,6 +968,50 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertIn("template/entry[@name='Branch-Template']", params["xpath"])
         self.assertEqual(params["action"], "set")
 
+    def test_scm_scope_envelopes_are_not_treated_as_rules(self):
+        self.assertFalse(main.is_complete_scm_policy({"id": "1", "name": "default", "folder": "PA-BPA"}))
+        self.assertFalse(main.is_complete_scm_policy({"id": "2", "name": "default", "folder": "PA-BPA", "policy_type": "Security"}))
+        self.assertTrue(main.is_complete_scm_policy({"id": "3", "name": "nat", "folder": "PA-BPA", "from": ["Trust"]}))
+        self.assertFalse(main.is_scm_policy_for_kind({"id": "3", "name": "nat", "folder": "PA-BPA", "from": ["Trust"]}, "nat"))
+        self.assertTrue(main.is_scm_policy_for_kind({"id": "4", "name": "nat", "folder": "PA-BPA", "from": ["Trust"], "to": ["Untrust"], "source": ["any"], "destination": ["any"], "service": "any"}, "nat"))
+
+    def test_nat_normalization_exposes_panos_translation_fields(self):
+        normalized = main.normalize_policy({
+            "id": "n1", "name": "NAT-1", "from": ["Trust"], "to": ["Untrust"],
+            "source": ["any"], "destination": ["server-public"], "service": "tcp-443",
+            "source_translation": {"dynamic_ip": {"translated_address": ["192.0.2.10"]}},
+            "destination_translation": {"translated_address": "server-private", "translated_port": 8443},
+        }, "nat")
+        self.assertEqual(normalized["service"], ["tcp-443"])
+        self.assertEqual(normalized["source_translation_mode"], "dynamic_ip")
+        self.assertEqual(normalized["source_translation_address"], "192.0.2.10")
+        self.assertEqual(normalized["destination_translation_address"], "server-private")
+        self.assertEqual(normalized["destination_translation_port"], "8443")
+
+    def test_nat_translation_form_builds_api_payload_shape(self):
+        replacements = main.nat_translation_replacements({
+            "nat_type": "ipv4", "to_interface": "ethernet1/1",
+            "source_translation_mode": "dynamic_ip", "source_translation_address": "192.0.2.10,192.0.2.11",
+            "destination_translation_address": "server-private", "destination_translation_port": "8443",
+        })
+        self.assertEqual(replacements["source_translation"], {"dynamic_ip": {"translated_address": ["192.0.2.10", "192.0.2.11"]}})
+        self.assertEqual(replacements["destination_translation"], {"translated_address": "server-private", "translated_port": 8443})
+
+    def test_nat_xml_editor_uses_scalar_service_and_translation_nodes(self):
+        policy = main.xml_entry_to_policy(main.ET.fromstring(
+            "<entry name='NAT-1'><from><member>Trust</member></from><to><member>Untrust</member></to>"
+            "<source><member>any</member></source><destination><member>public</member></destination><service>tcp-443</service>"
+            "<source-translation><dynamic-ip><translated-address><member>192.0.2.10</member></translated-address></dynamic-ip></source-translation>"
+            "</entry>"
+        ), "nat")
+        self.assertEqual(policy["service"], ["tcp-443"])
+        self.assertEqual(policy["source_translation_address"], "192.0.2.10")
+        policy["destination_translation"] = {"translated_address": "private", "translated_port": 8443}
+        xml = main.ET.fromstring(main.update_xml_policy(policy))
+        self.assertEqual(xml.findtext("./service"), "tcp-443")
+        self.assertEqual(xml.findtext("./destination-translation/translated-address"), "private")
+        self.assertEqual(xml.findtext("./destination-translation/translated-port"), "8443")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -108,6 +108,7 @@ SCM_POLICY_TYPES = {
     "sdwan": ("network", "sdwan-rules", "SD-WAN"),
 }
 SCM_UNAVAILABLE_POLICY_TYPES = {"tunnel-inspection", "dos", "sdwan"}
+SCM_POLICY_ENVELOPE_KEYS = {"id", "name", "folder", "snippet", "device", "position", "policy_type"}
 TARGET_TYPES = {"scm", "panorama", "panos"}
 PANOS_POLICY_NODES = {
     "security": "security", "nat": "nat", "qos": "qos", "pbf": "pbf",
@@ -540,9 +541,68 @@ def normalize_policy(rule: dict, policy_kind: str) -> dict:
         for field in POLICY_LIST_FIELDS:
             value = rule.get(field, []) or []
             normalized[field] = [str(item) for item in (value if isinstance(value, list) else [value])]
+    if policy_kind == "nat":
+        source_translation = copy.deepcopy(rule.get("source_translation") or {})
+        destination_translation = copy.deepcopy(rule.get("destination_translation") or {})
+        source_mode_raw = next(iter(source_translation), "none")
+        source_mode = source_mode_raw.replace("-", "_")
+        source_details = source_translation.get(source_mode_raw, {}) if source_mode != "none" else {}
+        if not isinstance(source_details, dict):
+            source_details = {"translated_address": source_details}
+        translated_address = source_details.get("translated_address", source_details.get("translated-address", []))
+        if not isinstance(translated_address, list):
+            translated_address = [translated_address] if translated_address not in (None, "") else []
+        interface_address = source_details.get("interface_address") or source_details.get("interface-address") or {}
+        normalized.update({
+            "nat_type": str(rule.get("nat_type", "ipv4") or "ipv4"),
+            "to_interface": str(rule.get("to_interface", "any") or "any"),
+            "source_translation": source_translation,
+            "destination_translation": destination_translation,
+            "source_translation_mode": source_mode,
+            "source_translation_address": ", ".join(str(value) for value in translated_address),
+            "source_translation_interface": str(interface_address.get("interface", "") if isinstance(interface_address, dict) else ""),
+            "destination_translation_address": str(destination_translation.get("translated_address", destination_translation.get("translated-address", "")) or ""),
+            "destination_translation_port": str(destination_translation.get("translated_port", destination_translation.get("translated-port", "")) or ""),
+            "source_translation_summary": _policy_value_summary(source_translation),
+            "destination_translation_summary": _policy_value_summary(destination_translation),
+        })
     normalized["_raw"] = rule
     normalized["_policy_kind"] = policy_kind
     return normalized
+
+
+def _policy_value_summary(value) -> str:
+    if isinstance(value, dict):
+        parts = []
+        for key, child in value.items():
+            rendered = _policy_value_summary(child)
+            if rendered:
+                parts.append(f"{key.replace('_', ' ')}: {rendered}")
+        return "; ".join(parts)
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value)
+    return str(value or "")
+
+
+SCM_POLICY_REQUIRED_FIELDS = {
+    "security": {"from", "to", "source", "destination", "application", "service", "action"},
+    "nat": {"from", "to", "source", "destination", "service"},
+    "qos": {"from", "to", "source", "destination"},
+    "pbf": {"from", "source", "destination", "action"},
+    "decryption": {"from", "to", "source", "destination", "action"},
+    "application-override": {"from", "to", "source", "destination", "application"},
+    "authentication": {"from", "to", "source", "destination", "action"},
+}
+
+
+def is_complete_scm_policy(rule: dict) -> bool:
+    """SCM list endpoints can include scope envelopes that are not policy rules."""
+    return bool(set(rule) - SCM_POLICY_ENVELOPE_KEYS)
+
+
+def is_scm_policy_for_kind(rule: dict, policy_kind: str) -> bool:
+    required = SCM_POLICY_REQUIRED_FIELDS.get(policy_kind)
+    return is_complete_scm_policy(rule) and (required is None or required.issubset(rule))
 
 
 def xml_value(node: ET.Element):
@@ -637,7 +697,8 @@ def fetch_panos_policies(profile, policy_kind: str) -> list[dict]:
 def fetch_security_policies(profile) -> list[dict]:
     if profile["target_type"] != "scm": return fetch_panos_policies(profile, "security")
     scm, token, endpoint, container = scm_client(profile)
-    return [normalize_policy(rule, "security") for rule in policy_api.scm_fetch_rules(endpoint, token, container, scm.scm_rulebase)]
+    rules = policy_api.scm_fetch_rules(endpoint, token, container, scm.scm_rulebase)
+    return [normalize_policy(rule, "security") for rule in rules if is_scm_policy_for_kind(rule, "security")]
 
 
 def fetch_scm_policy_type(profile, policy_kind: str) -> list[dict]:
@@ -648,7 +709,8 @@ def fetch_scm_policy_type(profile, policy_kind: str) -> list[dict]:
     service, endpoint_name, _ = SCM_POLICY_TYPES[policy_kind]
     scm, token, _, container = scm_client(profile)
     endpoint = policy_api.scm_api_root(scm.scm_api_base) + f"/config/{service}/v1/{endpoint_name}"
-    return [normalize_policy(rule, policy_kind) for rule in policy_api.scm_fetch_all(endpoint, token, {**container, "position": scm.scm_rulebase})]
+    rules = policy_api.scm_fetch_all(endpoint, token, {**container, "position": scm.scm_rulebase})
+    return [normalize_policy(rule, policy_kind) for rule in rules if is_scm_policy_for_kind(rule, policy_kind)]
 
 
 def fetch_scm_objects(profile, object_type: str) -> list[dict]:
@@ -1175,6 +1237,14 @@ def target_policy_payload(policy: dict, container: dict, policy_kind: str) -> di
             payload[field] = policy[field]
     for field in ("action", "disabled", "description", "log_setting", "schedule", "negate_source", "negate_destination", "log_start", "log_end"):
         if field in policy and (field in payload or policy.get(field) not in (None, "")): payload[field] = policy[field]
+    if policy_kind == "nat":
+        payload["service"] = (policy.get("service") or ["any"])[0]
+        for field in ("nat_type", "to_interface", "source_translation", "destination_translation"):
+            if field in policy:
+                if policy[field] in ({}, ""):
+                    payload.pop(field, None)
+                else:
+                    payload[field] = policy[field]
     payload.update(container)
     return payload
 
@@ -1183,7 +1253,10 @@ def update_xml_policy(policy: dict) -> str:
     entry = SafeET.fromstring(policy["_xml"])
     if policy.get("name"):
         entry.set("name", policy["name"])
+    policy_kind = policy.get("_policy_kind", "security")
     list_fields = set(POLICY_LIST_FIELDS)
+    if policy_kind == "nat":
+        list_fields.discard("service")
     for field in list_fields:
         if field not in policy: continue
         tag = field.replace("_", "-")
@@ -1199,6 +1272,23 @@ def update_xml_policy(policy: dict) -> str:
         if node is None and not policy[field]: continue
         if node is None: node = ET.SubElement(entry, tag)
         node.text = str(policy[field])
+    if policy_kind == "nat":
+        for field in ("service", "nat_type", "to_interface"):
+            if field not in policy: continue
+            tag = field.replace("_", "-")
+            node = entry.find(f"./{tag}")
+            value = policy[field]
+            if field == "service" and isinstance(value, list): value = value[0] if value else "any"
+            if node is None: node = ET.SubElement(entry, tag)
+            node.text = str(value)
+        for field in ("source_translation", "destination_translation"):
+            if field not in policy: continue
+            tag = field.replace("_", "-")
+            existing = entry.find(f"./{tag}")
+            if existing is not None: entry.remove(existing)
+            if policy[field]:
+                node = ET.SubElement(entry, tag)
+                _append_xml_payload(node, policy[field])
     if "profile_group" in policy:
         profile_setting = entry.find("./profile-setting")
         group = entry.find("./profile-setting/group")
@@ -1217,6 +1307,46 @@ def update_xml_policy(policy: dict) -> str:
         if node is None: node = ET.SubElement(entry, tag)
         node.text = "yes" if policy[field] else "no"
     return ET.tostring(entry, encoding="unicode")
+
+
+def _append_xml_payload(parent: ET.Element, value) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            node = ET.SubElement(parent, str(key).replace("_", "-"))
+            _append_xml_payload(node, child)
+    elif isinstance(value, list):
+        for child in value:
+            ET.SubElement(parent, "member").text = str(child)
+    elif value is not None:
+        parent.text = str(value)
+
+
+def nat_translation_replacements(form) -> dict:
+    mode = form.get("source_translation_mode", "none").strip()
+    source_address = split_values(form.get("source_translation_address", ""))
+    source_interface = form.get("source_translation_interface", "").strip()
+    if mode == "none":
+        source_translation = {}
+    elif mode in {"dynamic_ip", "static_ip"}:
+        source_translation = {mode: {"translated_address": source_address if mode == "dynamic_ip" else (source_address[0] if source_address else "")}}
+    elif mode == "dynamic_ip_and_port":
+        details = {"interface_address": {"interface": source_interface}} if source_interface else {"translated_address": source_address}
+        source_translation = {mode: details}
+    else:
+        raise ValueError("Onbekend source translation type")
+    destination_address = form.get("destination_translation_address", "").strip()
+    destination_port = form.get("destination_translation_port", "").strip()
+    destination_translation = {}
+    if destination_address: destination_translation["translated_address"] = destination_address
+    if destination_port:
+        if not destination_port.isdigit() or not 1 <= int(destination_port) <= 65535: raise ValueError("Translated port moet tussen 1 en 65535 liggen")
+        destination_translation["translated_port"] = int(destination_port)
+    return {
+        "nat_type": form.get("nat_type", "ipv4").strip() or "ipv4",
+        "to_interface": form.get("to_interface", "any").strip() or "any",
+        "source_translation": source_translation,
+        "destination_translation": destination_translation,
+    }
 
 
 def write_target_policy(profile, policy_kind: str, policy: dict, original_name: str | None = None) -> None:
@@ -2745,6 +2875,8 @@ def policy_single_preview(profile_id):
                 replacements[field] = values or ([] if field == "tag" else ["any"])
         for field in ("action", "log_setting", "profile_group", "schedule"):
             if request.form.get(f"{field}_present") == "1": replacements[field] = request.form.get(field, "").strip()
+        if policy_kind == "nat":
+            replacements.update(nat_translation_replacements(request.form))
         if request.form.get("description_present") == "1": replacements["description"] = request.form.get("description", "").strip()
         if request.form.get("disabled_present") == "1": replacements["disabled"] = request.form.get("disabled") == "true"
         updated = apply_single_replacements(policy, replacements)

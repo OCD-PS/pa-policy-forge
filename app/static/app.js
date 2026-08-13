@@ -256,7 +256,9 @@
       "destination-hip/member": "destinationHip", "application/member": "application",
       "service/member": "service", "category/member": "category", "action": "action",
       "disabled": "disabled", "log-start": "logStart", "log-end": "logEnd",
-      "schedule": "schedule", "profile-setting/group/member": "profileGroup", "log-setting": "logSetting"
+      "schedule": "schedule", "profile-setting/group/member": "profileGroup", "log-setting": "logSetting",
+      "to-interface": "toInterface", "nat-type": "natType", "source-translation": "sourceTranslationSummary",
+      "destination-translation": "destinationTranslationSummary"
     };
 
     function tokenize(value) {
