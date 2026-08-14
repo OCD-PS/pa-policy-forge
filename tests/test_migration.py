@@ -201,8 +201,7 @@ end''', "forti.conf")
         self.assertEqual(response.status_code, 200)
         page = response.get_data(as_text=True)
         self.assertIn("Migratieprojecten", page)
-        self.assertIn("Expedition-inspired", page)
-        self.assertIn("SCM, Panorama of standalone PAN-OS", page)
+        self.assertNotIn("Expedition-inspired", page)
 
     def test_panos_upload_becomes_full_base_workspace_and_ui_defaults_are_checked(self):
         stamp = main.now()
@@ -238,9 +237,12 @@ end''', "forti.conf")
         page = client.get(f"/migration/projects/{project_id}", base_url="https://forge.test").get_data(as_text=True)
         self.assertIn("Palo Alto PAN-OS / Panorama XML", page)
         self.assertIn('class="migration-kind-menu" open', page)
+        self.assertIn("<summary>Configuratie</summary>", page)
         self.assertIn('name="kind" value="interfaces" checked', page)
         self.assertIn('name="kind" value="zones" checked', page)
         self.assertIn('name="source_id"', page)
+        self.assertNotIn("Interfaces en zones zijn beschikbaar", page)
+        self.assertNotIn("standaard alles geselecteerd", page)
 
 
 if __name__ == "__main__":
