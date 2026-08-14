@@ -92,6 +92,8 @@ class Policy:
     tags: list[str] = field(default_factory=list)
     source_translation: dict = field(default_factory=dict)
     destination_translation: dict = field(default_factory=dict)
+    nat_type: str = "ipv4"
+    to_interface: str = "any"
     source_ref: str = ""
     original: dict = field(default_factory=dict)
 
@@ -364,6 +366,132 @@ class CheckPointParser(BaseParser):
         return deduplicate(model)
 
 
+def _xml_members(entry: ET.Element, path: str, default: list[str] | None = None) -> list[str]:
+    node = entry.find(path)
+    if node is None:
+        return list(default or [])
+    values = [member.text or "" for member in node.findall("./member") if (member.text or "").strip()]
+    if values:
+        return unique(values)
+    text = (node.text or "").strip()
+    return [text] if text else list(default or [])
+
+
+def _xml_payload(node: ET.Element | None):
+    if node is None:
+        return {}
+    children = list(node)
+    if not children:
+        return node.text or ""
+    if all(child.tag == "member" for child in children):
+        return [child.text or "" for child in children]
+    result = {}
+    for child in children:
+        key = child.tag.replace("-", "_")
+        value = _xml_payload(child)
+        if key in result:
+            result[key] = result[key] if isinstance(result[key], list) else [result[key]]
+            result[key].append(value)
+        else:
+            result[key] = value
+    return result
+
+
+class PanosConfigParser(BaseParser):
+    vendor = "panos"
+    label = "Palo Alto PAN-OS / Panorama XML"
+    extensions = (".xml",)
+    interface_types = ("ethernet", "aggregate-ethernet", "loopback", "tunnel", "vlan")
+
+    def parse(self, text: str, source_name: str) -> MigrationModel:
+        try:
+            root = SafeET.fromstring(text)
+        except Exception as exc:
+            raise MigrationError(f"Ongeldige PAN-OS XML: {exc}") from exc
+        if root.tag != "config":
+            root = root.find(".//config")
+        if root is None:
+            raise MigrationError("Geen PAN-OS <config>-root gevonden")
+        model = MigrationModel(self.vendor, source_name)
+        locations: list[tuple[str, ET.Element]] = []
+        shared = root.find("./shared")
+        if shared is not None:
+            locations.append(("Shared", shared))
+        for entry in root.findall("./devices/entry/vsys/entry"):
+            locations.append((f"VSYS {entry.get('name', '')}", entry))
+        for entry in root.findall("./devices/entry/device-group/entry"):
+            locations.append((f"Device Group {entry.get('name', '')}", entry))
+        if not locations:
+            raise MigrationError("Geen Shared, VSYS of Device Group in de PAN-OS-config gevonden")
+
+        for owner, location in locations:
+            self._objects(model, location, owner)
+            self._policies(model, location, owner)
+            for entry in location.findall("./zone/entry"):
+                model.zones.append({"name": entry.get("name", ""), "xml": ET.tostring(entry, encoding="unicode"), "source_ref": owner})
+
+        device = root.find("./devices/entry")
+        if device is not None:
+            for interface_type in self.interface_types:
+                for entry in device.findall(f"./network/interface/{interface_type}/entry"):
+                    model.interfaces.append({
+                        "name": entry.get("name", ""), "interface_type": interface_type,
+                        "xml": ET.tostring(entry, encoding="unicode"), "source_ref": "Device network",
+                    })
+        for template in root.findall("./devices/entry/template/entry"):
+            template_name = template.get("name", "")
+            for interface_type in self.interface_types:
+                for entry in template.findall(f"./config/devices/entry/network/interface/{interface_type}/entry"):
+                    model.interfaces.append({
+                        "name": entry.get("name", ""), "interface_type": interface_type,
+                        "xml": ET.tostring(entry, encoding="unicode"), "source_ref": f"Template {template_name}",
+                    })
+            for entry in template.findall("./config/devices/entry/vsys/entry/zone/entry"):
+                model.zones.append({"name": entry.get("name", ""), "xml": ET.tostring(entry, encoding="unicode"), "source_ref": f"Template {template_name}"})
+        return deduplicate(model)
+
+    @staticmethod
+    def _objects(model: MigrationModel, location: ET.Element, owner: str) -> None:
+        for entry in location.findall("./address/entry"):
+            for tag in ("ip-netmask", "ip-range", "ip-wildcard", "fqdn"):
+                value = entry.findtext(f"./{tag}")
+                if value is not None:
+                    model.addresses.append(Address(entry.get("name", ""), value, tag.replace("-", "_"), entry.findtext("./description") or "", _xml_members(entry, "./tag"), owner))
+                    break
+        for entry in location.findall("./address-group/entry"):
+            members = _xml_members(entry, "./static")
+            if members:
+                model.address_groups.append(AddressGroup(entry.get("name", ""), members, entry.findtext("./description") or "", _xml_members(entry, "./tag"), owner))
+            elif entry.find("./dynamic") is not None:
+                model.unsupported.append(f"{owner}: dynamic address group {entry.get('name', '')} vereist review")
+        for entry in location.findall("./service/entry"):
+            protocol_node = entry.find("./protocol")
+            if protocol_node is None or not list(protocol_node):
+                continue
+            protocol = list(protocol_node)[0]
+            model.services.append(Service(entry.get("name", ""), protocol.tag, protocol.findtext("./port") or "1-65535", protocol.findtext("./source-port") or "", entry.findtext("./description") or "", _xml_members(entry, "./tag"), owner))
+        for entry in location.findall("./service-group/entry"):
+            model.service_groups.append(ServiceGroup(entry.get("name", ""), _xml_members(entry, "./members"), entry.findtext("./description") or "", _xml_members(entry, "./tag"), owner))
+
+    @staticmethod
+    def _policies(model: MigrationModel, location: ET.Element, owner: str) -> None:
+        for rulebase in ("rulebase", "pre-rulebase", "post-rulebase"):
+            for kind, target in (("security", model.security_rules), ("nat", model.nat_rules)):
+                for entry in location.findall(f"./{rulebase}/{kind}/rules/entry"):
+                    rule = Policy(
+                        name=entry.get("name", ""), policy_type=kind,
+                        from_zones=_xml_members(entry, "./from", ["any"]), to_zones=_xml_members(entry, "./to", ["any"]),
+                        source=_xml_members(entry, "./source", ["any"]), destination=_xml_members(entry, "./destination", ["any"]),
+                        application=_xml_members(entry, "./application", ["any"]), service=_xml_members(entry, "./service", ["application-default" if kind == "security" else "any"]),
+                        action=entry.findtext("./action") or "allow", disabled=(entry.findtext("./disabled") or "no").lower() == "yes",
+                        description=entry.findtext("./description") or "", tags=_xml_members(entry, "./tag"),
+                        source_translation=_xml_payload(entry.find("./source-translation")), destination_translation=_xml_payload(entry.find("./destination-translation")),
+                        nat_type=entry.findtext("./nat-type") or "ipv4", to_interface=entry.findtext("./to-interface") or "any",
+                        source_ref=f"{owner} · {rulebase}", original={"owner": owner, "rulebase": rulebase},
+                    )
+                    target.append(rule)
+
+
 class GenericParser(BaseParser):
     vendor = "generic"
     label = "Overige / generiek"
@@ -386,7 +514,7 @@ class GenericParser(BaseParser):
         return deduplicate(model)
 
 
-PARSERS = {parser.vendor: parser for parser in (CiscoAsaParser(), CiscoIosParser(), CheckPointParser(), FortinetParser(), JuniperSrxParser(), GenericParser())}
+PARSERS = {parser.vendor: parser for parser in (PanosConfigParser(), CiscoAsaParser(), CiscoIosParser(), CheckPointParser(), FortinetParser(), JuniperSrxParser(), GenericParser())}
 
 
 def parse_vendor(vendor: str, content: bytes, source_name: str) -> MigrationModel:
@@ -396,7 +524,7 @@ def parse_vendor(vendor: str, content: bytes, source_name: str) -> MigrationMode
     try: text=content.decode("utf-8-sig")
     except UnicodeDecodeError: text=content.decode("latin-1")
     model=parser.parse(text,source_name)
-    if sum(model.counts()[key] for key in ("addresses","address_groups","services","service_groups","security_rules","nat_rules"))==0:
+    if sum(model.counts()[key] for key in ("addresses","address_groups","services","service_groups","security_rules","nat_rules","interfaces","zones"))==0:
         model.warnings.append("Geen direct mergeerbare objecten of policies gevonden")
     return model
 
@@ -405,12 +533,25 @@ def deduplicate(model: MigrationModel) -> MigrationModel:
     for attr in ("addresses","address_groups","services","service_groups","security_rules","nat_rules"):
         values=[]; seen={}
         for item in getattr(model,attr):
-            item.name=clean_name(item.name)
+            item.name=str(item.name or "").strip() if model.vendor == "panos" else clean_name(item.name)
             if item.name in seen:
                 if asdict(seen[item.name]) != asdict(item): model.warnings.append(f"Dubbele naam {item.name} in {attr}; eerste definitie behouden")
                 continue
             seen[item.name]=item; values.append(item)
         setattr(model,attr,values)
+    for attr in ("interfaces", "zones"):
+        values=[]; seen={}
+        for item in getattr(model, attr):
+            original_name=str(item.get("name", "")).strip()
+            name=original_name if model.vendor == "panos" else clean_name(original_name)
+            if not name: continue
+            item["name"]=name
+            key=(item.get("interface_type", ""), name) if attr == "interfaces" else name
+            if key in seen:
+                if item.get("xml") != seen[key].get("xml"): model.warnings.append(f"Dubbele naam {name} in {attr}; eerste definitie behouden")
+                continue
+            seen[key]=item; values.append(item)
+        setattr(model, attr, values)
     return model
 
 
@@ -436,29 +577,52 @@ def panos_fragment(model: MigrationModel, scope: str = "vsys1", panorama: bool =
     for item in model.addresses:
         e=ET.SubElement(addresses,"entry",{"name":item.name}); ET.SubElement(e,item.value_type.replace("_","-")).text=item.value
         if item.description: ET.SubElement(e,"description").text=item.description
+        if item.tags: members(ET.SubElement(e,"tag"),item.tags)
     groups=ET.SubElement(target,"address-group")
-    for item in model.address_groups: e=ET.SubElement(groups,"entry",{"name":item.name}); members(ET.SubElement(e,"static"),item.members)
+    for item in model.address_groups:
+        e=ET.SubElement(groups,"entry",{"name":item.name}); members(ET.SubElement(e,"static"),item.members)
+        if item.description: ET.SubElement(e,"description").text=item.description
+        if item.tags: members(ET.SubElement(e,"tag"),item.tags)
     services=ET.SubElement(target,"service")
-    for item in model.services: e=ET.SubElement(services,"entry",{"name":item.name}); p=ET.SubElement(ET.SubElement(e,"protocol"),item.protocol); ET.SubElement(p,"port").text=item.port
+    for item in model.services:
+        e=ET.SubElement(services,"entry",{"name":item.name}); p=ET.SubElement(ET.SubElement(e,"protocol"),item.protocol); ET.SubElement(p,"port").text=item.port
+        if item.source_port: ET.SubElement(p,"source-port").text=item.source_port
+        if item.description: ET.SubElement(e,"description").text=item.description
+        if item.tags: members(ET.SubElement(e,"tag"),item.tags)
     service_groups=ET.SubElement(target,"service-group")
-    for item in model.service_groups: e=ET.SubElement(service_groups,"entry",{"name":item.name}); members(ET.SubElement(e,"members"),item.members)
+    for item in model.service_groups:
+        e=ET.SubElement(service_groups,"entry",{"name":item.name}); members(ET.SubElement(e,"members"),item.members)
+        if item.description: ET.SubElement(e,"description").text=item.description
+        if item.tags: members(ET.SubElement(e,"tag"),item.tags)
     for kind,rules in (("security",model.security_rules),("nat",model.nat_rules)):
         root=ET.SubElement(ET.SubElement(rb,kind),"rules")
         for rule in rules:
             e=ET.SubElement(root,"entry",{"name":rule.name})
-            for tag,values in (("from",rule.from_zones),("to",rule.to_zones),("source",rule.source),("destination",rule.destination),("application",rule.application),("service",rule.service)): members(ET.SubElement(e,tag),values)
-            if kind=="security": ET.SubElement(e,"action").text=rule.action
-            if kind=="nat" and rule.source_translation:
-                st=ET.SubElement(e,"source-translation"); dip=rule.source_translation.get("dynamic_ip_and_port")
-                if dip is not None:
-                    ia=ET.SubElement(ET.SubElement(st,"dynamic-ip-and-port"),"interface-address")
-                    if dip.get("interface_address",{}).get("interface"): ET.SubElement(ia,"interface").text=dip["interface_address"]["interface"]
-            if kind=="nat" and rule.destination_translation:
-                dt=ET.SubElement(e,"destination-translation"); ET.SubElement(dt,"translated-address").text=rule.destination_translation.get("translated_address","")
-                if rule.destination_translation.get("translated_port"): ET.SubElement(dt,"translated-port").text=rule.destination_translation["translated_port"]
+            for tag,values in (("from",rule.from_zones),("to",rule.to_zones),("source",rule.source),("destination",rule.destination)): members(ET.SubElement(e,tag),values)
+            if kind=="security":
+                members(ET.SubElement(e,"application"),rule.application); members(ET.SubElement(e,"service"),rule.service); ET.SubElement(e,"action").text=rule.action
+            else:
+                ET.SubElement(e,"service").text=(rule.service or ["any"])[0]
+                ET.SubElement(e,"nat-type").text=rule.nat_type or "ipv4"
+                ET.SubElement(e,"to-interface").text=rule.to_interface or "any"
+                if rule.source_translation:
+                    st=ET.SubElement(e,"source-translation"); _append_xml_dict(st,rule.source_translation)
+                if rule.destination_translation:
+                    dt=ET.SubElement(e,"destination-translation"); _append_xml_dict(dt,rule.destination_translation)
+            if rule.tags: members(ET.SubElement(e,"tag"),rule.tags)
             ET.SubElement(e,"disabled").text="yes" if rule.disabled else "no"
             if rule.description: ET.SubElement(e,"description").text=rule.description
     return ET.tostring(config,encoding="utf-8",xml_declaration=True)
+
+
+def _append_xml_dict(parent: ET.Element, value) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            node=ET.SubElement(parent,str(key).replace("_","-")); _append_xml_dict(node,child)
+    elif isinstance(value, list):
+        for child in value: ET.SubElement(parent,"member").text=str(child)
+    elif value is not None:
+        parent.text=str(value)
 
 
 def scm_items(model: MigrationModel) -> list[dict]:
@@ -469,8 +633,9 @@ def scm_items(model: MigrationModel) -> list[dict]:
     for item in model.service_groups: items.append({"kind":"service-groups","name":item.name,"payload":{"name":item.name,"members":item.members}})
     for kind,rules in (("security",model.security_rules),("nat",model.nat_rules)):
         for rule in rules:
-            payload={"name":rule.name,"from":rule.from_zones,"to":rule.to_zones,"source":rule.source,"destination":rule.destination,"application":rule.application,"service":rule.service,"disabled":rule.disabled}
-            if kind=="security": payload["action"]=rule.action
+            payload={"name":rule.name,"from":rule.from_zones,"to":rule.to_zones,"source":rule.source,"destination":rule.destination,"service":rule.service if kind=="security" else (rule.service or ["any"])[0],"disabled":rule.disabled}
+            if kind=="security": payload.update({"application":rule.application,"action":rule.action})
+            else: payload.update({"nat_type":rule.nat_type,"to_interface":rule.to_interface})
             if kind=="nat" and rule.source_translation: payload["source_translation"]=rule.source_translation
             if kind=="nat" and rule.destination_translation: payload["destination_translation"]=rule.destination_translation
             if rule.description: payload["description"]=rule.description
@@ -705,6 +870,57 @@ def merge_model_into_panos_xml(
                     else:
                         plan["reuse"] += 1
                     continue
+                destination.append(copy.deepcopy(entry)); plan["create"] += 1
+
+    device = root.find("./devices/entry")
+    if device is None:
+        raise MigrationError("De doelconfiguratie bevat geen device-root")
+    network_owner = device
+    zone_owner = target
+    if panorama and (model.interfaces or model.zones):
+        reference = target.findtext("./reference-template") or target.findtext("./reference-templates/member")
+        if not reference:
+            stack_name = target.findtext("./reference-template-stack") or target.findtext("./reference-template-stack/member")
+            stack = next((entry for entry in root.findall("./devices/entry/template-stack/entry") if entry.get("name") == stack_name), None)
+            reference = stack.findtext("./templates/member") if stack is not None else ""
+        template = next((entry for entry in root.findall("./devices/entry/template/entry") if entry.get("name") == reference), None)
+        if template is None:
+            raise MigrationError("Interfaces/zones vereisen een bestaande referenced template in de gekozen Device Group")
+        network_owner = template.find("./config/devices/entry")
+        if network_owner is None:
+            raise MigrationError(f"Template {reference} bevat geen device-config")
+        zone_owner = network_owner.find("./vsys/entry")
+        if model.zones and zone_owner is None:
+            raise MigrationError(f"Template {reference} bevat geen VSYS voor zones")
+        plan["network_target"] = reference
+
+    if model.interfaces:
+        network = container(network_owner, "network")
+        interface_root = container(network, "interface")
+        for item in model.interfaces:
+            interface_type = str(item.get("interface_type", "ethernet"))
+            destination = container(interface_root, interface_type)
+            entry = SafeET.fromstring(item["xml"])
+            name = str(item.get("name", entry.get("name", "")))
+            entry.set("name", name)
+            existing = {value.get("name", ""): value for value in destination.findall("./entry")}
+            if name in existing:
+                if _entry_signature(existing[name]) != _entry_signature(entry): plan["conflicts"].append(f"interface: {name}")
+                else: plan["reuse"] += 1
+            else:
+                destination.append(copy.deepcopy(entry)); plan["create"] += 1
+
+    if model.zones:
+        if zone_owner is None:
+            raise MigrationError("Geen doel-VSYS voor zones gevonden")
+        destination = container(zone_owner, "zone")
+        existing = {value.get("name", ""): value for value in destination.findall("./entry")}
+        for item in model.zones:
+            entry = SafeET.fromstring(item["xml"]); name = str(item.get("name", entry.get("name", ""))); entry.set("name", name)
+            if name in existing:
+                if _entry_signature(existing[name]) != _entry_signature(entry): plan["conflicts"].append(f"zone: {name}")
+                else: plan["reuse"] += 1
+            else:
                 destination.append(copy.deepcopy(entry)); plan["create"] += 1
     if plan["conflicts"]:
         raise MigrationError("Mergeconflicten: " + ", ".join(plan["conflicts"][:12]))

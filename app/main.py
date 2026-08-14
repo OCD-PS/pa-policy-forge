@@ -1462,6 +1462,16 @@ def selected_migration_model(project_id: int, source_ids: list[int]) -> Migratio
                 continue
             seen[item.name] = item; values.append(item)
         setattr(merged, field, values)
+    for field in ("interfaces", "zones"):
+        values, seen = [], {}
+        for item in getattr(merged, field):
+            key = (item.get("interface_type", ""), item.get("name", "")) if field == "interfaces" else item.get("name", "")
+            if key in seen:
+                if item.get("xml") != seen[key].get("xml"):
+                    merged.warnings.append(f"Mergeconflict voor {field}: {item.get('name', '')}; eerste definitie behouden")
+                continue
+            seen[key] = item; values.append(item)
+        setattr(merged, field, values)
     return merged
 
 
@@ -2553,9 +2563,34 @@ def migration_source_upload(project_id):
         if not uploaded or not uploaded.filename: raise MigrationError("Kies een configuratiebestand")
         content = uploaded.stream.read(100 * 1024 * 1024 + 1)
         model = parse_vendor(vendor, content, uploaded.filename)
+        use_as_full_base = vendor == "panos" and project["target_type"] in {"panos", "panorama"}
+        profile = None
+        if use_as_full_base:
+            with db() as conn:
+                profile = conn.execute("SELECT * FROM profiles WHERE id=?", (project["target_profile_id"],)).fetchone()
+            if not profile:
+                raise MigrationError("Targetprofiel bestaat niet meer")
+            expected = "panorama" if project["target_type"] == "panorama" else "panos"
+            parse_snapshot(content, expected_kind=expected)
         source_id = store_migration_source(project_id, vendor, uploaded.filename, model)
+        workspace_id = None
+        if use_as_full_base:
+            workspace_id = store_config_workspace(
+                profile,
+                f"Bronconfiguratie - {uploaded.filename}",
+                uploaded.filename,
+                content,
+                "migration-import",
+            )
+            with db() as conn:
+                conn.execute(
+                    "UPDATE migration_projects SET base_workspace_id=?,updated_at=? WHERE id=?",
+                    (workspace_id, now(), project_id),
+                )
         audit("migration-source-imported", f"project={project_id} source={source_id} vendor={vendor} counts={model.counts()}")
-        flash(f"{PARSERS[vendor].label} geïmporteerd: {sum(model.counts()[key] for key in ('addresses','address_groups','services','service_groups','security_rules','nat_rules'))} mergeerbare items.", "success")
+        item_count = sum(model.counts()[key] for key in ('addresses','address_groups','services','service_groups','security_rules','nat_rules','interfaces','zones'))
+        base_message = f" De volledige XML is ook als base-workspace #{workspace_id} geselecteerd." if workspace_id else ""
+        flash(f"{PARSERS[vendor].label} geïmporteerd: {item_count} mergeerbare items.{base_message}", "success")
     except Exception as exc:
         flash(f"Vendorconfiguratie niet geïmporteerd: {exc}", "error")
     return redirect(url_for("migration_project", project_id=project_id))
@@ -2587,12 +2622,14 @@ def migration_merge_preview(project_id):
         model = selected_migration_model(project_id, source_ids)
         selected_kinds = set(request.form.getlist("kind"))
         if not selected_kinds: raise MigrationError("Selecteer minstens één configuratietype")
-        for attr in ("addresses", "address_groups", "services", "service_groups", "security_rules", "nat_rules"):
+        for attr in ("addresses", "address_groups", "services", "service_groups", "security_rules", "nat_rules", "interfaces", "zones"):
             if attr not in selected_kinds: setattr(model, attr, [])
         with db() as conn:
             profile = conn.execute("SELECT * FROM profiles WHERE id=?", (project["target_profile_id"],)).fetchone()
         if not profile: raise MigrationError("Targetprofiel bestaat niet meer")
         if profile["target_type"] == "scm":
+            if model.interfaces or model.zones:
+                raise MigrationError("PAN-OS interfaces en zones kunnen alleen naar een Panorama/PAN-OS XML-workspace worden gemerged; SCM-netwerkmapping is nog niet beschikbaar")
             model, plan = reconcile_model(model, migration_target_inventory(profile))
         else:
             base_id = int(project["base_workspace_id"] or 0)
