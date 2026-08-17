@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config version="12.1.0">
+  <devices>
+    <entry name="localhost.localdomain">
+      <network>
+        <interface>
+          <ethernet>
+            <entry name="ethernet1/1">
+              <layer3><ip><entry name="192.0.2.1/24"/></ip></layer3>
+            </entry>
+            <entry name="ethernet1/3">
+              <layer3><ip><entry name="198.51.100.1/24"/></ip></layer3>
+            </entry>
+          </ethernet>
+        </interface>
+        <virtual-router>
+          <entry name="default">
+            <interface><member>ethernet1/1</member><member>ethernet1/3</member></interface>
+          </entry>
+        </virtual-router>
+      </network>
+      <vsys>
+        <entry name="vsys1">
+          <zone>
+            <entry name="Trust"><network><layer3><member>ethernet1/1</member></layer3></network></entry>
+            <entry name="Untrust"><network><layer3><member>ethernet1/3</member></layer3></network></entry>
+          </zone>
+          <address>
+            <entry name="Existing-DNS"><ip-netmask>192.0.2.53/32</ip-netmask><description>Existing base object</description></entry>
+          </address>
+          <service>
+            <entry name="Existing-DNS-UDP"><protocol><udp><port>53</port></udp></protocol></entry>
+          </service>
+          <rulebase>
+            <security>
+              <rules>
+                <entry name="Existing-DNS-Allow">
+                  <from><member>Trust</member></from><to><member>Untrust</member></to>
+                  <source><member>any</member></source><destination><member>Existing-DNS</member></destination>
+                  <application><member>dns</member></application><service><member>application-default</member></service>
+                  <action>allow</action><disabled>no</disabled>
+                </entry>
+              </rules>
+            </security>
+            <nat><rules/></nat>
+          </rulebase>
+        </entry>
+      </vsys>
+    </entry>
+  </devices>
+</config>

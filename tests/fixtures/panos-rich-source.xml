@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config version="12.1.0">
+  <devices>
+    <entry name="localhost.localdomain">
+      <network>
+        <interface>
+          <ethernet><entry name="ethernet1/2"><layer3><ip><entry name="10.50.10.1/24"/></ip><interface-management-profile>Atlas-Mgmt</interface-management-profile></layer3></entry></ethernet>
+          <aggregate-ethernet><entry name="ae1"><layer3><ip><entry name="10.50.20.1/24"/></ip></layer3></entry></aggregate-ethernet>
+          <loopback><entry name="loopback.1"><ip><entry name="10.255.0.1/32"/></ip></entry></loopback>
+          <tunnel><entry name="tunnel.1"><ip><entry name="169.254.50.1/30"/></ip></entry></tunnel>
+          <vlan><entry name="vlan.30"><ip><entry name="10.50.30.1/24"/></ip></entry></vlan>
+        </interface>
+        <vlan><entry name="Atlas-VLAN30"><virtual-interface><interface>vlan.30</interface></virtual-interface></entry></vlan>
+        <virtual-router><entry name="Atlas-VR"><interface><member>ethernet1/2</member><member>ae1</member><member>tunnel.1</member></interface></entry></virtual-router>
+        <logical-router><entry name="Atlas-LR"><vrf><entry name="default"><interface><member>ethernet1/2</member></interface></entry></vrf></entry></logical-router>
+        <virtual-wire><entry name="Atlas-VWire"><interface1>ethernet1/5</interface1><interface2>ethernet1/6</interface2></entry></virtual-wire>
+        <ike><gateway><entry name="Atlas-IKE"><peer-address><ip>203.0.113.50</ip></peer-address><protocol><ikev2><dpd><enable>yes</enable></dpd></ikev2></protocol></entry></gateway></ike>
+        <tunnel><ipsec><entry name="Atlas-IPSec"><auto-key><ike-gateway><entry name="Atlas-IKE"/></ike-gateway></auto-key><tunnel-interface>tunnel.1</tunnel-interface></entry></ipsec></tunnel>
+        <global-protect>
+          <global-protect-portal><entry name="Atlas-Portal"><portal-config><local-address><ip><ipv4>198.51.100.10</ipv4></ip></local-address></portal-config></entry></global-protect-portal>
+          <global-protect-gateway><entry name="Atlas-Gateway"><local-address><ip><ipv4>198.51.100.10</ipv4></ip></local-address></entry></global-protect-gateway>
+        </global-protect>
+        <profiles>
+          <ike><entry name="Atlas-IKE-Crypto"><encryption><member>aes-256-cbc</member></encryption></entry></ike>
+          <interface-management-profile><entry name="Atlas-Mgmt"><https>yes</https><ping>yes</ping></entry></interface-management-profile>
+          <monitor-profile><entry name="Atlas-Monitor"><interval>3</interval><threshold>5</threshold></entry></monitor-profile>
+        </profiles>
+      </network>
+      <plugins><entry name="atlas-plugin"><enabled>yes</enabled></entry></plugins>
+      <vsys>
+        <entry name="vsys1">
+          <zone>
+            <entry name="DMZ"><network><layer3><member>ethernet1/2</member><member>ae1</member></layer3></network><enable-user-identification>yes</enable-user-identification></entry>
+            <entry name="VPN"><network><layer3><member>tunnel.1</member></layer3></network></entry>
+          </zone>
+          <address>
+            <entry name="Atlas-Web"><ip-netmask>10.50.10.10/32</ip-netmask><description>Web server</description><tag><member>Atlas-Prod</member></tag></entry>
+            <entry name="Atlas-Range"><ip-range>10.50.10.20-10.50.10.30</ip-range></entry>
+            <entry name="Atlas-FQDN"><fqdn>updates.example.test</fqdn></entry>
+            <entry name="Atlas-Wildcard"><ip-wildcard>10.60.0.0/0.0.255.255</ip-wildcard></entry>
+          </address>
+          <address-group><entry name="Atlas-Servers"><static><member>Atlas-Web</member><member>Atlas-Range</member></static><description>Server group</description><tag><member>Atlas-Prod</member></tag></entry></address-group>
+          <service>
+            <entry name="Atlas-TCP-8443"><protocol><tcp><source-port>1024-65535</source-port><port>8443</port></tcp></protocol><description>Application HTTPS</description></entry>
+            <entry name="Atlas-UDP-2055"><protocol><udp><port>2055</port></udp></protocol></entry>
+          </service>
+          <service-group><entry name="Atlas-App-Services"><members><member>Atlas-TCP-8443</member><member>Atlas-UDP-2055</member></members></entry></service-group>
+          <application><entry name="atlas-app"><default><port><member>tcp/8443</member></port></default><category>business-systems</category><subcategory>management</subcategory><technology>client-server</technology><risk>3</risk></entry></application>
+          <application-group><entry name="Atlas-Applications"><members><member>atlas-app</member><member>ssl</member></members></entry></application-group>
+          <application-filter><entry name="Atlas-Low-Risk"><risk><member>1</member><member>2</member></risk></entry></application-filter>
+          <tag><entry name="Atlas-Prod"><color>color6</color><comments>Production migration tag</comments></entry></tag>
+          <region><entry name="Atlas-Region"><address><member>203.0.113.0-203.0.113.255</member></address></entry></region>
+          <schedule><entry name="Atlas-Business-Hours"><schedule-type><recurring><weekly><monday><member>08:00-18:00</member></monday></weekly></recurring></schedule-type></entry></schedule>
+          <external-list><entry name="Atlas-EDL"><type><ip><url>https://example.test/atlas-edl.txt</url><repeat>hourly</repeat></ip></type></entry></external-list>
+          <profiles>
+            <custom-url-category><entry name="Atlas-Allow-URLs"><type>URL List</type><list><member>*.example.test/</member></list></entry></custom-url-category>
+            <virus><entry name="Atlas-AV"><decoder><entry name="http"><action>reset-both</action></entry></decoder></entry></virus>
+            <spyware><entry name="Atlas-Spyware"><rules><entry name="critical"><action><reset-both/></action><severity><member>critical</member></severity></entry></rules></entry></spyware>
+            <vulnerability><entry name="Atlas-Vulnerability"><rules><entry name="critical"><action><reset-both/></action><severity><member>critical</member></severity></entry></rules></entry></vulnerability>
+            <url-filtering><entry name="Atlas-URL"><allow><member>Atlas-Allow-URLs</member></allow><block><member>malware</member></block></entry></url-filtering>
+            <file-blocking><entry name="Atlas-File"><rules><entry name="block-pe"><application><member>any</member></application><file-type><member>pe</member></file-type><action>block</action></entry></rules></entry></file-blocking>
+            <wildfire-analysis><entry name="Atlas-WildFire"><rules><entry name="forward-all"><application><member>any</member></application><file-type><member>any</member></file-type><direction>both</direction><analysis>public-cloud</analysis></entry></rules></entry></wildfire-analysis>
+            <data-objects><entry name="Atlas-Data"><patterns><entry name="Atlas-Pattern"><pattern>atlas-[0-9]+</pattern></entry></patterns></entry></data-objects>
+            <dos-protection><entry name="Atlas-DoS"><type><aggregate><resources><sessions><enabled>yes</enabled></sessions></resources></aggregate></type></entry></dos-protection>
+            <decryption><entry name="Atlas-Decrypt"><ssl-forward-proxy><auto-include-altname>yes</auto-include-altname></ssl-forward-proxy></entry></decryption>
+          </profiles>
+          <profile-group><entry name="Atlas-Security-Group"><virus><member>Atlas-AV</member></virus><spyware><member>Atlas-Spyware</member></spyware><vulnerability><member>Atlas-Vulnerability</member></vulnerability><url-filtering><member>Atlas-URL</member></url-filtering></entry></profile-group>
+          <log-settings><entry name="Atlas-Log"><match-list><entry name="traffic"><log-type>traffic</log-type><send-syslog><member>Atlas-Syslog</member></send-syslog></entry></match-list></entry></log-settings>
+          <authentication-enforcement><entry name="Atlas-Auth"><authentication-profile>Atlas-LDAP</authentication-profile><timeout>60</timeout></entry></authentication-enforcement>
+          <rulebase>
+            <security><rules><entry name="Atlas-DMZ-Allow"><from><member>Trust</member></from><to><member>DMZ</member></to><source><member>any</member></source><destination><member>Atlas-Servers</member></destination><application><member>Atlas-Applications</member></application><service><member>application-default</member></service><action>allow</action><profile-setting><group><member>Atlas-Security-Group</member></group></profile-setting><log-setting>Atlas-Log</log-setting><tag><member>Atlas-Prod</member></tag><description>Rich PAN-OS source rule</description><disabled>no</disabled></entry></rules></security>
+            <nat><rules><entry name="Atlas-DNAT"><from><member>Untrust</member></from><to><member>DMZ</member></to><source><member>any</member></source><destination><member>Atlas-FQDN</member></destination><service>Atlas-TCP-8443</service><nat-type>ipv4</nat-type><to-interface>ethernet1/2</to-interface><source-translation><dynamic-ip-and-port><interface-address><interface>ethernet1/3</interface></interface-address></dynamic-ip-and-port></source-translation><destination-translation><translated-address>Atlas-Web</translated-address><translated-port>8443</translated-port></destination-translation><disabled>no</disabled></entry></rules></nat>
+            <qos><rules><entry name="Atlas-QoS"><from><member>Trust</member></from><to><member>DMZ</member></to><source><member>any</member></source><destination><member>Atlas-Servers</member></destination><class>2</class></entry></rules></qos>
+            <pbf><rules><entry name="Atlas-PBF"><from><member>Trust</member></from><source><member>any</member></source><destination><member>Atlas-Servers</member></destination><action><forward><egress-interface>ethernet1/2</egress-interface></forward></action></entry></rules></pbf>
+            <decryption><rules><entry name="Atlas-Decrypt-Rule"><from><member>Trust</member></from><to><member>Untrust</member></to><source><member>any</member></source><destination><member>any</member></destination><action>decrypt</action><type><ssl-forward-proxy/></type></entry></rules></decryption>
+            <application-override><rules><entry name="Atlas-App-Override"><from><member>Trust</member></from><to><member>DMZ</member></to><source><member>any</member></source><destination><member>Atlas-Web</member></destination><protocol>tcp</protocol><port>8443</port><application>atlas-app</application></entry></rules></application-override>
+            <authentication><rules><entry name="Atlas-Auth-Rule"><from><member>Trust</member></from><to><member>DMZ</member></to><source><member>any</member></source><destination><member>Atlas-Web</member></destination><authentication-enforcement>Atlas-Auth</authentication-enforcement></entry></rules></authentication>
+            <dos><rules><entry name="Atlas-DoS-Rule"><from><member>Untrust</member></from><to><member>DMZ</member></to><source><member>any</member></source><destination><member>Atlas-Web</member></destination><action><protect><aggregate><profile>Atlas-DoS</profile></aggregate></protect></action></entry></rules></dos>
+            <tunnel-inspect><rules><entry name="Atlas-Tunnel-Inspect"><from><member>VPN</member></from><to><member>Trust</member></to><source><member>any</member></source><destination><member>any</member></destination><action>allow</action></entry></rules></tunnel-inspect>
+          </rulebase>
+        </entry>
+      </vsys>
+    </entry>
+  </devices>
+</config>

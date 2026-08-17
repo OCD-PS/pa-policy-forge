@@ -1,0 +1,183 @@
+{
+  "objects-dictionary": [
+    {"uid": "act-accept", "name": "Accept", "type": "RulebaseAction"},
+    {"uid": "act-drop", "name": "Drop", "type": "RulebaseAction"},
+    {"uid": "track-log", "name": "Log", "type": "Track"},
+    {"uid": "targets", "name": "Policy Targets", "type": "Gateway"},
+    {"uid": "any", "name": "Any", "type": "CpmiAnyObject"},
+    {
+      "uid": "host-dual",
+      "name": "Atlas-Dual-Host",
+      "type": "host",
+      "ipv4-address": "10.30.10.10",
+      "ipv6-address": "2001:db8:30::10",
+      "comments": "Dual-stack application host"
+    },
+    {
+      "uid": "host-nat",
+      "name": "Atlas-NAT-Public",
+      "type": "host",
+      "ipv4-address": "198.51.100.30",
+      "comments": "Public NAT address"
+    },
+    {
+      "uid": "host-web",
+      "name": "Atlas-Web-Internal",
+      "type": "host",
+      "ipv4-address": "10.30.10.20"
+    },
+    {
+      "uid": "net-clients",
+      "name": "Atlas-Clients",
+      "type": "network",
+      "subnet4": "10.30.20.0",
+      "mask-length4": 24,
+      "subnet6": "2001:db8:30:20::",
+      "mask-length6": 64,
+      "comments": "Dual-stack client network"
+    },
+    {
+      "uid": "range-admin",
+      "name": "Atlas-Admin-Range",
+      "type": "address-range",
+      "ipv4-address-first": "10.30.30.10",
+      "ipv4-address-last": "10.30.30.25"
+    },
+    {
+      "uid": "wildcard-lab",
+      "name": "Atlas-Wildcard",
+      "type": "wildcard",
+      "ipv4-address": "10.40.0.0",
+      "ipv4-mask-wildcard": "0.0.255.255"
+    },
+    {
+      "uid": "dns-updates",
+      "name": ".updates.example.test",
+      "domain": ".updates.example.test",
+      "type": "dns-domain"
+    },
+    {
+      "uid": "grp-servers",
+      "name": "Atlas-Servers",
+      "type": "group",
+      "members": [
+        {"uid": "host-dual"},
+        {"uid": "host-web"}
+      ],
+      "comments": "Application server group"
+    },
+    {
+      "uid": "svc-8443",
+      "name": "Atlas-TCP-8443",
+      "type": "service-tcp",
+      "port": "8443",
+      "comments": "Application HTTPS alternate port"
+    },
+    {
+      "uid": "svc-high",
+      "name": "Atlas-TCP-High",
+      "type": "service-tcp",
+      "port": ">1024"
+    },
+    {
+      "uid": "svc-dns",
+      "name": "Atlas-DNS-UDP",
+      "type": "service-udp",
+      "port": "53"
+    },
+    {
+      "uid": "svc-group",
+      "name": "Atlas-App-Services",
+      "type": "service-group",
+      "members": [
+        {"uid": "svc-8443"},
+        {"uid": "svc-dns"}
+      ]
+    },
+    {
+      "uid": "svc-icmp",
+      "name": "Atlas-ICMP",
+      "type": "service-icmp",
+      "icmp-type": 8
+    },
+    {
+      "uid": "office365",
+      "name": "Office365",
+      "type": "application-site"
+    }
+  ],
+  "rulebase": [
+    {
+      "uid": "access-section-1",
+      "type": "access-section",
+      "name": "Atlas Application Rules",
+      "rulebase": [
+        {
+          "uid": "access-1",
+          "type": "access-rule",
+          "name": "Clients to Atlas",
+          "source": [{"uid": "net-clients"}, {"uid": "range-admin"}],
+          "destination": [{"uid": "grp-servers"}],
+          "service": [{"uid": "svc-group"}],
+          "content": [{"uid": "office365"}],
+          "vpn": [{"uid": "any"}],
+          "time": [{"uid": "any"}],
+          "action": {"uid": "act-accept"},
+          "track": {"uid": "track-log"},
+          "install-on": [{"uid": "targets"}],
+          "enabled": true,
+          "comments": "Allow client access and preserve review metadata"
+        },
+        {
+          "uid": "access-2",
+          "type": "access-rule",
+          "name": "Disabled Admin Drop",
+          "source": [{"uid": "range-admin"}],
+          "destination": [{"uid": "host-web"}],
+          "service": [{"uid": "svc-high"}],
+          "action": {"uid": "act-drop"},
+          "track": {"uid": "track-log"},
+          "enabled": false,
+          "comments": "Disabled negative test rule"
+        }
+      ]
+    }
+  ],
+  "nat-rulebase": [
+    {
+      "uid": "nat-section-1",
+      "type": "nat-section",
+      "name": "Atlas NAT",
+      "rulebase": [
+        {
+          "uid": "nat-hide-1",
+          "type": "nat-rule",
+          "name": "Atlas Clients Hide NAT",
+          "original-source": [{"uid": "net-clients"}],
+          "original-destination": [{"uid": "any"}],
+          "original-service": [{"uid": "any"}],
+          "translated-source": [{"uid": "host-nat"}],
+          "translated-destination": "Original",
+          "translated-service": "Original",
+          "method": "hide",
+          "enabled": true,
+          "comments": "Hide clients behind the public address"
+        },
+        {
+          "uid": "nat-static-1",
+          "type": "nat-rule",
+          "name": "Atlas Inbound Static NAT",
+          "original-source": [{"uid": "any"}],
+          "original-destination": [{"uid": "host-nat"}],
+          "original-service": [{"uid": "svc-8443"}],
+          "translated-source": "Original",
+          "translated-destination": [{"uid": "host-web"}],
+          "translated-service": [{"uid": "svc-8443"}],
+          "method": "static",
+          "enabled": true,
+          "comments": "Translate inbound application traffic"
+        }
+      ]
+    }
+  ]
+}

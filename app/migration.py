@@ -100,6 +100,21 @@ class Policy:
     original: dict = field(default_factory=dict)
 
 
+def policy_state(rule: Policy) -> dict:
+    """Normalized editable policy fields used to detect untouched raw PAN-OS rules."""
+    return {
+        "name": rule.name, "policy_type": rule.policy_type,
+        "from_zones": rule.from_zones, "to_zones": rule.to_zones,
+        "source": rule.source, "destination": rule.destination,
+        "application": rule.application, "service": rule.service,
+        "action": rule.action, "disabled": rule.disabled,
+        "description": rule.description, "tags": rule.tags,
+        "source_translation": rule.source_translation,
+        "destination_translation": rule.destination_translation,
+        "nat_type": rule.nat_type, "to_interface": rule.to_interface,
+    }
+
+
 @dataclass
 class MigrationModel:
     vendor: str
@@ -391,34 +406,212 @@ class CheckPointParser(BaseParser):
         if stripped.startswith("<"): return self._xml(text,source_name)
         model=MigrationModel(self.vendor,source_name); model.unsupported.append("Check Point text/dbedit-formaat vereist JSON/XML export voor betrouwbare mapping"); return model
 
-    def _json(self,data,source_name):
-        model=MigrationModel(self.vendor,source_name); items=data if isinstance(data,list) else data.get("objects",data.get("items",[]))
-        if not isinstance(items,list): items=[]
-        for item in items:
-            if not isinstance(item,dict): continue
-            typ=str(item.get("type","")).lower(); name=clean_name(item.get("name",item.get("uid","item"))); ref=str(item.get("uid",name))
-            if typ in {"host","network","address-range","dns-domain"}:
-                value=item.get("ipv4-address") or item.get("subnet4") or item.get("name","")
-                if typ=="network" and item.get("mask-length4") is not None: value=f"{value}/{item['mask-length4']}"
-                if typ=="address-range": value=f"{item.get('ipv4-address-first','')}-{item.get('ipv4-address-last','')}"
-                model.addresses.append(Address(name,str(value),"ip_range" if typ=="address-range" else "fqdn" if typ=="dns-domain" else "ip_netmask",source_ref=ref))
-            elif typ in {"group","network-group"}: model.address_groups.append(AddressGroup(name,[clean_name(m.get("name",m.get("uid","member"))) if isinstance(m,dict) else clean_name(m) for m in item.get("members",[])],source_ref=ref))
-            elif typ in {"service-tcp","service-udp"}: model.services.append(Service(name,"tcp" if typ.endswith("tcp") else "udp",str(item.get("port","1-65535")),source_ref=ref))
-            elif typ in {"service-group"}: model.service_groups.append(ServiceGroup(name,[clean_name(m.get("name",m.get("uid","member"))) if isinstance(m,dict) else clean_name(m) for m in item.get("members",[])],source_ref=ref))
-        packages=data.get("rulebase",data.get("access-layers",[])) if isinstance(data,dict) else []
-        self._walk_rules(packages,model); return deduplicate(model)
+    @staticmethod
+    def _description(item: dict) -> str:
+        return str(item.get("comments") or item.get("comment") or item.get("description") or "").strip()
 
-    def _walk_rules(self,value,model):
+    @staticmethod
+    def _normalise_port(value) -> str:
+        port = str(value or "1-65535").strip().replace(" ", "")
+        match = re.fullmatch(r">(\d+)", port)
+        if match:
+            return f"{min(int(match.group(1)) + 1, 65535)}-65535"
+        match = re.fullmatch(r"<(\d+)", port)
+        if match:
+            return f"1-{max(int(match.group(1)) - 1, 1)}"
+        return port or "1-65535"
+
+    @staticmethod
+    def _object_items(data) -> list[dict]:
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if not isinstance(data, dict):
+            return []
+        result = []
+        for key in ("objects", "items", "objects-dictionary"):
+            value = data.get(key, [])
+            if isinstance(value, dict):
+                value = list(value.values())
+            if isinstance(value, list):
+                result.extend(item for item in value if isinstance(item, dict))
+        return result
+
+    @staticmethod
+    def _name(value, lookup: dict[str, str]) -> str:
+        if isinstance(value, dict):
+            raw = value.get("name") or lookup.get(str(value.get("uid", ""))) or value.get("uid") or "any"
+        else:
+            raw = lookup.get(str(value), value)
+        text = str(raw or "any").strip()
+        if text.casefold() in {"any", "all"}:
+            return "any"
+        if text.casefold() in {"original", "= original"}:
+            return "original"
+        return clean_name(text)
+
+    @classmethod
+    def _names(cls, value, lookup: dict[str, str], default: list[str] | None = None) -> list[str]:
+        if value is None:
+            return list(default or ["any"])
+        values = value if isinstance(value, list) else [value]
+        return unique(cls._name(item, lookup) for item in values) or list(default or ["any"])
+
+    @staticmethod
+    def _append_address_variants(model: MigrationModel, name: str, variants: list[tuple[str, str, str]], description: str, ref: str) -> None:
+        variants = [(suffix, value, value_type) for suffix, value, value_type in variants if value]
+        if len(variants) == 1:
+            _, value, value_type = variants[0]
+            model.addresses.append(Address(name, value, value_type, description, source_ref=ref))
+            return
+        if len(variants) > 1:
+            members = []
+            for suffix, value, value_type in variants:
+                member = clean_name(f"{name}-{suffix}")
+                members.append(member)
+                model.addresses.append(Address(member, value, value_type, description, source_ref=ref))
+            model.address_groups.append(AddressGroup(name, members, description, source_ref=ref))
+
+    def _json(self, data, source_name):
+        model = MigrationModel(self.vendor, source_name)
+        items = self._object_items(data)
+        lookup = {
+            str(item.get("uid")): str(item.get("name") or item.get("uid"))
+            for item in items if item.get("uid")
+        }
+        services_by_name: dict[str, Service] = {}
+        ignored_types = {
+            "rulebaseaction", "track", "gateway", "simple-gateway", "simple-cluster",
+            "package", "access-layer", "nat-section", "access-section", "threat-layer", "cpmianyobject",
+        }
+        for item in items:
+            typ = str(item.get("type", "")).lower()
+            name = clean_name(item.get("name", item.get("uid", "item")))
+            ref = str(item.get("uid", name))
+            description = self._description(item)
+            if typ == "host":
+                ipv4 = str(item.get("ipv4-address", "")); ipv6 = str(item.get("ipv6-address", ""))
+                self._append_address_variants(model, name, [
+                    ("ipv4", cidr(ipv4 + ("/32" if ipv4 and "/" not in ipv4 else "")), "ip_netmask"),
+                    ("ipv6", cidr(ipv6 + ("/128" if ipv6 and "/" not in ipv6 else "")), "ip_netmask"),
+                ], description, ref)
+            elif typ == "network":
+                variants = []
+                if item.get("subnet4"):
+                    mask = item.get("mask-length4")
+                    variants.append(("ipv4", cidr(f"{item['subnet4']}/{mask}" if mask is not None else str(item["subnet4"])), "ip_netmask"))
+                if item.get("subnet6"):
+                    mask = item.get("mask-length6")
+                    variants.append(("ipv6", cidr(f"{item['subnet6']}/{mask}" if mask is not None else str(item["subnet6"])), "ip_netmask"))
+                self._append_address_variants(model, name, variants, description, ref)
+            elif typ == "address-range":
+                variants = []
+                if item.get("ipv4-address-first") and item.get("ipv4-address-last"):
+                    variants.append(("ipv4", f"{item['ipv4-address-first']}-{item['ipv4-address-last']}", "ip_range"))
+                if item.get("ipv6-address-first") and item.get("ipv6-address-last"):
+                    variants.append(("ipv6", f"{item['ipv6-address-first']}-{item['ipv6-address-last']}", "ip_range"))
+                self._append_address_variants(model, name, variants, description, ref)
+            elif typ == "wildcard":
+                address = str(item.get("ipv4-address", "")); mask = str(item.get("ipv4-mask-wildcard", ""))
+                if address and mask:
+                    model.addresses.append(Address(name, f"{address}/{mask}", "ip_wildcard", description, source_ref=ref))
+            elif typ == "dns-domain":
+                domain = str(item.get("domain") or item.get("name") or "").lstrip(".")
+                if domain:
+                    model.addresses.append(Address(name, domain, "fqdn", description, source_ref=ref))
+                    if str(item.get("domain") or item.get("name") or "").startswith("."):
+                        model.warnings.append(f"{ref}: DNS-domain {name} is als exacte PAN-OS FQDN geïmporteerd; controleer subdomeinsemantiek")
+            elif typ in {"group", "network-group"}:
+                model.address_groups.append(AddressGroup(name, self._names(item.get("members", []), lookup, []), description, source_ref=ref))
+            elif typ in {"service-tcp", "service-udp"}:
+                service = Service(name, "tcp" if typ.endswith("tcp") else "udp", self._normalise_port(item.get("port")), description=description, source_ref=ref)
+                model.services.append(service); services_by_name[name] = service
+            elif typ == "service-group":
+                model.service_groups.append(ServiceGroup(name, self._names(item.get("members", []), lookup, []), description, source_ref=ref))
+            elif typ in {"service-icmp", "service-icmp6", "service-other", "application-site", "application-site-group", "access-role"}:
+                model.unsupported.append(f"{ref}: Check Point {typ} {name} vereist application/user mapping")
+            elif typ and typ not in ignored_types:
+                model.unsupported.append(f"{ref}: Check Point objecttype {typ} {name} wordt nog niet geconverteerd")
+
+        if isinstance(data, dict):
+            access = data.get("rulebase", data.get("access-layers", []))
+            nat = data.get("nat-rulebase", data.get("nat-rules", []))
+        else:
+            access, nat = data, []
+        self._walk_rules(access, model, lookup)
+        self._walk_nat_rules(nat, model, lookup, services_by_name)
+        return deduplicate(model)
+
+    def _walk_rules(self, value, model, lookup):
         if isinstance(value,list):
-            for item in value: self._walk_rules(item,model)
+            for item in value: self._walk_rules(item,model,lookup)
         elif isinstance(value,dict):
             typ=str(value.get("type","")).lower()
             if typ in {"access-rule","rule"} or ("source" in value and "destination" in value and "action" in value):
-                names=lambda v:[clean_name(x.get("name",x.get("uid","any"))) if isinstance(x,dict) else clean_name(x) for x in (v if isinstance(v,list) else [v])]
-                action=value.get("action","Accept"); action=action.get("name",action) if isinstance(action,dict) else action
-                model.security_rules.append(Policy(clean_name(value.get("name",value.get("uid","rule"))),source=names(value.get("source",["any"])),destination=names(value.get("destination",["any"])),service=names(value.get("service",["application-default"])),action="allow" if str(action).lower() in {"accept","allow"} else "deny",disabled=not bool(value.get("enabled",True)),source_ref=str(value.get("uid","")),original=value))
+                action = self._name(value.get("action", "Accept"), lookup)
+                description = self._description(value)
+                track = self._names(value.get("track"), lookup, [])
+                install_on = self._names(value.get("install-on"), lookup, [])
+                metadata = []
+                if track and track != ["none"]: metadata.append("Track: " + ", ".join(track))
+                if install_on and install_on != ["policy-targets"]: metadata.append("Install On: " + ", ".join(install_on))
+                if metadata: description = "; ".join(filter(None, [description, *metadata]))
+                for field in ("content", "time", "vpn"):
+                    values = self._names(value.get(field), lookup, [])
+                    if values and values != ["any"]:
+                        model.warnings.append(f"{value.get('uid','')}: access-rule {value.get('name','')} veld {field} vereist review: {', '.join(values)}")
+                for field in ("source-negate", "destination-negate", "service-negate"):
+                    if value.get(field): model.warnings.append(f"{value.get('uid','')}: access-rule {value.get('name','')} gebruikt {field}; handmatige review vereist")
+                model.security_rules.append(Policy(
+                    clean_name(value.get("name",value.get("uid","rule"))),
+                    source=self._names(value.get("source"), lookup, ["any"]),
+                    destination=self._names(value.get("destination"), lookup, ["any"]),
+                    service=self._names(value.get("service"), lookup, ["application-default"]),
+                    action="allow" if action.casefold() in {"accept","allow"} else "deny",
+                    disabled=not bool(value.get("enabled",True)), description=description,
+                    source_ref=str(value.get("uid","")), original=value,
+                ))
             for child in value.values():
-                if isinstance(child,(list,dict)): self._walk_rules(child,model)
+                if isinstance(child,(list,dict)): self._walk_rules(child,model,lookup)
+
+    def _walk_nat_rules(self, value, model, lookup, services_by_name):
+        if isinstance(value, list):
+            for item in value: self._walk_nat_rules(item, model, lookup, services_by_name)
+            return
+        if not isinstance(value, dict):
+            return
+        typ = str(value.get("type", "")).lower()
+        if typ in {"nat-rule", "rule"} or "original-source" in value:
+            translated_source = self._names(value.get("translated-source"), lookup, ["original"])
+            translated_destination = self._names(value.get("translated-destination"), lookup, ["original"])
+            translated_service = self._names(value.get("translated-service"), lookup, ["original"])
+            method = str(value.get("method") or value.get("nat-method") or "static").casefold()
+            source_translation = {}
+            if translated_source and translated_source != ["original"]:
+                if method == "hide":
+                    source_translation = {"dynamic_ip_and_port": {"translated_address": translated_source}}
+                else:
+                    source_translation = {"static_ip": {"translated_address": translated_source[0]}}
+            destination_translation = {}
+            if translated_destination and translated_destination != ["original"]:
+                destination_translation["translated_address"] = translated_destination[0]
+            if translated_service and translated_service != ["original"]:
+                service = services_by_name.get(translated_service[0])
+                if service:
+                    destination_translation["translated_port"] = service.port
+                else:
+                    model.warnings.append(f"{value.get('uid','')}: translated service {translated_service[0]} vereist handmatige port mapping")
+            model.nat_rules.append(Policy(
+                clean_name(value.get("name", value.get("uid", "nat-rule"))), policy_type="nat",
+                source=self._names(value.get("original-source"), lookup, ["any"]),
+                destination=self._names(value.get("original-destination"), lookup, ["any"]),
+                service=self._names(value.get("original-service"), lookup, ["any"]),
+                disabled=not bool(value.get("enabled", True)), description=self._description(value),
+                source_translation=source_translation, destination_translation=destination_translation,
+                source_ref=str(value.get("uid", "")), original=value,
+            ))
+        for child in value.values():
+            if isinstance(child, (list, dict)):
+                self._walk_nat_rules(child, model, lookup, services_by_name)
 
     def _xml(self,text,source_name):
         root=SafeET.fromstring(text); model=MigrationModel(self.vendor,source_name)
@@ -637,8 +830,13 @@ class PanosConfigParser(BaseParser):
                         description=entry.findtext("./description") or "", tags=_xml_members(entry, "./tag"),
                         source_translation=_xml_payload(entry.find("./source-translation")), destination_translation=_xml_payload(entry.find("./destination-translation")),
                         nat_type=entry.findtext("./nat-type") or "ipv4", to_interface=entry.findtext("./to-interface") or "any",
-                        source_ref=f"{owner} · {rulebase}", original={"owner": owner, "rulebase": rulebase},
+                        source_ref=f"{owner} · {rulebase}",
                     )
+                    rule.original = {
+                        "owner": owner, "rulebase": rulebase,
+                        "xml": ET.tostring(entry, encoding="unicode"),
+                        "normalized": policy_state(rule),
+                    }
                     target.append(rule)
 
 
@@ -1117,24 +1315,41 @@ def panos_fragment(model: MigrationModel, scope: str = "vsys1", panorama: bool =
         e=ET.SubElement(service_groups,"entry",{"name":item.name}); members(ET.SubElement(e,"members"),item.members)
         if item.description: ET.SubElement(e,"description").text=item.description
         if item.tags: members(ET.SubElement(e,"tag"),item.tags)
+    def replace_members(entry, tag, values):
+        for child in list(entry.findall(f"./{tag}")): entry.remove(child)
+        members(ET.SubElement(entry,tag),values)
+    def replace_text(entry, tag, value):
+        for child in list(entry.findall(f"./{tag}")): entry.remove(child)
+        if value is not None: ET.SubElement(entry,tag).text=str(value)
     for kind,rules in (("security",model.security_rules),("nat",model.nat_rules)):
         root=ET.SubElement(ET.SubElement(rb,kind),"rules")
         for rule in rules:
-            e=ET.SubElement(root,"entry",{"name":rule.name})
-            for tag,values in (("from",rule.from_zones),("to",rule.to_zones),("source",rule.source),("destination",rule.destination)): members(ET.SubElement(e,tag),values)
+            raw_xml=str(rule.original.get("xml", "")) if isinstance(rule.original,dict) else ""
+            try: e=SafeET.fromstring(raw_xml) if raw_xml else ET.Element("entry")
+            except Exception: e=ET.Element("entry")
+            e.set("name",rule.name)
+            untouched=bool(raw_xml and rule.original.get("normalized")==policy_state(rule))
+            if untouched:
+                root.append(e)
+                continue
+            for tag,values in (("from",rule.from_zones),("to",rule.to_zones),("source",rule.source),("destination",rule.destination)): replace_members(e,tag,values)
             if kind=="security":
-                members(ET.SubElement(e,"application"),rule.application); members(ET.SubElement(e,"service"),rule.service); ET.SubElement(e,"action").text=rule.action
+                replace_members(e,"application",rule.application); replace_members(e,"service",rule.service); replace_text(e,"action",rule.action)
             else:
-                ET.SubElement(e,"service").text=(rule.service or ["any"])[0]
-                ET.SubElement(e,"nat-type").text=rule.nat_type or "ipv4"
-                ET.SubElement(e,"to-interface").text=rule.to_interface or "any"
+                replace_text(e,"service",(rule.service or ["any"])[0])
+                replace_text(e,"nat-type",rule.nat_type or "ipv4")
+                replace_text(e,"to-interface",rule.to_interface or "any")
+                for child in list(e.findall("./source-translation")): e.remove(child)
+                for child in list(e.findall("./destination-translation")): e.remove(child)
                 if rule.source_translation:
                     st=ET.SubElement(e,"source-translation"); _append_xml_dict(st,rule.source_translation)
                 if rule.destination_translation:
                     dt=ET.SubElement(e,"destination-translation"); _append_xml_dict(dt,rule.destination_translation)
+            for child in list(e.findall("./tag")): e.remove(child)
             if rule.tags: members(ET.SubElement(e,"tag"),rule.tags)
-            ET.SubElement(e,"disabled").text="yes" if rule.disabled else "no"
-            if rule.description: ET.SubElement(e,"description").text=rule.description
+            replace_text(e,"disabled","yes" if rule.disabled else "no")
+            replace_text(e,"description",rule.description if rule.description else None)
+            root.append(e)
     return ET.tostring(config,encoding="utf-8",xml_declaration=True)
 
 

@@ -3,6 +3,7 @@ import io
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 os.environ.setdefault("PPF_DATA_DIR", tempfile.mkdtemp(prefix="forge-migration-test-"))
 os.environ.setdefault("PPF_SYSLOG_PORT", "55149")
@@ -10,6 +11,8 @@ os.environ.setdefault("PPF_BOOTSTRAP_PASSWORD", "unit-test-bootstrap-password")
 
 from app.migration import Address, MigrationModel, PARSERS, MigrationError, apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, migration_base_xml, migration_zone_names, parse_vendor, panos_fragment, reconcile_model, scm_items
 from app import main
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
 class MigrationTests(unittest.TestCase):
@@ -141,6 +144,77 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         self.assertEqual(model.addresses[0].name, "srv")
         self.assertEqual(model.address_groups[0].members, ["srv", "db"])
         self.assertEqual(model.security_rules[0].action, "allow")
+
+    def test_checkpoint_rich_export_maps_dual_stack_access_and_nat(self):
+        source = (FIXTURES / "checkpoint-rich.json").read_bytes()
+        model = parse_vendor("checkpoint", source, "checkpoint-rich.json")
+        self.assertEqual(model.counts()["addresses"], 9)
+        self.assertEqual(model.counts()["address_groups"], 3)
+        self.assertEqual(model.counts()["services"], 3)
+        self.assertEqual(model.counts()["service_groups"], 1)
+        self.assertEqual(model.counts()["security_rules"], 2)
+        self.assertEqual(model.counts()["nat_rules"], 2)
+        self.assertEqual(next(group for group in model.address_groups if group.name == "Atlas-Dual-Host").members, ["Atlas-Dual-Host-ipv4", "Atlas-Dual-Host-ipv6"])
+        self.assertEqual(next(service for service in model.services if service.name == "Atlas-TCP-High").port, "1025-65535")
+        allow = next(rule for rule in model.security_rules if rule.name == "Clients-to-Atlas")
+        self.assertEqual(allow.source, ["Atlas-Clients", "Atlas-Admin-Range"])
+        self.assertEqual(allow.destination, ["Atlas-Servers"])
+        self.assertEqual(allow.service, ["Atlas-App-Services"])
+        self.assertEqual(allow.action, "allow")
+        self.assertIn("Track: Log", allow.description)
+        disabled = next(rule for rule in model.security_rules if rule.name == "Disabled-Admin-Drop")
+        self.assertTrue(disabled.disabled)
+        self.assertEqual(disabled.action, "deny")
+        hide = next(rule for rule in model.nat_rules if rule.name == "Atlas-Clients-Hide-NAT")
+        self.assertEqual(hide.source_translation, {"dynamic_ip_and_port": {"translated_address": ["Atlas-NAT-Public"]}})
+        inbound = next(rule for rule in model.nat_rules if rule.name == "Atlas-Inbound-Static-NAT")
+        self.assertEqual(inbound.destination_translation, {"translated_address": "Atlas-Web-Internal", "translated_port": "8443"})
+        self.assertTrue(any("application/user mapping" in item for item in model.unsupported))
+        self.assertTrue(any("veld content vereist review" in item for item in model.warnings))
+
+        base = migration_base_xml(model, "vsys1")
+        merged, plan = merge_model_into_panos_xml(base, model, "vsys1")
+        root, _ = main.parse_snapshot(merged, expected_kind="panos")
+        self.assertEqual(len(root.findall(".//vsys/entry/rulebase/security/rules/entry")), 2)
+        self.assertEqual(len(root.findall(".//vsys/entry/rulebase/nat/rules/entry")), 2)
+        self.assertIsNotNone(root.find(".//vsys/entry/address/entry[@name='Atlas-Wildcard']/ip-wildcard"))
+        self.assertGreater(plan["create"], 15)
+
+    def test_panos_to_panos_rich_config_preserves_every_supported_family(self):
+        base = (FIXTURES / "panos-rich-base.xml").read_bytes()
+        source = (FIXTURES / "panos-rich-source.xml").read_bytes()
+        model = parse_vendor("panos", source, "panos-rich-source.xml")
+        expected_counts = {
+            "addresses": 4, "address_groups": 1, "services": 2, "service_groups": 1,
+            "security_rules": 1, "nat_rules": 1, "interfaces": 5, "zones": 2,
+            "applications": 1, "application_groups": 1, "application_filters": 1,
+            "tags": 1, "regions": 1, "schedules": 1, "external_dynamic_lists": 1,
+            "custom_url_categories": 1, "security_profiles": 9,
+            "security_profile_groups": 1, "log_forwarding_profiles": 1,
+            "authentication_enforcement": 1, "qos_rules": 1, "pbf_rules": 1,
+            "decryption_rules": 1, "application_override_rules": 1,
+            "authentication_rules": 1, "dos_rules": 1, "tunnel_inspection_rules": 1,
+            "vlans": 1, "virtual_routers": 1, "logical_routers": 1,
+            "virtual_wires": 1, "ipsec_tunnels": 1, "ike_gateways": 1,
+            "network_profiles": 3, "globalprotect_portals": 1,
+            "globalprotect_gateways": 1, "device_configuration": 1,
+        }
+        counts = model.counts()
+        for kind, expected in expected_counts.items():
+            self.assertEqual(counts.get(kind), expected, kind)
+
+        merged, plan = merge_model_into_panos_xml(base, model, "vsys1")
+        root, snapshot = main.parse_snapshot(merged, expected_kind="panos")
+        self.assertEqual(snapshot.vsys, ["vsys1"])
+        self.assertEqual(len(root.findall(".//devices/entry/network/interface/*/entry")), 7)
+        self.assertEqual({entry.get("name") for entry in root.findall(".//vsys/entry/zone/entry")}, {"Trust", "Untrust", "DMZ", "VPN"})
+        self.assertIsNotNone(root.find(".//vsys/entry/rulebase/security/rules/entry[@name='Atlas-DMZ-Allow']/profile-setting"))
+        self.assertEqual(root.findtext(".//vsys/entry/rulebase/security/rules/entry[@name='Atlas-DMZ-Allow']/log-setting"), "Atlas-Log")
+        self.assertIsNotNone(root.find(".//devices/entry/network/tunnel/ipsec/entry[@name='Atlas-IPSec']"))
+        self.assertIsNotNone(root.find(".//vsys/entry/profiles/url-filtering/entry[@name='Atlas-URL']"))
+        self.assertIsNotNone(root.find(".//vsys/entry/rulebase/pbf/rules/entry[@name='Atlas-PBF']"))
+        self.assertIsNotNone(root.find(".//devices/entry/plugins/entry[@name='atlas-plugin']"))
+        self.assertGreater(plan["create"], 40)
 
     def test_srx_set_commands_are_parsed(self):
         model = parse_vendor("juniper-srx", b'''set security address-book global address app1 198.51.100.10/32
