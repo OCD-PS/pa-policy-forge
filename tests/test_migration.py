@@ -11,7 +11,7 @@ os.environ.setdefault("PPF_DATA_DIR", tempfile.mkdtemp(prefix="forge-migration-t
 os.environ.setdefault("PPF_SYSLOG_PORT", "55149")
 os.environ.setdefault("PPF_BOOTSTRAP_PASSWORD", "unit-test-bootstrap-password")
 
-from app.migration import Address, MigrationModel, PARSERS, MigrationError, apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, migration_base_xml, migration_collision_report, migration_zone_names, parse_vendor, panos_fragment, reconcile_model, scm_items, set_panos_ha_mode
+from app.migration import Address, MigrationModel, PARSERS, MigrationError, apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, migration_base_xml, migration_collision_report, migration_review_findings, migration_zone_names, parse_vendor, panos_fragment, reconcile_model, scm_items, set_panos_ha_mode
 from app import main
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -127,6 +127,37 @@ end''', "forti.conf")
         nat_item = next(item for item in scm_items(model) if item["kind"] == "policy:nat")
         self.assertEqual(nat_item["payload"]["destination_translation"]["translated_port"], "443")
 
+    def test_fortinet_crypto_blocks_are_skipped_without_parsing_or_retention(self):
+        config = b'''config vpn certificate local
+edit "factory-certificate"
+set private-key "-----BEGIN ENCRYPTED PRIVATE KEY-----
+THIS-MUST-NEVER-BE-RETAINED
+-----END ENCRYPTED PRIVATE KEY-----"
+set certificate "-----BEGIN CERTIFICATE-----
+THIS-CERTIFICATE-MUST-BE-REENTERED
+-----END CERTIFICATE-----"
+next
+end
+config firewall address
+edit "web01"
+set subnet 10.0.0.10 255.255.255.255
+next
+end'''
+        model = parse_vendor("fortinet", config, "fortigate-with-crypto.conf")
+        serialized = json.dumps(model.as_dict())
+        self.assertEqual(model.addresses[0].value, "10.0.0.10/32")
+        self.assertNotIn("THIS-MUST-NEVER-BE-RETAINED", serialized)
+        self.assertNotIn("THIS-CERTIFICATE-MUST-BE-REENTERED", serialized)
+        self.assertTrue(any("Fortinet cryptomateriaal overgeslagen" in message for message in model.warnings))
+        review = migration_review_findings(model)
+        self.assertTrue(any(item["code"] == "fortinet-crypto-reentry" for item in review["findings"]))
+
+    def test_panos_to_panos_keeps_existing_encrypted_material_opaque(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><deviceconfig><system><opaque-secret>ENCRYPTED-PANOS-VALUE</opaque-secret></system></deviceconfig><vsys><entry name="vsys1"><address><entry name="server"><ip-netmask>192.0.2.10/32</ip-netmask></entry></address><rulebase/></entry></vsys></entry></devices></config>'''
+        model = parse_vendor("panos", source, "panos.xml")
+        merged, _ = merge_model_into_panos_xml(source, model, "vsys1")
+        self.assertIn(b"ENCRYPTED-PANOS-VALUE", merged)
+
     def test_asa_acl_and_object_are_parsed(self):
         model = parse_vendor("cisco-asa", b'''object network WEB
  host 192.0.2.10
@@ -146,6 +177,24 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         self.assertEqual(model.addresses[0].name, "srv")
         self.assertEqual(model.address_groups[0].members, ["srv", "db"])
         self.assertEqual(model.security_rules[0].action, "allow")
+
+    def test_checkpoint_unknown_action_is_disabled_and_blocks_review(self):
+        data = {"rulebase": [{"type": "access-rule", "uid": "layer-1", "name": "Nested Layer", "action": "Inner Layer"}]}
+        model = parse_vendor("checkpoint", json.dumps(data).encode(), "checkpoint.json")
+        self.assertTrue(model.security_rules[0].disabled)
+        self.assertEqual(model.security_rules[0].action, "deny")
+        self.assertIn("REVIEW:", model.security_rules[0].description)
+        self.assertTrue(any("niet-ondersteunde Check Point actie" in message for message in model.warnings))
+        review = migration_review_findings(model)
+        self.assertTrue(any(item["code"] == "unsupported-actions" and item["severity"] == "critical" for item in review["findings"]))
+
+    def test_review_findings_always_require_engineer_acknowledgement(self):
+        model = MigrationModel("generic", "source", security_rules=[main.Policy("allow-any", disabled=False)])
+        review = migration_review_findings(model)
+        self.assertFalse(review["ready_for_push"])
+        self.assertEqual(review["status"], "review_required")
+        self.assertTrue(any(item["code"] == "engineer-review" for item in review["findings"]))
+        self.assertTrue(any(item["code"] == "zone-mapping" for item in review["findings"]))
 
     def test_checkpoint_rich_export_maps_dual_stack_access_and_nat(self):
         source = (FIXTURES / "checkpoint-rich.json").read_bytes()
@@ -489,6 +538,57 @@ end''', "atlas-a.conf")
         self.assertIn("Migratieprojecten", page)
         self.assertNotIn("Expedition-inspired", page)
 
+    def test_candidate_apply_is_blocked_server_side_without_review_acknowledgement(self):
+        stamp = main.now()
+        with main.db() as conn:
+            profile_id = conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("PANOS review gate test", "panos", json.dumps({"vsys": "vsys1"}), stamp, stamp),
+            ).lastrowid
+            project_id = conn.execute(
+                "INSERT INTO migration_projects(name,target_profile_id,created_at,updated_at) VALUES(?,?,?,?)",
+                ("review-gate", profile_id, stamp, stamp),
+            ).lastrowid
+            before = conn.execute("SELECT COUNT(*) FROM config_workspaces WHERE profile_id=?", (profile_id,)).fetchone()[0]
+        model = MigrationModel("generic", "review-source", addresses=[Address("review-host", "192.0.2.55/32")])
+        draft_id = "review-gate-test"
+        draft_path = main.OBJECT_DRAFTS / f"migration-{draft_id}.json"
+        draft_path.write_text(json.dumps({
+            "project_id": project_id,
+            "target_profile_id": profile_id,
+            "source_ids": [],
+            "model": model.as_dict(),
+            "fingerprint": model.fingerprint(),
+            "plan": {},
+            "review": migration_review_findings(model),
+            "created_at": stamp,
+        }))
+        client = main.app.test_client()
+        with main.app.test_request_context("/", base_url="https://forge.test"):
+            cookie_name = main.app.config["SESSION_COOKIE_NAME"]
+            serializer = main.app.session_interface.get_signing_serializer(main.app)
+            client.set_cookie(cookie_name, serializer.dumps({"user_id": 1, "username": "admin", "csrf": "migration-test-csrf"}), domain="forge.test", secure=True)
+
+        blocked = client.post(
+            f"/migration/drafts/{draft_id}/apply",
+            base_url="https://forge.test",
+            data={"csrf": "migration-test-csrf"},
+        )
+        self.assertEqual(blocked.status_code, 302)
+        with main.db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM config_workspaces WHERE profile_id=?", (profile_id,)).fetchone()[0], before)
+        self.assertTrue(draft_path.exists())
+
+        accepted = client.post(
+            f"/migration/drafts/{draft_id}/apply",
+            base_url="https://forge.test",
+            data={"csrf": "migration-test-csrf", "review_acknowledged": "reviewed"},
+        )
+        self.assertEqual(accepted.status_code, 302)
+        with main.db() as conn:
+            self.assertGreater(conn.execute("SELECT COUNT(*) FROM config_workspaces WHERE profile_id=?", (profile_id,)).fetchone()[0], before)
+        self.assertFalse(draft_path.exists())
+
     def test_active_active_project_renders_and_exports_two_outputs(self):
         stamp = main.now()
         with main.db() as conn:
@@ -545,6 +645,8 @@ end''', "atlas-a.conf")
         self.assertIn("Search &amp; Merge", page)
         self.assertIn("dns-a", page)
         self.assertIn("dns-b", page)
+        self.assertIn("REVIEW VERPLICHT", page)
+        self.assertIn("Niet klaar voor push", page)
 
     def test_panos_upload_becomes_full_base_workspace_and_ui_defaults_are_checked(self):
         stamp = main.now()

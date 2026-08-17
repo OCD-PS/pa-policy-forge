@@ -330,8 +330,21 @@ class FortinetParser(BaseParser):
     vendor = "fortinet"
     label = "Fortinet FortiGate"
 
+    # These sections can contain multiline encrypted certificates, private
+    # keys and SSH keys.  They are deliberately treated as opaque input: a
+    # migration must never try to parse, copy or decrypt them.  The target
+    # administrator has to provision fresh key material after migration.
+    OPAQUE_CRYPTO_SECTIONS = {
+        "vpn certificate ca",
+        "vpn certificate remote",
+        "vpn certificate local",
+        "firewall ssh local-key",
+        "firewall ssh local-ca",
+    }
+
     def parse(self, text: str, source_name: str) -> MigrationModel:
         model = MigrationModel(self.vendor, source_name); section = ""; current = None; values = {}
+        skipped_crypto_entries: set[tuple[str, str]] = set()
         def flush():
             nonlocal current, values
             if current is None: return
@@ -370,11 +383,35 @@ class FortinetParser(BaseParser):
         for number, line in self.lines(text):
             if line.startswith("config "): flush(); section = line[7:].strip(); continue
             if line == "end": flush(); section = ""; continue
-            if line.startswith("edit "): flush(); current = unquote(line[5:]); values = {"_ref": f"line {number}"}; continue
+            if line.startswith("edit "):
+                flush(); current = unquote(line[5:]); values = {"_ref": f"line {number}"}
+                if section in self.OPAQUE_CRYPTO_SECTIONS:
+                    skipped_crypto_entries.add((section, str(current)))
+                continue
             if line == "next": flush(); continue
             if current is not None and line.startswith("set "):
-                parts = shlex.split(line); values[parts[1]] = " ".join(parts[2:]) if len(parts)>2 else ""
-        flush(); return deduplicate(model)
+                if section in self.OPAQUE_CRYPTO_SECTIONS:
+                    continue
+                try:
+                    parts = shlex.split(line)
+                except ValueError:
+                    # Do not abort an otherwise usable import because an
+                    # unknown vendor field contains multiline quoting.  The
+                    # field name is safe to report; its value is never kept.
+                    field_name = line[4:].split(None, 1)[0] if line[4:].strip() else "onbekend"
+                    model.warnings.append(
+                        f"Fortinet veld {field_name} in {section or 'onbekende sectie'} overgeslagen wegens ongeldige of multiline quoting"
+                    )
+                    continue
+                if len(parts) >= 2:
+                    values[parts[1]] = " ".join(parts[2:]) if len(parts)>2 else ""
+        flush()
+        if skipped_crypto_entries:
+            model.warnings.append(
+                "Fortinet cryptomateriaal overgeslagen: "
+                f"{len(skipped_crypto_entries)} certificaat/private-key/SSH-key object(en) moeten opnieuw op het target worden ingegeven"
+            )
+        return deduplicate(model)
 
 
 class JuniperSrxParser(BaseParser):
@@ -652,6 +689,10 @@ class CheckPointParser(BaseParser):
             current_source = str(value.get("_source_file") or source_file)
             if typ == "access-rule":
                 action = self._name(value.get("action", "Accept"), lookup)
+                action_key = action.casefold()
+                supported_allow = action_key in {"accept", "allow"}
+                supported_deny = action_key in {"drop", "deny", "reject"}
+                unsupported_action = not (supported_allow or supported_deny)
                 description = self._description(value)
                 track = self._names(value.get("track"), lookup, [])
                 install_on = self._names(value.get("install-on"), lookup, [])
@@ -665,13 +706,18 @@ class CheckPointParser(BaseParser):
                         model.warnings.append(f"{value.get('uid','')}: access-rule {value.get('name','')} veld {field} vereist review: {', '.join(values)}")
                 for field in ("source-negate", "destination-negate", "service-negate"):
                     if value.get(field): model.warnings.append(f"{value.get('uid','')}: access-rule {value.get('name','')} gebruikt {field}; handmatige review vereist")
+                if unsupported_action:
+                    model.warnings.append(
+                        f"{value.get('uid','')}: niet-ondersteunde Check Point actie {action or 'onbekend'}; regel is disabled en vereist handmatige mapping"
+                    )
+                    description = "; ".join(filter(None, [f"REVIEW: actie {action or 'onbekend'} niet gemapt", description]))
                 model.security_rules.append(Policy(
                     self._unique_rule_name(model.security_rules, value, current_source, "rule"),
                     source=self._names(value.get("source"), lookup, ["any"]),
                     destination=self._names(value.get("destination"), lookup, ["any"]),
                     service=self._names(value.get("service"), lookup, ["application-default"]),
-                    action="allow" if action.casefold() in {"accept","allow"} else "deny",
-                    disabled=not bool(value.get("enabled",True)), description=description,
+                    action="allow" if supported_allow else "deny",
+                    disabled=not bool(value.get("enabled",True)) or unsupported_action, description=description,
                     source_ref=f"{current_source}:{value.get('uid','')}".strip(":"), original=value,
                 ))
             for child in value.values():
@@ -1364,6 +1410,113 @@ def migration_analysis(model: MigrationModel) -> dict:
         "unused_services":sorted(service_names-used_services),
         "unused_service_groups":sorted(service_group_names-used_services),
         "unresolved_references":sorted(unresolved), "duplicate_rules":duplicate_rules,
+    }
+
+
+def migration_review_findings(model: MigrationModel) -> dict:
+    """Return the mandatory, conservative review gate for a migration model.
+
+    This deliberately does not decide that a migration is safe.  It highlights
+    what can be detected automatically and always requires a human engineer to
+    acknowledge the complete candidate before it can be written.
+    """
+    analysis = migration_analysis(model)
+    findings: list[dict[str, object]] = []
+
+    def add(severity: str, code: str, title: str, detail: str, count: int = 0) -> None:
+        findings.append({
+            "severity": severity,
+            "code": code,
+            "title": title,
+            "detail": detail,
+            "count": int(count),
+        })
+
+    unresolved = len(analysis["unresolved_references"])
+    if unresolved:
+        add(
+            "critical", "unresolved-references", "Onopgeloste referenties",
+            "Objecten, services of groepen ontbreken nog op het doel en moeten worden gemapt.", unresolved,
+        )
+
+    if model.unsupported:
+        add(
+            "critical", "unsupported-items", "Niet automatisch geconverteerd",
+            "Niet-ondersteunde configuratie is niet stilzwijgend meegenomen en vereist een handmatige beslissing.",
+            len(model.unsupported),
+        )
+
+    unsupported_actions = sum(
+        1 for message in model.warnings if "niet-ondersteunde Check Point actie" in message
+    )
+    if unsupported_actions:
+        add(
+            "critical", "unsupported-actions", "Policy-acties niet gemapt",
+            "Deze regels zijn veiligheidshalve disabled; kies voor elke regel bewust de correcte actie.",
+            unsupported_actions,
+        )
+
+    policies = [*model.security_rules, *model.nat_rules]
+    any_zone_rules = sum(
+        1 for rule in policies
+        if "any" in rule.from_zones or "any" in rule.to_zones
+    )
+    if any_zone_rules:
+        severity = "critical" if policies and any_zone_rules == len(policies) else "warning"
+        add(
+            severity, "zone-mapping", "Zone-mapping nakijken",
+            "Policies met een bron- of doelzone 'any' kunnen uit ontbrekende vendorcontext komen.", any_zone_rules,
+        )
+
+    if model.nat_rules:
+        add(
+            "warning", "nat-review", "NAT handmatig valideren",
+            "Controleer volgorde, interfaces, vertaalmethode, adressen en poorten op het doel.", len(model.nat_rules),
+        )
+
+    duplicate_rules = len(analysis["duplicate_rules"])
+    if duplicate_rules:
+        add(
+            "warning", "duplicate-policies", "Mogelijk dubbele policies",
+            "Exact gelijke signatures worden getoond, maar worden niet automatisch verwijderd.", duplicate_rules,
+        )
+
+    skipped_crypto = any("Fortinet cryptomateriaal overgeslagen" in message for message in model.warnings)
+    if skipped_crypto:
+        add(
+            "warning", "fortinet-crypto-reentry", "Certificaten en sleutels opnieuw ingeven",
+            "Fortinet certificaten, private keys en SSH keys zijn bewust niet gekopieerd of ontsleuteld.",
+        )
+
+    other_warnings = sum(
+        1 for message in model.warnings
+        if "niet-ondersteunde Check Point actie" not in message
+        and "Fortinet cryptomateriaal overgeslagen" not in message
+    )
+    if other_warnings:
+        add(
+            "warning", "parser-warnings", "Parsermeldingen nakijken",
+            "De bron bevat velden of context die niet volledig automatisch konden worden beoordeeld.", other_warnings,
+        )
+
+    disabled_rules = sum(1 for rule in policies if rule.disabled)
+    if disabled_rules:
+        add(
+            "info", "disabled-policies", "Disabled policies",
+            "Controleer of deze regels disabled moeten blijven op het doel.", disabled_rules,
+        )
+
+    add(
+        "required", "engineer-review", "Volledige engineer review verplicht",
+        "Automatische checks zijn geen validatie van policy-intentie, rule order, routing, NAT of bereikbaarheid.",
+    )
+    return {
+        "status": "review_required",
+        "ready_for_push": False,
+        "findings": findings,
+        "critical": sum(1 for item in findings if item["severity"] == "critical"),
+        "warnings": sum(1 for item in findings if item["severity"] == "warning"),
+        "analysis": analysis,
     }
 
 

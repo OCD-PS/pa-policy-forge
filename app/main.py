@@ -45,7 +45,7 @@ from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_sin
 from app.migration import (
     MIGRATION_KIND_LABELS, Address, AddressGroup, MigrationError, MigrationModel, PARSERS, Policy, Service, ServiceGroup,
     apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, migration_base_xml, migration_zone_names,
-    item_selector, merge_member_names, migration_analysis, migration_item_semantic, migration_search, model_collections, panos_fragment, parse_vendor, raw_item_payload, reconcile_model, scm_items,
+    item_selector, merge_member_names, migration_analysis, migration_item_semantic, migration_review_findings, migration_search, model_collections, panos_fragment, parse_vendor, raw_item_payload, reconcile_model, scm_items,
 )
 from app.offline_config import (
     OBJECT_NODES, POLICY_NODES, OfflineConfigError, available_scopes, available_templates,
@@ -2918,6 +2918,7 @@ def migration_project(project_id):
         sources=sources, workspaces=workspaces, migration_kind_labels=MIGRATION_KIND_LABELS,
         available_kinds={key:len(value) for key,value in model_collections(combined).items() if value},
         merge_inventory=inventory, merge_rules=merge_rules, migration_analysis=migration_analysis(combined),
+        migration_review=migration_review_findings(combined) if source_ids else None,
         merge_query=merge_query, search_results=migration_search(combined,merge_query), transform_rules=transform_rules,
         configuration_items=configuration_items, outputs=outputs,
     )
@@ -3120,12 +3121,13 @@ def migration_merge_preview(project_id):
                 base_xml, model, scope, panorama, settings.get("rulebase", "pre")
             )
         draft_id = secrets.token_urlsafe(18)
-        draft = {"project_id": project_id, "target_profile_id": project["target_profile_id"], "source_ids": source_ids, "model": model.as_dict(), "fingerprint": model.fingerprint(), "plan": plan, "created_at": now()}
+        review = migration_review_findings(model)
+        draft = {"project_id": project_id, "target_profile_id": project["target_profile_id"], "source_ids": source_ids, "model": model.as_dict(), "fingerprint": model.fingerprint(), "plan": plan, "review": review, "created_at": now()}
         path = OBJECT_DRAFTS / f"migration-{draft_id}.json"; path.write_text(json.dumps(draft)); path.chmod(0o600)
         counts = model.counts()
         if profile["target_type"] != "scm" and not workspace:
             counts["zones"] = len(migration_zone_names(model))
-        return render_template("migration_preview.html", project=project, model=model, counts=counts, plan=plan, draft_id=draft_id)
+        return render_template("migration_preview.html", project=project, model=model, counts=counts, plan=plan, review=review, draft_id=draft_id)
     except Exception as exc:
         flash(f"Merge-preview mislukt: {exc}", "error")
         return redirect(url_for("migration_project", project_id=project_id))
@@ -3142,6 +3144,17 @@ def migration_merge_apply(draft_id):
     try:
         model = MigrationModel.from_dict(draft["model"])
         if not hmac.compare_digest(model.fingerprint(), draft["fingerprint"]): raise MigrationError("Merge-draft is gewijzigd")
+        review = migration_review_findings(model)
+        stored_review = draft.get("review")
+        if stored_review and not hmac.compare_digest(
+            hashlib.sha256(json.dumps(review, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            hashlib.sha256(json.dumps(stored_review, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+        ):
+            raise MigrationError("Reviewresultaat is gewijzigd; maak een nieuwe preview")
+        if request.form.get("review_acknowledged") != "reviewed":
+            audit("migration-review-blocked", f"project={project['id']} draft={draft_id}")
+            raise MigrationError("Bevestig eerst dat de volledige configuratie handmatig is nagekeken")
+        audit("migration-review-acknowledged", f"project={project['id']} draft={draft_id} findings={len(review['findings'])}")
         with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (draft["target_profile_id"],)).fetchone()
         if not profile: raise MigrationError("Targetprofiel bestaat niet meer")
         if profile["target_type"] == "scm":
