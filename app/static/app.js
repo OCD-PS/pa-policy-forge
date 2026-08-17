@@ -390,7 +390,7 @@
     var valuePicker = document.querySelector("[data-policy-value-picker]"); var policyCatalogNode = document.querySelector("[data-policy-catalog]");
     if (valuePicker && policyCatalogNode) {
       var policyCatalog = JSON.parse(policyCatalogNode.textContent || "[]"); var pickerTarget = null; var pickerSelections = new Set();
-      var bulkFormForCatalog = document.querySelector("[data-policy-bulk-form]"); var catalogProfileMatch = bulkFormForCatalog ? bulkFormForCatalog.action.match(/\/policies\/(\d+)\/preview/) : null; var workspaceApplicationState = document.querySelector("[data-workspace-application-catalog]"); var applicationPolls = 0;
+      var bulkFormForCatalog = document.querySelector("[data-policy-bulk-form]"); var catalogFormAction = bulkFormForCatalog ? (bulkFormForCatalog.getAttribute("action") || "") : ""; var catalogProfileMatch = catalogFormAction.match(/\/policies\/(\d+)\/preview/); var workspaceApplicationState = document.querySelector("[data-workspace-application-catalog]"); var applicationPolls = 0;
       var pickerKinds = {from:["zones"],to:["zones"],source:["addresses","address-groups"],destination:["addresses","address-groups"],application:["applications","application-groups","application-filters"],service:["services","service-groups"],tag:["tags"],source_user:["$current"],destination_user:["$current"],source_hip:["$current"],destination_hip:["$current"],category:["$current"],schedule:["$current"],log_setting:["$current"],profile_group:["$current"]};
       function addPickedValue(name) { if (!pickerTarget) return; if (typeof pickerTarget._addTagValue === "function") { pickerTarget._addTagValue(name); } else if (typeof pickerTarget._addTokenValue === "function") { pickerTarget._addTokenValue(name); } else if (pickerTarget.hasAttribute("data-bulk-entry")) { pickerTarget.value = name; pickerTarget.closest("[data-bulk-field]").querySelector("[data-bulk-add-button]").click(); } else { var values = pickerTarget.value.split(",").map(function (value) { return value.trim(); }).filter(Boolean); if (!values.includes(name)) values.push(name); pickerTarget.value = values.join(", "); } }
       function updatePickerCount() { var count = valuePicker.querySelector("[data-policy-picker-selected-count]"); if (count) count.textContent = pickerSelections.size; }
@@ -399,7 +399,11 @@
       function showApplicationStatus(data) { var status = valuePicker.querySelector("[data-policy-picker-status]"); if (!status) return; status.textContent = data.error ? "Applicatiecatalogus kon niet worden bijgewerkt." : data.ready ? data.items.length + " applicaties beschikbaar." : data.refreshing ? "Application database wordt geladen…" : "Geen application database beschikbaar."; }
       function loadApplications() { var catalogUrl = catalogProfileMatch ? "/profiles/" + catalogProfileMatch[1] + "/catalog/applications" : workspaceApplicationState ? workspaceApplicationState.dataset.workspaceApplicationCatalog : ""; if (!catalogUrl) return; var initialStatus = valuePicker.querySelector("[data-policy-picker-status]"); if (initialStatus) initialStatus.textContent = "Application database wordt geladen…"; fetch(catalogUrl, {headers:{"Accept":"application/json"}}).then(function (response) { if (!response.ok) throw new Error("HTTP " + response.status); return response.json(); }).then(function (data) { var existing = new Set(policyCatalog.filter(function (item) { return item.kind === "applications"; }).map(function (item) { return item.name; })); (data.items || []).forEach(function (item) { if (!existing.has(item.name)) policyCatalog.push(item); }); showApplicationStatus(data); if (pickerTarget && pickerTarget.dataset.pickerField === "application") { renderPolicyPicker((valuePicker.querySelector("[data-policy-picker-filter]").value || "").toLocaleLowerCase()); showApplicationError(data.error); } if (!data.ready && data.refreshing && applicationPolls < 40) { applicationPolls += 1; setTimeout(loadApplications, 3000); } }).catch(function (error) { showApplicationError(error.message); }); }
       function openPolicyValuePicker(input, fieldName) { pickerTarget = input; pickerTarget.dataset.pickerField = fieldName || input.dataset.pickerField; pickerSelections.clear(); var pickerStatus = valuePicker.querySelector("[data-policy-picker-status]"); if (pickerStatus) pickerStatus.textContent = ""; var activeDialog = input.closest("dialog"); if (activeDialog && valuePicker.parentElement !== activeDialog) activeDialog.appendChild(valuePicker); valuePicker.hidden = false; valuePicker.querySelector("[data-policy-picker-title]").textContent = "Bestaande waarden voor " + pickerTarget.dataset.pickerField; var filter = valuePicker.querySelector("[data-policy-picker-filter]"); filter.value = ""; renderPolicyPicker(""); if (pickerTarget.dataset.pickerField === "application") { applicationPolls = 0; loadApplications(); } }
-      all("[data-picker-field]").forEach(function (input) { if (!pickerKinds[input.dataset.pickerField]) return; input.addEventListener("focus", function () { openPolicyValuePicker(input); }); });
+      all("[data-picker-field]").forEach(function (input) {
+        if (!pickerKinds[input.dataset.pickerField]) return;
+        input.addEventListener("focus", function () { openPolicyValuePicker(input); });
+        input.addEventListener("input", function () { if (pickerTarget === input) valuePicker.hidden = true; });
+      });
       var singleTagPicker = document.querySelector("[data-single-tag-picker]"); if (singleTagPicker && singleTagEntry) singleTagPicker.addEventListener("click", function () { openPolicyValuePicker(singleTagEntry, "tag"); });
       valuePicker.querySelector("[data-policy-picker-filter]").addEventListener("input", function (event) { renderPolicyPicker(event.target.value.toLocaleLowerCase().trim()); });
       valuePicker.querySelector("[data-policy-picker-close]").addEventListener("click", function () { valuePicker.hidden = true; });
@@ -889,22 +893,26 @@
   }
 
   document.addEventListener("DOMContentLoaded", function () {
-    setupNavigation();
-    setupSidebarCollapse();
-    setupConfigTree();
-    setupPasswords();
-    setupConfirmations();
-    setupFlashes();
-    setupBulkSelection();
-    setupFilters();
-    setupConditionalTargets();
-    setupPushOptions();
-    setupPolicyManagement();
-    setupObjectManagement();
-    setupOfflinePolicyTabs();
-    setupWorkspaceConfigurationEditor();
-    setupConfigPullProgress();
-    setupWorkspaceObjects();
-    setupWorkspaceContextLoading();
+    function runSetup(name, callback) {
+      try { callback(); }
+      catch (error) { console.error("PA Policy Forge UI setup failed: " + name, error); }
+    }
+    runSetup("navigation", setupNavigation);
+    runSetup("sidebar", setupSidebarCollapse);
+    runSetup("config-tree", setupConfigTree);
+    runSetup("passwords", setupPasswords);
+    runSetup("confirmations", setupConfirmations);
+    runSetup("flashes", setupFlashes);
+    runSetup("bulk-selection", setupBulkSelection);
+    runSetup("filters", setupFilters);
+    runSetup("targets", setupConditionalTargets);
+    runSetup("push-options", setupPushOptions);
+    runSetup("policy-management", setupPolicyManagement);
+    runSetup("object-management", setupObjectManagement);
+    runSetup("offline-policy", setupOfflinePolicyTabs);
+    runSetup("configuration-editor", setupWorkspaceConfigurationEditor);
+    runSetup("pull-progress", setupConfigPullProgress);
+    runSetup("workspace-objects", setupWorkspaceObjects);
+    runSetup("workspace-context", setupWorkspaceContextLoading);
   });
 })();

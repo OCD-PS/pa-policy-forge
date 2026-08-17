@@ -176,6 +176,8 @@ MIGRATION_SCM_NETWORK_ENDPOINTS = {
 _catalog_refreshing: set[tuple[int, str]] = set()
 _catalog_refresh_lock = threading.Lock()
 _catalog_errors: dict[tuple[int, str], str] = {}
+_catalog_retry_after: dict[tuple[int, str], float] = {}
+CATALOG_RETRY_SECONDS = 60
 _panos_key_cache: dict[int, tuple[str, str, str, float]] = {}
 _panos_key_cache_lock = threading.Lock()
 PANOS_KEY_CACHE_SECONDS = 900
@@ -692,6 +694,7 @@ def invalidate_profile_caches(profile_id: int) -> None:
     with _catalog_refresh_lock:
         for key in [key for key in _catalog_errors if key[0] == profile_id]:
             _catalog_errors.pop(key, None)
+            _catalog_retry_after.pop(key, None)
     with _panos_key_cache_lock:
         _panos_key_cache.pop(profile_id, None)
 
@@ -993,16 +996,20 @@ def fetch_application_objects(profile) -> list[dict]:
 def refresh_catalog_async(profile, kind: str, cache_path: Path) -> None:
     key = (int(profile["id"]), kind)
     with _catalog_refresh_lock:
-        if key in _catalog_refreshing: return
+        if key in _catalog_refreshing or _catalog_retry_after.get(key, 0) > time.monotonic(): return
         _catalog_refreshing.add(key)
     def refresh():
         try:
             fresh = fetch_application_objects(profile) if kind == "applications" else fetch_scm_objects(profile, kind)
             temporary = cache_path.with_suffix(".tmp")
             temporary.write_text(json.dumps(fresh)); temporary.chmod(0o600); temporary.replace(cache_path)
-            with _catalog_refresh_lock: _catalog_errors.pop(key, None)
+            with _catalog_refresh_lock:
+                _catalog_errors.pop(key, None)
+                _catalog_retry_after.pop(key, None)
         except Exception as exc:
-            with _catalog_refresh_lock: _catalog_errors[key] = f"{type(exc).__name__}: ophalen mislukt"
+            with _catalog_refresh_lock:
+                _catalog_errors[key] = f"{type(exc).__name__}: ophalen mislukt"
+                _catalog_retry_after[key] = time.monotonic() + CATALOG_RETRY_SECONDS
             app.logger.exception("catalog refresh failed for profile=%s kind=%s", profile["id"], kind)
         finally:
             with _catalog_refresh_lock: _catalog_refreshing.discard(key)

@@ -1,6 +1,7 @@
 import pathlib
 import sys
 import tempfile
+import gc
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -120,6 +121,26 @@ class SafetyTests(unittest.TestCase):
         script = (ROOT / "app/static/app.js").read_text()
         self.assertIn('activeDialog.appendChild(valuePicker)', script)
 
+    def test_policy_bulk_catalog_does_not_use_shadowable_form_action_property(self):
+        script = (ROOT / "app/static/app.js").read_text()
+        self.assertIn('bulkFormForCatalog.getAttribute("action")', script)
+        self.assertNotIn("bulkFormForCatalog.action.match", script)
+
+    def test_policy_freeform_input_closes_the_value_picker(self):
+        script = (ROOT / "app/static/app.js").read_text()
+        self.assertIn('input.addEventListener("input", function () { if (pickerTarget === input) valuePicker.hidden = true; });', script)
+
+    def test_ui_initializers_are_isolated_and_report_failures(self):
+        script = (ROOT / "app/static/app.js").read_text()
+        self.assertIn('function runSetup(name, callback)', script)
+        self.assertIn('console.error("PA Policy Forge UI setup failed: " + name, error)', script)
+        self.assertIn('runSetup("policy-management", setupPolicyManagement)', script)
+        self.assertIn('runSetup("configuration-editor", setupWorkspaceConfigurationEditor)', script)
+
+    def test_wrapped_policy_and_object_names_keep_a_clickable_box(self):
+        stylesheet = (ROOT / "app/static/app.css").read_text()
+        self.assertIn(".object-name { display: inline-block;", stylesheet)
+
     def test_panos_12_versioned_traffic_log_is_parsed(self):
         line = (
             '<14>Aug  5 12:49:02 PA-VM '
@@ -144,10 +165,15 @@ class SafetyTests(unittest.TestCase):
             store.add_flow(Flow(serial="SERIAL-B", **base))
             store.add_flow(Flow(serial="SERIAL-C", **base))
             self.assertEqual(store.purge_serials(["SERIAL-A", "SERIAL-B"]), 2)
-            with store._connect() as conn:
+            conn = store._connect()
+            try:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM flows WHERE serial='SERIAL-A'").fetchone()[0], 0)
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM flows WHERE serial='SERIAL-B'").fetchone()[0], 0)
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM flows WHERE serial='SERIAL-C'").fetchone()[0], 1)
+            finally:
+                conn.close()
+            del store
+            gc.collect()
 
     def test_existing_objects_and_exact_groups_are_reused(self):
         root = ET.fromstring("""<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="new-a"><ip-netmask>10.0.0.1/32</ip-netmask></entry><entry name="new-b"><ip-netmask>10.0.0.2/32</ip-netmask></entry></address><address-group/><service><entry name="new-https"><protocol><tcp><port>443</port></tcp></protocol></entry></service><service-group/><rulebase><security><rules><entry name="rule-1"><source><member>new-a</member><member>new-b</member></source><destination><member>any</member></destination><application><member>ssl</member></application><service><member>new-https</member></service></entry></rules></security></rulebase></entry></vsys></entry></devices></config>""")

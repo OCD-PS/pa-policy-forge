@@ -2,6 +2,7 @@ import json
 import os
 import pathlib
 import tempfile
+import time
 import unittest
 import re
 from types import SimpleNamespace
@@ -73,6 +74,32 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertTrue(main.login_rate_limited(client, "last-user", record_failure=True))
         main.clear_login_failures(client, "last-user")
 
+    def test_failed_application_catalog_refresh_has_retry_backoff(self):
+        profile = {"id": 987654, "target_type": "panos"}
+        cache_path = main.application_cache_path(profile["id"])
+        key = (profile["id"], "applications")
+        with main._catalog_refresh_lock:
+            main._catalog_errors.pop(key, None)
+            main._catalog_retry_after.pop(key, None)
+            main._catalog_refreshing.discard(key)
+        try:
+            with patch.object(main, "fetch_application_objects", side_effect=RuntimeError("offline")) as fetch:
+                main.refresh_catalog_async(profile, "applications", cache_path)
+                for _ in range(100):
+                    with main._catalog_refresh_lock:
+                        finished = key not in main._catalog_refreshing
+                    if finished: break
+                    time.sleep(0.01)
+                main.refresh_catalog_async(profile, "applications", cache_path)
+                time.sleep(0.02)
+                self.assertEqual(fetch.call_count, 1)
+        finally:
+            with main._catalog_refresh_lock:
+                main._catalog_errors.pop(key, None)
+                main._catalog_retry_after.pop(key, None)
+                main._catalog_refreshing.discard(key)
+            cache_path.unlink(missing_ok=True)
+
     def test_panos_endpoint_requires_clean_https_origin(self):
         self.assertEqual(main.validate_panos_endpoint("https://192.0.2.1/"), "https://192.0.2.1")
         for value in ("http://192.0.2.1", "file:///etc/passwd", "https://user:pass@192.0.2.1", "https://192.0.2.1/api", "https://192.0.2.1/?x=1"):
@@ -102,6 +129,27 @@ class TargetAdapterTests(unittest.TestCase):
     def test_missing_csrf_is_rejected(self):
         response = main.app.test_client().post("/login", data={"username": "admin", "password": "not-used"}, base_url="https://forge.test")
         self.assertEqual(response.status_code, 400)
+
+    def test_profile_names_are_html_escaped(self):
+        payload = '<img src=x onerror="alert(1)">'
+        stamp = main.now()
+        with main.db() as conn:
+            profile_id = int(conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                (payload, "scm", "{}", b"", stamp, stamp),
+            ).lastrowid)
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1
+            login["username"] = "test"
+            login["must_change"] = False
+        try:
+            page = client.get("/", base_url="https://forge.test").get_data(as_text=True)
+            self.assertNotIn(payload, page)
+            self.assertIn("&lt;img src=x onerror=", page)
+        finally:
+            with main.db() as conn:
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
 
     def test_protected_routes_require_authentication(self):
         client = main.app.test_client()
