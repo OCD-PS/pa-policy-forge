@@ -149,6 +149,16 @@ Equivalent addresses and services are reused and policy references are rewritten
 collision with different content stops the merge for review. Nothing commits or deploys
 automatically.
 
+The migration workspace also preserves extended PAN-OS families instead of flattening
+them: applications, tags, schedules, EDLs, security profiles and groups, all PAN-OS
+policy rulebases, VLANs, virtual/logical routers, virtual wires, IKE/IPsec, GlobalProtect,
+network profiles, and device configuration. Global Search & Merge supports selection,
+name, value, and name-plus-value matching with an explicit master, reference rewrites,
+rename/delete/enable/disable transformations, duplicate and unresolved-reference analysis,
+live profile pulls, portable project bundles, full XML export, and set-command export.
+SCM mappings are preflighted before candidate writes so an unsupported selected family
+cannot result in a silent partial migration.
+
 ## Policy management
 
 The **Policybeheer** page uses an Expedition-inspired filter, selection, and

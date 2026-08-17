@@ -8,13 +8,21 @@ os.environ.setdefault("PPF_DATA_DIR", tempfile.mkdtemp(prefix="forge-migration-t
 os.environ.setdefault("PPF_SYSLOG_PORT", "55149")
 os.environ.setdefault("PPF_BOOTSTRAP_PASSWORD", "unit-test-bootstrap-password")
 
-from app.migration import PARSERS, MigrationError, merge_model_into_panos_xml, parse_vendor, panos_fragment, reconcile_model, scm_items
+from app.migration import Address, MigrationModel, PARSERS, MigrationError, apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, parse_vendor, panos_fragment, reconcile_model, scm_items
 from app import main
 
 
 class MigrationTests(unittest.TestCase):
     def test_all_approved_vendor_adapters_are_registered(self):
-        self.assertEqual(set(PARSERS), {"panos", "cisco-asa", "cisco-ios", "checkpoint", "fortinet", "juniper-srx", "generic"})
+        self.assertEqual(set(PARSERS), {"panos", "panos-csv", "cisco-asa", "cisco-ios", "checkpoint", "fortinet", "juniper-srx", "algosec", "stonesoft", "generic"})
+
+    def test_panos_csv_imports_objects_services_and_rules(self):
+        addresses=parse_vendor("panos-csv",b'name,type,value\nweb,address,10.0.0.10/32\n',"addresses.csv")
+        services=parse_vendor("panos-csv",b'name,type,protocol,port\nweb-https,service,tcp,443\n',"services.csv")
+        rules=parse_vendor("panos-csv",b'name,type,source_zone,destination_zone,source,destination,application,service,action\nallow-web,security,Trust,DMZ,any,web,ssl,web-https,allow\n',"rules.csv")
+        self.assertEqual(addresses.addresses[0].value,"10.0.0.10/32")
+        self.assertEqual(services.services[0].port,"443")
+        self.assertEqual(rules.security_rules[0].to_zones,["DMZ"])
 
     def test_panos_full_config_imports_interfaces_zones_objects_and_rules(self):
         source = b'''<config version="11.1.0"><devices><entry name="localhost.localdomain"><network><interface><ethernet><entry name="ethernet1/12"><layer3><ip><entry name="192.0.2.1/24"/></ip></layer3></entry></ethernet></interface></network><vsys><entry name="vsys1"><zone><entry name="Trust"><network><layer3><member>ethernet1/12</member></layer3></network></entry></zone><address><entry name="server"><ip-netmask>10.0.0.10/32</ip-netmask></entry></address><service><entry name="tcp-8443"><protocol><tcp><port>8443</port></tcp></protocol></entry></service><rulebase><security><rules><entry name="allow-server"><from><member>Trust</member></from><to><member>Trust</member></to><source><member>any</member></source><destination><member>server</member></destination><application><member>ssl</member></application><service><member>application-default</member></service><action>allow</action></entry></rules></security><nat><rules><entry name="dnat-server"><from><member>Untrust</member></from><to><member>Untrust</member></to><source><member>any</member></source><destination><member>192.0.2.10</member></destination><service>tcp-8443</service><destination-translation><translated-address>server</translated-address><translated-port>8443</translated-port></destination-translation></entry></rules></nat></rulebase></entry></vsys></entry></devices></config>'''
@@ -35,6 +43,41 @@ class MigrationTests(unittest.TestCase):
         self.assertIn(b'<service>tcp-8443</service>', merged)
         self.assertNotIn(b'<application><member>any</member></application>', merged)
         self.assertEqual(plan["create"], 6)
+
+    def test_panos_import_preserves_extended_objects_policies_and_network(self):
+        source=b'''<config><devices><entry name="localhost.localdomain"><network><virtual-router><entry name="default"><protocol/></entry></virtual-router><tunnel><ipsec><entry name="vpn-a"><auto-key/></entry></ipsec></tunnel></network><vsys><entry name="vsys1"><application><entry name="custom-app"><signature/></entry></application><tag><entry name="Blue"><color>color1</color></entry></tag><profiles><url-filtering><entry name="URL-Allow"><allow><member>example.com</member></allow></entry></url-filtering></profiles><rulebase><qos><rules><entry name="qos-1"><from><member>Trust</member></from></entry></rules></qos></rulebase></entry></vsys></entry></devices></config>'''
+        model=parse_vendor("panos",source,"extended.xml")
+        self.assertEqual(model.counts()["applications"],1)
+        self.assertEqual(model.counts()["tags"],1)
+        self.assertEqual(model.counts()["security_profiles"],1)
+        self.assertEqual(model.counts()["qos_rules"],1)
+        self.assertEqual(model.counts()["virtual_routers"],1)
+        self.assertEqual(model.counts()["ipsec_tunnels"],1)
+        base=b'''<config><devices><entry name="localhost.localdomain"><network/><vsys><entry name="vsys1"><rulebase/></entry></vsys></entry></devices></config>'''
+        merged,plan=merge_model_into_panos_xml(base,model,"vsys1")
+        self.assertIn(b'custom-app',merged); self.assertIn(b'URL-Allow',merged)
+        self.assertIn(b'qos-1',merged); self.assertIn(b'vpn-a',merged)
+        self.assertEqual(plan["conflicts"],[])
+
+    def test_expedition_style_merge_rewrites_references(self):
+        model=parse_vendor("generic",b'[{"name":"server-old","value":"10.0.0.1/32"},{"name":"server-main","value":"10.0.0.1/32"}]',"objects.json")
+        candidates=merge_inventory(model)
+        self.assertTrue(any(item["kind"]=="addresses" and item["reason"]=="value" for item in candidates))
+        merged=apply_merge_rules(model,[{"kind":"addresses","master":"server-main|||","members":["server-main|||","server-old|||"]}])
+        self.assertEqual([item.name for item in merged.addresses],["server-main"])
+
+    def test_same_name_conflict_keeps_selected_source_as_master(self):
+        model=MigrationModel("merged","two sources",addresses=[Address("shared","10.0.0.1/32",source_ref="A"),Address("shared","10.0.0.2/32",source_ref="B")])
+        candidates=merge_inventory(model)
+        self.assertTrue(any(item["reason"]=="name" and len(item["items"])==2 for item in candidates))
+        merged=apply_merge_rules(model,[{"kind":"addresses","master":"shared|||B","members":["shared|||A","shared|||B"]}])
+        self.assertEqual(len(merged.addresses),1)
+        self.assertEqual(merged.addresses[0].value,"10.0.0.2/32")
+
+    def test_rename_transform_changes_object_identity(self):
+        model=MigrationModel("merged","source",addresses=[Address("old-server","10.0.0.3/32",source_ref="A")])
+        transformed=apply_transform_rules(model,[{"operation":"rename","kind":"addresses","selector":"old-server|||A","value":"new-server"}])
+        self.assertEqual(transformed.addresses[0].name,"new-server")
 
     def test_fortinet_objects_and_policy_map_to_neutral_model_and_scm(self):
         config = b'''config firewall address

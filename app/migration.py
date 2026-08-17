@@ -4,6 +4,8 @@ import hashlib
 import ipaddress
 import json
 import copy
+import csv
+import io
 import re
 import shlex
 import xml.etree.ElementTree as ET
@@ -110,6 +112,10 @@ class MigrationModel:
     nat_rules: list[Policy] = field(default_factory=list)
     interfaces: list[dict] = field(default_factory=list)
     zones: list[dict] = field(default_factory=list)
+    # Configuration families that do not fit the first-wave normalized model.
+    # Each item keeps its original PAN-OS entry XML and destination path so a
+    # full configuration import never silently discards supported PAN-OS data.
+    extras: dict[str, list[dict]] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     unsupported: list[str] = field(default_factory=list)
 
@@ -127,6 +133,7 @@ class MigrationModel:
             security_rules=[Policy(**item) for item in value.get("security_rules", [])],
             nat_rules=[Policy(**item) for item in value.get("nat_rules", [])],
             interfaces=list(value.get("interfaces", [])), zones=list(value.get("zones", [])),
+            extras={str(key): list(items) for key, items in value.get("extras", {}).items()},
             warnings=list(value.get("warnings", [])), unsupported=list(value.get("unsupported", [])),
         )
 
@@ -134,13 +141,69 @@ class MigrationModel:
         return hashlib.sha256(json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     def counts(self) -> dict[str, int]:
-        return {
+        counts = {
             "addresses": len(self.addresses), "address_groups": len(self.address_groups),
             "services": len(self.services), "service_groups": len(self.service_groups),
             "security_rules": len(self.security_rules), "nat_rules": len(self.nat_rules),
             "interfaces": len(self.interfaces), "zones": len(self.zones),
             "warnings": len(self.warnings), "unsupported": len(self.unsupported),
         }
+        counts.update({key: len(items) for key, items in self.extras.items()})
+        return counts
+
+
+MIGRATION_KIND_LABELS = {
+    "addresses": "Addresses", "address_groups": "Address Groups",
+    "services": "Services", "service_groups": "Service Groups",
+    "applications": "Applications", "application_groups": "Application Groups",
+    "application_filters": "Application Filters", "tags": "Tags",
+    "regions": "Regions", "schedules": "Schedules",
+    "external_dynamic_lists": "External Dynamic Lists",
+    "custom_url_categories": "Custom URL Categories",
+    "security_profiles": "Security Profiles",
+    "security_profile_groups": "Security Profile Groups",
+    "log_forwarding_profiles": "Log Forwarding",
+    "authentication_enforcement": "Authentication Enforcement",
+    "security_rules": "Security policies", "nat_rules": "NAT policies",
+    "qos_rules": "QoS policies", "pbf_rules": "Policy Based Forwarding",
+    "decryption_rules": "Decryption policies",
+    "application_override_rules": "Application Override",
+    "authentication_rules": "Authentication policies",
+    "dos_rules": "DoS policies", "tunnel_inspection_rules": "Tunnel Inspection",
+    "interfaces": "Interfaces", "zones": "Zones", "vlans": "VLANs",
+    "virtual_routers": "Virtual Routers", "logical_routers": "Logical Routers",
+    "virtual_wires": "Virtual Wires", "ipsec_tunnels": "IPsec Tunnels",
+    "ike_gateways": "IKE Gateways", "network_profiles": "Network Profiles",
+    "globalprotect_portals": "GlobalProtect Portals",
+    "globalprotect_gateways": "GlobalProtect Gateways",
+    "device_configuration": "Device configuration",
+}
+
+
+PANOS_EXTRA_PATHS = {
+    "applications": ("./application/entry", "application"),
+    "application_groups": ("./application-group/entry", "application-group"),
+    "application_filters": ("./application-filter/entry", "application-filter"),
+    "tags": ("./tag/entry", "tag"), "regions": ("./region/entry", "region"),
+    "schedules": ("./schedule/entry", "schedule"),
+    "external_dynamic_lists": ("./external-list/entry", "external-list"),
+    "custom_url_categories": ("./profiles/custom-url-category/entry", "profiles/custom-url-category"),
+    "security_profile_groups": ("./profile-group/entry", "profile-group"),
+    "log_forwarding_profiles": ("./log-settings/entry", "log-settings"),
+    "authentication_enforcement": ("./authentication-enforcement/entry", "authentication-enforcement"),
+}
+
+PANOS_SECURITY_PROFILE_TYPES = (
+    "virus", "spyware", "vulnerability", "url-filtering", "file-blocking",
+    "wildfire-analysis", "data-objects", "dos-protection", "decryption",
+)
+
+PANOS_POLICY_PATHS = {
+    "qos_rules": "qos", "pbf_rules": "pbf", "decryption_rules": "decryption",
+    "application_override_rules": "application-override",
+    "authentication_rules": "authentication", "dos_rules": "dos",
+    "tunnel_inspection_rules": "tunnel-inspect",
+}
 
 
 class BaseParser:
@@ -397,6 +460,20 @@ def _xml_payload(node: ET.Element | None):
     return result
 
 
+def raw_item_payload(item: dict) -> dict:
+    """Convert a preserved PAN-OS entry into a neutral REST-shaped payload."""
+    if isinstance(item.get("payload"),dict):
+        return {"name":str(item.get("name",item["payload"].get("name",""))),**copy.deepcopy(item["payload"])}
+    try:
+        entry=SafeET.fromstring(str(item.get("xml", "")))
+    except Exception as exc:
+        raise MigrationError(f"Ongeldige entry XML voor {item.get('name','')}: {exc}") from exc
+    payload={"name":str(item.get("name",entry.get("name", "")))}
+    for child in entry:
+        payload[child.tag.replace("-","_")]=_xml_payload(child)
+    return payload
+
+
 class PanosConfigParser(BaseParser):
     vendor = "panos"
     label = "Palo Alto PAN-OS / Panorama XML"
@@ -427,6 +504,8 @@ class PanosConfigParser(BaseParser):
         for owner, location in locations:
             self._objects(model, location, owner)
             self._policies(model, location, owner)
+            self._extra_objects(model, location, owner)
+            self._extra_policies(model, location, owner)
             for entry in location.findall("./zone/entry"):
                 model.zones.append({"name": entry.get("name", ""), "xml": ET.tostring(entry, encoding="unicode"), "source_ref": owner})
 
@@ -438,6 +517,8 @@ class PanosConfigParser(BaseParser):
                         "name": entry.get("name", ""), "interface_type": interface_type,
                         "xml": ET.tostring(entry, encoding="unicode"), "source_ref": "Device network",
                     })
+            self._network(model, device.find("./network"), "Device network")
+            self._device_configuration(model, device, "Device")
         for template in root.findall("./devices/entry/template/entry"):
             template_name = template.get("name", "")
             for interface_type in self.interface_types:
@@ -448,7 +529,76 @@ class PanosConfigParser(BaseParser):
                     })
             for entry in template.findall("./config/devices/entry/vsys/entry/zone/entry"):
                 model.zones.append({"name": entry.get("name", ""), "xml": ET.tostring(entry, encoding="unicode"), "source_ref": f"Template {template_name}"})
+            template_device = template.find("./config/devices/entry")
+            if template_device is not None:
+                self._network(model, template_device.find("./network"), f"Template {template_name}")
+                self._device_configuration(model, template_device, f"Template {template_name}")
         return deduplicate(model)
+
+    @staticmethod
+    def _raw_item(entry: ET.Element, owner: str, target_path: str) -> dict:
+        return {
+            "name": entry.get("name", ""), "xml": ET.tostring(entry, encoding="unicode"),
+            "source_ref": owner, "target_path": target_path,
+        }
+
+    @classmethod
+    def _extra_objects(cls, model: MigrationModel, location: ET.Element, owner: str) -> None:
+        for kind, (xpath, target_path) in PANOS_EXTRA_PATHS.items():
+            for entry in location.findall(xpath):
+                model.extras.setdefault(kind, []).append(cls._raw_item(entry, owner, target_path))
+        for profile_type in PANOS_SECURITY_PROFILE_TYPES:
+            for entry in location.findall(f"./profiles/{profile_type}/entry"):
+                item = cls._raw_item(entry, owner, f"profiles/{profile_type}")
+                item["profile_type"] = profile_type
+                model.extras.setdefault("security_profiles", []).append(item)
+
+    @classmethod
+    def _extra_policies(cls, model: MigrationModel, location: ET.Element, owner: str) -> None:
+        for rulebase in ("rulebase", "pre-rulebase", "post-rulebase"):
+            for kind, policy_type in PANOS_POLICY_PATHS.items():
+                for entry in location.findall(f"./{rulebase}/{policy_type}/rules/entry"):
+                    item = cls._raw_item(entry, f"{owner} · {rulebase}", f"{rulebase}/{policy_type}/rules")
+                    item.update({"rulebase": rulebase, "policy_type": policy_type})
+                    model.extras.setdefault(kind, []).append(item)
+
+    @classmethod
+    def _network(cls, model: MigrationModel, network: ET.Element | None, owner: str) -> None:
+        if network is None:
+            return
+        paths = {
+            "vlans": ("./vlan/entry", "network/vlan"),
+            "virtual_routers": ("./virtual-router/entry", "network/virtual-router"),
+            "logical_routers": ("./logical-router/entry", "network/logical-router"),
+            "virtual_wires": ("./virtual-wire/entry", "network/virtual-wire"),
+            "ipsec_tunnels": ("./tunnel/ipsec/entry", "network/tunnel/ipsec"),
+            "ike_gateways": ("./ike/gateway/entry", "network/ike/gateway"),
+            "globalprotect_portals": ("./global-protect/global-protect-portal/entry", "network/global-protect/global-protect-portal"),
+            "globalprotect_gateways": ("./global-protect/global-protect-gateway/entry", "network/global-protect/global-protect-gateway"),
+        }
+        for kind, (xpath, target_path) in paths.items():
+            for entry in network.findall(xpath):
+                model.extras.setdefault(kind, []).append(cls._raw_item(entry, owner, target_path))
+        profile_roots = ("ike", "ipsec", "monitor-profile", "interface-management-profile", "qos-profile", "lldp")
+        for root_name in profile_roots:
+            root = network.find(f"./profiles/{root_name}")
+            if root is None:
+                continue
+            for entry in root.findall(".//entry"):
+                item = cls._raw_item(entry, owner, f"network/profiles/{root_name}")
+                item["profile_type"] = root_name
+                model.extras.setdefault("network_profiles", []).append(item)
+
+    @classmethod
+    def _device_configuration(cls, model: MigrationModel, device: ET.Element, owner: str) -> None:
+        for child in device:
+            if child.tag in {"network", "vsys", "device-group", "template", "template-stack"}:
+                continue
+            entries = child.findall("./entry")
+            for entry in entries:
+                item = cls._raw_item(entry, owner, child.tag)
+                item["section"] = child.tag
+                model.extras.setdefault("device_configuration", []).append(item)
 
     @staticmethod
     def _objects(model: MigrationModel, location: ET.Element, owner: str) -> None:
@@ -514,7 +664,58 @@ class GenericParser(BaseParser):
         return deduplicate(model)
 
 
-PARSERS = {parser.vendor: parser for parser in (PanosConfigParser(), CiscoAsaParser(), CiscoIosParser(), CheckPointParser(), FortinetParser(), JuniperSrxParser(), GenericParser())}
+class PaloAltoCsvParser(BaseParser):
+    vendor="panos-csv"; label="Palo Alto Networks CSV"; extensions=(".csv",)
+    def parse(self,text,source_name):
+        model=MigrationModel(self.vendor,source_name)
+        reader=csv.DictReader(io.StringIO(text))
+        for number,row in enumerate(reader,2):
+            normalized={re.sub(r"[^a-z0-9]+","_",str(key).strip().lower()).strip("_"):str(value or "").strip() for key,value in row.items() if key is not None}
+            name=normalized.get("name") or normalized.get("object_name") or normalized.get("rule_name")
+            if not name: continue
+            kind=(normalized.get("type") or normalized.get("object_type") or normalized.get("rule_type") or "").lower()
+            value=normalized.get("value") or normalized.get("ip_netmask") or normalized.get("address")
+            if value and kind not in {"service","security","nat","rule"}:
+                try: ipaddress.ip_network(value,strict=False); value_type="ip_netmask"
+                except ValueError: value_type="fqdn" if normalized.get("fqdn") or (re.search(r"[a-z]",value,re.I) and "/" not in value) else "ip_range" if "-" in value else "ip_netmask"
+                model.addresses.append(Address(name,value,value_type,normalized.get("description",""),source_ref=f"row {number}")); continue
+            if kind in {"service","tcp","udp"} or normalized.get("port") or normalized.get("destination_port"):
+                model.services.append(Service(name,normalized.get("protocol") or (kind if kind in {"tcp","udp"} else "tcp"),normalized.get("port") or normalized.get("destination_port") or "1-65535",source_ref=f"row {number}")); continue
+            if kind in {"security","nat","rule","policy"} or normalized.get("source_zone") or normalized.get("from"):
+                target=model.nat_rules if kind=="nat" else model.security_rules
+                target.append(Policy(name=name,policy_type="nat" if kind=="nat" else "security",from_zones=_csv_values(normalized.get("source_zone") or normalized.get("from"),["any"]),to_zones=_csv_values(normalized.get("destination_zone") or normalized.get("to"),["any"]),source=_csv_values(normalized.get("source"),["any"]),destination=_csv_values(normalized.get("destination"),["any"]),application=_csv_values(normalized.get("application"),["any"]),service=_csv_values(normalized.get("service"),["application-default"]),action=normalized.get("action") or "allow",disabled=(normalized.get("disabled","").lower() in {"yes","true","1"}),description=normalized.get("description",""),source_ref=f"row {number}"))
+        return deduplicate(model)
+
+
+def _csv_values(value: str, default: list[str]) -> list[str]:
+    values=[part.strip() for part in re.split(r"[;,|]",value or "") if part.strip()]
+    return values or list(default)
+
+
+class AlgoSecParser(BaseParser):
+    vendor="algosec"; label="AlgoSec"; extensions=(".xml",".csv",".json")
+    def parse(self,text,source_name):
+        if text.lstrip().startswith("{") or text.lstrip().startswith("["):
+            model=GenericParser().parse(text,source_name); model.vendor=self.vendor; return model
+        if not text.lstrip().startswith("<"):
+            model=PaloAltoCsvParser().parse(text,source_name); model.vendor=self.vendor; return model
+        root=SafeET.fromstring(text); model=MigrationModel(self.vendor,source_name)
+        for node in root.iter():
+            name=node.get("name") or node.findtext("./name"); value=node.get("ip") or node.get("address") or node.findtext("./ip") or node.findtext("./address")
+            tag=node.tag.lower().replace("_","-")
+            if name and value and any(token in tag for token in ("host","network","object")):
+                model.addresses.append(Address(clean_name(name),cidr(value),source_ref=f"<{node.tag}>"))
+            if name and any(token in tag for token in ("service","tcp","udp")):
+                port=node.get("port") or node.findtext("./port")
+                if port: model.services.append(Service(clean_name(name),"udp" if "udp" in tag else "tcp",port,source_ref=f"<{node.tag}>"))
+        return deduplicate(model)
+
+
+class StonesoftParser(AlgoSecParser):
+    vendor="stonesoft"; label="Stonesoft / Forcepoint SMC"; extensions=(".xml",".txt")
+
+
+PARSERS = {parser.vendor: parser for parser in (PanosConfigParser(), PaloAltoCsvParser(), CiscoAsaParser(), CiscoIosParser(), CheckPointParser(), FortinetParser(), JuniperSrxParser(), AlgoSecParser(), StonesoftParser(), GenericParser())}
 
 
 def parse_vendor(vendor: str, content: bytes, source_name: str) -> MigrationModel:
@@ -524,7 +725,7 @@ def parse_vendor(vendor: str, content: bytes, source_name: str) -> MigrationMode
     try: text=content.decode("utf-8-sig")
     except UnicodeDecodeError: text=content.decode("latin-1")
     model=parser.parse(text,source_name)
-    if sum(model.counts()[key] for key in ("addresses","address_groups","services","service_groups","security_rules","nat_rules","interfaces","zones"))==0:
+    if sum(value for key,value in model.counts().items() if key not in {"warnings","unsupported"})==0:
         model.warnings.append("Geen direct mergeerbare objecten of policies gevonden")
     return model
 
@@ -552,7 +753,230 @@ def deduplicate(model: MigrationModel) -> MigrationModel:
                 continue
             seen[key]=item; values.append(item)
         setattr(model, attr, values)
+    for kind, items in model.extras.items():
+        values=[]; seen={}
+        for item in items:
+            name=str(item.get("name", "")).strip()
+            if not name: continue
+            item["name"]=name
+            key=(item.get("profile_type", ""), item.get("target_path", ""), name)
+            if key in seen:
+                if generic_item_signature(item) != generic_item_signature(seen[key]):
+                    model.warnings.append(f"Dubbele naam {name} in {kind}; eerste definitie behouden")
+                continue
+            seen[key]=item; values.append(item)
+        model.extras[kind]=values
     return model
+
+
+def generic_item_signature(item: dict) -> str:
+    """Stable semantic signature for raw PAN-OS entries, excluding identity/source."""
+    xml = str(item.get("xml", ""))
+    if xml:
+        try:
+            entry = SafeET.fromstring(xml)
+            entry.attrib.pop("name", None)
+            xml = ET.tostring(entry, encoding="unicode")
+        except Exception:
+            pass
+    return json.dumps({
+        "xml": xml, "target_path": item.get("target_path", ""),
+        "payload": item.get("payload"),
+        "profile_type": item.get("profile_type", ""),
+        "policy_type": item.get("policy_type", ""),
+    }, sort_keys=True, separators=(",", ":"))
+
+
+def model_collections(model: MigrationModel) -> dict[str, list]:
+    collections = {
+        "addresses": model.addresses, "address_groups": model.address_groups,
+        "services": model.services, "service_groups": model.service_groups,
+        "security_rules": model.security_rules, "nat_rules": model.nat_rules,
+        "interfaces": model.interfaces, "zones": model.zones,
+    }
+    collections.update(model.extras)
+    return collections
+
+
+def item_selector(item: dict) -> str:
+    return f"{item.get('name','')}|||{item.get('source_ref','')}"
+
+
+def merge_inventory(model: MigrationModel, query: str = "") -> list[dict]:
+    """Return Expedition-style duplicate/search inventory for every collection."""
+    needle=query.casefold().strip(); result=[]
+    for kind, items in model_collections(model).items():
+        groups: dict[str, list[dict]] = {}
+        for item in items:
+            raw=asdict(item) if hasattr(item, "__dataclass_fields__") else dict(item)
+            raw["selector"]=item_selector(raw)
+            name=str(raw.get("name", "")); searchable=json.dumps(raw, sort_keys=True, default=str).casefold()
+            if needle and needle not in name.casefold() and needle not in searchable: continue
+            if kind in model.extras:
+                signature=generic_item_signature(raw)
+            else:
+                semantic={key:value for key,value in raw.items() if key not in {"name","source_ref","original","selector"}}
+                signature=json.dumps(semantic,sort_keys=True,separators=(",",":"),default=str)
+            groups.setdefault(signature,[]).append(raw)
+        names: dict[str,list[dict]]={}
+        for item in items:
+            raw=asdict(item) if hasattr(item, "__dataclass_fields__") else dict(item)
+            raw["selector"]=item_selector(raw)
+            names.setdefault(str(raw.get("name", "")).casefold(),[]).append(raw)
+        duplicates={id(item) for values in groups.values() if len(values)>1 for item in values}
+        for raw_items in names.values():
+            if len(raw_items)>1: duplicates.update(id(item) for item in raw_items)
+        for signature, values in groups.items():
+            if len(values)>1:
+                result.append({"kind":kind,"reason":"value","signature":signature,"items":values})
+        for name, values in names.items():
+            signatures={generic_item_signature(value) if kind in model.extras else json.dumps({k:v for k,v in value.items() if k not in {"name","source_ref","original","selector"}},sort_keys=True,default=str) for value in values}
+            if len(values)>1 and len(signatures)>1:
+                result.append({"kind":kind,"reason":"name","signature":name,"items":values})
+    return result
+
+
+def migration_search(model: MigrationModel, query: str) -> list[dict]:
+    needle=query.casefold().strip()
+    if not needle: return []
+    results=[]
+    for kind,items in model_collections(model).items():
+        for item in items:
+            raw=asdict(item) if hasattr(item,"__dataclass_fields__") else dict(item)
+            if needle in json.dumps(raw,sort_keys=True,default=str).casefold():
+                results.append({"kind":kind,"name":str(raw.get("name","")),"source_ref":str(raw.get("source_ref","")),"value":str(raw.get("value",raw.get("port","")))})
+    return results[:1000]
+
+
+def merge_member_names(model: MigrationModel, kind: str, master: str, mode: str, selected: list[str] | None = None) -> list[str]:
+    items=model_collections(model).get(kind,[])
+    raw=[asdict(item) if hasattr(item,"__dataclass_fields__") else dict(item) for item in items]
+    master_item=next((item for item in raw if item_selector(item)==master),None)
+    if master_item is None: return []
+    if kind in model.extras: signature=lambda item:generic_item_signature(item)
+    else: signature=lambda item:json.dumps({key:value for key,value in item.items() if key not in {"name","source_ref","original"}},sort_keys=True,separators=(",",":"),default=str)
+    if mode=="selection": return unique(selected or [])
+    master_name=str(master_item.get("name","")).casefold(); master_signature=signature(master_item); members=[]
+    for item in raw:
+        same_name=str(item.get("name","")).casefold()==master_name; same_value=signature(item)==master_signature
+        if (mode=="name" and same_name) or (mode=="value" and same_value) or (mode=="name_value" and same_name and same_value): members.append(item_selector(item))
+    return unique(members)
+
+
+def apply_merge_rules(model: MigrationModel, rules: list[dict]) -> MigrationModel:
+    """Apply explicit master/member choices and rewrite object references globally."""
+    result=MigrationModel.from_dict(model.as_dict()); rename={}
+    for rule in rules:
+        master_selector=str(rule.get("master", "")); members=unique(rule.get("members", [])); kind=str(rule.get("kind", ""))
+        collection=model_collections(result).get(kind,[])
+        master_item=next((item for item in collection if item_selector(asdict(item) if hasattr(item,"__dataclass_fields__") else item)==master_selector),None)
+        master=(master_item.name if hasattr(master_item,"name") else str(master_item.get("name",""))) if master_item is not None else ""
+        if not master or not members or kind not in model_collections(result): continue
+        for selector in members:
+            name=selector.split("|||",1)[0]
+            if name != master: rename[name]=master
+        filtered=[]; master_seen=False
+        for item in collection:
+            name=item.name if hasattr(item,"name") else str(item.get("name", ""))
+            selector=item_selector(asdict(item) if hasattr(item,"__dataclass_fields__") else item)
+            if selector == master_selector:
+                if master_seen: continue
+                master_seen=True; filtered.append(item)
+            elif selector in members: continue
+            else: filtered.append(item)
+        if kind in result.extras: result.extras[kind]=filtered
+        else: setattr(result,kind,filtered)
+    if not rename: return result
+    for group in result.address_groups: group.members=[rename.get(value,value) for value in group.members]
+    for group in result.service_groups: group.members=[rename.get(value,value) for value in group.members]
+    for attr in ("security_rules","nat_rules"):
+        for policy in getattr(result,attr):
+            for field_name in ("source","destination","service","application","tags"):
+                setattr(policy,field_name,[rename.get(value,value) for value in getattr(policy,field_name)])
+    for kind, items in result.extras.items():
+        for item in items:
+            try:
+                entry=SafeET.fromstring(item.get("xml", ""))
+                for node in entry.iter():
+                    if node.text in rename: node.text=rename[node.text]
+                item["xml"]=ET.tostring(entry,encoding="unicode")
+            except Exception: continue
+    return result
+
+
+def apply_transform_rules(model: MigrationModel, rules: list[dict]) -> MigrationModel:
+    result=MigrationModel.from_dict(model.as_dict()); replacements={}
+    for rule in rules:
+        operation=str(rule.get("operation","")); kind=str(rule.get("kind","")); selector=str(rule.get("selector","")); value=str(rule.get("value",""))
+        collection=model_collections(result).get(kind,[])
+        if operation in {"rename","delete","disable","enable"}:
+            for item in list(collection):
+                raw=asdict(item) if hasattr(item,"__dataclass_fields__") else item
+                if item_selector(raw)!=selector: continue
+                old=item.name if hasattr(item,"name") else str(item.get("name",""))
+                if operation=="delete": collection.remove(item)
+                elif operation=="rename" and value:
+                    if hasattr(item,"name"): item.name=value
+                    else:
+                        item["name"]=value
+                        try:
+                            entry=SafeET.fromstring(item.get("xml","")); entry.set("name",value); item["xml"]=ET.tostring(entry,encoding="unicode")
+                        except Exception: pass
+                    replacements[old]=value
+                elif hasattr(item,"disabled"): item.disabled=operation=="disable"
+        elif operation=="replace_reference" and selector and value:
+            replacements[selector]=value
+    if replacements:
+        for group in result.address_groups: group.members=[replacements.get(v,v) for v in group.members]
+        for group in result.service_groups: group.members=[replacements.get(v,v) for v in group.members]
+        for attr in ("security_rules","nat_rules"):
+            for policy in getattr(result,attr):
+                for field_name in ("from_zones","to_zones","source","destination","service","application","tags"):
+                    setattr(policy,field_name,[replacements.get(v,v) for v in getattr(policy,field_name)])
+        for items in result.extras.values():
+            for item in items:
+                try:
+                    entry=SafeET.fromstring(item.get("xml",""))
+                    for node in entry.iter():
+                        if node.text in replacements: node.text=replacements[node.text]
+                    item["xml"]=ET.tostring(entry,encoding="unicode")
+                except Exception: continue
+    return result
+
+
+def migration_analysis(model: MigrationModel) -> dict:
+    """Conservative project health analysis used by the Expedition-style toolbox."""
+    address_names={item.name for item in model.addresses}; service_names={item.name for item in model.services}
+    group_names={item.name for item in model.address_groups}; service_group_names={item.name for item in model.service_groups}
+    used_addresses=set(); used_services=set(); unresolved=set(); duplicate_rules=[]; rule_signatures={}
+    for group in model.address_groups: used_addresses.update(group.members)
+    for group in model.service_groups: used_services.update(group.members)
+    for attr in ("security_rules","nat_rules"):
+        for rule in getattr(model,attr):
+            used_addresses.update(value for value in rule.source+rule.destination if value!="any")
+            used_services.update(value for value in rule.service if value not in {"any","application-default"})
+            signature=json.dumps({
+                "policy_type":rule.policy_type,"from":rule.from_zones,"to":rule.to_zones,
+                "source":rule.source,"destination":rule.destination,"application":rule.application,
+                "service":rule.service,"action":rule.action,"translation":[rule.source_translation,rule.destination_translation],
+            },sort_keys=True,separators=(",",":"),default=str)
+            if signature in rule_signatures: duplicate_rules.append({"kind":attr,"master":rule_signatures[signature],"duplicate":rule.name})
+            else: rule_signatures[signature]=rule.name
+    known_addresses=address_names|group_names
+    for value in used_addresses:
+        try: ipaddress.ip_network(value,strict=False); continue
+        except ValueError: pass
+        if value not in known_addresses: unresolved.add(value)
+    known_services=service_names|service_group_names
+    for value in used_services:
+        if value not in known_services and not re.match(r"^(tcp|udp)-\d",value,re.I): unresolved.add(value)
+    return {
+        "unused_addresses":sorted(address_names-used_addresses),
+        "unused_address_groups":sorted(group_names-used_addresses),
+        "unused_services":sorted(service_names-used_services),
+        "unused_service_groups":sorted(service_group_names-used_services),
+        "unresolved_references":sorted(unresolved), "duplicate_rules":duplicate_rules,
+    }
 
 
 def split_forti(value: str, any_alias: str = "") -> list[str]:
@@ -877,7 +1301,9 @@ def merge_model_into_panos_xml(
         raise MigrationError("De doelconfiguratie bevat geen device-root")
     network_owner = device
     zone_owner = target
-    if panorama and (model.interfaces or model.zones):
+    network_extra_kinds = {"vlans","virtual_routers","logical_routers","virtual_wires","ipsec_tunnels","ike_gateways","network_profiles","globalprotect_portals","globalprotect_gateways","device_configuration"}
+    network_needed = bool(model.interfaces or model.zones or any(model.extras.get(kind) for kind in network_extra_kinds))
+    if panorama and network_needed:
         reference = target.findtext("./reference-template") or target.findtext("./reference-templates/member")
         if not reference:
             stack_name = target.findtext("./reference-template-stack") or target.findtext("./reference-template-stack/member")
@@ -919,6 +1345,40 @@ def merge_model_into_panos_xml(
             entry = SafeET.fromstring(item["xml"]); name = str(item.get("name", entry.get("name", ""))); entry.set("name", name)
             if name in existing:
                 if _entry_signature(existing[name]) != _entry_signature(entry): plan["conflicts"].append(f"zone: {name}")
+                else: plan["reuse"] += 1
+            else:
+                destination.append(copy.deepcopy(entry)); plan["create"] += 1
+
+    def ensure_path(owner: ET.Element, path: str) -> ET.Element:
+        current=owner
+        for segment in (value for value in path.strip("/").split("/") if value):
+            current=container(current,segment)
+        return current
+
+    # Preserve and merge every remaining PAN-OS family captured by the parser.
+    # The original entry XML is retained, so fields unknown to Policy Forge are
+    # not flattened or lost while still receiving collision protection.
+    for kind, items in model.extras.items():
+        for item in items:
+            raw_path=str(item.get("target_path", "")).strip("/")
+            if not raw_path: continue
+            if kind in network_extra_kinds:
+                owner=network_owner
+            elif kind == "device_configuration":
+                owner=network_owner
+            else:
+                owner=target
+            if not panorama and raw_path.startswith(("pre-rulebase/","post-rulebase/")):
+                raw_path="rulebase/"+raw_path.split("/",1)[1]
+            destination=ensure_path(owner,raw_path)
+            try: entry=SafeET.fromstring(str(item.get("xml", "")))
+            except Exception as exc:
+                plan["conflicts"].append(f"{kind}: ongeldige XML voor {item.get('name','')}: {exc}")
+                continue
+            name=str(item.get("name", entry.get("name", ""))); entry.set("name",name)
+            existing={value.get("name", ""):value for value in destination.findall("./entry")}
+            if name in existing:
+                if _entry_signature(existing[name]) != _entry_signature(entry): plan["conflicts"].append(f"{kind}: {name}")
                 else: plan["reuse"] += 1
             else:
                 destination.append(copy.deepcopy(entry)); plan["create"] += 1
