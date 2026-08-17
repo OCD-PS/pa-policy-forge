@@ -61,9 +61,30 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(deploy_scm_candidate(scm, ["active", "passive"]), "100")
         self.assertEqual(request.call_args_list[0].kwargs["payload"], {"devices": ["active", "passive"]})
 
-    def test_no_http_port_exposed(self):
+    def test_http_port_is_a_dedicated_redirect_only_service(self):
         text=(ROOT/"docker-compose.yml").read_text()
-        self.assertNotIn('"80:', text)
+        application, redirect = text.split("  http-redirect:", 1)
+        self.assertNotIn(":80:", application)
+        self.assertIn('${PPF_BIND_ADDRESS:-0.0.0.0}:80:8080/tcp', redirect)
+        self.assertIn('["python3", "-m", "app.http_redirect"]', redirect)
+        self.assertIn("assert r.status==308", redirect)
+
+    def test_certificate_activation_does_not_mount_the_docker_socket(self):
+        compose=(ROOT/"docker-compose.yml").read_text()
+        template=(ROOT/"app/templates/app.html").read_text()
+        app_text=(ROOT/"app/main.py").read_text()
+        self.assertNotIn("docker.sock", compose + app_text)
+        self.assertIn("PPF_TLS_RELOAD_SIGNAL", compose)
+        self.assertIn('enctype="multipart/form-data"', template)
+        self.assertIn("FQDN-certificaat activeren", template)
+        self.assertIn('@app.post("/settings/certificate")', app_text)
+
+    def test_installer_bootstraps_generic_self_signed_certificate(self):
+        installer=(ROOT/"install.sh").read_text()
+        self.assertIn("openssl req -x509", installer)
+        self.assertIn("subjectAltName=$subject_alt_name", installer)
+        self.assertIn("wait_for_healthy pa-policy-forge-http", installer)
+        self.assertIn('chown "$APP_UID:$APP_GID" "$certificate" "$private_key"', installer)
 
     def test_distribution_uses_documented_default_bootstrap_login(self):
         compose=(ROOT/"docker-compose.yml").read_text()

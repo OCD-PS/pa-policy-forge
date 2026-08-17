@@ -36,7 +36,7 @@
 <div>
 <span class="status-dot">
 </span>Collector actief</div>
-<div>UDP 514 · HTTPS only</div>
+<div>UDP 514 · HTTPS 443</div>
 </div>
 </aside>
 <main class="main">
@@ -486,7 +486,7 @@
 <div class="stack">
 <div class="metric-row">
 <span>FQDN</span>
-<code>{{request.host.split(':')[0]}}</code>
+<code>{{certificate.fqdn or request.host.split(':')[0]}}</code>
 </div>
 <div class="metric-row">
 <span>Web</span>
@@ -498,11 +498,31 @@
 </div>
 <div class="metric-row">
 <span>HTTP</span>
-<span class="badge">Niet actief</span>
+<span class="badge badge-success">80 → 443</span>
+</div>
+{% if certificate.available %}
+<div class="metric-row"><span>Certificaattype</span>{% if certificate.self_signed %}<span class="badge badge-warning">Self-signed</span>{% else %}<span class="badge badge-success">FQDN</span>{% endif %}</div>
+<div class="metric-row"><span>Subject</span><code>{{certificate.subject}}</code></div>
+<div class="metric-row"><span>Issuer</span><code>{{certificate.issuer}}</code></div>
+<div class="metric-row"><span>Geldig tot</span><code>{{certificate.valid_until}}</code></div>
+<div class="metric-row metric-row-wrap"><span>DNS-namen</span><code>{{certificate.dns_names|join(', ')}}</code></div>
+<div class="metric-row metric-row-wrap"><span>SHA-256</span><code>{{certificate.fingerprint}}</code></div>
+{% else %}
+<div class="callout"><strong>Certificaatstatus niet beschikbaar</strong>{% if certificate.error %}<br>{{certificate.error}}{% endif %}</div>
+{% endif %}
 </div>
 </div>
+<div class="card certificate-upload-card">
+<h2>FQDN-certificaat activeren</h2>
+<form class="stack" method="post" action="{{url_for('settings_certificate')}}" enctype="multipart/form-data">
+<input type="hidden" name="csrf" value="{{csrf_token()}}">
+<div class="field"><label for="certificate-fqdn">FQDN</label><input id="certificate-fqdn" name="fqdn" value="{{certificate.fqdn}}" placeholder="policy-forge.example.com" autocomplete="off" spellcheck="false" required></div>
+<div class="field"><label for="certificate-chain">Certificate chain</label><input id="certificate-chain" name="certificate" type="file" accept=".crt,.cer,.pem,application/x-pem-file" required><p class="help">PEM-formaat, met het servercertificaat eerst.</p></div>
+<div class="field"><label for="certificate-key">Private key</label><input id="certificate-key" name="private_key" type="file" accept=".key,.pem,application/x-pem-file" required><p class="help">Niet-versleutelde PEM-key die bij het certificaat hoort.</p></div>
+<button class="btn btn-primary" type="submit">Certificaat activeren</button>
+</form>
 </div>
-<div class="card">
+<div class="card settings-audit">
 <h2>Auditlog</h2>
 <div class="timeline">{% for a in audits %}<div class="timeline-item">
 <span class="timeline-dot">

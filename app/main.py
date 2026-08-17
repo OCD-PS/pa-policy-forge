@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import signal
 import socketserver
 import sqlite3
 import ssl
@@ -30,6 +31,15 @@ from cryptography.fernet import Fernet
 from defusedxml import ElementTree as SafeET
 from flask import Flask, Response, flash, has_request_context, redirect, render_template, request, send_file, session, url_for
 
+from app.certificates import (
+    CERTIFICATE_MAX_BYTES,
+    PRIVATE_KEY_MAX_BYTES,
+    CertificateError,
+    certificate_summary,
+    configured_fqdn,
+    install_certificate,
+    read_upload,
+)
 from vendor.paloalto_light_syslog import FlowStore, parse_panos_syslog
 from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_single_replacements
 from app.migration import (
@@ -51,6 +61,8 @@ from app.offline_config import (
 
 BASE = Path(__file__).resolve().parent.parent
 DATA = Path(os.getenv("PPF_DATA_DIR", "/data"))
+CERT_DIR = Path(os.getenv("PPF_CERT_DIR", "/certs"))
+APPLIANCE_CONFIG = Path(os.getenv("PPF_APPLIANCE_CONFIG", str(DATA / "appliance.json")))
 APP_DB = DATA / "forge.sqlite3"
 FLOW_DB = DATA / "flows.sqlite3"
 RUNS = DATA / "runs"
@@ -202,6 +214,9 @@ app.config.update(
     MAX_FORM_PARTS=200,
 )
 trusted_hosts = [value.strip() for value in os.getenv("PPF_TRUSTED_HOSTS", "").split(",") if value.strip()]
+appliance_fqdn = configured_fqdn(APPLIANCE_CONFIG)
+if appliance_fqdn and appliance_fqdn not in trusted_hosts:
+    trusted_hosts.append(appliance_fqdn)
 if trusted_hosts: app.config["TRUSTED_HOSTS"] = trusted_hosts
 fernet = Fernet(secret_file("encryption.key", Fernet.generate_key))
 flow_store = FlowStore(FLOW_DB, retention_days=0)
@@ -441,6 +456,63 @@ def change_password():
             session["must_change"] = False; audit("password-changed"); flash("Wachtwoord gewijzigd.", "success")
             return redirect(url_for("index"))
     return render_template("change_password.html")
+
+
+def add_runtime_trusted_host(hostname: str) -> None:
+    configured = app.config.get("TRUSTED_HOSTS")
+    if configured is None:
+        return
+    trusted = list(configured)
+    if hostname not in trusted:
+        trusted.append(hostname)
+    app.config["TRUSTED_HOSTS"] = trusted
+
+
+def schedule_tls_reload() -> None:
+    if os.getenv("PPF_TLS_RELOAD_SIGNAL", "0") != "1":
+        return
+
+    def reload_gunicorn() -> None:
+        try:
+            os.kill(os.getppid(), signal.SIGHUP)
+        except (OSError, ProcessLookupError):
+            app.logger.exception("TLS certificate was installed but Gunicorn could not be reloaded")
+
+    timer = threading.Timer(0.75, reload_gunicorn)
+    timer.daemon = True
+    timer.start()
+
+
+@app.post("/settings/certificate")
+@login_required
+def settings_certificate():
+    try:
+        certificate_pem = read_upload(
+            request.files.get("certificate"), CERTIFICATE_MAX_BYTES, "certificate chain"
+        )
+        private_key_pem = read_upload(
+            request.files.get("private_key"), PRIVATE_KEY_MAX_BYTES, "private key"
+        )
+        result = install_certificate(
+            CERT_DIR,
+            APPLIANCE_CONFIG,
+            request.form.get("fqdn", ""),
+            certificate_pem,
+            private_key_pem,
+        )
+        add_runtime_trusted_host(str(result["fqdn"]))
+        audit(
+            "tls-certificate-updated",
+            f"fqdn={result['fqdn']} fingerprint={result['fingerprint']}",
+        )
+        schedule_tls_reload()
+        flash("FQDN en TLS-certificaat zijn opgeslagen en worden geactiveerd.", "success")
+    except CertificateError as exc:
+        flash(f"TLS-certificaat niet opgeslagen: {exc}", "error")
+    except OSError:
+        app.logger.exception("TLS certificate could not be stored")
+        flash("TLS-certificaat niet opgeslagen: de certificaatopslag is niet schrijfbaar.", "error")
+    return redirect(url_for("index") + "#settings")
 
 
 def stats() -> dict:
@@ -2641,7 +2713,7 @@ def index():
                         policies = fetch_scm_policy_type(policy_profile, policy_kind)
                         policy_catalog = fetch_object_catalog(policy_profile, "policy-picker")
                 except Exception as exc: policy_error = str(exc)
-    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, live_application_state=live_application_state, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, config_section=config_section, scm_configuration_sections=SCM_CONFIGURATION_SECTIONS, config_records=scm_config_records, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats())
+    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, live_application_state=live_application_state, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, config_section=config_section, scm_configuration_sections=SCM_CONFIGURATION_SECTIONS, config_records=scm_config_records, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats(), certificate=certificate_summary(CERT_DIR / "tls.crt", APPLIANCE_CONFIG))
 
 
 @app.get("/migration")

@@ -32,7 +32,7 @@ Self-hosted Palo Alto traffic-flow policy builder with an HTTPS web interface, U
   policy in SCM, Panorama, or standalone PAN-OS. If the anchor is not present
   in the selected target scope/rulebase, the generated rule is moved to the
   bottom instead.
-- HTTP is not exposed; the appliance serves HTTPS only.
+- HTTP serves redirects only; every request on port 80 receives a permanent redirect to HTTPS.
 - Runtime databases, credentials, keys, certificates, logs, and generated artifacts stay outside Git.
 
 ## Install on Ubuntu Server
@@ -43,6 +43,7 @@ sudo ./install.sh
 
 Ports:
 
+- `80/tcp`: HTTP to HTTPS redirect only
 - `443/tcp`: HTTPS GUI
 - `514/udp`: PAN-OS syslog
 
@@ -57,7 +58,25 @@ primary address through `PPF_BIND_ADDRESS`. Override `PPF_BIND_ADDRESS` and
 `PPF_TRUSTED_HOSTS` in `/opt/pa-policy-forge/.env` when the appliance uses a
 different management address or additional DNS aliases.
 
-The installer creates a self-signed certificate for the server IP and exposes no HTTP listener. To use a trusted certificate, replace `/opt/pa-policy-forge/certs/tls.crt` and `/opt/pa-policy-forge/certs/tls.key` with your certificate and private key, then run `docker compose restart` from `/opt/pa-policy-forge`.
+The installer creates a self-signed certificate for the server IP and starts a dedicated,
+unprivileged HTTP redirect container. If the final FQDN is already known, provide it during
+installation:
+
+```bash
+sudo env PPF_FQDN=policy-forge.example.com ./install.sh
+```
+
+After login, open **Instellingen** to activate the end-user certificate. Enter the FQDN and
+upload a PEM certificate chain plus its matching unencrypted PEM private key. PA Policy Forge
+checks the DNS SAN, validity period, key strength, certificate/key match, and OpenSSL loadability
+before atomically replacing the active files. The previous pair is retained as
+`tls.crt.previous` and `tls.key.previous`, the new FQDN is accepted as a trusted host, the HTTP
+redirect target changes immediately, and Gunicorn reloads the certificate without requiring
+Docker access from the application.
+
+Certificate files remain outside Git under `/opt/pa-policy-forge/certs`. The private key and
+appliance configuration are mode `0600`; the certificate directory is writable only by the
+non-root container user so certificate activation does not require mounting the Docker socket.
 
 For offline customers, transfer the repository plus a saved container image bundle, load it with `docker load`, and run the same Compose stack. SCM functionality naturally requires connectivity to Palo Alto cloud endpoints.
 

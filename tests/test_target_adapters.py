@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import pathlib
 import tempfile
@@ -129,6 +130,39 @@ class TargetAdapterTests(unittest.TestCase):
     def test_missing_csrf_is_rejected(self):
         response = main.app.test_client().post("/login", data={"username": "admin", "password": "not-used"}, base_url="https://forge.test")
         self.assertEqual(response.status_code, 400)
+
+    def test_authenticated_certificate_upload_activates_validated_bundle(self):
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1
+            login["username"] = "admin"
+            login["csrf"] = "certificate-csrf"
+        result = {
+            "fqdn": "forge.customer.example",
+            "fingerprint": "AA11",
+        }
+        previous_hosts = main.app.config.get("TRUSTED_HOSTS")
+        main.app.config["TRUSTED_HOSTS"] = ["forge.test"]
+        try:
+            with patch.object(main, "install_certificate", return_value=result) as installer, patch.object(main, "schedule_tls_reload") as reload_tls:
+                response = client.post(
+                    "/settings/certificate",
+                    base_url="https://forge.test",
+                    content_type="multipart/form-data",
+                    data={
+                        "csrf": "certificate-csrf",
+                        "fqdn": "forge.customer.example",
+                        "certificate": (io.BytesIO(b"certificate-pem"), "fullchain.pem"),
+                        "private_key": (io.BytesIO(b"private-key-pem"), "private.key"),
+                    },
+                )
+            self.assertEqual(response.status_code, 302)
+            self.assertEqual(response.headers["Location"], "/#settings")
+            self.assertEqual(installer.call_args.args[2:], ("forge.customer.example", b"certificate-pem", b"private-key-pem"))
+            reload_tls.assert_called_once_with()
+            self.assertIn("forge.customer.example", main.app.config["TRUSTED_HOSTS"])
+        finally:
+            main.app.config["TRUSTED_HOSTS"] = previous_hosts
 
     def test_profile_names_are_html_escaped(self):
         payload = '<img src=x onerror="alert(1)">'

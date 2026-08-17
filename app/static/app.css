@@ -197,6 +197,11 @@ tbody tr:hover { background: rgba(255,255,255,.02); }
 .progress-indeterminate { width: 38%; animation: progress-slide 1.15s ease-in-out infinite; }
 @keyframes progress-slide { from { transform: translateX(-110%); } to { transform: translateX(270%); } }
 .metric-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.metric-row-wrap { align-items: flex-start; }
+.metric-row-wrap code { max-width: 70%; overflow-wrap: anywhere; text-align: right; }
+.certificate-upload-card form { height: calc(100% - 36px); }
+.certificate-upload-card .btn { margin-top: auto; }
+.settings-audit { grid-column: 1 / -1; }
 
 /* Feedback */
 .flash-stack { position: fixed; right: 22px; top: 88px; z-index: 100; display: grid; gap: 10px; width: min(420px, calc(100vw - 44px)); }
