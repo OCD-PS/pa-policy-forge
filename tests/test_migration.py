@@ -3,6 +3,7 @@ import io
 import os
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 os.environ.setdefault("PPF_DATA_DIR", tempfile.mkdtemp(prefix="forge-migration-test-"))
@@ -215,6 +216,19 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         self.assertIsNotNone(root.find(".//vsys/entry/rulebase/pbf/rules/entry[@name='Atlas-PBF']"))
         self.assertIsNotNone(root.find(".//devices/entry/plugins/entry[@name='atlas-plugin']"))
         self.assertGreater(plan["create"], 40)
+
+    def test_panos_sdwan_rules_are_deliberately_not_migrated(self):
+        base = b'''<config><devices><entry name="localhost.localdomain"><device-group><entry name="DG-Test"><pre-rulebase><sdwan><rules><entry name="Existing-SDWAN"/></rules></sdwan></pre-rulebase></entry></device-group></entry></devices></config>'''
+        source = b'''<config><devices><entry name="localhost.localdomain"><device-group><entry name="DG-Source"><pre-rulebase><sdwan><rules><entry name="Source-SDWAN"/></rules></sdwan></pre-rulebase></entry></device-group></entry></devices></config>'''
+        model = parse_vendor("panos", source, "panorama-with-sdwan.xml")
+        self.assertNotIn("sdwan_rules", model.extras)
+        self.assertTrue(any("SD-WAN policy Source-SDWAN wordt bewust niet gemigreerd" in item for item in model.unsupported))
+
+        merged, plan = merge_model_into_panos_xml(base, model, "DG-Test", True, "pre")
+        root = ET.fromstring(merged)
+        names = [entry.get("name") for entry in root.findall(".//device-group/entry[@name='DG-Test']/pre-rulebase/sdwan/rules/entry")]
+        self.assertEqual(names, ["Existing-SDWAN"])
+        self.assertEqual(plan["conflicts"], [])
 
     def test_srx_set_commands_are_parsed(self):
         model = parse_vendor("juniper-srx", b'''set security address-book global address app1 198.51.100.10/32

@@ -220,6 +220,11 @@ PANOS_POLICY_PATHS = {
     "tunnel_inspection_rules": "tunnel-inspect",
 }
 
+# Intentionally outside migration parity. SD-WAN policies are Panorama-specific
+# and are left in the target/base configuration instead of being transferred
+# from a migration source.
+PANOS_EXCLUDED_POLICY_PATHS = {"sdwan": "SD-WAN"}
+
 
 class BaseParser:
     vendor = "generic"
@@ -754,6 +759,11 @@ class PanosConfigParser(BaseParser):
                     item = cls._raw_item(entry, f"{owner} · {rulebase}", f"{rulebase}/{policy_type}/rules")
                     item.update({"rulebase": rulebase, "policy_type": policy_type})
                     model.extras.setdefault(kind, []).append(item)
+            for policy_type, label in PANOS_EXCLUDED_POLICY_PATHS.items():
+                for entry in location.findall(f"./{rulebase}/{policy_type}/rules/entry"):
+                    model.unsupported.append(
+                        f"{owner} · {rulebase}: {label} policy {entry.get('name', '')} wordt bewust niet gemigreerd"
+                    )
 
     @classmethod
     def _network(cls, model: MigrationModel, network: ET.Element | None, owner: str) -> None:
