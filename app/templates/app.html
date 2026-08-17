@@ -522,6 +522,24 @@
 <button class="btn btn-primary" type="submit">Certificaat activeren</button>
 </form>
 </div>
+<div class="card">
+<div class="card-header"><div><h2>Application Database</h2><p class="muted">Centrale Palo Alto App-ID catalogus voor alle policy- en migratie-editors.</p></div>{% if application_catalog_settings.refreshing %}<span class="badge badge-warning">Bezig</span>{% elif application_catalog_settings.last_error %}<span class="badge badge-danger">Fout</span>{% elif application_catalog_settings.item_count %}<span class="badge badge-success">{{application_catalog_settings.item_count}} apps</span>{% else %}<span class="badge">Niet geladen</span>{% endif %}</div>
+<form class="stack" method="post" action="{{url_for('settings_application_catalog')}}">
+<input type="hidden" name="csrf" value="{{csrf_token()}}">
+<label class="checkbox"><input type="checkbox" name="enabled" {{'checked' if application_catalog_settings.enabled else ''}}> Automatisch vernieuwen via SCM</label>
+<div class="form-grid">
+<div class="field"><label>SCM Client ID</label><input name="client_id" autocomplete="off" placeholder="{{'Ingesteld — leeg laten om te behouden' if application_catalog_settings.credentials_configured else 'Client ID'}}"></div>
+<div class="field"><label>SCM Client secret</label><input name="client_secret" type="password" autocomplete="new-password" placeholder="{{'Ingesteld — leeg laten om te behouden' if application_catalog_settings.credentials_configured else 'Client secret'}}"></div>
+<div class="field"><label>TSG ID</label><input name="tsg_id" autocomplete="off" placeholder="{{'Ingesteld — leeg laten om te behouden' if application_catalog_settings.credentials_configured else 'TSG ID'}}"></div>
+<div class="field"><label>Folder</label><input name="folder" value="{{application_catalog_settings.folder}}" placeholder="All"></div>
+<div class="field"><label>Refresh-interval</label><select name="interval_hours">{% for hours,label in [(1,'Elk uur'),(6,'Elke 6 uur'),(12,'Elke 12 uur'),(24,'Dagelijks'),(168,'Wekelijks')] %}<option value="{{hours}}" {{'selected' if application_catalog_settings.interval_hours==hours else ''}}>{{label}}</option>{% endfor %}</select></div>
+</div>
+<div class="metric-row"><span>Laatste succesvolle refresh</span><code>{{application_catalog_settings.last_success or 'Nog niet uitgevoerd'}}</code></div>
+{% if application_catalog_settings.last_error %}<div class="callout"><strong>Laatste fout</strong><br>{{application_catalog_settings.last_error}}</div>{% endif %}
+<button class="btn btn-primary" type="submit">Instellingen opslaan</button>
+</form>
+<form method="post" action="{{url_for('settings_application_catalog_refresh')}}" class="cluster"><input type="hidden" name="csrf" value="{{csrf_token()}}"><button class="btn" type="submit" {{'disabled' if not application_catalog_settings.credentials_configured or not application_catalog_settings.enabled else ''}}>Nu ophalen & verbinding testen</button></form>
+</div>
 <div class="card settings-audit">
 <h2>Auditlog</h2>
 <div class="timeline">{% for a in audits %}<div class="timeline-item">

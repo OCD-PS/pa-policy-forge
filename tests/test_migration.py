@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("PPF_DATA_DIR", tempfile.mkdtemp(prefix="forge-migration-test-"))
 os.environ.setdefault("PPF_SYSLOG_PORT", "55149")
@@ -588,6 +589,154 @@ end''', "atlas-a.conf")
         with main.db() as conn:
             self.assertGreater(conn.execute("SELECT COUNT(*) FROM config_workspaces WHERE profile_id=?", (profile_id,)).fetchone()[0], before)
         self.assertFalse(draft_path.exists())
+
+    def test_central_scm_application_catalog_settings_are_encrypted_and_reused(self):
+        client = main.app.test_client()
+        with main.app.test_request_context("/", base_url="https://forge.test"):
+            cookie_name = main.app.config["SESSION_COOKIE_NAME"]
+            serializer = main.app.session_interface.get_signing_serializer(main.app)
+            client.set_cookie(cookie_name, serializer.dumps({"user_id": 1, "username": "admin", "csrf": "migration-test-csrf"}), domain="forge.test", secure=True)
+        with patch("app.main.refresh_default_application_catalog_async", return_value=True):
+            response = client.post(
+                "/settings/application-catalog",
+                base_url="https://forge.test",
+                data={
+                    "csrf": "migration-test-csrf",
+                    "enabled": "on",
+                    "client_id": "catalog-client",
+                    "client_secret": "catalog-secret-value",
+                    "tsg_id": "123456789",
+                    "folder": "All",
+                    "interval_hours": "24",
+                },
+            )
+        self.assertEqual(response.status_code, 302)
+        with main.db() as conn:
+            row = conn.execute("SELECT * FROM system_settings WHERE setting_key='application_catalog'").fetchone()
+        self.assertIsNotNone(row)
+        self.assertNotIn(b"catalog-secret-value", bytes(row["secret_blob"]))
+        decrypted = json.loads(main.fernet.decrypt(row["secret_blob"]).decode())
+        self.assertEqual(decrypted["client_id"], "catalog-client")
+        self.assertEqual(decrypted["client_secret"], "catalog-secret-value")
+
+        applications = [{"name": "ssl"}, {"name": "web-browsing"}, {"name": "ssl"}]
+        with patch("app.main.fetch_scm_objects", return_value=applications):
+            self.assertEqual(main.refresh_default_application_catalog(), 2)
+        settings = main.application_catalog_configuration()
+        self.assertEqual(settings["item_count"], 2)
+        self.assertFalse(settings["last_error"])
+        with patch("app.main.refresh_catalog_async"):
+            catalog = main.cached_application_catalog({"id": 987654, "target_type": "panos"})
+        self.assertEqual([item["name"] for item in catalog["items"]], ["ssl", "web-browsing"])
+
+    def test_imported_vendor_source_opens_full_workspace_editor_and_syncs_back(self):
+        stamp = main.now()
+        with main.db() as conn:
+            profile_id = conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("PANOS import editor test", "panos", json.dumps({"vsys": "vsys1"}), stamp, stamp),
+            ).lastrowid
+            project_id = conn.execute(
+                "INSERT INTO migration_projects(name,target_profile_id,created_at,updated_at) VALUES(?,?,?,?)",
+                ("editable-import", profile_id, stamp, stamp),
+            ).lastrowid
+        model = parse_vendor("fortinet", b'''config firewall address
+edit "web01"
+set subnet 192.0.2.10 255.255.255.255
+next
+end
+config firewall policy
+edit 1
+set name "allow-web"
+set srcintf "Trust"
+set dstintf "DMZ"
+set srcaddr "all"
+set dstaddr "web01"
+set service "HTTPS"
+set action accept
+next
+end''', "editable-fortigate.conf")
+        source_id = main.store_migration_source(project_id, "fortinet", model.source_name, model)
+        client = main.app.test_client()
+        with main.app.test_request_context("/", base_url="https://forge.test"):
+            cookie_name = main.app.config["SESSION_COOKIE_NAME"]
+            serializer = main.app.session_interface.get_signing_serializer(main.app)
+            client.set_cookie(cookie_name, serializer.dumps({"user_id": 1, "username": "admin", "csrf": "migration-test-csrf"}), domain="forge.test", secure=True)
+        response = client.post(
+            f"/migration/projects/{project_id}/sources/{source_id}/edit",
+            base_url="https://forge.test",
+            data={"csrf": "migration-test-csrf"},
+        )
+        self.assertEqual(response.status_code, 302)
+        with main.db() as conn:
+            source = conn.execute("SELECT * FROM migration_sources WHERE id=?", (source_id,)).fetchone()
+        workspace_id = int(source["staging_workspace_id"])
+        self.assertGreater(workspace_id, 0)
+
+        policy_page = client.get(
+            f"/config-workspaces/{workspace_id}/edit?workspace_view=policies&policy_kind=security",
+            base_url="https://forge.test",
+        ).get_data(as_text=True)
+        self.assertIn("Importeditor", policy_page)
+        self.assertIn("allow-web", policy_page)
+        self.assertIn("Bulk edit", policy_page)
+        self.assertIn("Gebruik wijzigingen in migratie", policy_page)
+        self.assertNotIn(">API push<", policy_page)
+        object_page = client.get(
+            f"/config-workspaces/{workspace_id}/edit?workspace_view=objects&object_type=addresses",
+            base_url="https://forge.test",
+        ).get_data(as_text=True)
+        self.assertIn("web01", object_page)
+        self.assertIn("+ Add", object_page)
+        self.assertIn("− Delete", object_page)
+
+        preview = client.post(
+            f"/config-workspaces/{workspace_id}/policies/preview",
+            base_url="https://forge.test",
+            data={
+                "csrf": "migration-test-csrf", "scope": "vsys1",
+                "policy_kind": "security", "rulebase": "standard",
+                "policy_name": "allow-web", "name": "allow-web-edited",
+                "from": "Trust", "to": "DMZ", "source": "any",
+                "destination": "web01", "source_user": "any",
+                "destination_user": "any", "source_hip": "any",
+                "destination_hip": "any", "category": "any",
+                "application": "any", "service": "HTTPS", "action": "allow",
+                "description": "edited before migration merge",
+            },
+        )
+        self.assertEqual(preview.status_code, 200)
+        draft_path = max(main.POLICY_DRAFTS.glob("offline-*.json"), key=lambda path: path.stat().st_mtime_ns)
+        draft_id = draft_path.stem.removeprefix("offline-")
+        applied = client.post(
+            f"/config-workspaces/policy-drafts/{draft_id}/apply",
+            base_url="https://forge.test",
+            data={"csrf": "migration-test-csrf"},
+        )
+        self.assertEqual(applied.status_code, 302)
+        with main.db() as conn:
+            edited_source = conn.execute("SELECT * FROM migration_sources WHERE id=?", (source_id,)).fetchone()
+        edited_workspace_id = int(edited_source["staging_workspace_id"])
+        self.assertNotEqual(edited_workspace_id, workspace_id)
+        edited_page = client.get(
+            f"/config-workspaces/{edited_workspace_id}/edit?workspace_view=policies&policy_kind=security",
+            base_url="https://forge.test",
+        ).get_data(as_text=True)
+        self.assertIn("allow-web-edited", edited_page)
+        self.assertIn("Gebruik wijzigingen in migratie", edited_page)
+        self.assertNotIn(">API push<", edited_page)
+
+        synced = client.post(
+            f"/migration/projects/{project_id}/sources/{source_id}/sync-workspace",
+            base_url="https://forge.test",
+            data={"csrf": "migration-test-csrf"},
+        )
+        self.assertEqual(synced.status_code, 302)
+        refreshed = main.migration_model(main.migration_source_row(source_id))
+        self.assertEqual(refreshed.vendor, "fortinet")
+        self.assertEqual(refreshed.security_rules[0].name, "allow-web-edited")
+        project_page = client.get(f"/migration/projects/{project_id}", base_url="https://forge.test").get_data(as_text=True)
+        self.assertIn("Open importeditor", project_page)
 
     def test_active_active_project_renders_and_exports_two_outputs(self):
         stamp = main.now()

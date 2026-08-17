@@ -9,6 +9,7 @@ import io
 import ipaddress
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import shutil
@@ -190,6 +191,10 @@ _catalog_refresh_lock = threading.Lock()
 _catalog_errors: dict[tuple[int, str], str] = {}
 _catalog_retry_after: dict[tuple[int, str], float] = {}
 CATALOG_RETRY_SECONDS = 60
+DEFAULT_APPLICATION_CACHE = OBJECT_CACHE / "default-applications-v2.json"
+DEFAULT_CATALOG_INITIAL_DELAY = max(30, int(os.getenv("PPF_APP_CATALOG_INITIAL_DELAY", "60")))
+_default_catalog_refresh_lock = threading.RLock()
+_default_catalog_refreshing = False
 _panos_key_cache: dict[int, tuple[str, str, str, float]] = {}
 _panos_key_cache_lock = threading.Lock()
 PANOS_KEY_CACHE_SECONDS = 900
@@ -313,7 +318,8 @@ def init_db() -> None:
           id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, vendor TEXT NOT NULL,
           source_name TEXT NOT NULL, model_path TEXT NOT NULL, fingerprint TEXT NOT NULL,
           counts_json TEXT NOT NULL DEFAULT '{}', warnings_json TEXT NOT NULL DEFAULT '[]',
-          created_at TEXT NOT NULL, FOREIGN KEY(project_id) REFERENCES migration_projects(id)
+          staging_workspace_id INTEGER, created_at TEXT NOT NULL,
+          FOREIGN KEY(project_id) REFERENCES migration_projects(id)
         );
         CREATE TABLE IF NOT EXISTS migration_merge_rules (
           id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, kind TEXT NOT NULL,
@@ -333,10 +339,17 @@ def init_db() -> None:
           FOREIGN KEY(project_id) REFERENCES migration_projects(id),
           FOREIGN KEY(workspace_id) REFERENCES config_workspaces(id)
         );
+        CREATE TABLE IF NOT EXISTS system_settings (
+          setting_key TEXT PRIMARY KEY, settings_json TEXT NOT NULL DEFAULT '{}',
+          secret_blob BLOB NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+        );
         """)
         project_columns = {row[1] for row in conn.execute("PRAGMA table_info(migration_projects)")}
         if "topology" not in project_columns:
             conn.execute("ALTER TABLE migration_projects ADD COLUMN topology TEXT NOT NULL DEFAULT 'active-passive'")
+        source_columns = {row[1] for row in conn.execute("PRAGMA table_info(migration_sources)")}
+        if "staging_workspace_id" not in source_columns:
+            conn.execute("ALTER TABLE migration_sources ADD COLUMN staging_workspace_id INTEGER")
         if not conn.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
             bootstrap_password = os.getenv("PPF_BOOTSTRAP_PASSWORD", "admin") or "admin"
             if bootstrap_password != "admin" and (len(bootstrap_password) < 12 or password_is_blocked(bootstrap_password)):
@@ -524,6 +537,66 @@ def settings_certificate():
     except OSError:
         app.logger.exception("TLS certificate could not be stored")
         flash("TLS-certificaat niet opgeslagen: de certificaatopslag is niet schrijfbaar.", "error")
+    return redirect(url_for("index") + "#settings")
+
+
+@app.post("/settings/application-catalog")
+@login_required
+def settings_application_catalog():
+    try:
+        enabled = request.form.get("enabled") == "on"
+        folder = request.form.get("folder", "All").strip() or "All"
+        if not re.fullmatch(r"[A-Za-z0-9_. -]{1,64}", folder):
+            raise ValueError("Ongeldige SCM-folder")
+        interval_hours = max(1, min(168, int(request.form.get("interval_hours", "24"))))
+        supplied = {
+            key: request.form.get(key, "").strip()
+            for key in ("client_id", "client_secret", "tsg_id")
+        }
+        with db() as conn:
+            existing = conn.execute(
+                "SELECT * FROM system_settings WHERE setting_key='application_catalog'"
+            ).fetchone()
+            current_secret = (
+                json.loads(fernet.decrypt(existing["secret_blob"]).decode())
+                if existing and existing["secret_blob"] else {}
+            )
+            merged_secret = {
+                **current_secret,
+                **{key: value for key, value in supplied.items() if value},
+            }
+            if enabled and not all(merged_secret.get(key) for key in ("client_id", "client_secret", "tsg_id")):
+                raise ValueError("Client ID, Client secret en TSG ID zijn verplicht")
+            old_settings = json.loads(existing["settings_json"] or "{}") if existing else {}
+            settings = {
+                **old_settings,
+                "enabled": enabled,
+                "folder": folder,
+                "interval_hours": interval_hours,
+            }
+            blob = fernet.encrypt(json.dumps(merged_secret).encode()) if merged_secret else b""
+            conn.execute(
+                "INSERT INTO system_settings(setting_key,settings_json,secret_blob,updated_at) VALUES('application_catalog',?,?,?) "
+                "ON CONFLICT(setting_key) DO UPDATE SET settings_json=excluded.settings_json,secret_blob=excluded.secret_blob,updated_at=excluded.updated_at",
+                (json.dumps(settings), blob, now()),
+            )
+        audit("application-catalog-settings-saved", f"enabled={enabled} interval_hours={interval_hours}")
+        if enabled:
+            refresh_default_application_catalog_async()
+        flash("Application Database-instellingen opgeslagen.", "success")
+    except Exception as exc:
+        flash(f"Application Database niet opgeslagen: {exc}", "error")
+    return redirect(url_for("index") + "#settings")
+
+
+@app.post("/settings/application-catalog/refresh")
+@login_required
+def settings_application_catalog_refresh():
+    try:
+        count = refresh_default_application_catalog()
+        flash(f"SCM-verbinding geslaagd; {count} applications opgeslagen.", "success")
+    except Exception as exc:
+        flash(f"Application Database refresh mislukt: {type(exc).__name__}.", "error")
     return redirect(url_for("index") + "#settings")
 
 
@@ -1077,6 +1150,123 @@ def fetch_application_objects(profile) -> list[dict]:
     return list(combined.values())
 
 
+def application_catalog_configuration(include_record: bool = False):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM system_settings WHERE setting_key='application_catalog'"
+        ).fetchone()
+    settings = {
+        "enabled": False,
+        "folder": "All",
+        "interval_hours": 24,
+        "last_success": "",
+        "last_error": "",
+        "item_count": 0,
+    }
+    if row:
+        try:
+            settings.update(json.loads(row["settings_json"] or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            pass
+    settings["enabled"] = bool(settings.get("enabled"))
+    settings["folder"] = str(settings.get("folder") or "All")
+    settings["interval_hours"] = max(1, min(168, int(settings.get("interval_hours") or 24)))
+    settings["item_count"] = max(0, int(settings.get("item_count") or 0))
+    settings["credentials_configured"] = bool(row and row["secret_blob"])
+    with _default_catalog_refresh_lock:
+        settings["refreshing"] = _default_catalog_refreshing
+    return (settings, row) if include_record else settings
+
+
+def update_application_catalog_state(**updates) -> dict:
+    settings, row = application_catalog_configuration(include_record=True)
+    settings.pop("credentials_configured", None)
+    settings.pop("refreshing", None)
+    settings.update(updates)
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO system_settings(setting_key,settings_json,secret_blob,updated_at) VALUES('application_catalog',?,?,?) "
+            "ON CONFLICT(setting_key) DO UPDATE SET settings_json=excluded.settings_json,updated_at=excluded.updated_at",
+            (json.dumps(settings), row["secret_blob"] if row else b"", now()),
+        )
+    return application_catalog_configuration()
+
+
+def default_application_items() -> list[dict]:
+    try:
+        raw = json.loads(DEFAULT_APPLICATION_CACHE.read_text()) if DEFAULT_APPLICATION_CACHE.exists() else []
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [item for item in raw if isinstance(item, dict) and str(item.get("name", "")).strip()]
+
+
+def refresh_default_application_catalog() -> int:
+    global _default_catalog_refreshing
+    if not _default_catalog_refresh_lock.acquire(blocking=False):
+        raise RuntimeError("De Application Database wordt al vernieuwd")
+    _default_catalog_refreshing = True
+    try:
+        settings, row = application_catalog_configuration(include_record=True)
+        if not settings["enabled"]:
+            raise ValueError("Activeer eerst de automatische Application Database")
+        if not row or not row["secret_blob"]:
+            raise ValueError("SCM-credentials ontbreken")
+        profile = {
+            "id": -1,
+            "name": "Default Application Database",
+            "target_type": "scm",
+            "settings_json": json.dumps({
+                "folder": settings["folder"],
+                "object_folder": settings["folder"],
+                "rulebase": "pre",
+            }),
+            "secret_blob": row["secret_blob"],
+            "updated_at": row["updated_at"],
+        }
+        fresh = fetch_scm_objects(profile, "applications")
+        by_name = {
+            str(item.get("name", "")).strip(): item
+            for item in fresh
+            if str(item.get("name", "")).strip()
+        }
+        items = [by_name[name] for name in sorted(by_name, key=str.casefold)]
+        temporary = DEFAULT_APPLICATION_CACHE.with_suffix(".tmp")
+        temporary.write_text(json.dumps(items))
+        temporary.chmod(0o600)
+        temporary.replace(DEFAULT_APPLICATION_CACHE)
+        update_application_catalog_state(
+            last_success=now(), last_error="", item_count=len(items)
+        )
+        audit("application-catalog-refreshed", f"items={len(items)}")
+        return len(items)
+    except Exception as exc:
+        try:
+            update_application_catalog_state(
+                last_error=f"{type(exc).__name__}: ophalen mislukt"
+            )
+        except Exception:
+            app.logger.exception("Application Database status kon niet worden bijgewerkt")
+        raise
+    finally:
+        _default_catalog_refreshing = False
+        _default_catalog_refresh_lock.release()
+
+
+def refresh_default_application_catalog_async() -> bool:
+    with _default_catalog_refresh_lock:
+        if _default_catalog_refreshing:
+            return False
+
+    def refresh():
+        try:
+            refresh_default_application_catalog()
+        except Exception:
+            app.logger.exception("periodieke SCM Application Database refresh mislukt")
+
+    threading.Thread(target=refresh, name="default-application-catalog", daemon=True).start()
+    return True
+
+
 def refresh_catalog_async(profile, kind: str, cache_path: Path) -> None:
     key = (int(profile["id"]), kind)
     with _catalog_refresh_lock:
@@ -1116,7 +1306,21 @@ def cached_application_catalog(profile) -> dict:
     with _catalog_refresh_lock:
         refreshing = (profile_id, "applications") in _catalog_refreshing
         error = _catalog_errors.get((profile_id, "applications"), "")
-    return {"ready": bool(items), "refreshing": refreshing, "error": error, "items": [{"name": item.get("name", ""), "kind": "applications"} for item in items if item.get("name")]}
+    combined = {
+        item.get("name", ""): item
+        for item in default_application_items()
+        if item.get("name")
+    }
+    combined.update({item.get("name", ""): item for item in items if item.get("name")})
+    return {
+        "ready": bool(combined),
+        "refreshing": refreshing or application_catalog_configuration()["refreshing"],
+        "error": error,
+        "items": [
+            {"name": name, "kind": "applications"}
+            for name in sorted(combined, key=str.casefold)
+        ],
+    }
 
 
 def fetch_object_catalog(profile, object_type: str) -> list[dict]:
@@ -1519,6 +1723,37 @@ def store_config_workspace(profile, name: str, original_name: str, xml_bytes: by
     return workspace_id
 
 
+def advance_migration_staging_workspace(previous_workspace_id: int, new_workspace_id: int) -> bool:
+    """Keep an imported source attached to the newest immutable workspace version."""
+    with db() as conn:
+        linked_sources = conn.execute(
+            "SELECT id,project_id FROM migration_sources WHERE staging_workspace_id=?",
+            (previous_workspace_id,),
+        ).fetchall()
+        if not linked_sources:
+            return False
+        conn.execute(
+            "UPDATE migration_sources SET staging_workspace_id=? WHERE staging_workspace_id=?",
+            (new_workspace_id, previous_workspace_id),
+        )
+        project_ids = {int(source["project_id"]) for source in linked_sources}
+        for project_id in project_ids:
+            conn.execute(
+                "UPDATE migration_projects SET base_workspace_id=?,updated_at=? "
+                "WHERE id=? AND base_workspace_id=?",
+                (new_workspace_id, now(), project_id, previous_workspace_id),
+            )
+    return True
+
+
+def workspace_version_source(workspace) -> str:
+    return (
+        "migration-staging"
+        if str(workspace["source"]) in {"migration-staging", "migration-import", "migration-api"}
+        else "edit"
+    )
+
+
 def store_migration_output(
     project_id: int,
     workspace_id: int,
@@ -1597,6 +1832,29 @@ def store_migration_source(project_id: int, vendor: str, source_name: str, model
             source_id = int(cursor.lastrowid)
             conn.execute("UPDATE migration_projects SET updated_at=? WHERE id=?", (now(), project_id))
         return source_id
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def replace_migration_source_model(source, model: MigrationModel) -> None:
+    raw = json.dumps(model.as_dict(), sort_keys=True, separators=(",", ":")).encode()
+    path = MIGRATION_SOURCES / f"{secrets.token_hex(16)}.json"
+    path.write_bytes(raw)
+    path.chmod(0o600)
+    try:
+        with db() as conn:
+            conn.execute(
+                "UPDATE migration_sources SET vendor=?,source_name=?,model_path=?,fingerprint=?,counts_json=?,warnings_json=? WHERE id=?",
+                (
+                    model.vendor, model.source_name[:255], str(path), hashlib.sha256(raw).hexdigest(),
+                    json.dumps(model.counts()), json.dumps(model.warnings + model.unsupported), source["id"],
+                ),
+            )
+            conn.execute(
+                "UPDATE migration_projects SET updated_at=? WHERE id=?",
+                (now(), source["project_id"]),
+            )
     except Exception:
         path.unlink(missing_ok=True)
         raise
@@ -1967,6 +2225,12 @@ def config_workspace_editor(workspace_id):
     try:
         with db() as conn:
             workspace_profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+            staging_source = conn.execute(
+                "SELECT migration_sources.id source_id,migration_sources.project_id,migration_sources.vendor,migration_sources.source_name,migration_projects.name project_name "
+                "FROM migration_sources JOIN migration_projects ON migration_projects.id=migration_sources.project_id "
+                "WHERE migration_sources.staging_workspace_id=?",
+                (workspace_id,),
+            ).fetchone()
         if not workspace_profile:
             raise OfflineConfigError("Het gekoppelde firewallprofiel bestaat niet meer")
         xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
@@ -2082,6 +2346,8 @@ def config_workspace_editor(workspace_id):
             offline_policy_fields=OFFLINE_POLICY_FIELDS,
             workspace_policy_nav=WORKSPACE_POLICY_NAV, workspace_object_nav=WORKSPACE_OBJECT_NAV,
             workspace_network_nav=WORKSPACE_NETWORK_NAV, workspace_device_nav=WORKSPACE_DEVICE_NAV,
+            staging_source=staging_source,
+            migration_staging=str(workspace["source"]) in {"migration-staging", "migration-import", "migration-api"},
         )
     except Exception as exc:
         flash(f"Workspace niet geopend: {exc}", "error")
@@ -2195,8 +2461,9 @@ def config_workspace_policy_bulk_apply(draft_id):
             new_xml = replace_policy_in_snapshot(new_xml, draft["scope"], draft["kind"], draft["rulebase"], change["policy_name"], change["fingerprint"], change["replacement_xml"])
         with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
         if not profile: raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
-        new_id = store_config_workspace(profile, f"{workspace['name']} · bulk edit {now()}", workspace["original_name"], new_xml, "edit")
-        set_active_config_workspace(workspace["profile_id"], new_id)
+        new_id = store_config_workspace(profile, f"{workspace['name']} · bulk edit {now()}", workspace["original_name"], new_xml, workspace_version_source(workspace))
+        if not advance_migration_staging_workspace(workspace["id"], new_id):
+            set_active_config_workspace(workspace["profile_id"], new_id)
         audit("config-workspace-policy-bulk-edited", f"source={workspace['id']} workspace={new_id} scope={draft['scope']} rules={len(draft['changes'])}")
         draft_path.unlink(missing_ok=True)
         flash(f"{len(draft['changes'])} policies gewijzigd in een nieuwe workspaceversie.", "success")
@@ -2229,9 +2496,10 @@ def config_workspace_policy_apply(draft_id):
         if not profile:
             raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
         new_id = store_config_workspace(
-            profile, f"{workspace['name']} · edit {now()}", workspace["original_name"], new_xml, "edit",
+            profile, f"{workspace['name']} · edit {now()}", workspace["original_name"], new_xml, workspace_version_source(workspace),
         )
-        set_active_config_workspace(workspace["profile_id"], new_id)
+        if not advance_migration_staging_workspace(workspace["id"], new_id):
+            set_active_config_workspace(workspace["profile_id"], new_id)
         audit("config-workspace-policy-edited", f"source={workspace['id']} workspace={new_id} scope={draft['scope']} policy={draft['policy_name']}")
         draft_path.unlink(missing_ok=True)
         flash("Policy gewijzigd in een nieuwe workspaceversie; de bronsnapshot bleef onaangeroerd.", "success")
@@ -2371,9 +2639,10 @@ def config_workspace_object_apply(draft_id):
         if not profile:
             raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
         new_id = store_config_workspace(
-            profile, f"{workspace['name']} · object edit {now()}", workspace["original_name"], new_xml, "edit",
+            profile, f"{workspace['name']} · object edit {now()}", workspace["original_name"], new_xml, workspace_version_source(workspace),
         )
-        set_active_config_workspace(workspace["profile_id"], new_id)
+        if not advance_migration_staging_workspace(workspace["id"], new_id):
+            set_active_config_workspace(workspace["profile_id"], new_id)
         draft_path.unlink(missing_ok=True)
         audit("config-workspace-object-edited", f"source={workspace['id']} workspace={new_id} scope={draft['scope']} type={draft['object_type']} operation={draft['operation']}")
         flash("Objectwijziging bewaard in een nieuwe workspaceversie; de bron bleef onaangeroerd.", "success")
@@ -2401,9 +2670,10 @@ def _store_workspace_configuration_version(workspace, context: dict, changes: li
         raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
     new_id = store_config_workspace(
         profile, f"{workspace['name']} · {context['view']} edit {now()}",
-        workspace["original_name"], new_xml, "edit",
+        workspace["original_name"], new_xml, workspace_version_source(workspace),
     )
-    set_active_config_workspace(workspace["profile_id"], new_id)
+    if not advance_migration_staging_workspace(workspace["id"], new_id):
+        set_active_config_workspace(workspace["profile_id"], new_id)
     audit("config-workspace-configuration-edited", f"source={workspace['id']} workspace={new_id} view={context['view']} section={context['section']} operation={context.get('operation','update')}")
     return new_id
 
@@ -2778,7 +3048,7 @@ def index():
                         policies = fetch_scm_policy_type(policy_profile, policy_kind)
                         policy_catalog = fetch_object_catalog(policy_profile, "policy-picker")
                 except Exception as exc: policy_error = str(exc)
-    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, live_application_state=live_application_state, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, config_section=config_section, scm_configuration_sections=SCM_CONFIGURATION_SECTIONS, config_records=scm_config_records, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats(), certificate=certificate_summary(CERT_DIR / "tls.crt", APPLIANCE_CONFIG))
+    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, live_application_state=live_application_state, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, config_section=config_section, scm_configuration_sections=SCM_CONFIGURATION_SECTIONS, config_records=scm_config_records, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats(), certificate=certificate_summary(CERT_DIR / "tls.crt", APPLIANCE_CONFIG), application_catalog_settings=application_catalog_configuration())
 
 
 @app.get("/migration")
@@ -2955,6 +3225,11 @@ def migration_source_upload(project_id):
                 content,
                 "migration-import",
             )
+            with db() as conn:
+                conn.execute(
+                    "UPDATE migration_sources SET staging_workspace_id=? WHERE id=?",
+                    (workspace_id, source_id),
+                )
             if not int(project["base_workspace_id"] or 0):
                 base_selected = True
                 with db() as conn:
@@ -2989,11 +3264,107 @@ def migration_source_profile(project_id):
         source_id=store_migration_source(project_id,model.vendor,model.source_name,model)
         if xml_bytes is not None and int(profile["id"])==int(project["target_profile_id"]):
             workspace_id=store_config_workspace(profile,f"Bronconfiguratie - {profile['name']}",f"{profile['name']}-candidate.xml",xml_bytes,"migration-api")
-            with db() as conn: conn.execute("UPDATE migration_projects SET base_workspace_id=?,updated_at=? WHERE id=?",(workspace_id,now(),project_id))
+            with db() as conn:
+                conn.execute("UPDATE migration_projects SET base_workspace_id=?,updated_at=? WHERE id=?",(workspace_id,now(),project_id))
+                conn.execute("UPDATE migration_sources SET staging_workspace_id=? WHERE id=?",(workspace_id,source_id))
         audit("migration-live-source",f"project={project_id} source={source_id} profile={profile['name']}")
         flash(f"Live configuratie van {profile['name']} toegevoegd.","success")
     except Exception as exc: flash(f"Live configuratie niet opgehaald: {exc}","error")
     return redirect(url_for("migration_project",project_id=project_id))
+
+
+@app.post("/migration/projects/<int:project_id>/sources/<int:source_id>/edit")
+@login_required
+def migration_source_edit(project_id, source_id):
+    project = migration_project_row(project_id)
+    source = migration_source_row(source_id)
+    if not project or not source or int(source["project_id"]) != project_id:
+        return "Not found", 404
+    try:
+        existing_workspace_id = int(source["staging_workspace_id"] or 0)
+        if existing_workspace_id and workspace_row(existing_workspace_id):
+            return redirect(url_for("config_workspace_editor", workspace_id=existing_workspace_id, workspace_view="policies"))
+        with db() as conn:
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (project["target_profile_id"],)).fetchone()
+        if not profile:
+            raise MigrationError("Targetprofiel bestaat niet meer")
+        model = migration_model(source)
+        settings = profile_settings(profile)
+        panorama = profile["target_type"] == "panorama"
+        scope = settings.get("device_group", "") if panorama else settings.get("vsys", "vsys1") or "vsys1"
+        base_xml = migration_base_xml(model, scope, panorama)
+        merged_xml, _ = merge_model_into_panos_xml(
+            base_xml, model, scope, panorama, settings.get("rulebase", "pre")
+        )
+        safe_source_name = re.sub(
+            r"[^A-Za-z0-9._-]+", "-", Path(source["source_name"]).stem
+        ).strip("-") or "migration-source"
+        workspace_id = store_config_workspace(
+            profile,
+            f"{source['source_name']} · import editor",
+            f"{safe_source_name}.xml",
+            merged_xml,
+            "migration-staging",
+        )
+        with db() as conn:
+            conn.execute(
+                "UPDATE migration_sources SET staging_workspace_id=? WHERE id=?",
+                (workspace_id, source_id),
+            )
+        audit("migration-source-editor-created", f"project={project_id} source={source_id} workspace={workspace_id}")
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, workspace_view="policies"))
+    except Exception as exc:
+        flash(f"Importeditor niet geopend: {exc}", "error")
+        return redirect(url_for("migration_project", project_id=project_id))
+
+
+@app.post("/migration/projects/<int:project_id>/sources/<int:source_id>/sync-workspace")
+@login_required
+def migration_source_sync_workspace(project_id, source_id):
+    project = migration_project_row(project_id)
+    source = migration_source_row(source_id)
+    if not project or not source or int(source["project_id"]) != project_id:
+        return "Not found", 404
+    try:
+        workspace_id = int(source["staging_workspace_id"] or 0)
+        workspace = workspace_row(workspace_id) if workspace_id else None
+        if not workspace or int(workspace["profile_id"]) != int(project["target_profile_id"]):
+            raise MigrationError("De importeditor-workspace ontbreekt")
+        original = migration_model(source)
+        edited = parse_vendor("panos", workspace_config_path(workspace).read_bytes(), source["source_name"])
+        edited.vendor = original.vendor
+        edited.source_name = original.source_name
+        unsupported_action_warnings = [
+            message for message in original.warnings
+            if "niet-ondersteunde Check Point actie" in message
+        ]
+        remaining_markers = sum(
+            1 for rule in edited.security_rules
+            if rule.description.startswith("REVIEW: actie")
+        )
+        preserved_warnings = [
+            message for message in original.warnings
+            if "niet-ondersteunde Check Point actie" not in message
+        ] + unsupported_action_warnings[:remaining_markers]
+        edited.warnings = list(dict.fromkeys([*edited.warnings, *preserved_warnings]))
+        edited.unsupported = list(dict.fromkeys([*edited.unsupported, *original.unsupported]))
+        replace_migration_source_model(source, edited)
+        with db() as conn:
+            outputs = conn.execute(
+                "SELECT id,sanity_json FROM migration_outputs WHERE project_id=?", (project_id,)
+            ).fetchall()
+            for output in outputs:
+                sanity = json.loads(output["sanity_json"] or "{}")
+                sanity.update({"regenerate_required": True, "source_changed": True})
+                conn.execute(
+                    "UPDATE migration_outputs SET sanity_json=? WHERE id=?",
+                    (json.dumps(sanity, sort_keys=True), output["id"]),
+                )
+        audit("migration-source-editor-synced", f"project={project_id} source={source_id} workspace={workspace_id}")
+        flash("Wijzigingen uit de importeditor zijn opgenomen. Maak nu een nieuwe merge-preview.", "success")
+    except Exception as exc:
+        flash(f"Importwijzigingen niet opgenomen: {exc}", "error")
+    return redirect(url_for("migration_project", project_id=project_id))
 
 
 @app.post("/migration/projects/<int:project_id>/base")
@@ -3874,6 +4245,30 @@ def quota_loop():
             app.logger.exception("storage quota cleanup failed")
 
 
+def application_catalog_loop():
+    time.sleep(DEFAULT_CATALOG_INITIAL_DELAY)
+    while True:
+        try:
+            settings = application_catalog_configuration()
+            if settings["enabled"] and settings["credentials_configured"]:
+                due = not settings.get("last_success")
+                if not due:
+                    try:
+                        last_success = datetime.strptime(
+                            settings["last_success"], "%Y-%m-%d %H:%M:%S"
+                        ).replace(tzinfo=timezone.utc)
+                        due = datetime.now(timezone.utc) >= last_success + timedelta(
+                            hours=settings["interval_hours"]
+                        )
+                    except (TypeError, ValueError):
+                        due = True
+                if due:
+                    refresh_default_application_catalog_async()
+        except Exception:
+            app.logger.exception("Application Database scheduler mislukt")
+        time.sleep(300)
+
+
 @app.get("/runs/<int:run_id>")
 @login_required
 def run_detail(run_id):
@@ -3959,6 +4354,7 @@ refresh_syslog_source_policy()
 threading.Thread(target=udp_loop,daemon=True,name="syslog-udp").start()
 threading.Thread(target=quota_loop,daemon=True,name="storage-quota").start()
 threading.Thread(target=prepare_loop,daemon=True,name="policy-prepare").start()
+threading.Thread(target=application_catalog_loop,daemon=True,name="application-catalog-scheduler").start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0",port=8080)
