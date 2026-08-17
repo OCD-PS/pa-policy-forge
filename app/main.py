@@ -44,7 +44,7 @@ from vendor.paloalto_light_syslog import FlowStore, parse_panos_syslog
 from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_single_replacements
 from app.migration import (
     MIGRATION_KIND_LABELS, Address, AddressGroup, MigrationError, MigrationModel, PARSERS, Policy, Service, ServiceGroup,
-    apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml,
+    apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, migration_base_xml, migration_zone_names,
     item_selector, merge_member_names, migration_analysis, migration_search, model_collections, panos_fragment, parse_vendor, raw_item_payload, reconcile_model, scm_items,
 )
 from app.offline_config import (
@@ -1711,16 +1711,28 @@ def apply_xml_migration(profile, model: MigrationModel) -> int:
 
 def create_merged_workspace(profile, project, model: MigrationModel) -> tuple[int, dict]:
     base_id = int(project["base_workspace_id"] or 0)
-    if not base_id:
-        raise MigrationError("Kies eerst een volledige base-configuratie voor Panorama/PAN-OS")
-    workspace = workspace_row(base_id)
-    if not workspace or int(workspace["profile_id"]) != int(profile["id"]):
-        raise MigrationError("De gekozen base-workspace hoort niet bij het targetprofiel")
     settings = profile_settings(profile)
     panorama = profile["target_type"] == "panorama"
     scope = settings.get("device_group", "") if panorama else settings.get("vsys", "vsys1")
     if not scope:
         raise MigrationError("Doelscope ontbreekt")
+    if not base_id:
+        base_xml = migration_base_xml(model, scope, panorama)
+        base_id = store_config_workspace(
+            profile,
+            f"{project['name']} · nieuwe configuratie",
+            f"{project['name']}-new-config.xml",
+            base_xml,
+            "migration-generated-base",
+        )
+        with db() as conn:
+            conn.execute(
+                "UPDATE migration_projects SET base_workspace_id=?,updated_at=? WHERE id=?",
+                (base_id, now(), project["id"]),
+            )
+    workspace = workspace_row(base_id)
+    if not workspace or int(workspace["profile_id"]) != int(profile["id"]):
+        raise MigrationError("De gekozen base-workspace hoort niet bij het targetprofiel")
     merged_xml, plan = merge_model_into_panos_xml(
         workspace_config_path(workspace).read_bytes(), model, scope, panorama, settings.get("rulebase", "pre")
     )
@@ -2776,9 +2788,9 @@ def migration_candidate_export(project_id,kind):
     if project["target_type"]=="scm": return "SCM gebruikt een API-candidate en heeft geen PAN-OS XML-output",400
     with db() as conn: source_ids=[int(row["id"]) for row in conn.execute("SELECT id FROM migration_sources WHERE project_id=?",(project_id,)).fetchall()]
     model=selected_migration_model(project_id,source_ids); base_id=int(project["base_workspace_id"] or 0); workspace=workspace_row(base_id) if base_id else None
-    if not workspace: return "Geen base-workspace geselecteerd",400
     settings=json.loads(project["settings_json"] or "{}"); panorama=project["target_type"]=="panorama"; scope=settings.get("device_group","") if panorama else settings.get("vsys","vsys1")
-    xml_bytes,_=merge_model_into_panos_xml(workspace_config_path(workspace).read_bytes(),model,scope,panorama,settings.get("rulebase","pre"))
+    base_xml=workspace_config_path(workspace).read_bytes() if workspace else migration_base_xml(model,scope,panorama)
+    xml_bytes,_=merge_model_into_panos_xml(base_xml,model,scope,panorama,settings.get("rulebase","pre"))
     safe="".join(char if char.isalnum() or char in "-_." else "-" for char in project["name"]).strip("-.") or f"migration-{project_id}"
     if kind=="xml": return Response(xml_bytes,mimetype="application/xml",headers={"Content-Disposition":f'attachment; filename="{safe}.xml"'})
     return Response(render_set_commands(xml_bytes),mimetype="text/plain",headers={"Content-Disposition":f'attachment; filename="{safe}.set.txt"'})
@@ -2857,6 +2869,7 @@ def migration_source_upload(project_id):
             parse_snapshot(content, expected_kind=expected)
         source_id = store_migration_source(project_id, vendor, uploaded.filename, model)
         workspace_id = None
+        base_selected = False
         if use_as_full_base:
             workspace_id = store_config_workspace(
                 profile,
@@ -2865,14 +2878,21 @@ def migration_source_upload(project_id):
                 content,
                 "migration-import",
             )
-            with db() as conn:
-                conn.execute(
-                    "UPDATE migration_projects SET base_workspace_id=?,updated_at=? WHERE id=?",
-                    (workspace_id, now(), project_id),
-                )
+            if not int(project["base_workspace_id"] or 0):
+                base_selected = True
+                with db() as conn:
+                    conn.execute(
+                        "UPDATE migration_projects SET base_workspace_id=?,updated_at=? WHERE id=?",
+                        (workspace_id, now(), project_id),
+                    )
         audit("migration-source-imported", f"project={project_id} source={source_id} vendor={vendor} counts={model.counts()}")
         item_count = sum(model.counts()[key] for key in ('addresses','address_groups','services','service_groups','security_rules','nat_rules','interfaces','zones'))
-        base_message = f" De volledige XML is ook als base-workspace #{workspace_id} geselecteerd." if workspace_id else ""
+        if base_selected:
+            base_message = f" De volledige XML is ook als base-workspace #{workspace_id} geselecteerd."
+        elif workspace_id:
+            base_message = f" De volledige XML is als workspace #{workspace_id} beschikbaar; de bestaande base bleef geselecteerd."
+        else:
+            base_message = ""
         flash(f"{PARSERS[vendor].label} geïmporteerd: {item_count} mergeerbare items.{base_message}", "success")
     except Exception as exc:
         flash(f"Vendorconfiguratie niet geïmporteerd: {exc}", "error")
@@ -3015,17 +3035,21 @@ def migration_merge_preview(project_id):
         else:
             base_id = int(project["base_workspace_id"] or 0)
             workspace = workspace_row(base_id) if base_id else None
-            if not workspace or int(workspace["profile_id"]) != int(profile["id"]):
-                raise MigrationError("Kies eerst een volledige base-configuratie voor Panorama/PAN-OS")
+            if workspace and int(workspace["profile_id"]) != int(profile["id"]):
+                raise MigrationError("De gekozen base-workspace hoort niet bij het targetprofiel")
             settings = profile_settings(profile); panorama = profile["target_type"] == "panorama"
             scope = settings.get("device_group", "") if panorama else settings.get("vsys", "vsys1")
+            base_xml = workspace_config_path(workspace).read_bytes() if workspace else migration_base_xml(model, scope, panorama)
             _, plan = merge_model_into_panos_xml(
-                workspace_config_path(workspace).read_bytes(), model, scope, panorama, settings.get("rulebase", "pre")
+                base_xml, model, scope, panorama, settings.get("rulebase", "pre")
             )
         draft_id = secrets.token_urlsafe(18)
         draft = {"project_id": project_id, "target_profile_id": project["target_profile_id"], "source_ids": source_ids, "model": model.as_dict(), "fingerprint": model.fingerprint(), "plan": plan, "created_at": now()}
         path = OBJECT_DRAFTS / f"migration-{draft_id}.json"; path.write_text(json.dumps(draft)); path.chmod(0o600)
-        return render_template("migration_preview.html", project=project, model=model, counts=model.counts(), plan=plan, draft_id=draft_id)
+        counts = model.counts()
+        if profile["target_type"] != "scm" and not workspace:
+            counts["zones"] = len(migration_zone_names(model))
+        return render_template("migration_preview.html", project=project, model=model, counts=counts, plan=plan, draft_id=draft_id)
     except Exception as exc:
         flash(f"Merge-preview mislukt: {exc}", "error")
         return redirect(url_for("migration_project", project_id=project_id))

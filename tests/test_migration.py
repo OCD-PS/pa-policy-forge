@@ -8,7 +8,7 @@ os.environ.setdefault("PPF_DATA_DIR", tempfile.mkdtemp(prefix="forge-migration-t
 os.environ.setdefault("PPF_SYSLOG_PORT", "55149")
 os.environ.setdefault("PPF_BOOTSTRAP_PASSWORD", "unit-test-bootstrap-password")
 
-from app.migration import Address, MigrationModel, PARSERS, MigrationError, apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, parse_vendor, panos_fragment, reconcile_model, scm_items
+from app.migration import Address, MigrationModel, PARSERS, MigrationError, apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, migration_base_xml, migration_zone_names, parse_vendor, panos_fragment, reconcile_model, scm_items
 from app import main
 
 
@@ -221,6 +221,72 @@ end''', "forti.conf")
         with self.assertRaises(MigrationError):
             merge_model_into_panos_xml(base, conflict, "vsys1")
 
+    def test_new_standalone_config_can_be_built_without_imported_panos_xml(self):
+        model = parse_vendor("fortinet", b'''config firewall address
+edit "atlas-web"
+set subnet 10.10.10.10 255.255.255.255
+next
+end
+config firewall policy
+edit 1
+set name "clients-to-atlas"
+set srcintf "Trust"
+set dstintf "DMZ"
+set srcaddr "all"
+set dstaddr "atlas-web"
+set service "ALL"
+set action accept
+next
+end''', "atlas-a.conf")
+        base = migration_base_xml(model, "vsys1")
+        merged, plan = merge_model_into_panos_xml(base, model, "vsys1")
+        root, snapshot = main.parse_snapshot(merged, expected_kind="panos")
+        self.assertEqual(snapshot.vsys, ["vsys1"])
+        self.assertEqual({entry.get("name") for entry in root.findall(".//vsys/entry/zone/entry")}, {"Trust", "DMZ"})
+        self.assertIsNotNone(root.find(".//address/entry[@name='atlas-web']"))
+        self.assertIsNotNone(root.find(".//rulebase/security/rules/entry[@name='clients-to-atlas']"))
+        self.assertEqual(plan["create"], 2)
+
+    def test_generated_config_preview_counts_policy_referenced_zones(self):
+        model = MigrationModel(
+            "fortinet",
+            "atlas",
+            zones=[{"name": "DMZ", "xml": '<entry name="DMZ" />'}],
+            security_rules=[main.Policy("allow", from_zones=["Trust"], to_zones=["DMZ"])],
+        )
+        self.assertEqual(migration_zone_names(model), ["DMZ", "Trust"])
+
+    def test_new_panorama_config_generates_referenced_template_for_zones(self):
+        model = MigrationModel("fortinet", "atlas", security_rules=[main.Policy("allow", from_zones=["Trust"], to_zones=["DMZ"])])
+        base = migration_base_xml(model, "Atlas-DG", panorama=True)
+        merged, _ = merge_model_into_panos_xml(base, model, "Atlas-DG", panorama=True)
+        root, snapshot = main.parse_snapshot(merged, expected_kind="panorama")
+        self.assertEqual(snapshot.device_groups[0]["name"], "Atlas-DG")
+        self.assertEqual(snapshot.device_groups[0]["reference_template"], "PPF-Migration-Template")
+        self.assertEqual({entry.get("name") for entry in root.findall(".//template/entry/config/devices/entry/vsys/entry/zone/entry")}, {"Trust", "DMZ"})
+
+    def test_create_merged_workspace_generates_and_remembers_zero_base(self):
+        stamp = main.now()
+        with main.db() as conn:
+            profile_id = conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("PANOS zero base test", "panos", json.dumps({"vsys": "vsys1"}), stamp, stamp),
+            ).lastrowid
+            project_id = conn.execute(
+                "INSERT INTO migration_projects(name,target_profile_id,created_at,updated_at) VALUES(?,?,?,?)",
+                ("testatlas-zero", profile_id, stamp, stamp),
+            ).lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        project = main.migration_project_row(project_id)
+        model = parse_vendor("generic", b'[{"name":"atlas-host","value":"192.0.2.40/32"}]', "atlas.json")
+        workspace_id, plan = main.create_merged_workspace(profile, project, model)
+        with main.db() as conn:
+            refreshed = conn.execute("SELECT * FROM migration_projects WHERE id=?", (project_id,)).fetchone()
+            base_workspace = conn.execute("SELECT * FROM config_workspaces WHERE id=?", (refreshed["base_workspace_id"],)).fetchone()
+        self.assertEqual(base_workspace["source"], "migration-generated-base")
+        self.assertNotEqual(workspace_id, base_workspace["id"])
+        self.assertEqual(plan["create"], 1)
+
     def test_operational_device_pages_are_not_in_navigation(self):
         for label in ("Licenses", "Dynamic Updates", "Software"):
             self.assertNotIn(label, main.WORKSPACE_DEVICE_NAV)
@@ -245,6 +311,31 @@ end''', "forti.conf")
         page = response.get_data(as_text=True)
         self.assertIn("Migratieprojecten", page)
         self.assertNotIn("Expedition-inspired", page)
+
+    def test_project_page_renders_duplicate_candidates_from_two_sources(self):
+        stamp = main.now()
+        with main.db() as conn:
+            profile_id = conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("PANOS duplicate UI test", "panos", json.dumps({"vsys": "vsys1"}), stamp, stamp),
+            ).lastrowid
+            project_id = conn.execute(
+                "INSERT INTO migration_projects(name,target_profile_id,created_at,updated_at) VALUES(?,?,?,?)",
+                ("duplicate-ui", profile_id, stamp, stamp),
+            ).lastrowid
+        main.store_migration_source(project_id, "generic", "source-a", MigrationModel("generic", "source-a", addresses=[Address("dns-a", "192.0.2.53/32", source_ref="source-a")]))
+        main.store_migration_source(project_id, "generic", "source-b", MigrationModel("generic", "source-b", addresses=[Address("dns-b", "192.0.2.53/32", source_ref="source-b")]))
+        client = main.app.test_client()
+        with main.app.test_request_context("/", base_url="https://forge.test"):
+            cookie_name = main.app.config["SESSION_COOKIE_NAME"]
+            serializer = main.app.session_interface.get_signing_serializer(main.app)
+            client.set_cookie(cookie_name, serializer.dumps({"user_id": 1, "username": "admin", "csrf": "migration-test-csrf"}), domain="forge.test", secure=True)
+        response = client.get(f"/migration/projects/{project_id}", base_url="https://forge.test")
+        self.assertEqual(response.status_code, 200)
+        page = response.get_data(as_text=True)
+        self.assertIn("Search &amp; Merge", page)
+        self.assertIn("dns-a", page)
+        self.assertIn("dns-b", page)
 
     def test_panos_upload_becomes_full_base_workspace_and_ui_defaults_are_checked(self):
         stamp = main.now()
@@ -285,6 +376,9 @@ end''', "forti.conf")
         self.assertIn('name="kind" value="interfaces" checked', page)
         self.assertIn('name="kind" value="zones" checked', page)
         self.assertIn('name="source_id"', page)
+        self.assertIn("XML", page)
+        self.assertIn("Set commands", page)
+        self.assertIn("Nieuwe configuratie (vanaf nul)", page)
         self.assertNotIn("Interfaces en zones zijn beschikbaar", page)
         self.assertNotIn("standaard alles geselecteerd", page)
 

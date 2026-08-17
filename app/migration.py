@@ -941,6 +941,13 @@ def apply_transform_rules(model: MigrationModel, rules: list[dict]) -> Migration
                         if node.text in replacements: node.text=replacements[node.text]
                     item["xml"]=ET.tostring(entry,encoding="unicode")
                 except Exception: continue
+        for item in [*result.interfaces, *result.zones]:
+            try:
+                entry=SafeET.fromstring(item.get("xml",""))
+                for node in entry.iter():
+                    if node.text in replacements: node.text=replacements[node.text]
+                item["xml"]=ET.tostring(entry,encoding="unicode")
+            except Exception: continue
     return result
 
 
@@ -977,6 +984,98 @@ def migration_analysis(model: MigrationModel) -> dict:
         "unused_service_groups":sorted(service_group_names-used_services),
         "unresolved_references":sorted(unresolved), "duplicate_rules":duplicate_rules,
     }
+
+
+def migration_zone_names(model: MigrationModel) -> list[str]:
+    """Return configured and policy-referenced zones in stable order."""
+    return unique(
+        [
+            str(item.get("name", "")).strip()
+            for item in model.zones
+            if str(item.get("name", "")).strip()
+        ]
+        + [
+            value
+            for rule in [*model.security_rules, *model.nat_rules]
+            for value in [*rule.from_zones, *rule.to_zones]
+            if value and value != "any"
+        ]
+    )
+
+
+def migration_base_xml(
+    model: MigrationModel,
+    scope: str,
+    panorama: bool = False,
+    version: str = "12.1.0",
+) -> bytes:
+    """Build a conservative full-config base for an offline migration.
+
+    The generated base contains only the requested VSYS or Device Group and
+    empty zones inferred from policy references.  Interfaces are deliberately
+    not guessed: they can be mapped in the resulting workspace before push.
+    """
+    scope = str(scope or "").strip()
+    if not scope:
+        raise MigrationError("Doelscope ontbreekt")
+    configured_zones = {
+        str(item.get("name", "")).strip() for item in model.zones if str(item.get("name", "")).strip()
+    }
+    inferred_zones = [name for name in migration_zone_names(model) if name not in configured_zones]
+    network_kinds = {
+        "vlans", "virtual_routers", "logical_routers", "virtual_wires",
+        "ipsec_tunnels", "ike_gateways", "network_profiles",
+        "globalprotect_portals", "globalprotect_gateways", "device_configuration",
+    }
+    needs_template = bool(
+        panorama and (
+            inferred_zones or model.interfaces or model.zones
+            or any(model.extras.get(kind) for kind in network_kinds)
+        )
+    )
+
+    root = ET.Element("config", {"version": version})
+    devices = ET.SubElement(root, "devices")
+    device = ET.SubElement(devices, "entry", {"name": "localhost.localdomain"})
+    if panorama:
+        device_groups = ET.SubElement(device, "device-group")
+        target = ET.SubElement(device_groups, "entry", {"name": scope})
+        ET.SubElement(target, "pre-rulebase")
+        ET.SubElement(target, "post-rulebase")
+        if needs_template:
+            template_name = "PPF-Migration-Template"
+            ET.SubElement(target, "reference-template").text = template_name
+            templates = ET.SubElement(device, "template")
+            template = ET.SubElement(templates, "entry", {"name": template_name})
+            config = ET.SubElement(template, "config")
+            template_devices = ET.SubElement(config, "devices")
+            template_device = ET.SubElement(template_devices, "entry", {"name": "localhost.localdomain"})
+            network = ET.SubElement(template_device, "network")
+            interface = ET.SubElement(network, "interface")
+            ET.SubElement(interface, "ethernet")
+            vsys = ET.SubElement(template_device, "vsys")
+            zone_owner = ET.SubElement(vsys, "entry", {"name": "vsys1"})
+            if inferred_zones:
+                zones = ET.SubElement(zone_owner, "zone")
+                for zone_name in inferred_zones:
+                    zone = ET.SubElement(zones, "entry", {"name": zone_name})
+                    zone_network = ET.SubElement(zone, "network")
+                    ET.SubElement(zone_network, "layer3")
+    else:
+        network = ET.SubElement(device, "network")
+        interface = ET.SubElement(network, "interface")
+        ET.SubElement(interface, "ethernet")
+        vsys = ET.SubElement(device, "vsys")
+        target = ET.SubElement(vsys, "entry", {"name": scope})
+        if inferred_zones:
+            zones = ET.SubElement(target, "zone")
+            for zone_name in inferred_zones:
+                zone = ET.SubElement(zones, "entry", {"name": zone_name})
+                zone_network = ET.SubElement(zone, "network")
+                ET.SubElement(zone_network, "layer3")
+        ET.SubElement(target, "rulebase")
+    ET.indent(root, space="  ")
+    return b'<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="utf-8") + b"\n"
 
 
 def split_forti(value: str, any_alias: str = "") -> list[str]:
