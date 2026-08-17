@@ -1,6 +1,7 @@
 import json
 import io
 import os
+import tarfile
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -10,7 +11,7 @@ os.environ.setdefault("PPF_DATA_DIR", tempfile.mkdtemp(prefix="forge-migration-t
 os.environ.setdefault("PPF_SYSLOG_PORT", "55149")
 os.environ.setdefault("PPF_BOOTSTRAP_PASSWORD", "unit-test-bootstrap-password")
 
-from app.migration import Address, MigrationModel, PARSERS, MigrationError, apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, migration_base_xml, migration_zone_names, parse_vendor, panos_fragment, reconcile_model, scm_items
+from app.migration import Address, MigrationModel, PARSERS, MigrationError, apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, migration_base_xml, migration_collision_report, migration_zone_names, parse_vendor, panos_fragment, reconcile_model, scm_items, set_panos_ha_mode
 from app import main
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -181,6 +182,78 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         self.assertIsNotNone(root.find(".//vsys/entry/address/entry[@name='Atlas-Wildcard']/ip-wildcard"))
         self.assertGreater(plan["create"], 15)
 
+    def test_checkpoint_show_package_tar_uses_one_global_uid_dictionary(self):
+        documents = {
+            "Standard_objects.json": [
+                {"type": "CpmiAnyObject", "uid": "any", "name": "Any"},
+                {"type": "CpmiAnyObject", "uid": "original", "name": "Original"},
+            ],
+            "Access-Management_server.json": {
+                "objects-dictionary": [
+                    {"type": "rulebaseaction", "uid": "action-accept", "name": "Accept"},
+                    {"type": "track", "uid": "track-log", "name": "Log"},
+                    {"type": "host", "uid": "host-web", "name": "Web", "ipv4-address": "192.0.2.10"},
+                    {"type": "service-tcp", "uid": "svc-https", "name": "HTTPS", "port": "443"},
+                ],
+                "rulebase": [
+                    {"type": "access-rule", "uid": "rule-1", "name": "Allow Web", "source": ["any"], "destination": ["host-web"], "service": ["svc-https"], "action": "action-accept", "track": {"uid": "track-log"}},
+                ],
+            },
+            "Standard_NAT-Management_server.json": [
+                {"type": "nat-rule", "uid": "nat-1", "name": "Web NAT", "original-source": ["any"], "original-destination": ["host-web"], "original-service": ["svc-https"], "translated-source": ["original"], "translated-destination": ["original"], "translated-service": ["original"]},
+            ],
+        }
+        payload = io.BytesIO()
+        with tarfile.open(fileobj=payload, mode="w") as archive:
+            for name, document in documents.items():
+                raw = json.dumps(document).encode()
+                info = tarfile.TarInfo(name)
+                info.size = len(raw)
+                archive.addfile(info, io.BytesIO(raw))
+        model = parse_vendor("checkpoint", payload.getvalue(), "show_package.tar")
+        self.assertEqual(model.counts()["addresses"], 1)
+        self.assertEqual(model.counts()["services"], 1)
+        self.assertEqual(model.counts()["security_rules"], 1)
+        self.assertEqual(model.counts()["nat_rules"], 1)
+        self.assertEqual(model.security_rules[0].destination, ["Web"])
+        self.assertEqual(model.security_rules[0].service, ["HTTPS"])
+        self.assertEqual(model.security_rules[0].action, "allow")
+        self.assertIn("Track: Log", model.security_rules[0].description)
+        self.assertTrue(any("globale UID-dictionary" in message for message in model.warnings))
+
+    def test_checkpoint_show_package_rejects_parent_traversal(self):
+        payload = io.BytesIO()
+        with tarfile.open(fileobj=payload, mode="w") as archive:
+            raw = b"[]"
+            info = tarfile.TarInfo("../objects.json")
+            info.size = len(raw)
+            archive.addfile(info, io.BytesIO(raw))
+        with self.assertRaises(MigrationError):
+            parse_vendor("checkpoint", payload.getvalue(), "show_package.tar")
+
+    def test_checkpoint_duplicate_long_rule_names_receive_bounded_suffixes(self):
+        long_name = "A Check Point rule name that is deliberately longer than sixty three characters"
+        documents = {
+            "Standard_objects.json": [
+                {"type": "rulebaseaction", "uid": "accept", "name": "Accept"},
+            ],
+            "Layer-Management_server.json": [
+                {"type": "access-rule", "uid": f"rule-{number}", "name": long_name, "action": "accept"}
+                for number in range(3)
+            ],
+        }
+        payload = io.BytesIO()
+        with tarfile.open(fileobj=payload, mode="w") as archive:
+            for name, document in documents.items():
+                raw = json.dumps(document).encode()
+                info = tarfile.TarInfo(name)
+                info.size = len(raw)
+                archive.addfile(info, io.BytesIO(raw))
+        model = parse_vendor("checkpoint", payload.getvalue(), "show_package.tar")
+        self.assertEqual(len(model.security_rules), 3)
+        self.assertEqual(len({rule.name for rule in model.security_rules}), 3)
+        self.assertTrue(all(len(rule.name) <= 63 for rule in model.security_rules))
+
     def test_panos_to_panos_rich_config_preserves_every_supported_family(self):
         base = (FIXTURES / "panos-rich-base.xml").read_bytes()
         source = (FIXTURES / "panos-rich-source.xml").read_bytes()
@@ -229,6 +302,22 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         names = [entry.get("name") for entry in root.findall(".//device-group/entry[@name='DG-Test']/pre-rulebase/sdwan/rules/entry")]
         self.assertEqual(names, ["Existing-SDWAN"])
         self.assertEqual(plan["conflicts"], [])
+
+    def test_collision_report_ignores_source_provenance(self):
+        left = MigrationModel("panos", "left", addresses=[Address("same", "192.0.2.1/32", source_ref="left")])
+        right = MigrationModel("panos", "right", addresses=[Address("same", "192.0.2.1/32", source_ref="right")])
+        report = migration_collision_report(left, right)
+        self.assertEqual(report["addresses"]["identical"], 1)
+        self.assertEqual(report["addresses"]["conflicts"], 0)
+
+    def test_existing_ha_config_can_switch_to_active_passive(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><deviceconfig><high-availability><group><group-id>1</group-id><mode><active-active><device-id>0</device-id></active-active></mode><peer-ip>192.0.2.2</peer-ip></group><enabled>yes</enabled></high-availability></deviceconfig><vsys><entry name="vsys1"><rulebase/></entry></vsys></entry></devices></config>'''
+        converted, report = set_panos_ha_mode(source, "active-passive")
+        root = ET.fromstring(converted)
+        self.assertIsNotNone(root.find(".//high-availability/group/mode/active-passive"))
+        self.assertIsNone(root.find(".//high-availability/group/mode/active-active"))
+        self.assertEqual(root.findtext(".//high-availability/group/peer-ip"), "192.0.2.2")
+        self.assertEqual(report, {"topology": "active-passive", "ha_nodes": 1, "changed": 1, "ha_missing": False})
 
     def test_srx_set_commands_are_parsed(self):
         model = parse_vendor("juniper-srx", b'''set security address-book global address app1 198.51.100.10/32
@@ -399,6 +488,38 @@ end''', "atlas-a.conf")
         page = response.get_data(as_text=True)
         self.assertIn("Migratieprojecten", page)
         self.assertNotIn("Expedition-inspired", page)
+
+    def test_active_active_project_renders_and_exports_two_outputs(self):
+        stamp = main.now()
+        with main.db() as conn:
+            profile_id = conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("PANOS AA output test", "panos", json.dumps({"vsys": "vsys1"}), stamp, stamp),
+            ).lastrowid
+            project_id = conn.execute(
+                "INSERT INTO migration_projects(name,target_profile_id,topology,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("AA output test", profile_id, "active-active", stamp, stamp),
+            ).lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase/></entry></vsys></entry></devices></config>'''
+        workspace_a = main.store_config_workspace(profile, "AA node 1", "aa-node-1.xml", xml, "migration-output")
+        workspace_b = main.store_config_workspace(profile, "AA node 2", "aa-node-2.xml", xml, "migration-output")
+        output_a = main.store_migration_output(project_id, workspace_a, "AA node 1", "active-active", "node 1", sanity={"ha_mode": "active-active"})
+        output_b = main.store_migration_output(project_id, workspace_b, "AA node 2", "active-active", "node 2", collisions={"interfaces": {"conflicts": 2, "conflict_names": ["ethernet1/1", "ethernet1/2"]}})
+
+        client = main.app.test_client()
+        with main.app.test_request_context("/", base_url="https://forge.test"):
+            cookie_name = main.app.config["SESSION_COOKIE_NAME"]
+            serializer = main.app.session_interface.get_signing_serializer(main.app)
+            client.set_cookie(cookie_name, serializer.dumps({"user_id": 1, "username": "admin", "csrf": "migration-test-csrf"}), domain="forge.test", secure=True)
+        page = client.get(f"/migration/projects/{project_id}", base_url="https://forge.test")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("AA node 1", page.get_data(as_text=True))
+        self.assertIn("AA node 2", page.get_data(as_text=True))
+        self.assertIn("2 conflicten", page.get_data(as_text=True))
+        for output_id in (output_a, output_b):
+            self.assertEqual(client.get(f"/migration/projects/{project_id}/outputs/{output_id}/xml", base_url="https://forge.test").status_code, 200)
+            self.assertEqual(client.get(f"/migration/projects/{project_id}/outputs/{output_id}/set", base_url="https://forge.test").status_code, 200)
 
     def test_project_page_renders_duplicate_candidates_from_two_sources(self):
         stamp = main.now()

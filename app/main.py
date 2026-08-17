@@ -45,7 +45,7 @@ from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_sin
 from app.migration import (
     MIGRATION_KIND_LABELS, Address, AddressGroup, MigrationError, MigrationModel, PARSERS, Policy, Service, ServiceGroup,
     apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, migration_base_xml, migration_zone_names,
-    item_selector, merge_member_names, migration_analysis, migration_search, model_collections, panos_fragment, parse_vendor, raw_item_payload, reconcile_model, scm_items,
+    item_selector, merge_member_names, migration_analysis, migration_item_semantic, migration_search, model_collections, panos_fragment, parse_vendor, raw_item_payload, reconcile_model, scm_items,
 )
 from app.offline_config import (
     OBJECT_NODES, POLICY_NODES, OfflineConfigError, available_scopes, available_templates,
@@ -304,7 +304,8 @@ def init_db() -> None:
         );
         CREATE TABLE IF NOT EXISTS migration_projects (
           id INTEGER PRIMARY KEY, name TEXT NOT NULL, target_profile_id INTEGER NOT NULL,
-          base_workspace_id INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          base_workspace_id INTEGER, topology TEXT NOT NULL DEFAULT 'active-passive',
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
           FOREIGN KEY(target_profile_id) REFERENCES profiles(id),
           FOREIGN KEY(base_workspace_id) REFERENCES config_workspaces(id)
         );
@@ -324,7 +325,18 @@ def init_db() -> None:
           kind TEXT NOT NULL DEFAULT '', selector TEXT NOT NULL DEFAULT '', value TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL, FOREIGN KEY(project_id) REFERENCES migration_projects(id)
         );
+        CREATE TABLE IF NOT EXISTS migration_outputs (
+          id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, workspace_id INTEGER NOT NULL,
+          label TEXT NOT NULL, topology TEXT NOT NULL DEFAULT 'active-passive',
+          node_role TEXT NOT NULL DEFAULT '', collision_json TEXT NOT NULL DEFAULT '{}',
+          sanity_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+          FOREIGN KEY(project_id) REFERENCES migration_projects(id),
+          FOREIGN KEY(workspace_id) REFERENCES config_workspaces(id)
+        );
         """)
+        project_columns = {row[1] for row in conn.execute("PRAGMA table_info(migration_projects)")}
+        if "topology" not in project_columns:
+            conn.execute("ALTER TABLE migration_projects ADD COLUMN topology TEXT NOT NULL DEFAULT 'active-passive'")
         if not conn.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
             bootstrap_password = os.getenv("PPF_BOOTSTRAP_PASSWORD", "admin") or "admin"
             if bootstrap_password != "admin" and (len(bootstrap_password) < 12 or password_is_blocked(bootstrap_password)):
@@ -1507,6 +1519,47 @@ def store_config_workspace(profile, name: str, original_name: str, xml_bytes: by
     return workspace_id
 
 
+def store_migration_output(
+    project_id: int,
+    workspace_id: int,
+    label: str,
+    topology: str = "active-passive",
+    node_role: str = "",
+    collisions: dict | None = None,
+    sanity: dict | None = None,
+) -> int:
+    if topology not in {"active-passive", "active-active"}:
+        raise MigrationError("Onbekende migratietopologie")
+    with db() as conn:
+        project = conn.execute("SELECT * FROM migration_projects WHERE id=?", (project_id,)).fetchone()
+        workspace = conn.execute("SELECT * FROM config_workspaces WHERE id=?", (workspace_id,)).fetchone()
+        if not project or not workspace:
+            raise MigrationError("Migratieproject of output-workspace ontbreekt")
+        if int(workspace["profile_id"]) != int(project["target_profile_id"]):
+            raise MigrationError("Output-workspace hoort niet bij het targetprofiel")
+        cursor = conn.execute(
+            "INSERT INTO migration_outputs(project_id,workspace_id,label,topology,node_role,collision_json,sanity_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                project_id, workspace_id, label[:120], topology, node_role[:40],
+                json.dumps(collisions or {}, sort_keys=True),
+                json.dumps(sanity or {}, sort_keys=True), now(),
+            ),
+        )
+        conn.execute("UPDATE migration_projects SET topology=?,updated_at=? WHERE id=?", (topology, now(), project_id))
+        return int(cursor.lastrowid)
+
+
+def migration_output_row(project_id: int, output_id: int):
+    with db() as conn:
+        return conn.execute(
+            "SELECT migration_outputs.*,config_workspaces.config_path,config_workspaces.original_name,"
+            "config_workspaces.profile_id FROM migration_outputs JOIN config_workspaces "
+            "ON config_workspaces.id=migration_outputs.workspace_id "
+            "WHERE migration_outputs.id=? AND migration_outputs.project_id=?",
+            (output_id, project_id),
+        ).fetchone()
+
+
 def migration_project_row(project_id: int):
     with db() as conn:
         return conn.execute(
@@ -1569,7 +1622,7 @@ def selected_migration_model(project_id: int, source_ids: list[int]) -> Migratio
         values, seen = [], {}
         for item in getattr(merged, field):
             if item.name in seen:
-                if json.dumps(item.__dict__, sort_keys=True) != json.dumps(seen[item.name].__dict__, sort_keys=True):
+                if migration_item_semantic(item) != migration_item_semantic(seen[item.name]):
                     merged.warnings.append(f"Mergeconflict voor {field}: {item.name}; kies de master in Search & Merge")
                     values.append(item)
                 continue
@@ -2749,7 +2802,7 @@ def migration_project_export(project_id):
         sources=conn.execute("SELECT * FROM migration_sources WHERE project_id=? ORDER BY id",(project_id,)).fetchall()
         rules=conn.execute("SELECT kind,master,members_json,mode FROM migration_merge_rules WHERE project_id=? ORDER BY id",(project_id,)).fetchall()
         transforms=conn.execute("SELECT operation,kind,selector,value FROM migration_transform_rules WHERE project_id=? ORDER BY id",(project_id,)).fetchall()
-    bundle={"schema":"pa-policy-forge-migration-v2","name":project["name"],"sources":[{"vendor":row["vendor"],"source_name":row["source_name"],"model":migration_model(row).as_dict()} for row in sources],"merge_rules":[{"kind":row["kind"],"master":row["master"],"members":json.loads(row["members_json"]),"mode":row["mode"]} for row in rules],"transform_rules":[dict(row) for row in transforms]}
+    bundle={"schema":"pa-policy-forge-migration-v2","name":project["name"],"topology":project["topology"],"sources":[{"vendor":row["vendor"],"source_name":row["source_name"],"model":migration_model(row).as_dict()} for row in sources],"merge_rules":[{"kind":row["kind"],"master":row["master"],"members":json.loads(row["members_json"]),"mode":row["mode"]} for row in rules],"transform_rules":[dict(row) for row in transforms]}
     safe="".join(char if char.isalnum() or char in "-_." else "-" for char in project["name"]).strip("-.") or f"migration-{project_id}"
     return Response(json.dumps(bundle,indent=2),mimetype="application/json",headers={"Content-Disposition":f'attachment; filename="{safe}.migration.json"'})
 
@@ -2766,7 +2819,9 @@ def migration_project_import():
         if bundle.get("schema")!="pa-policy-forge-migration-v2": raise MigrationError("Onbekend projectformaat")
         with db() as conn:
             if not conn.execute("SELECT 1 FROM profiles WHERE id=?",(profile_id,)).fetchone(): raise MigrationError("Targetprofiel bestaat niet")
-            project_id=int(conn.execute("INSERT INTO migration_projects(name,target_profile_id,created_at,updated_at) VALUES(?,?,?,?)",(str(bundle.get("name") or uploaded.filename)[:120],profile_id,now(),now())).lastrowid)
+            topology=str(bundle.get("topology","active-passive"))
+            if topology not in {"active-passive","active-active"}: raise MigrationError("Ongeldige topologie in projectbestand")
+            project_id=int(conn.execute("INSERT INTO migration_projects(name,target_profile_id,topology,created_at,updated_at) VALUES(?,?,?,?,?)",(str(bundle.get("name") or uploaded.filename)[:120],profile_id,topology,now(),now())).lastrowid)
         for source in bundle.get("sources",[]):
             model=MigrationModel.from_dict(source["model"]); store_migration_source(project_id,str(source.get("vendor",model.vendor)),str(source.get("source_name",model.source_name)),model)
         with db() as conn:
@@ -2796,6 +2851,19 @@ def migration_candidate_export(project_id,kind):
     return Response(render_set_commands(xml_bytes),mimetype="text/plain",headers={"Content-Disposition":f'attachment; filename="{safe}.set.txt"'})
 
 
+@app.get("/migration/projects/<int:project_id>/outputs/<int:output_id>/<kind>")
+@login_required
+def migration_output_export(project_id, output_id, kind):
+    output = migration_output_row(project_id, output_id)
+    if not output or kind not in {"xml", "set"}:
+        return "Not found", 404
+    xml_bytes = workspace_config_path(output).read_bytes()
+    safe = "".join(char if char.isalnum() or char in "-_ ." else "-" for char in output["label"]).strip(" -. ") or f"output-{output_id}"
+    if kind == "xml":
+        return Response(xml_bytes, mimetype="application/xml", headers={"Content-Disposition": f'attachment; filename="{safe}.xml"'})
+    return Response(render_set_commands(xml_bytes), mimetype="text/plain", headers={"Content-Disposition": f'attachment; filename="{safe}.set.txt"'})
+
+
 @app.post("/migration/projects")
 @login_required
 def migration_project_create():
@@ -2823,9 +2891,17 @@ def migration_project(project_id):
         source_rows = conn.execute("SELECT * FROM migration_sources WHERE project_id=? ORDER BY id", (project_id,)).fetchall()
         profiles = conn.execute("SELECT id,name,target_type FROM profiles ORDER BY name").fetchall()
         workspaces = conn.execute("SELECT id,name,source,created_at FROM config_workspaces WHERE profile_id=? ORDER BY id DESC", (project["target_profile_id"],)).fetchall()
+        output_rows = conn.execute("SELECT * FROM migration_outputs WHERE project_id=? ORDER BY id", (project_id,)).fetchall()
     sources = []
     for row in source_rows:
         source = dict(row); source["counts"] = json.loads(row["counts_json"]); source["messages"] = json.loads(row["warnings_json"]); sources.append(source)
+    outputs = []
+    for row in output_rows:
+        output = dict(row)
+        output["collisions"] = json.loads(row["collision_json"] or "{}")
+        output["sanity"] = json.loads(row["sanity_json"] or "{}")
+        output["conflict_total"] = sum(int(item.get("conflicts", 0)) for item in output["collisions"].values() if isinstance(item, dict))
+        outputs.append(output)
     source_ids=[int(row["id"]) for row in source_rows]
     combined=selected_migration_model(project_id,source_ids) if source_ids else MigrationModel("merged","")
     merge_query=request.args.get("merge_query","").strip(); inventory=merge_inventory(combined)
@@ -2843,7 +2919,7 @@ def migration_project(project_id):
         available_kinds={key:len(value) for key,value in model_collections(combined).items() if value},
         merge_inventory=inventory, merge_rules=merge_rules, migration_analysis=migration_analysis(combined),
         merge_query=merge_query, search_results=migration_search(combined,merge_query), transform_rules=transform_rules,
-        configuration_items=configuration_items,
+        configuration_items=configuration_items, outputs=outputs,
     )
 
 

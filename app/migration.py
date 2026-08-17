@@ -8,8 +8,10 @@ import csv
 import io
 import re
 import shlex
+import tarfile
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
+from pathlib import PurePosixPath
 from typing import Iterable
 
 from defusedxml import ElementTree as SafeET
@@ -403,7 +405,85 @@ class JuniperSrxParser(BaseParser):
 class CheckPointParser(BaseParser):
     vendor = "checkpoint"
     label = "Check Point"
-    extensions = (".json", ".xml", ".txt")
+    extensions = (".json", ".xml", ".txt", ".tar")
+
+    def parse_bytes(self, content: bytes, source_name: str) -> MigrationModel:
+        """Parse a Check Point show-package archive with one global UID dictionary."""
+        try:
+            archive = tarfile.open(fileobj=io.BytesIO(content), mode="r:*")
+        except tarfile.TarError as exc:
+            raise MigrationError(f"Ongeldig Check Point show-package archief: {exc}") from exc
+        documents: list[tuple[str, object]] = []
+        total_size = 0
+        with archive:
+            members = archive.getmembers()
+            if len(members) > 500:
+                raise MigrationError("Check Point archief bevat te veel bestanden")
+            for member in members:
+                path = PurePosixPath(member.name)
+                if path.is_absolute() or ".." in path.parts:
+                    raise MigrationError(f"Onveilig pad in Check Point archief: {member.name}")
+                if member.issym() or member.islnk() or member.isdev():
+                    raise MigrationError(f"Onveilig bestandstype in Check Point archief: {member.name}")
+                if not member.isfile() or path.suffix.casefold() != ".json":
+                    continue
+                if member.size > 25 * 1024 * 1024:
+                    raise MigrationError(f"Check Point JSON is te groot: {member.name}")
+                total_size += member.size
+                if total_size > 100 * 1024 * 1024:
+                    raise MigrationError("Uitgepakte Check Point JSON is groter dan 100 MiB")
+                stream = archive.extractfile(member)
+                if stream is None:
+                    continue
+                try:
+                    document = json.loads(stream.read().decode("utf-8-sig"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise MigrationError(f"Ongeldige JSON in {member.name}: {exc}") from exc
+                documents.append((member.name, document))
+        if not documents:
+            raise MigrationError("Check Point archief bevat geen JSON-export")
+
+        objects: list[dict] = []
+        access_layers: list[object] = []
+        nat_layers: list[object] = []
+
+        def types_in(value) -> set[str]:
+            found: set[str] = set()
+            if isinstance(value, dict):
+                if value.get("type"):
+                    found.add(str(value["type"]).casefold())
+                for child in value.values():
+                    found.update(types_in(child))
+            elif isinstance(value, list):
+                for child in value:
+                    found.update(types_in(child))
+            return found
+
+        def annotate(value, source_file: str):
+            if isinstance(value, dict):
+                result = {key: annotate(child, source_file) for key, child in value.items()}
+                result["_source_file"] = source_file
+                return result
+            if isinstance(value, list):
+                return [annotate(child, source_file) for child in value]
+            return value
+
+        for member_name, document in documents:
+            document_types = types_in(document)
+            annotated = annotate(document, member_name)
+            if isinstance(annotated, dict):
+                objects.extend(self._object_items(annotated))
+            elif "access-rule" not in document_types and "nat-rule" not in document_types:
+                objects.extend(item for item in annotated if isinstance(item, dict))
+            if "nat-rule" in document_types:
+                nat_layers.append(annotated)
+            elif "access-rule" in document_types:
+                access_layers.append(annotated)
+        model = self._json({"objects": objects, "rulebase": access_layers, "nat-rulebase": nat_layers}, source_name)
+        model.warnings.append(
+            f"Check Point show-package: {len(documents)} JSON-bestanden gecombineerd met één globale UID-dictionary"
+        )
+        return model
 
     def parse(self, text: str, source_name: str) -> MigrationModel:
         stripped=text.lstrip()
@@ -546,12 +626,31 @@ class CheckPointParser(BaseParser):
         self._walk_nat_rules(nat, model, lookup, services_by_name)
         return deduplicate(model)
 
-    def _walk_rules(self, value, model, lookup):
+    @staticmethod
+    def _unique_rule_name(rules: list[Policy], value: dict, source_file: str, fallback: str) -> str:
+        base = clean_name(value.get("name") or value.get("uid") or fallback)
+        existing = {rule.name for rule in rules}
+        if base not in existing:
+            return base
+        layer = PurePosixPath(source_file).stem.replace("-Management_server", "") if source_file else "layer"
+        candidate = clean_name(f"{base} [{layer}]")
+        if candidate not in existing:
+            return candidate
+        number = 2
+        while True:
+            suffix = f"-{number}"
+            numbered = f"{candidate[:63 - len(suffix)].rstrip('-.')}{suffix}"
+            if numbered not in existing:
+                return numbered
+            number += 1
+
+    def _walk_rules(self, value, model, lookup, source_file=""):
         if isinstance(value,list):
-            for item in value: self._walk_rules(item,model,lookup)
+            for item in value: self._walk_rules(item,model,lookup,source_file)
         elif isinstance(value,dict):
             typ=str(value.get("type","")).lower()
-            if typ in {"access-rule","rule"} or ("source" in value and "destination" in value and "action" in value):
+            current_source = str(value.get("_source_file") or source_file)
+            if typ == "access-rule":
                 action = self._name(value.get("action", "Accept"), lookup)
                 description = self._description(value)
                 track = self._names(value.get("track"), lookup, [])
@@ -567,25 +666,26 @@ class CheckPointParser(BaseParser):
                 for field in ("source-negate", "destination-negate", "service-negate"):
                     if value.get(field): model.warnings.append(f"{value.get('uid','')}: access-rule {value.get('name','')} gebruikt {field}; handmatige review vereist")
                 model.security_rules.append(Policy(
-                    clean_name(value.get("name",value.get("uid","rule"))),
+                    self._unique_rule_name(model.security_rules, value, current_source, "rule"),
                     source=self._names(value.get("source"), lookup, ["any"]),
                     destination=self._names(value.get("destination"), lookup, ["any"]),
                     service=self._names(value.get("service"), lookup, ["application-default"]),
                     action="allow" if action.casefold() in {"accept","allow"} else "deny",
                     disabled=not bool(value.get("enabled",True)), description=description,
-                    source_ref=str(value.get("uid","")), original=value,
+                    source_ref=f"{current_source}:{value.get('uid','')}".strip(":"), original=value,
                 ))
             for child in value.values():
-                if isinstance(child,(list,dict)): self._walk_rules(child,model,lookup)
+                if isinstance(child,(list,dict)): self._walk_rules(child,model,lookup,current_source)
 
-    def _walk_nat_rules(self, value, model, lookup, services_by_name):
+    def _walk_nat_rules(self, value, model, lookup, services_by_name, source_file=""):
         if isinstance(value, list):
-            for item in value: self._walk_nat_rules(item, model, lookup, services_by_name)
+            for item in value: self._walk_nat_rules(item, model, lookup, services_by_name, source_file)
             return
         if not isinstance(value, dict):
             return
         typ = str(value.get("type", "")).lower()
-        if typ in {"nat-rule", "rule"} or "original-source" in value:
+        current_source = str(value.get("_source_file") or source_file)
+        if typ == "nat-rule":
             translated_source = self._names(value.get("translated-source"), lookup, ["original"])
             translated_destination = self._names(value.get("translated-destination"), lookup, ["original"])
             translated_service = self._names(value.get("translated-service"), lookup, ["original"])
@@ -606,17 +706,17 @@ class CheckPointParser(BaseParser):
                 else:
                     model.warnings.append(f"{value.get('uid','')}: translated service {translated_service[0]} vereist handmatige port mapping")
             model.nat_rules.append(Policy(
-                clean_name(value.get("name", value.get("uid", "nat-rule"))), policy_type="nat",
+                self._unique_rule_name(model.nat_rules, value, current_source, "nat-rule"), policy_type="nat",
                 source=self._names(value.get("original-source"), lookup, ["any"]),
                 destination=self._names(value.get("original-destination"), lookup, ["any"]),
                 service=self._names(value.get("original-service"), lookup, ["any"]),
                 disabled=not bool(value.get("enabled", True)), description=self._description(value),
                 source_translation=source_translation, destination_translation=destination_translation,
-                source_ref=str(value.get("uid", "")), original=value,
+                source_ref=f"{current_source}:{value.get('uid','')}".strip(":"), original=value,
             ))
         for child in value.values():
             if isinstance(child, (list, dict)):
-                self._walk_nat_rules(child, model, lookup, services_by_name)
+                self._walk_nat_rules(child, model, lookup, services_by_name, current_source)
 
     def _xml(self,text,source_name):
         root=SafeET.fromstring(text); model=MigrationModel(self.vendor,source_name)
@@ -930,6 +1030,11 @@ def parse_vendor(vendor: str, content: bytes, source_name: str) -> MigrationMode
     parser=PARSERS.get(vendor)
     if not parser: raise MigrationError("Onbekende vendorparser")
     if len(content)>100*1024*1024: raise MigrationError("Importbestand is groter dan 100 MiB")
+    if hasattr(parser, "parse_bytes") and source_name.casefold().endswith(".tar"):
+        model=parser.parse_bytes(content,source_name)
+        if sum(value for key,value in model.counts().items() if key not in {"warnings","unsupported"})==0:
+            model.warnings.append("Geen direct mergeerbare objecten of policies gevonden")
+        return model
     try: text=content.decode("utf-8-sig")
     except UnicodeDecodeError: text=content.decode("latin-1")
     model=parser.parse(text,source_name)
@@ -1008,6 +1113,74 @@ def model_collections(model: MigrationModel) -> dict[str, list]:
 
 def item_selector(item: dict) -> str:
     return f"{item.get('name','')}|||{item.get('source_ref','')}"
+
+
+def migration_item_semantic(item) -> str:
+    """Stable value comparison that deliberately ignores source provenance."""
+    raw = asdict(item) if hasattr(item, "__dataclass_fields__") else dict(item)
+    semantic = {
+        key: value for key, value in raw.items()
+        if key not in {"source_ref", "original", "selector"}
+    }
+    return json.dumps(semantic, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def migration_collision_report(left: MigrationModel, right: MigrationModel) -> dict:
+    """Compare two sources by item name and semantic value for operator review."""
+    result = {}
+    for kind in sorted(set(model_collections(left)) | set(model_collections(right))):
+        def named(items):
+            values = {}
+            for item in items:
+                raw = asdict(item) if hasattr(item, "__dataclass_fields__") else dict(item)
+                name = str(raw.get("name", ""))
+                if name:
+                    values.setdefault(name, item)
+            return values
+        left_items = named(model_collections(left).get(kind, []))
+        right_items = named(model_collections(right).get(kind, []))
+        shared = set(left_items) & set(right_items)
+        conflicts = sorted(
+            name for name in shared
+            if migration_item_semantic(left_items[name]) != migration_item_semantic(right_items[name])
+        )
+        result[kind] = {
+            "left": len(left_items), "right": len(right_items), "shared": len(shared),
+            "identical": len(shared) - len(conflicts), "conflicts": len(conflicts),
+            "conflict_names": conflicts,
+            "left_only": len(set(left_items) - set(right_items)),
+            "right_only": len(set(right_items) - set(left_items)),
+        }
+    return result
+
+
+def set_panos_ha_mode(xml_bytes: bytes, topology: str) -> tuple[bytes, dict]:
+    """Switch an existing HA pair between active/passive and active/active."""
+    if topology not in {"active-passive", "active-active"}:
+        raise MigrationError("Onbekende HA-topologie")
+    root = SafeET.fromstring(xml_bytes)
+    ha_nodes = root.findall(".//deviceconfig/high-availability")
+    changed = 0
+    target_tag = "active-passive" if topology == "active-passive" else "active-active"
+    for ha in ha_nodes:
+        group = ha.find("./group")
+        if group is None:
+            group = ET.SubElement(ha, "group")
+        mode = group.find("./mode")
+        if mode is None:
+            mode = ET.SubElement(group, "mode")
+        current = [child.tag for child in mode]
+        if current == [target_tag]:
+            continue
+        for child in list(mode):
+            mode.remove(child)
+        ET.SubElement(mode, target_tag)
+        changed += 1
+    ET.indent(root, space="  ")
+    return b'<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="utf-8") + b"\n", {
+        "topology": topology, "ha_nodes": len(ha_nodes), "changed": changed,
+        "ha_missing": not bool(ha_nodes),
+    }
 
 
 def merge_inventory(model: MigrationModel, query: str = "") -> list[dict]:
