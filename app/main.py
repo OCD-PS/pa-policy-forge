@@ -2740,6 +2740,12 @@ def config_workspace_editor(workspace_id):
                 "WHERE migration_sources.staging_workspace_id=?",
                 (workspace_id,),
             ).fetchone()
+            migration_output = conn.execute(
+                "SELECT migration_outputs.*,migration_projects.id project_id,migration_projects.name project_name "
+                "FROM migration_outputs JOIN migration_projects ON migration_projects.id=migration_outputs.project_id "
+                "WHERE migration_outputs.workspace_id=? ORDER BY migration_outputs.id DESC LIMIT 1",
+                (workspace_id,),
+            ).fetchone()
         if not workspace_profile:
             raise OfflineConfigError("Het gekoppelde firewallprofiel bestaat niet meer")
         xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
@@ -2813,6 +2819,14 @@ def config_workspace_editor(workspace_id):
         edit_name = request.args.get("edit_policy", "")
         edit_policy = next((item for item in policies if item["name"] == edit_name and item["editable"]), None)
         edit_object_name = request.args.get("edit_object", "")
+        migration_output_sanity = json.loads(migration_output["sanity_json"] or "{}") if migration_output else {}
+        migration_output_push_blocked = bool(
+            migration_output and (
+                migration_output_sanity.get("regenerate_required")
+                or int(migration_output_sanity.get("critical_findings", 0) or 0) > 0
+                or int(migration_output_sanity.get("unresolved_references", 0) or 0) > 0
+            )
+        )
         return render_template(
             "workspace_editor.html", workspace=workspace, snapshot=snapshot,
             scopes=scopes, scope=scope, templates=templates, template=template,
@@ -2833,6 +2847,9 @@ def config_workspace_editor(workspace_id):
             workspace_policy_nav=WORKSPACE_POLICY_NAV, workspace_object_nav=WORKSPACE_OBJECT_NAV,
             workspace_network_nav=WORKSPACE_NETWORK_NAV, workspace_device_nav=WORKSPACE_DEVICE_NAV,
             staging_source=staging_source,
+            migration_output=migration_output,
+            migration_output_sanity=migration_output_sanity,
+            migration_output_push_blocked=migration_output_push_blocked,
             migration_staging=str(workspace["source"]) in {"migration-staging", "migration-import", "migration-api"},
         )
     except Exception as exc:
@@ -3458,12 +3475,37 @@ def config_workspace_export(workspace_id, kind):
     return "Not found", 404
 
 
+def migration_output_push_block(workspace_id: int):
+    """Return the migration output and a reason when direct API load is unsafe."""
+    with db() as conn:
+        output = conn.execute(
+            "SELECT migration_outputs.*,migration_projects.id project_id FROM migration_outputs "
+            "JOIN migration_projects ON migration_projects.id=migration_outputs.project_id "
+            "WHERE migration_outputs.workspace_id=? ORDER BY migration_outputs.id DESC LIMIT 1",
+            (workspace_id,),
+        ).fetchone()
+    if not output:
+        return None, ""
+    sanity = json.loads(output["sanity_json"] or "{}")
+    if sanity.get("regenerate_required"):
+        return output, "Deze migratiecandidate is verouderd; maak eerst een nieuwe merge."
+    if int(sanity.get("unresolved_references", 0) or 0) > 0:
+        return output, "Deze migratiecandidate bevat nog onopgeloste referenties."
+    if int(sanity.get("critical_findings", 0) or 0) > 0:
+        return output, "Deze migratiecandidate bevat nog kritieke reviewpunten."
+    return output, ""
+
+
 @app.get("/config-workspaces/<int:workspace_id>/push-preview")
 @login_required
 def config_workspace_push_preview(workspace_id):
     workspace = workspace_row(workspace_id)
     if not workspace:
         return "Not found", 404
+    output, block_reason = migration_output_push_block(workspace_id)
+    if block_reason:
+        flash(f"API-load geblokkeerd: {block_reason}", "error")
+        return redirect(url_for("migration_project", project_id=output["project_id"]))
     metadata = json.loads(workspace["metadata_json"] or "{}")
     return render_template("workspace_push.html", workspace=workspace, metadata=metadata)
 
@@ -3474,6 +3516,10 @@ def config_workspace_push(workspace_id):
     workspace = workspace_row(workspace_id)
     if not workspace:
         return "Not found", 404
+    output, block_reason = migration_output_push_block(workspace_id)
+    if block_reason:
+        flash(f"API-load geblokkeerd: {block_reason}", "error")
+        return redirect(url_for("migration_project", project_id=output["project_id"]))
     if request.form.get("confirm_name", "") != workspace["name"]:
         flash("API-load gestopt: de workspacenaam kwam niet overeen.", "error")
         return redirect(url_for("config_workspace_push_preview", workspace_id=workspace_id))
@@ -3687,11 +3733,21 @@ def migration_candidate_export(project_id,kind):
     project=migration_project_row(project_id)
     if not project or kind not in {"xml","set"}: return "Not found",404
     if project["target_type"]=="scm": return "SCM gebruikt een API-candidate en heeft geen PAN-OS XML-output",400
-    with db() as conn: source_ids=[int(row["id"]) for row in conn.execute("SELECT id FROM migration_sources WHERE project_id=?",(project_id,)).fetchall()]
-    model=selected_migration_model(project_id,source_ids); base_id=int(project["base_workspace_id"] or 0); workspace=workspace_row(base_id) if base_id else None
-    settings=json.loads(project["settings_json"] or "{}"); panorama=project["target_type"]=="panorama"; scope=settings.get("device_group","") if panorama else settings.get("vsys","vsys1")
-    base_xml=workspace_config_path(workspace).read_bytes() if workspace else migration_base_xml(model,scope,panorama)
-    xml_bytes,_=merge_model_into_panos_xml(base_xml,model,scope,panorama,settings.get("rulebase","pre"))
+    with db() as conn:
+        latest_output = conn.execute(
+            "SELECT migration_outputs.*,config_workspaces.config_path FROM migration_outputs "
+            "JOIN config_workspaces ON config_workspaces.id=migration_outputs.workspace_id "
+            "WHERE migration_outputs.project_id=? ORDER BY migration_outputs.id DESC LIMIT 1",
+            (project_id,),
+        ).fetchone()
+        source_ids=[int(row["id"]) for row in conn.execute("SELECT id FROM migration_sources WHERE project_id=?",(project_id,)).fetchall()]
+    if latest_output:
+        xml_bytes=workspace_config_path(latest_output).read_bytes()
+    else:
+        model=selected_migration_model(project_id,source_ids); base_id=int(project["base_workspace_id"] or 0); workspace=workspace_row(base_id) if base_id else None
+        settings=json.loads(project["settings_json"] or "{}"); panorama=project["target_type"]=="panorama"; scope=settings.get("device_group","") if panorama else settings.get("vsys","vsys1")
+        base_xml=workspace_config_path(workspace).read_bytes() if workspace else migration_base_xml(model,scope,panorama)
+        xml_bytes,_=merge_model_into_panos_xml(base_xml,model,scope,panorama,settings.get("rulebase","pre"))
     safe="".join(char if char.isalnum() or char in "-_." else "-" for char in project["name"]).strip("-.") or f"migration-{project_id}"
     if kind=="xml": return Response(xml_bytes,mimetype="application/xml",headers={"Content-Disposition":f'attachment; filename="{safe}.xml"'})
     return Response(render_set_commands(xml_bytes),mimetype="text/plain",headers={"Content-Disposition":f'attachment; filename="{safe}.set.txt"'})
@@ -3837,14 +3893,16 @@ def migration_source_profile(project_id):
         with db() as conn: profile=conn.execute("SELECT * FROM profiles WHERE id=?",(profile_id,)).fetchone()
         if not profile: raise MigrationError("Bronprofiel bestaat niet")
         model,xml_bytes=live_profile_migration_source(profile)
-        source_id=store_migration_source(project_id,model.vendor,model.source_name,model)
         if xml_bytes is not None and int(profile["id"])==int(project["target_profile_id"]):
             workspace_id=store_config_workspace(profile,f"Bronconfiguratie - {profile['name']}",f"{profile['name']}-candidate.xml",xml_bytes,"migration-api")
             with db() as conn:
                 conn.execute("UPDATE migration_projects SET base_workspace_id=?,updated_at=? WHERE id=?",(workspace_id,now(),project_id))
-                conn.execute("UPDATE migration_sources SET staging_workspace_id=? WHERE id=?",(workspace_id,source_id))
-        audit("migration-live-source",f"project={project_id} source={source_id} profile={profile['name']}")
-        flash(f"Live configuratie van {profile['name']} toegevoegd.","success")
+            audit("migration-live-base",f"project={project_id} workspace={workspace_id} profile={profile['name']}")
+            flash(f"Volledige doelconfiguratie van {profile['name']} als base opgehaald.","success")
+        else:
+            source_id=store_migration_source(project_id,model.vendor,model.source_name,model)
+            audit("migration-live-source",f"project={project_id} source={source_id} profile={profile['name']}")
+            flash(f"Live configuratie van {profile['name']} als migratiebron toegevoegd.","success")
     except Exception as exc: flash(f"Live configuratie niet opgehaald: {exc}","error")
     return redirect(url_for("migration_project",project_id=project_id))
 

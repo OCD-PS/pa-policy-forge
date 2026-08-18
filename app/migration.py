@@ -443,6 +443,47 @@ class CheckPointParser(BaseParser):
     vendor = "checkpoint"
     label = "Check Point"
     extensions = (".json", ".xml", ".txt", ".tar")
+    # Mappings verified against the PAN-OS 12.1 predefined application catalog.
+    # Keep this deliberately small: an uncertain mapping must remain a review
+    # item instead of silently broadening a Check Point rule.
+    PANOS_APPLICATION_ALIASES = {
+        "deliveryoptimazation": "ms-update-optimization-p2p",
+        "dhcp-reply": "dhcp",
+        "dhcp-request": "dhcp",
+        "dropbox": "dropbox-base",
+        "dropbox-web": "dropbox-base",
+        "dropbox-web-download": "dropbox-downloading",
+        "dropbox-web-upload": "dropbox-uploading",
+        "echo-request": "ping",
+        "filestack": "filestack-base",
+        "gmail": "gmail-base",
+        "hangouts-audio-video": "google-hangouts-audio-video",
+        "icmp-proto": "icmp",
+        "icmp-protocol": "icmp",
+        "itunes": "itunes-base",
+        "lastpass": "lastpass",
+        "microsoft-remote-desktop-connection": "ms-rdp",
+        "netflix": "netflix-base",
+        "netflix-streaming": "netflix-streaming",
+        "openvpn": "open-vpn",
+        "psiphon": "psiphon",
+        "rpc-over-http": "rpc-over-http",
+        "sharepoint-online-upload": "sharepoint-online-uploading",
+        "sharepoint-wiki": "sharepoint-wiki",
+        "skype": "skype",
+        "spotify": "spotify",
+        "symantec-update": "symantec-av-update",
+        "teamviewer": "teamviewer-base",
+        "thunder-vpn": "thunder-vpn",
+        "traceroute": "traceroute",
+        "vrrp": "vrrp",
+        "whatsapp-messenger": "whatsapp-base",
+        "whatsapp-messenger-file-transfer": "whatsapp-file-transfer",
+        "whatsapp-messenger-voice-call": "whatsapp-voice",
+        "whatsapp-messenger-web-pc": "whatsapp-web",
+        "windows-update": "ms-update",
+        "zabbix": "zabbix",
+    }
 
     def parse_bytes(self, content: bytes, source_name: str) -> MigrationModel:
         """Parse a Check Point show-package archive with one global UID dictionary."""
@@ -624,6 +665,212 @@ class CheckPointParser(BaseParser):
                 model.addresses.append(Address(member, value, value_type, description, source_ref=ref))
             model.address_groups.append(AddressGroup(name, members, description, source_ref=ref))
 
+    @staticmethod
+    def _review_description(description: str, notes: list[str]) -> str:
+        notes = unique(notes)
+        if not notes:
+            return description
+        review = "MIGRATION-REVIEW: " + "; ".join(notes)
+        return "; ".join(filter(None, [description, review]))[:1023]
+
+    @staticmethod
+    def _is_address_reference(value: str, known: set[str]) -> bool:
+        if value in {"any", "original"} or value in known:
+            return True
+        try:
+            ipaddress.ip_network(value, strict=False)
+            return True
+        except ValueError:
+            return False
+
+    def _conservative_panos_staging(self, model: MigrationModel) -> MigrationModel:
+        """Remove invalid PAN-OS references and make Check Point output safe to stage.
+
+        Check Point exports do not contain PAN-OS zones, interface placement,
+        user-ID mappings or equivalent VPN semantics. The generated candidate
+        retains representable data, records dropped semantics for review, and
+        disables every imported rule until an engineer completes those choices.
+        """
+        mapped_names: dict[str, str] = {}
+        remaining_unsupported: list[str] = []
+        mapping_pattern = re.compile(
+            r"Check Point (?:application-site(?:-category|-group)?|service-(?:icmp6?|other)) (.+?) vereist application/user mapping$"
+        )
+        for message in model.unsupported:
+            match = mapping_pattern.search(message)
+            source_name = match.group(1) if match else ""
+            target_name = self.PANOS_APPLICATION_ALIASES.get(source_name.casefold())
+            if target_name:
+                mapped_names[source_name.casefold()] = target_name
+                model.warnings.append(
+                    f"Check Point application/service {source_name} gemapt naar PAN-OS App-ID {target_name}"
+                )
+            else:
+                remaining_unsupported.append(message)
+        model.unsupported = remaining_unsupported
+
+        address_names = {item.name for item in model.addresses}
+        service_names = {item.name for item in model.services}
+
+        # Repeat because pruning an empty child group can invalidate a parent.
+        while True:
+            group_names = {item.name for item in model.address_groups}
+            known = address_names | group_names
+            changed = False
+            kept_groups = []
+            for group in model.address_groups:
+                removed = [value for value in group.members if not self._is_address_reference(value, known)]
+                members = [value for value in group.members if self._is_address_reference(value, known)]
+                if removed:
+                    changed = True
+                    model.warnings.append(
+                        f"{group.source_ref}: address-group {group.name} mist members: {', '.join(removed)}"
+                    )
+                    group.description = self._review_description(
+                        group.description, ["ontbrekende members verwijderd: " + ", ".join(removed)]
+                    )
+                group.members = unique(members)
+                if group.members:
+                    kept_groups.append(group)
+                else:
+                    changed = True
+                    model.unsupported.append(
+                        f"{group.source_ref}: Check Point address-group {group.name} heeft geen geldige PAN-OS members"
+                    )
+            model.address_groups = kept_groups
+            if not changed:
+                break
+
+        while True:
+            service_group_names = {item.name for item in model.service_groups}
+            known = service_names | service_group_names
+            changed = False
+            kept_groups = []
+            for group in model.service_groups:
+                removed = [value for value in group.members if value not in known]
+                members = [value for value in group.members if value in known]
+                if removed:
+                    changed = True
+                    model.warnings.append(
+                        f"{group.source_ref}: service-group {group.name} mist members: {', '.join(removed)}"
+                    )
+                    group.description = self._review_description(
+                        group.description, ["ontbrekende members verwijderd: " + ", ".join(removed)]
+                    )
+                group.members = unique(members)
+                if group.members:
+                    kept_groups.append(group)
+                else:
+                    changed = True
+                    model.unsupported.append(
+                        f"{group.source_ref}: Check Point service-group {group.name} heeft geen geldige PAN-OS members"
+                    )
+            model.service_groups = kept_groups
+            if not changed:
+                break
+
+        known_addresses = address_names | {item.name for item in model.address_groups}
+        known_services = service_names | {item.name for item in model.service_groups}
+
+        def address_values(values: list[str]) -> tuple[list[str], list[str]]:
+            kept = [value for value in values if self._is_address_reference(value, known_addresses)]
+            removed = [value for value in values if not self._is_address_reference(value, known_addresses)]
+            return unique(kept) or ["any"], unique(removed)
+
+        def service_values(values: list[str], fallback: str) -> tuple[list[str], list[str]]:
+            valid = {
+                value for value in values
+                if value in {"any", "application-default"}
+                or value in known_services
+                or re.match(r"^(?:tcp|udp)-\d+(?:-\d+)?$", value, re.I)
+            }
+            kept = [value for value in values if value in valid]
+            removed = [value for value in values if value not in valid]
+            return unique(kept) or [fallback], unique(removed)
+
+        def sanitize_translation(translation: dict) -> tuple[dict, list[str]]:
+            removed: list[str] = []
+
+            def walk(value):
+                if isinstance(value, dict):
+                    result = {}
+                    for key, child in value.items():
+                        if str(key).replace("-", "_") == "translated_address":
+                            candidates = child if isinstance(child, list) else [child]
+                            invalid = [
+                                str(item) for item in candidates
+                                if not self._is_address_reference(str(item), known_addresses)
+                            ]
+                            if invalid:
+                                removed.extend(invalid)
+                                continue
+                        cleaned = walk(child)
+                        if cleaned not in ({}, [], None, ""):
+                            result[key] = cleaned
+                    return result
+                if isinstance(value, list):
+                    return [item for item in (walk(child) for child in value) if item not in ({}, [], None, "")]
+                return value
+
+            return walk(translation), unique(removed)
+
+        for rule in model.security_rules:
+            notes = ["Check Point policy disabled; map zones, identity, VPN and rule order before enabling"]
+            rule.source, removed = address_values(rule.source)
+            if removed:
+                notes.append("source references not converted: " + ", ".join(removed))
+            rule.destination, removed = address_values(rule.destination)
+            if removed:
+                notes.append("destination references not converted: " + ", ".join(removed))
+
+            applications: list[str] = []
+            removed_applications: list[str] = []
+            for application in rule.application:
+                if application == "any":
+                    applications.append("any")
+                    continue
+                mapped = mapped_names.get(application.casefold()) or self.PANOS_APPLICATION_ALIASES.get(application.casefold())
+                if mapped:
+                    applications.append(mapped)
+                else:
+                    removed_applications.append(application)
+            rule.application = unique(applications) or ["any"]
+            if removed_applications:
+                notes.append("applications/categories not converted: " + ", ".join(unique(removed_applications)))
+
+            service_fallback = "application-default" if rule.application != ["any"] else "any"
+            rule.service, removed = service_values(rule.service, service_fallback)
+            if removed:
+                notes.append("service references not converted: " + ", ".join(removed))
+            rule.disabled = True
+            rule.description = self._review_description(rule.description, notes)
+
+        for rule in model.nat_rules:
+            notes = ["Check Point NAT disabled; validate order, zones, interfaces and translations before enabling"]
+            rule.source, removed = address_values(rule.source)
+            if removed:
+                notes.append("source references not converted: " + ", ".join(removed))
+            rule.destination, removed = address_values(rule.destination)
+            if removed:
+                notes.append("destination references not converted: " + ", ".join(removed))
+            rule.service, removed = service_values(rule.service, "any")
+            if removed:
+                notes.append("service references not converted: " + ", ".join(removed))
+            rule.source_translation, removed = sanitize_translation(rule.source_translation)
+            if removed:
+                notes.append("source translation not converted: " + ", ".join(removed))
+            rule.destination_translation, removed = sanitize_translation(rule.destination_translation)
+            if removed:
+                notes.append("destination translation not converted: " + ", ".join(removed))
+            rule.disabled = True
+            rule.description = self._review_description(rule.description, notes)
+
+        if model.security_rules or model.nat_rules:
+            model.warnings.append(
+                "Check Point policies zijn standaard disabled: PAN-OS zones, identiteit, VPN, NAT-interfaces en rule order vereisen engineer review"
+            )
+        return model
+
     def _json(self, data, source_name):
         model = MigrationModel(self.vendor, source_name)
         items = self._object_items(data)
@@ -724,7 +971,7 @@ class CheckPointParser(BaseParser):
             access, nat = data, []
         self._walk_rules(access, model, lookup, type_lookup)
         self._walk_nat_rules(nat, model, lookup, services_by_name)
-        return deduplicate(model)
+        return self._conservative_panos_staging(deduplicate(model))
 
     @staticmethod
     def _unique_rule_name(rules: list[Policy], value: dict, source_file: str, fallback: str) -> str:

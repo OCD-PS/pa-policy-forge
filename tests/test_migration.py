@@ -208,8 +208,10 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         data = {"objects": [{"type": "host", "name": "srv", "ipv4-address": "192.0.2.4"}, {"type": "group", "name": "servers", "members": ["srv", {"name": "db"}]}], "rulebase": [{"type": "access-rule", "name": "allow-srv", "source": ["Any"], "destination": ["srv"], "service": ["https"], "action": "Accept"}]}
         model = parse_vendor("checkpoint", json.dumps(data).encode(), "checkpoint.json")
         self.assertEqual(model.addresses[0].name, "srv")
-        self.assertEqual(model.address_groups[0].members, ["srv", "db"])
+        self.assertEqual(model.address_groups[0].members, ["srv"])
+        self.assertIn("db", model.address_groups[0].description)
         self.assertEqual(model.security_rules[0].action, "allow")
+        self.assertTrue(model.security_rules[0].disabled)
 
     def test_checkpoint_unknown_action_is_disabled_and_blocks_review(self):
         data = {"rulebase": [{"type": "access-rule", "uid": "layer-1", "name": "Nested Layer", "action": "Inner Layer"}]}
@@ -360,11 +362,48 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         self.assertEqual(addresses["nested-member"], "192.0.2.22/32")
         self.assertTrue(any("DNS-domain objecten" in warning for warning in model.warnings))
         rule = model.security_rules[0]
-        self.assertEqual(rule.application, ["Dropbox", "echo-request"])
+        self.assertEqual(rule.application, ["dropbox-base", "ping"])
         self.assertEqual(rule.service, ["application-default"])
+        self.assertTrue(rule.disabled)
         analysis = migration_analysis(model)
-        self.assertIn("Dropbox", analysis["unresolved_references"])
-        self.assertIn("echo-request", analysis["unresolved_references"])
+        self.assertEqual(analysis["unresolved_references"], [])
+
+    def test_checkpoint_candidate_removes_unsafe_references_and_disables_all_rules(self):
+        data = {
+            "objects": [
+                {"type": "host", "uid": "host-1", "name": "server", "ipv4-address": "192.0.2.10"},
+                {"type": "access-role", "uid": "role-1", "name": "Developers"},
+                {"type": "application-site", "uid": "app-1", "name": "Dropbox"},
+                {"type": "application-site-category", "uid": "category-1", "name": "File-Storage"},
+                {"type": "group", "uid": "group-1", "name": "servers", "members": ["host-1", "missing-1"]},
+            ],
+            "rulebase": [{
+                "type": "access-rule", "uid": "rule-1", "name": "unsafe-rule",
+                "source": ["role-1"], "destination": ["host-1", "Internet"],
+                "service": ["app-1", "category-1"], "action": "Accept",
+            }],
+            "nat-rulebase": [{
+                "type": "nat-rule", "uid": "nat-1", "name": "unsafe-nat",
+                "original-source": ["role-1"], "original-destination": ["host-1"],
+                "translated-source": ["missing-translation"], "method": "static",
+            }],
+        }
+        model = parse_vendor("checkpoint", json.dumps(data).encode(), "checkpoint.json")
+        security = model.security_rules[0]
+        self.assertTrue(security.disabled)
+        self.assertEqual(security.source, ["any"])
+        self.assertEqual(security.destination, ["server"])
+        self.assertEqual(security.application, ["dropbox-base"])
+        self.assertIn("Developers", security.description)
+        self.assertIn("Internet", security.description)
+        self.assertIn("File-Storage", security.description)
+        nat = model.nat_rules[0]
+        self.assertTrue(nat.disabled)
+        self.assertEqual(nat.source, ["any"])
+        self.assertEqual(nat.source_translation, {})
+        self.assertIn("missing-translation", nat.description)
+        self.assertEqual(model.address_groups[0].members, ["server"])
+        self.assertEqual(migration_analysis(model)["unresolved_references"], [])
 
     def test_migration_analysis_ignores_any_in_object_groups(self):
         model = MigrationModel(
@@ -945,6 +984,104 @@ end''', "editable-fortigate.conf")
         self.assertEqual(cleared.status_code, 302)
         with main.db() as conn:
             self.assertIsNone(conn.execute("SELECT base_workspace_id FROM migration_projects WHERE id=?", (project_id,)).fetchone()["base_workspace_id"])
+
+    def test_live_target_pull_becomes_base_without_duplicate_migration_source(self):
+        stamp = main.now()
+        with main.db() as conn:
+            profile_id = conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("PANOS live base test", "panos", json.dumps({"vsys": "vsys1"}), stamp, stamp),
+            ).lastrowid
+            project_id = conn.execute(
+                "INSERT INTO migration_projects(name,target_profile_id,created_at,updated_at) VALUES(?,?,?,?)",
+                ("live-base-only", profile_id, stamp, stamp),
+            ).lastrowid
+        client = main.app.test_client()
+        with main.app.test_request_context("/", base_url="https://forge.test"):
+            cookie_name = main.app.config["SESSION_COOKIE_NAME"]
+            serializer = main.app.session_interface.get_signing_serializer(main.app)
+            client.set_cookie(cookie_name, serializer.dumps({"user_id": 1, "username": "admin", "csrf": "migration-test-csrf"}), domain="forge.test", secure=True)
+        xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase/></entry></vsys></entry></devices></config>'''
+        pulled_model = parse_vendor("panos", xml, "live-candidate.xml")
+        with patch("app.main.live_profile_migration_source", return_value=(pulled_model, xml)):
+            response = client.post(
+                f"/migration/projects/{project_id}/source-profile",
+                base_url="https://forge.test",
+                data={"csrf": "migration-test-csrf", "source_profile_id": str(profile_id)},
+            )
+        self.assertEqual(response.status_code, 302)
+        with main.db() as conn:
+            project = conn.execute("SELECT * FROM migration_projects WHERE id=?", (project_id,)).fetchone()
+            source_count = conn.execute("SELECT COUNT(*) count FROM migration_sources WHERE project_id=?", (project_id,)).fetchone()["count"]
+            workspace = conn.execute("SELECT * FROM config_workspaces WHERE id=?", (project["base_workspace_id"],)).fetchone()
+        self.assertEqual(source_count, 0)
+        self.assertIsNotNone(workspace)
+        self.assertEqual(workspace["source"], "migration-api")
+
+    def test_candidate_export_uses_latest_generated_output(self):
+        stamp = main.now()
+        with main.db() as conn:
+            profile_id = conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("PANOS latest output test", "panos", json.dumps({"vsys": "vsys1"}), stamp, stamp),
+            ).lastrowid
+            project_id = conn.execute(
+                "INSERT INTO migration_projects(name,target_profile_id,created_at,updated_at) VALUES(?,?,?,?)",
+                ("latest-output-export", profile_id, stamp, stamp),
+            ).lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        main.store_migration_source(
+            project_id, "generic", "would-recompute.json",
+            MigrationModel("generic", "would-recompute.json", addresses=[Address("wrong-object", "192.0.2.1/32")]),
+        )
+        latest_xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="latest-output"><ip-netmask>192.0.2.2/32</ip-netmask></entry></address><rulebase/></entry></vsys></entry></devices></config>'''
+        workspace_id = main.store_config_workspace(profile, "Latest output", "latest.xml", latest_xml, "migration-output")
+        main.store_migration_output(project_id, workspace_id, "Latest output")
+        client = main.app.test_client()
+        with main.app.test_request_context("/", base_url="https://forge.test"):
+            cookie_name = main.app.config["SESSION_COOKIE_NAME"]
+            serializer = main.app.session_interface.get_signing_serializer(main.app)
+            client.set_cookie(cookie_name, serializer.dumps({"user_id": 1, "username": "admin", "csrf": "migration-test-csrf"}), domain="forge.test", secure=True)
+        response = client.get(f"/migration/projects/{project_id}/export-candidate/xml", base_url="https://forge.test")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, main.workspace_config_path(main.workspace_row(workspace_id)).read_bytes())
+        self.assertIn(b"latest-output", response.data)
+        self.assertNotIn(b"wrong-object", response.data)
+
+    def test_migration_output_workspace_links_back_and_blocks_push_when_review_fails(self):
+        stamp = main.now()
+        with main.db() as conn:
+            profile_id = conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("PANOS review gate test", "panos", json.dumps({"vsys": "vsys1"}), stamp, stamp),
+            ).lastrowid
+            project_id = conn.execute(
+                "INSERT INTO migration_projects(name,target_profile_id,created_at,updated_at) VALUES(?,?,?,?)",
+                ("blocked-output", profile_id, stamp, stamp),
+            ).lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase/></entry></vsys></entry></devices></config>'''
+        workspace_id = main.store_config_workspace(profile, "Blocked candidate", "blocked.xml", xml, "migration-output")
+        main.store_migration_output(
+            project_id, workspace_id, "Blocked candidate",
+            sanity={"critical_findings": 1, "unresolved_references": 0, "regenerate_required": False},
+        )
+        client = main.app.test_client()
+        with main.app.test_request_context("/", base_url="https://forge.test"):
+            cookie_name = main.app.config["SESSION_COOKIE_NAME"]
+            serializer = main.app.session_interface.get_signing_serializer(main.app)
+            client.set_cookie(cookie_name, serializer.dumps({"user_id": 1, "username": "admin", "csrf": "migration-test-csrf"}), domain="forge.test", secure=True)
+        page = client.get(f"/config-workspaces/{workspace_id}/edit", base_url="https://forge.test").get_data(as_text=True)
+        self.assertIn("Terug naar migratieproject", page)
+        self.assertIn("Migratiecandidate", page)
+        self.assertIn("Review vereist", page)
+        self.assertNotIn(">API push<", page)
+        blocked = client.get(
+            f"/config-workspaces/{workspace_id}/push-preview",
+            base_url="https://forge.test",
+        )
+        self.assertEqual(blocked.status_code, 302)
+        self.assertIn(f"/migration/projects/{project_id}", blocked.headers["Location"])
 
 
 if __name__ == "__main__":
