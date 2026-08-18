@@ -17,7 +17,7 @@ class OfflineConfigError(ValueError):
 
 PANORAMA_TREE = [
     ("Policies", ["Security", "NAT", "QoS", "Policy Based Forwarding", "Decryption", "Tunnel Inspection", "Application Override", "Authentication", "DoS Protection", "SD-WAN"]),
-    ("Objects", ["Addresses", "Address Groups", "Regions", "Dynamic User Groups", "Applications", "Application Groups", "Application Filters", "Services", "Service Groups", "Tags", "HIP Objects", "HIP Profiles", "External Dynamic Lists", "Custom URL Categories", "Security Profiles", "↳ Antivirus", "↳ Anti-Spyware", "↳ Vulnerability Protection", "↳ URL Filtering", "↳ File Blocking", "↳ WildFire Analysis", "↳ DoS Protection", "Security Profile Groups", "Log Forwarding", "Authentication", "Decryption"]),
+    ("Objects", ["Addresses", "Address Groups", "Regions", "Dynamic User Groups", "Applications", "Application Groups", "Application Filters", "Services", "Service Groups", "Tags", "HIP Objects", "HIP Profiles", "External Dynamic Lists", "Custom URL Categories", "Security Profiles", "↳ Antivirus", "↳ Anti-Spyware", "↳ Vulnerability Protection", "↳ URL Filtering", "↳ File Blocking", "↳ WildFire Analysis", "↳ DoS Protection", "Security Profile Groups", "Log Forwarding", "Authentication", "Decryption", "Schedules"]),
     ("Network", ["Interfaces", "Zones", "VLANs", "Virtual Wires", "Virtual Routers", "Logical Routers", "Routing Profiles", "IPSec Tunnels", "GRE Tunnels", "GlobalProtect Portals", "GlobalProtect Gateways", "DHCP", "DNS Proxy", "QoS", "LLDP", "Network Profiles"]),
     ("Device", ["Setup", "Administrators", "Admin Roles", "Authentication Profile", "Authentication Sequence", "Certificates", "Certificate Management", "Local User Database", "Server Profiles", "Log Settings", "High Availability", "User Identification", "VM Information Sources"]),
 ]
@@ -42,6 +42,82 @@ OBJECT_NODES = {
     "dos-protection": "profiles/dos-protection",
     "schedules": "schedule", "security-profile-groups": "profile-group",
     "log-forwarding": "log-settings/profiles", "authentication": "authentication-profile",
+    "decryption-profiles": "profiles/decryption",
+}
+
+
+# New generic objects need a real PAN-OS-shaped entry before the field editor can
+# render anything.  These seeds deliberately contain only safe, editable defaults;
+# fields unknown to this application are still preserved when an existing entry is
+# edited.  Structured object families are created by object_payload_xml instead.
+OBJECT_CREATE_XML = {
+    "regions": '<entry name=""><address><member></member></address><description /></entry>',
+    "dynamic-user-groups": '<entry name=""><filter /></entry>',
+    "applications": (
+        '<entry name=""><category>business-systems</category><subcategory>general-business</subcategory>'
+        '<technology>client-server</technology><risk>1</risk><description />'
+        '<default><port><member></member></port></default></entry>'
+    ),
+    "application-filters": (
+        '<entry name=""><category><member></member></category><subcategory><member></member></subcategory>'
+        '<technology><member></member></technology><risk><member></member></risk>'
+        '<evasive>no</evasive><excessive-bandwidth-use>no</excessive-bandwidth-use>'
+        '<has-known-vulnerabilities>no</has-known-vulnerabilities><is-saas>no</is-saas>'
+        '<new-appid>no</new-appid><pervasive>no</pervasive><prone-to-misuse>no</prone-to-misuse>'
+        '<transfers-files>no</transfers-files><tunnels-other-apps>no</tunnels-other-apps>'
+        '<used-by-malware>no</used-by-malware></entry>'
+    ),
+    "external-dynamic-lists": (
+        '<entry name=""><type><ip><description /><url />'
+        '<certificate-profile>None</certificate-profile><recurring><five-minute /></recurring>'
+        '<exception-list><member></member></exception-list></ip></type></entry>'
+    ),
+    "hip-objects": '<entry name=""><description /><host-info><criteria><os><contains><Microsoft>All</Microsoft></contains></os></criteria></host-info></entry>',
+    "hip-profiles": '<entry name=""><description /><match>any</match></entry>',
+    "custom-url-categories": '<entry name=""><description /><type>URL List</type><list><member></member></list></entry>',
+    "antivirus": (
+        '<entry name=""><description /><packet-capture>disable</packet-capture><decoder>'
+        '<entry name="http"><action>default</action><wildfire-action>default</wildfire-action>'
+        '<mlav-action>default</mlav-action></entry></decoder></entry>'
+    ),
+    "anti-spyware": (
+        '<entry name=""><description /><rules><entry name="critical-high"><action><default /></action>'
+        '<severity><member>critical</member><member>high</member></severity><threat-name>any</threat-name>'
+        '<category>any</category><packet-capture>disable</packet-capture></entry></rules></entry>'
+    ),
+    "vulnerability-protection": (
+        '<entry name=""><description /><rules><entry name="critical-high"><action><default /></action>'
+        '<severity><member>critical</member><member>high</member></severity><cve><member>any</member></cve>'
+        '<vendor-id><member>any</member></vendor-id><threat-name>any</threat-name>'
+        '<host>any</host><category>any</category><packet-capture>disable</packet-capture></entry></rules></entry>'
+    ),
+    "url-filtering": (
+        '<entry name=""><description /><allow><member></member></allow><alert><member></member></alert>'
+        '<block><member></member></block><continue><member></member></continue>'
+        '<override><member></member></override><redirect><member></member></redirect>'
+        '<safe-search-enforcement>no</safe-search-enforcement><log-container-page-only>yes</log-container-page-only></entry>'
+    ),
+    "file-blocking": (
+        '<entry name=""><description /><rules><entry name="rule-1"><application><member>any</member></application>'
+        '<file-type><member>any</member></file-type><direction>both</direction><action>alert</action></entry></rules></entry>'
+    ),
+    "wildfire-analysis": (
+        '<entry name=""><description /><rules><entry name="rule-1"><application><member>any</member></application>'
+        '<file-type><member>any</member></file-type><direction>both</direction><analysis>public-cloud</analysis></entry></rules></entry>'
+    ),
+    "dos-protection": '<entry name=""><description /><type><aggregate><resources><sessions><enabled>yes</enabled></sessions></resources></aggregate></type></entry>',
+    "schedules": '<entry name=""><schedule-type><recurring><weekly><monday><member></member></monday></weekly></recurring></schedule-type></entry>',
+    "security-profile-groups": (
+        '<entry name=""><virus><member></member></virus><spyware><member></member></spyware>'
+        '<vulnerability><member></member></vulnerability><url-filtering><member></member></url-filtering>'
+        '<file-blocking><member></member></file-blocking><wildfire-analysis><member></member></wildfire-analysis></entry>'
+    ),
+    "authentication": '<entry name=""><authentication-profile /><timeout>60</timeout></entry>',
+    "decryption-profiles": (
+        '<entry name=""><ssl-forward-proxy><auto-include-altname>yes</auto-include-altname>'
+        '<block-expired-certificate>yes</block-expired-certificate><block-untrusted-issuer>yes</block-untrusted-issuer>'
+        '<block-unknown-cert>yes</block-unknown-cert></ssl-forward-proxy></entry>'
+    ),
 }
 
 SERVER_PROFILE_NODES = {
@@ -605,6 +681,12 @@ def _object_edit_fields(entry: ET.Element, object_type: str = "") -> list[dict]:
         children = list(node)
         label = " / ".join(labels)
         group = labels[0] if labels else "General"
+        if path and node.tag == "entry" and node.get("name") is not None:
+            fields.append({
+                "path": "/".join(str(index) for index in path),
+                "label": f"{label} / Name", "group": group,
+                "kind": "attribute", "value": node.get("name", ""),
+            })
         if object_type == "url-filtering":
             top = labels[0].strip().lower() if labels else ""
             if top in {"allow", "alert", "block", "continue", "override", "redirect", "none"}:
@@ -652,6 +734,65 @@ def _object_edit_fields(entry: ET.Element, object_type: str = "") -> list[dict]:
     for index, child in enumerate(list(entry)):
         walk(child, [index], [child.tag.replace("-", " ").title()])
     return fields
+
+
+def object_create_record(object_type: str, owner: str = "") -> dict | None:
+    """Return the PAN-OS-shaped seed used by the generic Add editor."""
+    source = OBJECT_CREATE_XML.get(object_type)
+    if not source:
+        return None
+    entry = SafeET.fromstring(source)
+    record = object_record(entry, owner, True, object_type)
+    record["generic"] = True
+    record["create_template"] = True
+    return record
+
+
+def generic_object_xml(object_type: str, current_xml: str | None, name: str, updates: list[dict]) -> str:
+    """Apply validated generic form updates to an existing entry or create seed."""
+    source = current_xml or OBJECT_CREATE_XML.get(object_type)
+    if not source:
+        raise OfflineConfigError("Voor dit objecttype is geen veilig PAN-OS create-schema beschikbaar")
+    entry = SafeET.fromstring(source)
+    if entry.tag != "entry":
+        raise OfflineConfigError("Ongeldig object-create-schema")
+    clean_name = str(name).strip()
+    if not clean_name:
+        raise OfflineConfigError("Name is verplicht")
+    entry.set("name", clean_name)
+    allowed = {
+        (field["path"], field["kind"])
+        for field in _object_edit_fields(entry, object_type)
+        if field.get("kind") != "protected"
+    }
+    if not isinstance(updates, list) or len(updates) > 10000:
+        raise OfflineConfigError("Ongeldige objectvelden")
+    for update in updates:
+        key = (str(update.get("path", "")), str(update.get("kind", "")))
+        if key not in allowed:
+            raise OfflineConfigError("Een objectveld bestaat niet meer of is beschermd")
+        try:
+            target = entry
+            for index in (int(part) for part in key[0].split("/") if part != ""):
+                target = list(target)[index]
+        except (ValueError, IndexError):
+            raise OfflineConfigError("Een objectveld bestaat niet meer")
+        if key[1] == "members":
+            values = update.get("values", [])
+            if not isinstance(values, list) or len(values) > 10000:
+                raise OfflineConfigError("Ongeldige memberlijst")
+            for child in list(target):
+                target.remove(child)
+            for value in values:
+                clean = str(value).strip()
+                if clean:
+                    member = ET.SubElement(target, "member")
+                    member.text = clean
+        elif key[1] == "attribute":
+            target.set("name", str(update.get("value", ""))[:63])
+        else:
+            target.text = str(update.get("value", ""))[:65535]
+    return ET.tostring(entry, encoding="unicode")
 
 
 def object_fingerprint(record: dict) -> str:
@@ -812,33 +953,12 @@ def apply_object_changes(xml_bytes: bytes, scope: str, object_type: str, changes
             container.remove(current)
             continue
         if change.get("generic_updates") is not None:
-            if current is None:
-                raise OfflineConfigError("Dit objecttype kan pas worden aangemaakt zodra een PAN-OS-schema beschikbaar is")
-            replacement = copy.deepcopy(current)
-            replacement.set("name", change.get("name", original_name).strip())
-            allowed = {
-                (field["path"], field["kind"])
-                for field in _object_edit_fields(current, object_type)
-                if field.get("kind") != "protected"
-            }
-            for update in change["generic_updates"]:
-                if (update.get("path"), update.get("kind")) not in allowed:
-                    raise OfflineConfigError("Een objectveld bestaat niet meer of is beschermd")
-                try:
-                    indices = [int(part) for part in update["path"].split("/")]
-                    target = replacement
-                    for index in indices:
-                        target = list(target)[index]
-                except (KeyError, ValueError, IndexError):
-                    raise OfflineConfigError("Een objectveld bestaat niet meer")
-                if update.get("kind") == "members":
-                    for child in list(target):
-                        target.remove(child)
-                    for value in update.get("values", []):
-                        member = ET.SubElement(target, "member")
-                        member.text = str(value)
-                else:
-                    target.text = str(update.get("value", ""))
+            replacement = SafeET.fromstring(generic_object_xml(
+                object_type,
+                ET.tostring(current, encoding="unicode") if current is not None else None,
+                change.get("name", original_name),
+                change["generic_updates"],
+            ))
         else:
             replacement = SafeET.fromstring(change.get("replacement_xml", ""))
         if replacement.tag != "entry" or not replacement.get("name"):

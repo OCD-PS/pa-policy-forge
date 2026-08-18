@@ -403,7 +403,33 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertIn('item.generic', javascript)
         self.assertIn('Toestaan en een URL Filtering-log genereren.', javascript)
         self.assertIn('/catalog/url-categories', javascript)
-        self.assertIn('schemaRequiredTypes', javascript)
+        self.assertNotIn('schemaRequiredTypes', javascript)
+        self.assertIn('data-object-create-template', javascript)
+
+    def test_all_presented_generic_object_families_are_creatable(self):
+        generic_types = {
+            object_type for object_type, metadata in main.SCM_OBJECT_TYPES.items()
+            if metadata.get("generic")
+        }
+        self.assertIn("external-dynamic-lists", generic_types)
+        self.assertIn("decryption-profiles", generic_types)
+        self.assertIn("dos-protection", generic_types)
+        for object_type in sorted(generic_types):
+            with self.subTest(object_type=object_type):
+                metadata = main.SCM_OBJECT_TYPES[object_type]
+                self.assertTrue(metadata.get("creatable"))
+                self.assertTrue(metadata.get("editable"))
+                record = main.scm_generic_create_record(object_type, {"folder": "Branch"})
+                self.assertIsNotNone(record)
+                self.assertTrue(record["edit_fields"])
+                self.assertEqual(record["_raw"]["folder"], "Branch")
+
+    def test_workspace_generic_add_uses_server_side_create_schema(self):
+        template = (main.BASE / "app" / "templates" / "workspace_editor.html").read_text()
+        javascript = (main.BASE / "app" / "static" / "app.js").read_text()
+        self.assertIn("data-object-create-template", template)
+        self.assertIn('add.textContent = "+ Add"', javascript)
+        self.assertIn("genericEditor ? createTemplate : null", javascript)
 
     def test_scm_url_category_catalog_returns_selectable_custom_categories(self):
         timestamp = main.now()
@@ -457,6 +483,39 @@ class TargetAdapterTests(unittest.TestCase):
             self.assertEqual(draft["payload"]["allow"], ["OCD-ALLOW"])
             self.assertEqual(draft["payload"]["block"], ["malware"])
             self.assertNotIn("_raw", response.data.decode())
+        finally:
+            draft_path.unlink(missing_ok=True)
+            with main.db() as conn: conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
+    def test_scm_external_dynamic_list_can_be_created_without_existing_schema(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("scm-edl-create", 1, "", "", "scm", "{}", b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+        seed = main.scm_generic_create_record("external-dynamic-lists", {"folder": "Branch"})
+        url_field = next(field for field in seed["edit_fields"] if field["label"] == "Type / Ip / Url")
+        updates = [{"path": url_field["path"], "kind": "text", "value": "https://example.test/edl.txt"}]
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1; login["username"] = "test"; login["must_change"] = False; login["csrf"] = "edl-csrf"
+        draft_path = main.OBJECT_DRAFTS / "generic-edl-draft.json"
+        try:
+            with patch.object(main, "fetch_scm_objects", return_value=[]), \
+                 patch.object(main, "scm_client", return_value=(SimpleNamespace(scm_folder="Branch", scm_object_folder="Branch", scm_snippet="", scm_device=""), "token", None, {})), \
+                 patch.object(main.secrets, "token_urlsafe", return_value="generic-edl-draft"):
+                response = client.post(
+                    f"/objects/{profile_id}/external-dynamic-lists/preview",
+                    data={"csrf": "edl-csrf", "name": "OCD-EDL", "generic_updates": json.dumps(updates)},
+                    base_url="https://forge.test",
+                )
+            self.assertEqual(response.status_code, 200, response.data.decode())
+            draft = json.loads(draft_path.read_text())
+            self.assertEqual(draft["operation"], "create")
+            self.assertEqual(draft["payload"]["type"]["ip"]["url"], "https://example.test/edl.txt")
+            self.assertEqual(draft["payload"]["folder"], "Branch")
         finally:
             draft_path.unlink(missing_ok=True)
             with main.db() as conn: conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))

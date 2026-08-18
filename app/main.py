@@ -53,6 +53,7 @@ from app.offline_config import (
     apply_configuration_changes, apply_object_changes, configuration_inventory,
     configuration_records as scoped_configuration_records,
     normalized_config_xml, parse_snapshot,
+    object_create_record,
     object_fingerprint as offline_object_fingerprint,
     policy_fingerprint as offline_policy_fingerprint, render_set_commands,
     panos_ui_decorate_record, scoped_server_profiles,
@@ -136,12 +137,16 @@ SCM_OBJECT_TYPES = {
     "address-groups": {"label": "Address Groups", "creatable": True},
     "applications": {"label": "Applications", "creatable": False},
     "application-groups": {"label": "Application Groups", "creatable": True},
-    "application-filters": {"label": "Application Filters", "creatable": False},
+    "application-filters": {"label": "Application Filters", "creatable": True, "editable": True, "generic": True},
     "services": {"label": "Services", "creatable": True},
     "service-groups": {"label": "Service Groups", "creatable": True},
     "tags": {"label": "Tags", "creatable": True},
-    "hip-profiles": {"label": "HIP Profiles", "creatable": False},
-    "schedules": {"label": "Schedules", "creatable": False},
+    "regions": {"label": "Regions", "creatable": True, "editable": True, "generic": True},
+    "dynamic-user-groups": {"label": "Dynamic User Groups", "creatable": True, "editable": True, "generic": True},
+    "external-dynamic-lists": {"label": "External Dynamic Lists", "creatable": True, "editable": True, "generic": True},
+    "hip-objects": {"label": "HIP Objects", "creatable": True, "editable": True, "generic": True},
+    "hip-profiles": {"label": "HIP Profiles", "creatable": True, "editable": True, "generic": True},
+    "schedules": {"label": "Schedules", "creatable": True, "editable": True, "generic": True},
     "log-forwarding": {"label": "Log Forwarding", "creatable": True, "editable": True, "endpoint": "log-forwarding-profiles"},
     "syslog-server-profiles": {"label": "Syslog Server Profiles", "creatable": False, "endpoint": "syslog-server-profiles", "catalog_only": True},
     "email-server-profiles": {"label": "Email Server Profiles", "creatable": False, "endpoint": "email-server-profiles", "catalog_only": True},
@@ -156,7 +161,55 @@ SCM_OBJECT_TYPES = {
     "url-filtering": {"label": "URL Filtering", "creatable": True, "editable": True, "generic": True, "service": "security", "endpoint": "url-access-profiles"},
     "file-blocking": {"label": "File Blocking", "creatable": True, "editable": True, "generic": True, "service": "security", "endpoint": "file-blocking-profiles"},
     "wildfire-analysis": {"label": "WildFire Analysis", "creatable": True, "editable": True, "generic": True, "service": "security", "endpoint": "wildfire-anti-virus-profiles"},
+    "dos-protection": {"label": "DoS Protection", "creatable": True, "editable": True, "generic": True, "service": "security", "endpoint": "dos-protection-profiles"},
+    "decryption-profiles": {"label": "Decryption Profiles", "creatable": True, "editable": True, "generic": True, "service": "security", "endpoint": "decryption-profiles"},
     "security-profile-groups": {"label": "Security Profile Groups", "creatable": True, "editable": True, "generic": True, "service": "security", "endpoint": "profile-groups"},
+}
+
+SCM_GENERIC_CREATE_DEFAULTS = {
+    "regions": {"name": "", "address": []},
+    "dynamic-user-groups": {"name": "", "description": "", "filter": ""},
+    "application-filters": {
+        "name": "", "category": [], "subcategory": [], "technology": [], "risk": [],
+        "evasive": False, "excessive_bandwidth_use": False,
+        "has_known_vulnerabilities": False, "is_saas": False, "new_appid": False,
+        "pervasive": False, "prone_to_misuse": False, "transfers_files": False,
+        "tunnels_other_apps": False, "used_by_malware": False,
+    },
+    "external-dynamic-lists": {
+        "name": "", "type": {"ip": {
+            "description": "", "url": "", "certificate_profile": "None",
+            "recurring": {"five_minute": {}}, "exception_list": [],
+        }},
+    },
+    "hip-objects": {"name": "", "description": "", "host_info": {
+        "criteria": {"os": {"contains": {"microsoft": "Microsoft Windows 10"}}},
+    }},
+    "hip-profiles": {"name": "", "description": "", "match": "any"},
+    "schedules": {"name": "", "schedule_type": {"recurring": {"daily": []}}},
+    "custom-url-categories": {"name": "", "description": "", "type": "URL List", "list": []},
+    "antivirus": {"name": "", "description": "", "packet_capture": False, "rules": []},
+    "anti-spyware": {"name": "", "description": "", "cloud_inline_analysis": False, "rules": []},
+    "dns-security": {"name": "", "description": ""},
+    "vulnerability-protection": {"name": "", "description": "", "rules": []},
+    "url-filtering": {
+        "name": "", "description": "", "allow": [], "alert": [], "block": [],
+        "continue": [], "redirect": [], "safe_search_enforcement": False,
+        "log_container_page_only": True, "log_http_hdr_referer": False,
+        "log_http_hdr_user_agent": False, "log_http_hdr_xff": False,
+    },
+    "file-blocking": {"name": "", "description": "", "rules": []},
+    "wildfire-analysis": {"name": "", "description": "", "packet_capture": False, "rules": []},
+    "dos-protection": {"name": "", "description": "", "type": "aggregate"},
+    "decryption-profiles": {"name": "", "ssl_forward_proxy": {
+        "auto_include_altname": True, "block_expired_certificate": True,
+        "block_untrusted_issuer": True, "block_unknown_cert": True,
+    }},
+    "security-profile-groups": {
+        "name": "", "virus_and_wildfire_analysis": [], "spyware": [],
+        "dns_security": [], "vulnerability": [], "url_filtering": [],
+        "file_blocking": [], "data_filtering": [], "saas_security": [],
+    },
 }
 SCM_CONFIGURATION_SECTIONS = {
     "network": {
@@ -983,6 +1036,26 @@ def _scm_config_fields(payload: dict) -> list[dict]:
             continue
         walk(value, [str(key)], [str(key).replace("_", " ").title()])
     return fields
+
+
+def scm_generic_create_record(object_type: str, container: dict) -> dict | None:
+    raw = copy.deepcopy(SCM_GENERIC_CREATE_DEFAULTS.get(object_type))
+    if raw is None:
+        return None
+    raw.update(container)
+    fields = _scm_config_fields(raw)
+    if object_type == "url-filtering":
+        for field in fields:
+            top = str(field.get("label", "")).split(" / ", 1)[0].strip().lower()
+            if top in URL_PROFILE_ACTIONS: field["group"] = "Categories"
+            elif top == "credential enforcement": field["group"] = "User Credential Detection"
+            elif "inline" in top or top.startswith("mlav"): field["group"] = "Inline Categorization"
+            elif top.startswith("log http") or "header" in top: field["group"] = "HTTP Header Insertion"
+            else: field["group"] = "General"
+    return {
+        "id": "", "name": "", "generic": True, "create_template": True,
+        "edit_fields": fields, "_raw": raw,
+    }
 
 
 def _scm_config_fingerprint(payload: dict) -> str:
@@ -2619,7 +2692,8 @@ WORKSPACE_OBJECT_NAV = {
     "↳ URL Filtering": "url-filtering", "↳ File Blocking": "file-blocking",
     "↳ WildFire Analysis": "wildfire-analysis", "↳ DoS Protection": "dos-protection",
     "Security Profile Groups": "security-profile-groups", "Log Forwarding": "log-forwarding",
-    "Authentication": "authentication",
+    "Authentication": "authentication", "Decryption": "decryption-profiles",
+    "Schedules": "schedules",
 }
 WORKSPACE_NETWORK_NAV = {
     "Interfaces": "interfaces", "Zones": "zones", "VLANs": "vlans", "Virtual Wires": "virtual-wires",
@@ -2644,6 +2718,7 @@ WORKSPACE_STRUCTURED_OBJECT_TYPES = {
     "services", "service-groups", "tags", "log-forwarding",
 }
 WORKSPACE_EDITABLE_OBJECT_TYPES = set(OBJECT_NODES)
+WORKSPACE_CREATABLE_OBJECT_TYPES = set(OBJECT_NODES)
 
 
 def workspace_policy_reference_catalog(xml_bytes: bytes, scope: str, parsed, profile) -> tuple[list[dict], dict]:
@@ -2783,6 +2858,7 @@ def config_workspace_editor(workspace_id):
         session["workspace_contexts"] = dict(list(workspace_contexts.items())[-20:])
         policies = objects = []
         workspace_object_catalog = []
+        workspace_object_create_template = None
         workspace_policy_catalog = []
         application_state = {}
         alternate_policy_count = 0
@@ -2800,6 +2876,7 @@ def config_workspace_editor(workspace_id):
             workspace_policy_catalog = extend_policy_catalog_with_current(workspace_policy_catalog, policies)
         elif workspace_view == "objects":
             _, objects = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
+            workspace_object_create_template = object_create_record(object_type, scope)
             workspace_object_catalog = workspace_object_reference_catalog(
                 xml_bytes, scope, object_type, (parsed_root, snapshot), workspace_profile
             )
@@ -2837,9 +2914,11 @@ def config_workspace_editor(workspace_id):
             object_type=object_type, object_nodes=OBJECT_NODES, objects=objects,
             edit_object_name=edit_object_name,
             workspace_object_catalog=workspace_object_catalog,
+            workspace_object_create_template=workspace_object_create_template,
             workspace_policy_catalog=workspace_policy_catalog,
             application_catalog_state=application_state,
             workspace_editable_object_types=WORKSPACE_EDITABLE_OBJECT_TYPES,
+            workspace_creatable_object_types=WORKSPACE_CREATABLE_OBJECT_TYPES,
             workspace_structured_object_types=WORKSPACE_STRUCTURED_OBJECT_TYPES,
             config_section=config_section,
             inventory=inventory, config_records=config_records,
@@ -3101,14 +3180,15 @@ def config_workspace_object_preview(workspace_id):
                 ),
             )
         else:
-            if before is None:
-                raise OfflineConfigError("Maak dit objecttype voorlopig via de native PAN-OS-interface aan; bestaande objecten zijn hier volledig bewerkbaar")
             name = request.form.get("name", "").strip()
             if not name:
                 raise OfflineConfigError("Name is verplicht")
             if any(item["name"] == name and item["name"] != original_name for item in existing):
                 raise OfflineConfigError(f"Object {name} bestaat al in {scope}")
-            editable_fields = [field for field in before.get("edit_fields", []) if field.get("kind") != "protected"]
+            schema_record = before or object_create_record(object_type, scope)
+            if schema_record is None:
+                raise OfflineConfigError("Voor dit objecttype is geen veilig PAN-OS create-schema beschikbaar")
+            editable_fields = [field for field in schema_record.get("edit_fields", []) if field.get("kind") != "protected"]
             allowed = {(field["path"], field["kind"]) for field in editable_fields}
             try:
                 submitted = json.loads(request.form.get("generic_updates", "[]"))
@@ -3622,7 +3702,7 @@ def index():
             if serials:
                 placeholders = ",".join("?" for _ in serials)
                 flows = conn.execute(f"SELECT * FROM flows WHERE serial IN ({placeholders}) ORDER BY last_seen DESC LIMIT 100", serials).fetchall()
-    policy_profile = None; policies = []; policy_error = ""; policy_objects = []; object_catalog = []; policy_catalog = []; policy_workspaces = []; live_application_state = {}; scm_config_records = []
+    policy_profile = None; policies = []; policy_error = ""; policy_objects = []; object_catalog = []; policy_catalog = []; policy_workspaces = []; live_application_state = {}; scm_config_records = []; object_create_template = None
     policy_source = request.args.get("policy_source", "").strip()
     policy_view = request.args.get("policy_view", "policies")
     if policy_view not in {"policies", "objects", "network", "device"}: policy_view = "policies"
@@ -3663,6 +3743,14 @@ def index():
                             ]
                         else:
                             policy_objects = fetch_scm_objects(policy_profile, object_type)
+                        if SCM_OBJECT_TYPES[object_type].get("generic"):
+                            object_create_template = scm_generic_create_record(
+                                object_type,
+                                policy_api.scm_container(
+                                    folder=policy_profile.get("object_folder") or policy_profile.get("folder"),
+                                    snippet=policy_profile.get("snippet"), device=policy_profile.get("device"),
+                                ),
+                            )
                         object_catalog = fetch_object_catalog(policy_profile, object_type)
                     else:
                         policies = fetch_scm_policy_type(policy_profile, policy_kind)
@@ -3670,7 +3758,7 @@ def index():
                             fetch_object_catalog(policy_profile, "policy-picker"), policies
                         )
                 except Exception as exc: policy_error = str(exc)
-    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, live_application_state=live_application_state, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, config_section=config_section, scm_configuration_sections=SCM_CONFIGURATION_SECTIONS, config_records=scm_config_records, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats(), certificate=certificate_summary(CERT_DIR / "tls.crt", APPLIANCE_CONFIG), application_catalog_settings=application_catalog_configuration())
+    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, object_create_template=object_create_template, policy_catalog=policy_catalog, live_application_state=live_application_state, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, config_section=config_section, scm_configuration_sections=SCM_CONFIGURATION_SECTIONS, config_records=scm_config_records, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats(), certificate=certificate_summary(CERT_DIR / "tls.crt", APPLIANCE_CONFIG), application_catalog_settings=application_catalog_configuration())
 
 
 @app.get("/migration")
@@ -4496,13 +4584,14 @@ def object_preview(profile_id, object_type):
         if object_id and not before: raise ValueError("Het object bestaat niet meer. Vernieuw de lijst.")
         if metadata.get("generic"):
             if profile["target_type"] != "scm": raise ValueError("Gebruik de XML-workspace voor dit target")
-            if before is None: raise ValueError("Open eerst een bestaand profiel; aanmaken zonder geldig target-schema is nog niet veilig")
             name = request.form.get("name", "").strip()
             if not name: raise ValueError("Naam is verplicht")
             if any(item.get("name") == name and str(item.get("id", "")) != object_id for item in existing): raise ValueError(f"Object {name} bestaat al")
             try: submitted = json.loads(request.form.get("generic_updates", "[]"))
             except json.JSONDecodeError as exc: raise ValueError("Ongeldige profielvelden") from exc
-            editable_fields = [field for field in before.get("edit_fields", []) if field.get("kind") != "protected"]
+            schema_record = before or scm_generic_create_record(object_type, container)
+            if schema_record is None: raise ValueError("Voor dit objecttype is geen geldig SCM create-schema beschikbaar")
+            editable_fields = [field for field in schema_record.get("edit_fields", []) if field.get("kind") != "protected"]
             allowed = {(field["path"], field["kind"]) for field in editable_fields}
             if not isinstance(submitted, list) or len(submitted) > 10000: raise ValueError("Ongeldige profielvelden")
             updates = []
@@ -4513,8 +4602,8 @@ def object_preview(profile_id, object_type):
                 else: clean["value"] = str(update.get("value", ""))[:65535]
                 updates.append(clean)
             if object_type == "url-filtering": updates = normalize_url_profile_updates(editable_fields, updates)
-            payload = _scm_config_payload(before["_raw"], updates, name)
-            if _scm_config_fingerprint(payload) == _scm_config_fingerprint(before["_raw"]): raise ValueError("Er zijn geen wijzigingen om te bewaren")
+            payload = _scm_config_payload(schema_record["_raw"], updates, name)
+            if before is not None and _scm_config_fingerprint(payload) == _scm_config_fingerprint(before["_raw"]): raise ValueError("Er zijn geen wijzigingen om te bewaren")
         else:
             payload = scm_object_payload(object_type, request.form, container)
             validate_object_payload(payload, object_type, existing, object_id)
@@ -4566,8 +4655,11 @@ def object_push(draft_id):
         current = fetch_scm_objects(profile, object_type)
         operation = draft.get("operation", "create")
         if operation == "create":
-            if metadata.get("generic"): raise RuntimeError("Aanmaken zonder gevalideerd target-schema is niet toegestaan")
-            validate_object_payload(draft["payload"], object_type, current)
+            if metadata.get("generic"):
+                if any(item.get("name") == draft["payload"].get("name") for item in current):
+                    raise RuntimeError(f"Object {draft['payload'].get('name')} bestaat al")
+            else:
+                validate_object_payload(draft["payload"], object_type, current)
         elif operation == "update":
             before = draft["before"]; live = next((item for item in current if str(item.get("id", "")) == str(before.get("id", ""))), None)
             if not live or object_fingerprint(live) != draft["fingerprint"]: raise RuntimeError(f"Object {before['name']} is intussen gewijzigd; Push gestopt.")

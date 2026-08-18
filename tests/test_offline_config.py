@@ -8,7 +8,7 @@ sys.path.insert(0, str(ROOT))
 from app.offline_config import (
     OfflineConfigError, apply_configuration_changes, apply_object_changes, available_scopes, available_templates,
     configuration_inventory, configuration_records, parse_snapshot,
-    object_fingerprint, policy_fingerprint, render_set_commands, replace_policy_in_snapshot,
+    object_create_record, object_fingerprint, policy_fingerprint, render_set_commands, replace_policy_in_snapshot,
     referenced_template, scoped_objects, scoped_policies,
     scoped_server_profiles,
 )
@@ -254,6 +254,32 @@ class OfflineConfigTests(unittest.TestCase):
         self.assertIn(b'<enabled>no</enabled>', updated)
         self.assertIn(b'<nested preserve="true">', updated)
         self.assertIn(b'<label>new</label>', updated)
+
+    def test_every_generic_object_family_has_a_creatable_panos_seed(self):
+        generic_types = {
+            "regions", "dynamic-user-groups", "applications", "application-filters",
+            "external-dynamic-lists", "hip-objects", "hip-profiles", "custom-url-categories",
+            "antivirus", "anti-spyware", "vulnerability-protection", "url-filtering",
+            "file-blocking", "wildfire-analysis", "dos-protection", "schedules",
+            "security-profile-groups", "authentication", "decryption-profiles",
+        }
+        source = b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"/></vsys></entry></devices></config>'
+        for object_type in sorted(generic_types):
+            with self.subTest(object_type=object_type):
+                seed = object_create_record(object_type, "vsys1")
+                self.assertIsNotNone(seed)
+                self.assertTrue(seed["edit_fields"])
+                created = apply_object_changes(source, "vsys1", object_type, [{
+                    "operation": "create", "original_name": "", "fingerprint": "",
+                    "name": f"new-{object_type}", "generic_updates": [],
+                }])
+                _, objects = scoped_objects(created, "vsys1", object_type)
+                self.assertEqual([item["name"] for item in objects], [f"new-{object_type}"])
+
+    def test_generic_nested_entry_names_are_editable_attributes(self):
+        seed = object_create_record("file-blocking", "vsys1")
+        rule_name = next(field for field in seed["edit_fields"] if field["label"] == "Rules / Entry / Name")
+        self.assertEqual(rule_name["kind"], "attribute")
 
     def test_security_profile_fields_are_structured_and_secrets_stay_protected(self):
         source = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><profiles><url-filtering><entry name="OCD-URL"><allow><member>business-and-economy</member></allow><block><member>malware</member></block><credential-enforcement><mode><group-mapping>Employees</group-mapping></mode></credential-enforcement></entry></url-filtering></profiles><authentication-profile><entry name="LDAP"><server-profile>LDAP-BDND</server-profile><password>never-render-this</password></entry></authentication-profile></entry></vsys></entry></devices></config>'''

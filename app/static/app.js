@@ -548,7 +548,7 @@
     function commitDynamicEntry() { if (!dynamicEntry) return; var value = dynamicEntry.value.trim(); if (!value) return; dynamicTokens = dynamicTokens.concat(dynamicExpressionTokens(value)); dynamicEntry.value = ""; syncDynamicFilter(); }
     if (dynamicEntry) dynamicEntry.addEventListener("keydown", function (event) { if ((event.key === " " && !dynamicQuoteOpen(dynamicEntry.value)) || event.key === "Enter") { event.preventDefault(); commitDynamicEntry(); } });
     function setField(name, value) { var field = form.querySelector('[data-object-field="' + name + '"]'); if (!field) return; field.value = Array.isArray(value) ? value.join(", ") : (value == null ? "" : value); }
-    var genericEditor = dialog.dataset.genericObjectEditor === "true";
+    var genericEditor = dialog.dataset.genericObjectEditor === "true" || Boolean(document.querySelector('[data-object-create-template][data-object-generic="true"]'));
     var genericUpdates = [];
     var genericCatalogList = null; var genericCatalogLoaded = false;
     function loadGenericUrlCatalog() {
@@ -668,15 +668,15 @@
     }
     function setLogMatches(values) { logMatches = (Array.isArray(values) ? values : []).map(normalizedLogMatch); if (!logMatches.length) logMatches.push(normalizedLogMatch({}, 0)); renderLogMatches(); }
     var addLogMatch = form.querySelector("[data-log-match-add]"); if (addLogMatch) addLogMatch.addEventListener("click", function () { logMatches.push(normalizedLogMatch({}, logMatches.length)); renderLogMatches(); });
-    function openEditor(item) {
-      form.reset(); form.querySelector("[data-object-id]").value = item && item.id ? item.id : "";
-      dialog.querySelector("[data-object-dialog-title]").textContent = (item ? "Edit " : "Add ") + document.querySelector(".object-list h2").textContent;
+    function openEditor(item, createMode) {
+      form.reset(); form.querySelector("[data-object-id]").value = !createMode && item && item.id ? item.id : "";
+      dialog.querySelector("[data-object-dialog-title]").textContent = (createMode ? "Add " : "Edit ") + document.querySelector(".object-list h2").textContent;
       setMembers([]); setTags([]); setDynamicFilter(""); setLogMatches(item && item.match_list ? item.match_list : []); zoneReferenceFields.forEach(function (field) { setZoneReference(field.dataset.zoneReferenceField, []); });
       var zoneConfig = form.querySelector("[data-zone-current-config]");
       if (!zoneConfig && form.querySelector('[data-object-field="zone_type"]')) { zoneConfig = document.createElement("details"); zoneConfig.className = "zone-current-config field full"; zoneConfig.dataset.zoneCurrentConfig = ""; var summary = document.createElement("summary"); summary.textContent = "Volledige huidige zoneconfig"; var pre = document.createElement("pre"); pre.className = "mono"; zoneConfig.appendChild(summary); zoneConfig.appendChild(pre); form.querySelector(".form-grid").appendChild(zoneConfig); }
       if (zoneConfig) { zoneConfig.hidden = !(item && item.network); if (item && item.network) { var visibleConfig = {}; Object.keys(item).sort().forEach(function (key) { if (!["_xml", "_raw"].includes(key)) visibleConfig[key] = item[key]; }); zoneConfig.querySelector("pre").textContent = JSON.stringify(visibleConfig, null, 2); } }
       if (item) {
-        setField("name", item.name); setField("description", item.description); setField("comments", item.comments); setTags(item.tag);
+        setField("name", createMode ? "" : item.name); setField("description", item.description); setField("comments", item.comments); setTags(item.tag);
         if (genericEditor || item.generic) { loadGenericUrlCatalog(); var descriptionField = form.querySelector('[data-object-field="description"]'); if (descriptionField) descriptionField.closest(".field").hidden = true; renderGenericFields(item); }
         ["ip_netmask", "ip_range", "ip_wildcard", "fqdn"].some(function (kind) { if (item[kind]) { setField("value_type", kind); setField("value", item[kind]); return true; } return false; });
         if (item.dynamic) { if (groupType) groupType.value = "dynamic"; setDynamicFilter(typeof item.dynamic === "object" ? item.dynamic.filter : item.dynamic); } else { if (groupType) groupType.value = "static"; setMembers(item.static); setDynamicFilter(""); }
@@ -690,13 +690,27 @@
       var enhancedLogging = form.querySelector('[data-object-field="enhanced_application_logging"]'); if (enhancedLogging) enhancedLogging.checked = Boolean(item && item.enhanced_application_logging);
       updateGroupType(); updateTimeouts(); dialog.showModal();
     }
-    var add = document.querySelector("[data-object-add]"); var genericRows = rows.filter(function (row) { try { return JSON.parse(row.dataset.object).generic; } catch (_) { return false; } }); var currentObjectType = new URLSearchParams(window.location.search).get("object_type") || ""; var schemaRequiredTypes = ["custom-url-categories", "antivirus", "anti-spyware", "dns-security", "vulnerability-protection", "url-filtering", "file-blocking", "wildfire-analysis", "security-profile-groups"]; if (add && (genericRows.length || schemaRequiredTypes.includes(currentObjectType))) add.hidden = true; if (add) add.addEventListener("click", function () { openEditor(null); }); if (add && new URLSearchParams(window.location.search).get("add_object") === "1" && !add.hidden) openEditor(null);
-    rows.forEach(function (row) { var button = row.querySelector("[data-object-edit]"); if (!button) return; var item = JSON.parse(row.dataset.object); if (item.network) { var zoneType = Object.keys(item.network)[0] || "onbekend"; var zoneValue = item.network[zoneType] || []; var zoneInterfaces = Array.isArray(zoneValue) ? zoneValue : zoneValue.member || []; var valueCell = row.querySelector("td.mono"); if (valueCell) valueCell.textContent = zoneType.replace("_", "-") + (zoneInterfaces.length ? " · " + zoneInterfaces.join(", ") : " · geen interfaces") + " · User-ID " + ((item.enable_user_identification === true || item.enable_user_identification === "yes") ? "aan" : "uit"); } button.addEventListener("click", function () { openEditor(item); }); row.addEventListener("click", function (event) { if (!event.target.closest("input,button,a")) openEditor(item); }); });
+    var add = document.querySelector("[data-object-add]");
+    var createTemplateNode = document.querySelector("[data-object-create-template]");
+    var createTemplate = null;
+    if (createTemplateNode) { try { createTemplate = JSON.parse(createTemplateNode.textContent || "null"); } catch (_) { createTemplate = null; } }
+    if (!add && genericEditor) {
+      var actionCluster = deleteButton && deleteButton.closest(".object-actionbar") && deleteButton.closest(".object-actionbar").querySelector(".cluster");
+      if (actionCluster) { add = document.createElement("button"); add.type = "button"; add.className = "btn btn-primary"; add.dataset.objectAdd = ""; add.textContent = "+ Add"; actionCluster.insertBefore(add, deleteButton); }
+    }
+    if (add) add.addEventListener("click", function () {
+      if (genericEditor && !createTemplate) { window.alert("Voor dit objecttype is geen veilig create-schema beschikbaar."); return; }
+      openEditor(genericEditor ? createTemplate : null, true);
+    });
+    if (add && new URLSearchParams(window.location.search).get("add_object") === "1") {
+      if (!genericEditor || createTemplate) openEditor(genericEditor ? createTemplate : null, true);
+    }
+    rows.forEach(function (row) { var button = row.querySelector("[data-object-edit]"); if (!button) return; var item = JSON.parse(row.dataset.object); if (item.network) { var zoneType = Object.keys(item.network)[0] || "onbekend"; var zoneValue = item.network[zoneType] || []; var zoneInterfaces = Array.isArray(zoneValue) ? zoneValue : zoneValue.member || []; var valueCell = row.querySelector("td.mono"); if (valueCell) valueCell.textContent = zoneType.replace("_", "-") + (zoneInterfaces.length ? " · " + zoneInterfaces.join(", ") : " · geen interfaces") + " · User-ID " + ((item.enable_user_identification === true || item.enable_user_identification === "yes") ? "aan" : "uit"); } button.addEventListener("click", function () { openEditor(item, false); }); row.addEventListener("click", function (event) { if (!event.target.closest("input,button,a")) openEditor(item, false); }); });
     var objectList = document.querySelector(".object-list[data-edit-object]");
     var requestedObject = objectList ? objectList.dataset.editObject : "";
     if (requestedObject) {
       var requestedRow = rows.find(function (row) { var item = JSON.parse(row.dataset.object); return item.editable && item.name === requestedObject; });
-      if (requestedRow) openEditor(JSON.parse(requestedRow.dataset.object));
+      if (requestedRow) openEditor(JSON.parse(requestedRow.dataset.object), false);
     }
     var cancel = dialog.querySelector("[data-object-cancel]"); if (cancel) cancel.addEventListener("click", function () { dialog.close(); });
     form.addEventListener("submit", function () { addFreeformTag(); commitDynamicEntry(); syncGenericUpdates(); syncLogMatches(); });
