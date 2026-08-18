@@ -694,7 +694,8 @@ class CheckPointParser(BaseParser):
         Check Point exports do not contain PAN-OS zones, interface placement,
         user-ID mappings or equivalent VPN semantics. The generated candidate
         retains representable data, records dropped semantics for review, and
-        disables every imported rule until an engineer completes those choices.
+        preserves the source enabled/disabled state. Rules with an unsupported
+        action remain disabled independently of the import override.
         """
         mapped_names: dict[str, str] = {}
         remaining_unsupported: list[str] = []
@@ -820,7 +821,7 @@ class CheckPointParser(BaseParser):
             return walk(translation), unique(removed)
 
         for rule in model.security_rules:
-            notes = ["Check Point policy disabled; map zones, identity, VPN and rule order before enabling"]
+            notes = ["Check Point policy requires review: map zones, identity, VPN and rule order before deployment"]
             rule.source, removed = address_values(rule.source)
             if removed:
                 notes.append("source references not converted: " + ", ".join(removed))
@@ -847,11 +848,10 @@ class CheckPointParser(BaseParser):
             rule.service, removed = service_values(rule.service, service_fallback)
             if removed:
                 notes.append("service references not converted: " + ", ".join(removed))
-            rule.disabled = True
             rule.description = self._review_description(rule.description, notes)
 
         for rule in model.nat_rules:
-            notes = ["Check Point NAT disabled; validate order, zones, interfaces and translations before enabling"]
+            notes = ["Check Point NAT requires review: validate order, zones, interfaces and translations before deployment"]
             rule.source, removed = address_values(rule.source)
             if removed:
                 notes.append("source references not converted: " + ", ".join(removed))
@@ -867,12 +867,11 @@ class CheckPointParser(BaseParser):
             rule.destination_translation, removed = sanitize_translation(rule.destination_translation)
             if removed:
                 notes.append("destination translation not converted: " + ", ".join(removed))
-            rule.disabled = True
             rule.description = self._review_description(rule.description, notes)
 
         if model.security_rules or model.nat_rules:
             model.warnings.append(
-                "Check Point policies zijn standaard disabled: PAN-OS zones, identiteit, VPN, NAT-interfaces en rule order vereisen engineer review"
+                "Check Point policies behouden hun bronstatus: PAN-OS zones, identiteit, VPN, NAT-interfaces en rule order vereisen engineer review"
             )
         return model
 

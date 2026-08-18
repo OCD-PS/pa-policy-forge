@@ -2602,6 +2602,27 @@ def cached_migration_workspace_model(config_path: str, sha256: str) -> Migration
     return parse_vendor("panos", raw, Path(config_path).name)
 
 
+def apply_migration_import_policy_status(model: MigrationModel, force_disabled: bool) -> dict[str, int | bool]:
+    """Preserve vendor policy state unless the engineer explicitly overrides it."""
+    policies = model.security_rules
+    source_disabled = sum(1 for rule in policies if rule.disabled)
+    changed = 0
+    if force_disabled:
+        for rule in policies:
+            if not rule.disabled:
+                rule.disabled = True
+                changed += 1
+        model.warnings.append(
+            f"Importoverride: alle {len(policies)} security policies disabled gemaakt ({changed} gewijzigd)"
+        )
+    return {
+        "force_disabled": force_disabled,
+        "total": len(policies),
+        "source_disabled": source_disabled,
+        "changed": changed,
+    }
+
+
 def store_migration_source(project_id: int, vendor: str, source_name: str, model: MigrationModel) -> int:
     raw = json.dumps(model.as_dict(), sort_keys=True, separators=(",", ":")).encode()
     token = secrets.token_hex(16)
@@ -4873,6 +4894,9 @@ def migration_source_upload(project_id):
         if not uploaded or not uploaded.filename: raise MigrationError("Kies een configuratiebestand")
         content = uploaded.stream.read(100 * 1024 * 1024 + 1)
         model = parse_vendor(vendor, content, uploaded.filename)
+        policy_status = apply_migration_import_policy_status(
+            model, request.form.get("force_disable_policies") == "yes"
+        )
         use_as_full_base = vendor == "panos" and project["target_type"] in {"panos", "panorama"}
         profile = None
         if use_as_full_base:
@@ -4905,7 +4929,11 @@ def migration_source_upload(project_id):
                         "UPDATE migration_projects SET base_workspace_id=?,updated_at=? WHERE id=?",
                         (workspace_id, now(), project_id),
                     )
-        audit("migration-source-imported", f"project={project_id} source={source_id} vendor={vendor} counts={model.counts()}")
+        status_mode = "force-disabled" if policy_status["force_disabled"] else "preserved"
+        audit(
+            "migration-source-imported",
+            f"project={project_id} source={source_id} vendor={vendor} policy_status={status_mode} counts={model.counts()}",
+        )
         item_count = sum(model.counts()[key] for key in ('addresses','address_groups','services','service_groups','security_rules','nat_rules','interfaces','zones'))
         if base_selected:
             base_message = f" De volledige XML is ook als base-workspace #{workspace_id} geselecteerd."
@@ -4913,7 +4941,18 @@ def migration_source_upload(project_id):
             base_message = f" De volledige XML is als workspace #{workspace_id} beschikbaar; de bestaande base bleef geselecteerd."
         else:
             base_message = ""
-        flash(f"{PARSERS[vendor].label} geïmporteerd: {item_count} mergeerbare items.{base_message}", "success")
+        if policy_status["force_disabled"]:
+            status_message = f" Alle {policy_status['total']} security policies zijn disabled gemaakt."
+        else:
+            status_message = (
+                f" Security-policy-status behouden: {policy_status['source_disabled']} van "
+                f"{policy_status['total']} security policies disabled."
+            )
+        flash(
+            f"{PARSERS[vendor].label} geïmporteerd: {item_count} mergeerbare items."
+            f"{status_message}{base_message}",
+            "success",
+        )
     except Exception as exc:
         flash(f"Vendorconfiguratie niet geïmporteerd: {exc}", "error")
     return redirect(url_for("migration_project", project_id=project_id))

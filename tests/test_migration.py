@@ -366,7 +366,7 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         self.assertEqual(model.address_groups[0].members, ["srv"])
         self.assertIn("db", model.address_groups[0].description)
         self.assertEqual(model.security_rules[0].action, "allow")
-        self.assertTrue(model.security_rules[0].disabled)
+        self.assertFalse(model.security_rules[0].disabled)
 
     def test_checkpoint_unknown_action_is_disabled_and_blocks_review(self):
         data = {"rulebase": [{"type": "access-rule", "uid": "layer-1", "name": "Nested Layer", "action": "Inner Layer"}]}
@@ -519,11 +519,11 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         rule = model.security_rules[0]
         self.assertEqual(rule.application, ["dropbox-base", "ping"])
         self.assertEqual(rule.service, ["application-default"])
-        self.assertTrue(rule.disabled)
+        self.assertFalse(rule.disabled)
         analysis = migration_analysis(model)
         self.assertEqual(analysis["unresolved_references"], [])
 
-    def test_checkpoint_candidate_removes_unsafe_references_and_disables_all_rules(self):
+    def test_checkpoint_candidate_removes_unsafe_references_and_preserves_policy_status(self):
         data = {
             "objects": [
                 {"type": "host", "uid": "host-1", "name": "server", "ipv4-address": "192.0.2.10"},
@@ -545,7 +545,7 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         }
         model = parse_vendor("checkpoint", json.dumps(data).encode(), "checkpoint.json")
         security = model.security_rules[0]
-        self.assertTrue(security.disabled)
+        self.assertFalse(security.disabled)
         self.assertEqual(security.source, ["any"])
         self.assertEqual(security.destination, ["server"])
         self.assertEqual(security.application, ["dropbox-base"])
@@ -553,7 +553,7 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         self.assertIn("Internet", security.description)
         self.assertIn("File-Storage", security.description)
         nat = model.nat_rules[0]
-        self.assertTrue(nat.disabled)
+        self.assertFalse(nat.disabled)
         self.assertEqual(nat.source, ["any"])
         self.assertEqual(nat.source_translation, {})
         self.assertIn("missing-translation", nat.description)
@@ -1146,6 +1146,80 @@ end''', "editable-fortigate.conf")
         self.assertIn("dns-b", page)
         self.assertIn("REVIEW VERPLICHT", page)
         self.assertIn("Niet klaar voor push", page)
+
+    def test_source_import_can_preserve_or_override_policy_status(self):
+        stamp = main.now()
+        with main.db() as conn:
+            profile_id = conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("PANOS import status test", "panos", json.dumps({"vsys": "vsys1"}), stamp, stamp),
+            ).lastrowid
+            project_id = conn.execute(
+                "INSERT INTO migration_projects(name,target_profile_id,owner,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("policy-status-import", profile_id, "admin", stamp, stamp),
+            ).lastrowid
+        client = main.app.test_client()
+        with main.app.test_request_context("/", base_url="https://forge.test"):
+            serializer = main.app.session_interface.get_signing_serializer(main.app)
+            client.set_cookie(
+                main.app.config["SESSION_COOKIE_NAME"],
+                serializer.dumps({"user_id": 1, "username": "admin", "csrf": "migration-test-csrf"}),
+                domain="forge.test", secure=True,
+            )
+        source = json.dumps({
+            "rulebase": [
+                {"type": "access-rule", "uid": "enabled", "name": "Enabled rule", "action": "Accept", "enabled": True},
+                {"type": "access-rule", "uid": "disabled", "name": "Disabled rule", "action": "Accept", "enabled": False},
+            ],
+            "nat-rulebase": [
+                {"type": "nat-rule", "uid": "nat-enabled", "name": "Enabled NAT", "enabled": True,
+                 "original-source": ["any"], "original-destination": ["any"], "original-service": ["any"],
+                 "translated-source": ["original"], "translated-destination": ["original"],
+                 "translated-service": ["original"]},
+            ],
+        }).encode()
+
+        preserved = client.post(
+            f"/migration/projects/{project_id}/source",
+            base_url="https://forge.test",
+            data={
+                "csrf": "migration-test-csrf", "vendor": "checkpoint",
+                "config_file": (io.BytesIO(source), "preserve.json"),
+            },
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(preserved.status_code, 302)
+        with main.db() as conn:
+            preserved_source = conn.execute(
+                "SELECT * FROM migration_sources WHERE project_id=? ORDER BY id DESC LIMIT 1", (project_id,)
+            ).fetchone()
+        preserved_model = main.migration_model(preserved_source)
+        self.assertEqual([rule.disabled for rule in preserved_model.security_rules], [False, True])
+        self.assertEqual([rule.disabled for rule in preserved_model.nat_rules], [False])
+
+        overridden = client.post(
+            f"/migration/projects/{project_id}/source",
+            base_url="https://forge.test",
+            data={
+                "csrf": "migration-test-csrf", "vendor": "checkpoint", "force_disable_policies": "yes",
+                "config_file": (io.BytesIO(source), "override.json"),
+            },
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(overridden.status_code, 302)
+        with main.db() as conn:
+            overridden_source = conn.execute(
+                "SELECT * FROM migration_sources WHERE project_id=? ORDER BY id DESC LIMIT 1", (project_id,)
+            ).fetchone()
+        overridden_model = main.migration_model(overridden_source)
+        self.assertEqual([rule.disabled for rule in overridden_model.security_rules], [True, True])
+        self.assertEqual([rule.disabled for rule in overridden_model.nat_rules], [False])
+        self.assertTrue(any("Importoverride" in warning for warning in overridden_model.warnings))
+
+        page = client.get(f"/migration/projects/{project_id}", base_url="https://forge.test").get_data(as_text=True)
+        self.assertIn('name="force_disable_policies"', page)
+        self.assertNotIn('name="force_disable_policies" value="yes" checked', page)
+        self.assertIn("hun enabled/disabled-status uit de bronconfiguratie behouden", page)
 
     def test_panos_upload_becomes_full_base_workspace_and_ui_defaults_are_checked(self):
         stamp = main.now()
