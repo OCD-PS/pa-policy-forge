@@ -304,6 +304,22 @@ body.sidebar-collapsed .object-actionbar { left: 100px; }
 .policy-value-chip button:hover { background: var(--orange); color: #111; }
 .policy-value-chip.is-removed { border-color: #754343; opacity: .55; text-decoration: line-through; }
 .policy-value-chip.is-added { border-color: rgba(67,196,120,.65); background: rgba(67,196,120,.12); }
+.log-forwarding-match-section { margin-top: 4px; padding: 0; }
+.log-forwarding-match-section>.card-header { position: sticky; top: 0; z-index: 2; padding: 10px 0; background: #171717; border-bottom: 1px solid #383838; }
+.log-forwarding-match-section h3 { margin: 0; color: var(--orange); }
+.log-forwarding-match-list { display: grid; gap: 12px; margin-top: 12px; }
+.log-match-card { border: 1px solid #3c3c3c; border-radius: 6px; background: #121212; overflow: hidden; }
+.log-match-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 12px; border-bottom: 2px solid var(--orange); background: #1d1d1d; }
+.log-match-grid { padding: 12px; }
+.log-match-grid .token-input { min-height: 40px; }
+.log-match-grid textarea { min-height: 68px; }
+.log-actions-section { margin-top: 6px; padding-top: 12px; border-top: 1px solid #383838; }
+.log-actions-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; color: var(--orange); }
+.log-action-card { margin-top: 8px; padding: 10px; border: 1px solid #343434; border-radius: 5px; background: #181818; }
+.log-action-remove { align-items: flex-end; }
+.log-action-remove .btn { margin-left: auto; }
+.reference-input[readonly] { cursor: pointer; color: #ddd; }
+.picker-create-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; padding: 10px; border-top: 1px solid #393939; }
 .policy-value-entry { display: grid; grid-template-columns: 1fr auto; gap: 7px; }
 .policy-value-entry .btn { min-width: 42px; padding-inline: 12px; font-size: 18px; }
 .bulk-dialog-actions { position: sticky; z-index: 4; right: 0; bottom: -22px; left: 0; justify-content: flex-end; margin: 18px -22px -22px; padding: 14px 22px; border-top: 1px solid #444; background: rgba(23,23,23,.97); box-shadow: 0 -12px 24px rgba(0,0,0,.3); }

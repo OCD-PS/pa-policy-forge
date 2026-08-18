@@ -55,7 +55,7 @@ from app.offline_config import (
     normalized_config_xml, parse_snapshot,
     object_fingerprint as offline_object_fingerprint,
     policy_fingerprint as offline_policy_fingerprint, render_set_commands,
-    panos_ui_decorate_record,
+    panos_ui_decorate_record, scoped_server_profiles,
     replace_policy_in_snapshot, safe_workspace_path, scoped_objects,
     scoped_policies, snapshot_sha256, referenced_template,
 )
@@ -140,6 +140,13 @@ SCM_OBJECT_TYPES = {
     "services": {"label": "Services", "creatable": True},
     "service-groups": {"label": "Service Groups", "creatable": True},
     "tags": {"label": "Tags", "creatable": True},
+    "hip-profiles": {"label": "HIP Profiles", "creatable": False},
+    "schedules": {"label": "Schedules", "creatable": False},
+    "log-forwarding": {"label": "Log Forwarding", "creatable": True, "editable": True, "endpoint": "log-forwarding-profiles"},
+    "syslog-server-profiles": {"label": "Syslog Server Profiles", "creatable": False, "endpoint": "syslog-server-profiles", "catalog_only": True},
+    "email-server-profiles": {"label": "Email Server Profiles", "creatable": False, "endpoint": "email-server-profiles", "catalog_only": True},
+    "snmp-trap-server-profiles": {"label": "SNMP Trap Server Profiles", "creatable": False, "endpoint": "snmp-trap-server-profiles", "catalog_only": True},
+    "http-server-profiles": {"label": "HTTP Server Profiles", "creatable": False, "endpoint": "http-server-profiles", "catalog_only": True},
     "zones": {"label": "Zones", "creatable": True, "network": True},
     "custom-url-categories": {"label": "Custom URL Categories", "creatable": True, "editable": True, "generic": True, "service": "security", "endpoint": "url-categories"},
     "antivirus": {"label": "Antivirus / WildFire", "creatable": True, "editable": True, "generic": True, "service": "security", "endpoint": "wildfire-anti-virus-profiles"},
@@ -1082,12 +1089,22 @@ def managed_view(object_type: str) -> str:
     return "network" if object_type == "zones" else "objects"
 
 
-PANOS_OBJECT_NODES = {"addresses": "address", "address-groups": "address-group", "applications": "application", "application-groups": "application-group", "application-filters": "application-filter", "services": "service", "service-groups": "service-group", "tags": "tag", "zones": "zone"}
+PANOS_OBJECT_NODES = {
+    "addresses": "address", "address-groups": "address-group", "applications": "application",
+    "application-groups": "application-group", "application-filters": "application-filter",
+    "services": "service", "service-groups": "service-group", "tags": "tag", "zones": "zone",
+    "hip-profiles": "hip-profiles", "schedules": "schedule", "security-profile-groups": "profile-group",
+    "log-forwarding": "log-settings/profiles", "syslog-server-profiles": "server-profile/syslog",
+    "email-server-profiles": "server-profile/email", "snmp-trap-server-profiles": "server-profile/snmptrap",
+    "http-server-profiles": "server-profile/http",
+}
 
 
 def panos_object_bases(profile, object_type: str) -> list[str]:
     settings = json.loads(profile["settings_json"] or "{}")
     if object_type == "applications": return ["/config/predefined"]
+    if object_type in {"syslog-server-profiles", "email-server-profiles", "snmp-trap-server-profiles", "http-server-profiles"}:
+        return ["/config/shared"]
     device = policy_api.xpath_literal("localhost.localdomain")
     if object_type == "zones" and profile["target_type"] == "panorama":
         vsys = policy_api.xpath_literal(settings.get("vsys", "vsys1"))
@@ -1119,6 +1136,41 @@ def xml_object_to_dict(entry: ET.Element, object_type: str, base: str) -> dict:
     children = {child.tag.replace("-", "_"): xml_value(child) for child in entry}
     item.update(children)
     if object_type == "address-groups" and isinstance(item.get("dynamic"), dict): item["dynamic"] = item["dynamic"].get("filter", "")
+    if object_type == "log-forwarding":
+        item["match_list"] = []
+        for match in entry.findall("./match-list/entry"):
+            actions = []
+            for action in match.findall("./actions/entry"):
+                tagging = action.find("./type/tagging")
+                integration = action.find("./type/integration")
+                if tagging is not None:
+                    actions.append({
+                        "name": action.get("name", ""), "type": "tagging",
+                        "action": tagging.findtext("./action", "add-tag"),
+                        "target": tagging.findtext("./target", "source-address"),
+                        "registration": tagging.findtext("./registration", "localhost"),
+                        "timeout": tagging.findtext("./timeout", ""),
+                        "tags": [node.text or "" for node in tagging.findall("./tags/member") if node.text],
+                    })
+                elif integration is not None:
+                    actions.append({
+                        "name": action.get("name", ""), "type": "integration",
+                        "integration_action": integration.findtext("./action", ""),
+                    })
+            item["match_list"].append({
+                "name": match.get("name", ""),
+                "action_desc": match.findtext("./action-desc", ""),
+                "log_type": match.findtext("./log-type", "traffic") or "traffic",
+                "filter": match.findtext("./filter", ""),
+                "send_to_panorama": match.findtext("./send-to-panorama", "no") == "yes",
+                "send_syslog": [node.text or "" for node in match.findall("./send-syslog/member") if node.text],
+                "send_email": [node.text or "" for node in match.findall("./send-email/member") if node.text],
+                "send_snmptrap": [node.text or "" for node in match.findall("./send-snmptrap/member") if node.text],
+                "send_http": [node.text or "" for node in match.findall("./send-http/member") if node.text],
+                "quarantine": match.findtext("./quarantine", "no") == "yes",
+                "actions": actions,
+            })
+        item["enhanced_application_logging"] = entry.findtext("./enhanced-application-logging", "no") == "yes"
     return item
 
 
@@ -1128,7 +1180,10 @@ def fetch_panos_objects(profile, object_type: str) -> list[dict]:
     collected = []
     for base in panos_object_bases(profile, object_type):
         response = policy_api.require_success(policy_api.api_get(endpoint, {"type": "config", "action": "get", "xpath": f"{base}/{node}", "key": key}, ctx), f"fetch {object_type}")
-        collected.extend(xml_object_to_dict(entry, object_type, base) for entry in response.findall(".//entry"))
+        result = response.find("./result")
+        containers = list(result) if result is not None else []
+        for container in containers:
+            collected.extend(xml_object_to_dict(entry, object_type, base) for entry in container.findall("./entry"))
     return collected
 
 
@@ -1342,9 +1397,28 @@ def cached_application_catalog(profile) -> dict:
 
 
 def fetch_object_catalog(profile, object_type: str) -> list[dict]:
-    related = {"addresses": ("tags",), "services": ("tags",), "address-groups": ("addresses", "address-groups", "tags"), "service-groups": ("services", "service-groups", "tags"), "application-groups": ("applications", "application-groups", "tags"), "zones": ("zones",), "policy-picker": ("zones", "addresses", "address-groups", "applications", "application-groups", "application-filters", "services", "service-groups", "tags")}.get(object_type, ())
+    related = {
+        "addresses": ("tags",), "services": ("tags",),
+        "address-groups": ("addresses", "address-groups", "tags"),
+        "service-groups": ("services", "service-groups", "tags"),
+        "application-groups": ("applications", "application-groups", "tags"),
+        "zones": ("zones", "interfaces", "zone-protection-profiles", "log-forwarding"),
+        "log-forwarding": ("syslog-server-profiles", "email-server-profiles", "snmp-trap-server-profiles", "http-server-profiles", "tags"),
+        "policy-picker": (
+            "zones", "addresses", "address-groups", "applications", "application-groups",
+            "application-filters", "services", "service-groups", "tags", "hip-profiles",
+            "custom-url-categories", "schedules", "security-profile-groups", "log-forwarding", "interfaces",
+        ),
+    }.get(object_type, ())
     catalog = []
     for kind in related:
+        if kind in {"interfaces", "zone-protection-profiles"}:
+            try:
+                catalog.extend(fetch_network_reference_catalog(profile, kind))
+            except Exception:
+                if object_type != "policy-picker":
+                    raise
+            continue
         cache_path = application_cache_path(profile["id"]) if kind == "applications" else OBJECT_CACHE / f"{profile['id']}-{kind}.json"
         cached = None
         if cache_path.exists():
@@ -1361,7 +1435,62 @@ def fetch_object_catalog(profile, object_type: str) -> list[dict]:
                 if cached is None and object_type != "policy-picker": raise
         cached = cached or []
         catalog.extend({"name": item.get("name", ""), "kind": kind} for item in cached if item.get("name"))
+    if object_type == "log-forwarding":
+        try:
+            profiles = fetch_scm_objects(profile, "log-forwarding")
+        except Exception:
+            profiles = []
+        known = {(item["name"], item["kind"]) for item in catalog}
+        for profile_item in profiles:
+            for match in profile_item.get("match_list", []) or []:
+                for action in match.get("actions", []) or []:
+                    name = str(action.get("integration_action", "")).strip()
+                    key = (name, "log-integration-actions")
+                    if name and key not in known:
+                        known.add(key)
+                        catalog.append({"name": name, "kind": "log-integration-actions"})
     return sorted(catalog, key=lambda item: (item["name"].lower(), item["kind"]))
+
+
+def fetch_network_reference_catalog(profile, kind: str) -> list[dict]:
+    """Return existing interface/profile names used by object-backed editor fields."""
+    if kind not in {"interfaces", "zone-protection-profiles"}:
+        return []
+    names = set()
+    if profile["target_type"] == "scm":
+        section = "interfaces" if kind == "interfaces" else "network-profiles"
+        for item in fetch_scm_configuration_records(profile, "network", section):
+            if kind == "zone-protection-profiles" and item.get("endpoint") != "zone-protection-profiles":
+                continue
+            name = str(item.get("name", "")).strip()
+            if name:
+                names.add(name)
+    else:
+        _, endpoint, key, ctx = panos_profile_context(profile)
+        for zone_base in panos_object_bases(profile, "zones"):
+            device_base = zone_base.rsplit("/vsys/entry", 1)[0]
+            xpath = (
+                f"{device_base}/network/interface"
+                if kind == "interfaces"
+                else f"{device_base}/network/profiles/zone-protection-profile"
+            )
+            response = policy_api.require_success(
+                policy_api.api_get(endpoint, {"type": "config", "action": "get", "xpath": xpath, "key": key}, ctx),
+                f"fetch {kind}",
+            )
+            if kind == "zone-protection-profiles":
+                entries = response.findall("./result/zone-protection-profile/entry")
+            else:
+                entries = []
+                for interface in response.findall("./result/interface"):
+                    entries.extend(interface.findall("./*/entry"))
+                    entries.extend(interface.findall("./*/units/entry"))
+                    entries.extend(interface.findall("./*/entry/*/units/entry"))
+            for entry in entries:
+                name = str(entry.get("name", "")).strip()
+                if name:
+                    names.add(name)
+    return [{"name": name, "kind": kind} for name in sorted(names, key=str.casefold)]
 
 
 @app.get("/profiles/<int:profile_id>/catalog/applications")
@@ -1472,6 +1601,88 @@ def scm_object_payload(object_type: str, form, container: dict) -> dict:
         for form_key, payload_key in (("zone_protection_profile", "zone_protection_profile"), ("log_setting", "log_setting")):
             value = form.get(form_key, "").strip()
             if value: payload[payload_key] = value
+    elif object_type == "log-forwarding":
+        try:
+            submitted_matches = json.loads(form.get("match_list_json", "[]"))
+        except json.JSONDecodeError as exc:
+            raise ValueError("Ongeldige Log Forwarding match list") from exc
+        if not isinstance(submitted_matches, list) or not submitted_matches or len(submitted_matches) > 128:
+            raise ValueError("Voeg minstens één geldige match-list entry toe")
+        allowed_log_types = {"traffic", "threat", "wildfire", "url", "data", "gtp", "sctp", "tunnel", "auth", "decryption", "dns-security"}
+        match_list = []
+        names = set()
+        for raw in submitted_matches:
+            if not isinstance(raw, dict):
+                raise ValueError("Ongeldige match-list entry")
+            match_name = str(raw.get("name", "")).strip()
+            if not match_name or len(match_name) > 63:
+                raise ValueError("Elke match-list entry heeft een unieke naam nodig")
+            if match_name in names:
+                raise ValueError(f"Match-list entry {match_name} staat meermaals in het profiel")
+            names.add(match_name)
+            log_type = str(raw.get("log_type", "traffic")).strip()
+            if log_type not in allowed_log_types:
+                raise ValueError(f"Ongeldig log type: {log_type}")
+            clean = {
+                "name": match_name,
+                "action_desc": str(raw.get("action_desc", "")).strip()[:255],
+                "log_type": log_type,
+                "filter": str(raw.get("filter", "")).strip()[:65535],
+            }
+            for key in ("send_syslog", "send_email", "send_snmptrap", "send_http"):
+                values = raw.get(key, [])
+                if not isinstance(values, list):
+                    raise ValueError(f"Ongeldige destinationlijst voor {match_name}")
+                clean[key] = list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+            clean["send_to_panorama"] = bool(raw.get("send_to_panorama"))
+            clean["quarantine"] = bool(raw.get("quarantine"))
+            submitted_actions = raw.get("actions", [])
+            if not isinstance(submitted_actions, list) or len(submitted_actions) > 128:
+                raise ValueError(f"Ongeldige Actions-lijst voor {match_name}")
+            actions = []
+            action_names = set()
+            for raw_action in submitted_actions:
+                if not isinstance(raw_action, dict):
+                    raise ValueError(f"Ongeldige Action voor {match_name}")
+                action_name = str(raw_action.get("name", "")).strip()
+                if not action_name or len(action_name) > 63 or action_name in action_names:
+                    raise ValueError(f"Elke Action in {match_name} heeft een unieke naam nodig")
+                action_names.add(action_name)
+                action_type = str(raw_action.get("type", "tagging")).strip()
+                if action_type == "tagging":
+                    tag_action = str(raw_action.get("action", "add-tag")).strip()
+                    target = str(raw_action.get("target", "source-address")).strip()
+                    registration = str(raw_action.get("registration", "localhost")).strip()
+                    if tag_action not in {"add-tag", "remove-tag"}:
+                        raise ValueError(f"Ongeldige tagging action in {match_name}")
+                    if target not in {"source-address", "destination-address", "xff-address", "user"}:
+                        raise ValueError(f"Ongeldig tagging target in {match_name}")
+                    if registration not in {"remote", "panorama", "localhost"}:
+                        raise ValueError(f"Ongeldige tagging registration in {match_name}")
+                    timeout = str(raw_action.get("timeout", "")).strip()
+                    if timeout:
+                        timeout_value = int(timeout)
+                        if timeout_value < 0 or timeout_value > 2592000:
+                            raise ValueError(f"Tag timeout in {match_name} moet tussen 0 en 2592000 liggen")
+                    tags = raw_action.get("tags", [])
+                    if not isinstance(tags, list) or not tags:
+                        raise ValueError(f"Selecteer minstens één bestaande tag voor Action {action_name}")
+                    actions.append({
+                        "name": action_name, "type": "tagging", "action": tag_action,
+                        "target": target, "registration": registration, "timeout": timeout,
+                        "tags": list(dict.fromkeys(str(value).strip() for value in tags if str(value).strip())),
+                    })
+                elif action_type == "integration":
+                    integration_action = str(raw_action.get("integration_action", "")).strip()
+                    if not integration_action:
+                        raise ValueError(f"Integration Action {action_name} heeft een bestaande integratieactie nodig")
+                    actions.append({"name": action_name, "type": "integration", "integration_action": integration_action})
+                else:
+                    raise ValueError(f"Ongeldig Action type in {match_name}")
+            clean["actions"] = actions
+            match_list.append(clean)
+        payload["match_list"] = match_list
+        payload["enhanced_application_logging"] = form.get("enhanced_application_logging") == "on"
     else:
         raise ValueError("Dit objecttype gebruikt een andere configuratie-editor")
     return payload
@@ -1483,6 +1694,47 @@ def object_fingerprint(value: dict) -> str:
 
 def object_payload_xml(payload: dict) -> str:
     entry = ET.Element("entry", {"name": payload["name"]})
+    if "match_list" in payload:
+        description = str(payload.get("description", "")).strip()
+        if description:
+            ET.SubElement(entry, "description").text = description
+        if payload.get("enhanced_application_logging"):
+            ET.SubElement(entry, "enhanced-application-logging").text = "yes"
+        match_list = ET.SubElement(entry, "match-list")
+        for match in payload["match_list"]:
+            match_entry = ET.SubElement(match_list, "entry", {"name": match["name"]})
+            if match.get("action_desc"):
+                ET.SubElement(match_entry, "action-desc").text = str(match["action_desc"])
+            ET.SubElement(match_entry, "log-type").text = str(match["log_type"])
+            ET.SubElement(match_entry, "filter").text = str(match.get("filter", ""))
+            if match.get("send_to_panorama"):
+                ET.SubElement(match_entry, "send-to-panorama").text = "yes"
+            if match.get("quarantine"):
+                ET.SubElement(match_entry, "quarantine").text = "yes"
+            for key in ("send_syslog", "send_email", "send_snmptrap", "send_http"):
+                values = match.get(key, [])
+                if values:
+                    node = ET.SubElement(match_entry, key.replace("_", "-"))
+                    for value in values:
+                        ET.SubElement(node, "member").text = str(value)
+            if match.get("actions"):
+                actions_node = ET.SubElement(match_entry, "actions")
+                for action in match["actions"]:
+                    action_entry = ET.SubElement(actions_node, "entry", {"name": action["name"]})
+                    action_type = ET.SubElement(action_entry, "type")
+                    if action.get("type") == "integration":
+                        integration = ET.SubElement(action_type, "integration")
+                        ET.SubElement(integration, "action").text = str(action.get("integration_action", ""))
+                    else:
+                        tagging = ET.SubElement(action_type, "tagging")
+                        for key in ("action", "target", "registration"):
+                            ET.SubElement(tagging, key).text = str(action.get(key, ""))
+                        if action.get("timeout") not in (None, ""):
+                            ET.SubElement(tagging, "timeout").text = str(action["timeout"])
+                        tags = ET.SubElement(tagging, "tags")
+                        for value in action.get("tags", []):
+                            ET.SubElement(tags, "member").text = str(value)
+        return ET.tostring(entry, encoding="unicode")
     for key, value in payload.items():
         if key in {"name", "folder", "snippet", "device"} or value in (None, "", []): continue
         tag = key.replace("_", "-")
@@ -1531,11 +1783,88 @@ def validate_object_payload(payload: dict, object_type: str, existing: list[dict
         "addresses": ("ip_netmask", "ip_range", "ip_wildcard", "fqdn"),
         "address-groups": ("static", "dynamic"), "application-groups": ("members",),
         "services": ("protocol",), "service-groups": ("members",), "tags": ("color",), "zones": ("network",),
+        "log-forwarding": ("match_list", "enhanced_application_logging"),
     }[object_type]
     wanted = {key: payload.get(key) for key in comparable_keys if payload.get(key) is not None}
     equivalent = next((item for item in others if {key: item.get(key) for key in comparable_keys if item.get(key) is not None} == wanted), None)
     if equivalent:
         raise ValueError(f"Een equivalent object bestaat al als {equivalent['name']}; gebruik dat bestaande object.")
+
+
+def validate_log_forwarding_destinations(payload: dict, catalog: list[dict]) -> None:
+    kinds = {
+        "send_syslog": "syslog-server-profiles", "send_email": "email-server-profiles",
+        "send_snmptrap": "snmp-trap-server-profiles", "send_http": "http-server-profiles",
+    }
+    available = {}
+    for item in catalog:
+        available.setdefault(item.get("kind", ""), set()).add(item.get("name", ""))
+    for match in payload.get("match_list", []):
+        for field, kind in kinds.items():
+            missing = sorted(set(match.get(field, [])) - available.get(kind, set()))
+            if missing:
+                raise ValueError(
+                    f"Match-list {match['name']} verwijst naar niet-bestaande {kind}: {', '.join(missing)}"
+                )
+
+
+def validate_object_references(payload: dict, object_type: str, catalog: list[dict]) -> None:
+    """Reject object references that cannot be resolved in the selected scope."""
+    available: dict[str, set[str]] = {}
+    for item in catalog:
+        available.setdefault(str(item.get("kind", "")), set()).add(str(item.get("name", "")))
+
+    def require(field: str, values, kinds: tuple[str, ...]) -> None:
+        permitted = set().union(*(available.get(kind, set()) for kind in kinds))
+        missing = sorted({str(value) for value in values if str(value) and str(value) not in permitted})
+        if missing:
+            raise ValueError(
+                f"{field} verwijst naar niet-bestaande objecten: {', '.join(missing)}. Maak ze eerst aan."
+            )
+
+    if object_type != "tags":
+        require("Tags", payload.get("tag", []), ("tags",))
+    if object_type == "address-groups":
+        if "static" in payload:
+            require("Static members", payload["static"], ("addresses", "address-groups"))
+            if payload.get("name") in payload["static"]:
+                raise ValueError("Een Address Group kan zichzelf niet als member bevatten")
+        elif "dynamic" in payload:
+            expression = str(payload.get("dynamic", {}).get("filter", ""))
+            operands = []
+            for single, double, bare in re.findall(r"'([^']+)'|\"([^\"]+)\"|([^\s()]+)", expression):
+                value = single or double or bare
+                if value.lower() not in {"and", "or", "not"}:
+                    operands.append(value)
+            require("Dynamic filter", operands, ("tags",))
+    elif object_type == "application-groups":
+        require("Application members", payload.get("members", []), ("applications", "application-groups"))
+        if payload.get("name") in payload.get("members", []):
+            raise ValueError("Een Application Group kan zichzelf niet als member bevatten")
+    elif object_type == "service-groups":
+        require("Service members", payload.get("members", []), ("services", "service-groups"))
+        if payload.get("name") in payload.get("members", []):
+            raise ValueError("Een Service Group kan zichzelf niet als member bevatten")
+    elif object_type == "log-forwarding":
+        validate_log_forwarding_destinations(payload, catalog)
+        for match in payload.get("match_list", []):
+            for action in match.get("actions", []):
+                if action.get("type") == "tagging":
+                    require(f"Action {action['name']} tags", action.get("tags", []), ("tags",))
+                elif action.get("type") == "integration":
+                    require(
+                        f"Action {action['name']} integration",
+                        [action.get("integration_action", "")], ("log-integration-actions",),
+                    )
+    elif object_type == "zones":
+        network = payload.get("network", {})
+        interfaces = next(iter(network.values()), []) if isinstance(network, dict) else []
+        require("Interfaces", interfaces, ("interfaces",))
+        require(
+            "Zone Protection Profile", [payload.get("zone_protection_profile", "")],
+            ("zone-protection-profiles",),
+        )
+        require("Log Forwarding Profile", [payload.get("log_setting", "")], ("log-forwarding",))
 
 
 def policy_fingerprint(policy: dict) -> str:
@@ -1549,6 +1878,65 @@ def split_values(value: str) -> list[str]:
 def validate_policy_zones(policy: dict, zone_names: set[str]) -> None:
     missing = sorted({value for field in ("from", "to") for value in policy.get(field, []) if value != "any" and value not in zone_names})
     if missing: raise ValueError("Onbekende zone(s): " + ", ".join(missing) + ". Maak ze eerst aan onder Network > Zones.")
+
+
+POLICY_REFERENCE_KINDS = {
+    "from": {"zones"}, "to": {"zones"},
+    "source": {"addresses", "address-groups"}, "destination": {"addresses", "address-groups"},
+    "source_hip": {"hip-profiles"}, "destination_hip": {"hip-profiles"},
+    "application": {"applications", "application-groups", "application-filters"},
+    "service": {"services", "service-groups"}, "tag": {"tags"},
+    "log_setting": {"log-forwarding"}, "profile_group": {"security-profile-groups"},
+    "schedule": {"schedules"}, "category": {"custom-url-categories", "predefined-url-categories"},
+    "to_interface": {"interfaces"}, "source_translation_interface": {"interfaces"},
+    "source_translation_address": {"addresses", "address-groups"},
+    "destination_translation_address": {"addresses", "address-groups"},
+}
+POLICY_REFERENCE_BUILTINS = {
+    "from": {"any"}, "to": {"any"}, "source": {"any"}, "destination": {"any"},
+    "source_hip": {"any"}, "destination_hip": {"any"}, "application": {"any"},
+    "service": {"any", "application-default"}, "category": {"any"},
+    "log_setting": {"Cortex Data Lake"},
+    "to_interface": {"any"},
+}
+
+
+def extend_policy_catalog_with_current(catalog: list[dict], policies: list[dict]) -> list[dict]:
+    """Add valid predefined values already present in the current rulebase."""
+    result = list(catalog)
+    seen = {(item.get("name", ""), item.get("kind", "")) for item in result}
+    for policy in policies:
+        for name in policy.get("category", []) or []:
+            key = (name, "predefined-url-categories")
+            if name and name != "any" and key not in seen:
+                seen.add(key)
+                result.append({"name": name, "kind": "predefined-url-categories"})
+    return result
+
+
+def validate_policy_references(policy: dict, catalog: list[dict], changed_fields: set[str], allow_zone_freeform: bool = False) -> None:
+    available = {}
+    for item in catalog:
+        available.setdefault(item.get("kind", ""), set()).add(item.get("name", ""))
+    for field in changed_fields & {"log_setting", "profile_group", "schedule"}:
+        value = str(policy.get(field, "") or "")
+        if "," in value:
+            raise ValueError(f"{field.replace('_', ' ').title()} accepteert maximaal één waarde")
+    for field in changed_fields & POLICY_REFERENCE_KINDS.keys():
+        if field in {"from", "to"} and allow_zone_freeform:
+            continue
+        raw = policy.get(field, [])
+        values = raw if isinstance(raw, list) else ([raw] if raw else [])
+        permitted = set(POLICY_REFERENCE_BUILTINS.get(field, set()))
+        for kind in POLICY_REFERENCE_KINDS[field]:
+            permitted.update(available.get(kind, set()))
+        missing = sorted({str(value) for value in values if str(value) and str(value) not in permitted})
+        if missing:
+            target = next(iter(POLICY_REFERENCE_KINDS[field])).replace("-", " ")
+            raise ValueError(
+                f"{field.replace('_', ' ').title()} verwijst naar niet-bestaande waarden: {', '.join(missing)}. "
+                f"Maak deze eerst aan onder {target}."
+            )
 
 
 def scm_policy_payload(policy: dict, container: dict) -> dict:
@@ -2253,9 +2641,88 @@ WORKSPACE_DEVICE_NAV = {
 }
 WORKSPACE_STRUCTURED_OBJECT_TYPES = {
     "addresses", "address-groups", "application-groups",
-    "services", "service-groups", "tags",
+    "services", "service-groups", "tags", "log-forwarding",
 }
 WORKSPACE_EDITABLE_OBJECT_TYPES = set(OBJECT_NODES)
+
+
+def workspace_policy_reference_catalog(xml_bytes: bytes, scope: str, parsed, profile) -> tuple[list[dict], dict]:
+    parsed_root, snapshot = parsed
+    catalog = []
+    seen = set()
+    for catalog_type in (
+        "addresses", "address-groups", "applications", "application-groups", "application-filters",
+        "services", "service-groups", "tags", "hip-profiles", "custom-url-categories", "schedules",
+        "security-profile-groups", "log-forwarding",
+    ):
+        _, catalog_objects = scoped_objects(xml_bytes, scope, catalog_type, parsed=parsed)
+        for item in catalog_objects:
+            key = (item["name"], catalog_type)
+            if key not in seen:
+                seen.add(key)
+                catalog.append({"name": item["name"], "kind": catalog_type})
+    template = referenced_template(snapshot, scope) if snapshot.kind == "panorama" else ""
+    zone_inventory = configuration_inventory(xml_bytes, scope, template, parsed=parsed)["network"] if (snapshot.kind != "panorama" or template) else []
+    for kind, inventory_name in (("zones", "Zones"), ("interfaces", "Interfaces")):
+        for name in next((item.get("names", []) for item in zone_inventory if item["name"] == inventory_name), []):
+            key = (name, kind)
+            if key not in seen:
+                seen.add(key)
+                catalog.append({"name": name, "kind": kind})
+    application_state = cached_application_catalog(profile)
+    for item in application_state["items"]:
+        key = (item["name"], "applications")
+        if key not in seen:
+            seen.add(key)
+            catalog.append({"name": item["name"], "kind": "applications"})
+    return catalog, application_state
+
+
+def workspace_object_reference_catalog(xml_bytes: bytes, scope: str, object_type: str, parsed, profile) -> list[dict]:
+    related_types = {
+        "addresses": ("tags",),
+        "address-groups": ("addresses", "address-groups", "tags"),
+        "application-groups": ("applications", "application-groups", "tags"),
+        "services": ("tags",),
+        "service-groups": ("services", "service-groups", "tags"),
+    }.get(object_type, ())
+    catalog = []
+    seen = set()
+    for related_type in related_types:
+        _, related_objects = scoped_objects(xml_bytes, scope, related_type, parsed=parsed)
+        for item in related_objects:
+            key = (item["name"], related_type)
+            if key not in seen:
+                seen.add(key)
+                catalog.append({"name": item["name"], "kind": related_type})
+    if object_type == "application-groups":
+        for item in cached_application_catalog(profile)["items"]:
+            key = (item["name"], "applications")
+            if key not in seen:
+                seen.add(key)
+                catalog.append({"name": item["name"], "kind": "applications"})
+    if object_type == "log-forwarding":
+        for item in scoped_server_profiles(xml_bytes, scope, parsed=parsed):
+            key = (item["name"], item["kind"])
+            if key not in seen:
+                seen.add(key)
+                catalog.append(item)
+        _, tags = scoped_objects(xml_bytes, scope, "tags", parsed=parsed)
+        for item in tags:
+            key = (item["name"], "tags")
+            if key not in seen:
+                seen.add(key)
+                catalog.append({"name": item["name"], "kind": "tags"})
+        _, log_profiles = scoped_objects(xml_bytes, scope, "log-forwarding", parsed=parsed)
+        for profile_item in log_profiles:
+            for match in profile_item.get("match_list", []) or []:
+                for action in match.get("actions", []) or []:
+                    name = str(action.get("integration_action", "")).strip()
+                    key = (name, "log-integration-actions")
+                    if name and key not in seen:
+                        seen.add(key)
+                        catalog.append({"name": name, "kind": "log-integration-actions"})
+    return catalog
 
 
 @app.get("/config-workspaces/<int:workspace_id>/edit")
@@ -2321,40 +2788,15 @@ def config_workspace_editor(workspace_id):
                 other_rulebase = "post" if rulebase == "pre" else "pre"
                 _, alternate_policies = scoped_policies(xml_bytes, scope, policy_kind, other_rulebase, parsed=(parsed_root, snapshot))
                 alternate_policy_count = len(alternate_policies)
-            seen_policy_catalog = set()
-            for catalog_type in ("addresses", "address-groups", "applications", "application-groups", "application-filters", "services", "service-groups", "tags", "security-profile-groups", "log-forwarding"):
-                _, catalog_objects = scoped_objects(xml_bytes, scope, catalog_type, parsed=(parsed_root, snapshot))
-                for item in catalog_objects:
-                    key = (item["name"], catalog_type)
-                    if key not in seen_policy_catalog:
-                        seen_policy_catalog.add(key)
-                        workspace_policy_catalog.append({"name": item["name"], "kind": catalog_type})
-            policy_zone_template = preferred_template if snapshot.kind == "panorama" else template
-            zone_inventory = configuration_inventory(xml_bytes, scope, policy_zone_template, parsed=(parsed_root, snapshot))["network"] if (snapshot.kind != "panorama" or policy_zone_template) else []
-            zones = next((item.get("names", []) for item in zone_inventory if item["name"] == "Zones"), [])
-            workspace_policy_catalog.extend({"name": name, "kind": "zones"} for name in zones)
-            interfaces = next((item.get("names", []) for item in zone_inventory if item["name"] == "Interfaces"), [])
-            workspace_policy_catalog.extend({"name": name, "kind": "interfaces"} for name in interfaces)
-            application_state = cached_application_catalog(workspace_profile)
-            existing_applications = {item["name"] for item in workspace_policy_catalog if item["kind"] == "applications"}
-            workspace_policy_catalog.extend(item for item in application_state["items"] if item["name"] not in existing_applications)
+            workspace_policy_catalog, application_state = workspace_policy_reference_catalog(
+                xml_bytes, scope, (parsed_root, snapshot), workspace_profile
+            )
+            workspace_policy_catalog = extend_policy_catalog_with_current(workspace_policy_catalog, policies)
         elif workspace_view == "objects":
             _, objects = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
-            related_types = {
-                "addresses": ("tags",),
-                "address-groups": ("addresses", "address-groups", "tags"),
-                "application-groups": ("applications", "application-groups", "tags"),
-                "services": ("tags",),
-                "service-groups": ("services", "service-groups", "tags"),
-            }.get(object_type, ())
-            seen_catalog = set()
-            for related_type in related_types:
-                _, related_objects = scoped_objects(xml_bytes, scope, related_type, parsed=(parsed_root, snapshot))
-                for item in related_objects:
-                    key = (item["name"], related_type)
-                    if key not in seen_catalog:
-                        seen_catalog.add(key)
-                        workspace_object_catalog.append({"name": item["name"], "kind": related_type})
+            workspace_object_catalog = workspace_object_reference_catalog(
+                xml_bytes, scope, object_type, (parsed_root, snapshot), workspace_profile
+            )
             if object_type == "application-groups":
                 application_state = cached_application_catalog(workspace_profile)
         else:
@@ -2406,6 +2848,10 @@ def config_workspace_policy_preview(workspace_id):
         return "Not found", 404
     try:
         xml_bytes, parsed_root, parsed_snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
+        with db() as conn:
+            workspace_profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+        if not workspace_profile:
+            raise OfflineConfigError("Het gekoppelde firewallprofiel bestaat niet meer")
         scope = request.form.get("scope", "")
         kind = request.form.get("policy_kind", "security")
         rulebase = request.form.get("rulebase", "pre")
@@ -2429,6 +2875,15 @@ def config_workspace_policy_preview(workspace_id):
         updated["disabled"] = request.form.get("disabled") == "yes"
         if kind == "nat" and request.form.get("nat_translation_editor") == "yes":
             updated.update(nat_translation_replacements(request.form))
+        changed_fields = {field for field in set(before) | set(updated) if before.get(field) != updated.get(field)}
+        reference_catalog, _ = workspace_policy_reference_catalog(
+            xml_bytes, scope, (parsed_root, parsed_snapshot), workspace_profile
+        )
+        reference_catalog = extend_policy_catalog_with_current(reference_catalog, policies)
+        validate_policy_references(
+            updated, reference_catalog, changed_fields,
+            allow_zone_freeform=parsed_snapshot.kind == "panorama" and not referenced_template(parsed_snapshot, scope),
+        )
         replacement_xml = update_xml_policy(updated)
         if replacement_xml == before["_xml"]:
             raise OfflineConfigError("Er zijn geen wijzigingen om te bewaren")
@@ -2468,6 +2923,10 @@ def config_workspace_policy_bulk_preview(workspace_id):
     if not workspace: return "Not found", 404
     try:
         xml_bytes, parsed_root, parsed_snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
+        with db() as conn:
+            workspace_profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+        if not workspace_profile:
+            raise OfflineConfigError("Het gekoppelde firewallprofiel bestaat niet meer")
         scope = request.form.get("scope", "")
         kind = request.form.get("policy_kind", "security")
         rulebase = request.form.get("rulebase", "pre")
@@ -2484,10 +2943,19 @@ def config_workspace_policy_bulk_preview(workspace_id):
         operations["description_append"] = request.form.get("description_append", "").strip()
         disabled = request.form.get("disabled", "")
         operations["disabled"] = disabled == "true" if disabled in {"true", "false"} else None
+        reference_catalog, _ = workspace_policy_reference_catalog(
+            xml_bytes, scope, (parsed_root, parsed_snapshot), workspace_profile
+        )
+        reference_catalog = extend_policy_catalog_with_current(reference_catalog, policies)
         changes = []
         for before in selected:
             after = apply_bulk_operations(before, operations)
             if after != before:
+                changed_fields = {field for field in set(before) | set(after) if before.get(field) != after.get(field)}
+                validate_policy_references(
+                    after, reference_catalog, changed_fields,
+                    allow_zone_freeform=parsed_snapshot.kind == "panorama" and not referenced_template(parsed_snapshot, scope),
+                )
                 changes.append({
                     "policy_name": before["name"], "fingerprint": offline_policy_fingerprint(before),
                     "before": before, "after": after, "replacement_xml": update_xml_policy(after),
@@ -2603,6 +3071,18 @@ def config_workspace_object_preview(workspace_id):
         if object_type in WORKSPACE_STRUCTURED_OBJECT_TYPES:
             payload = scm_object_payload(object_type, request.form, {})
             validate_object_payload(payload, object_type, existing, original_name)
+            with db() as conn:
+                workspace_profile = conn.execute(
+                    "SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)
+                ).fetchone()
+            if not workspace_profile:
+                raise OfflineConfigError("Het gekoppelde firewallprofiel bestaat niet meer")
+            validate_object_references(
+                payload, object_type,
+                workspace_object_reference_catalog(
+                    xml_bytes, scope, object_type, (parsed_root, snapshot), workspace_profile
+                ),
+            )
         else:
             if before is None:
                 raise OfflineConfigError("Maak dit objecttype voorlopig via de native PAN-OS-interface aan; bestaande objecten zijn hier volledig bewerkbaar")
@@ -3140,7 +3620,9 @@ def index():
                         object_catalog = fetch_object_catalog(policy_profile, object_type)
                     else:
                         policies = fetch_scm_policy_type(policy_profile, policy_kind)
-                        policy_catalog = fetch_object_catalog(policy_profile, "policy-picker")
+                        policy_catalog = extend_policy_catalog_with_current(
+                            fetch_object_catalog(policy_profile, "policy-picker"), policies
+                        )
                 except Exception as exc: policy_error = str(exc)
     return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, policy_catalog=policy_catalog, live_application_state=live_application_state, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, config_section=config_section, scm_configuration_sections=SCM_CONFIGURATION_SECTIONS, config_records=scm_config_records, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats(), certificate=certificate_summary(CERT_DIR / "tls.crt", APPLIANCE_CONFIG), application_catalog_settings=application_catalog_configuration())
 
@@ -3865,11 +4347,14 @@ def policy_bulk_preview(profile_id):
         current = fetch_scm_policy_type(profile, policy_kind)
         selected = [policy for policy in current if policy["id"] in selected_ids]
         if len(selected) != len(selected_ids): raise ValueError("Niet alle geselecteerde policies bestaan nog. Vernieuw de rulebase.")
+        reference_catalog = extend_policy_catalog_with_current(fetch_object_catalog(profile, "policy-picker"), current)
         changes = []; zones_changed = profile["target_type"] != "panorama" and any(operations[field]["add"] or operations[field]["remove"] for field in ("from", "to")); zone_names = {item.get("name", "") for item in fetch_scm_objects(profile, "zones")} if zones_changed else set()
         for policy in selected:
             updated = apply_bulk_operations(policy, operations)
             if zones_changed: validate_policy_zones(updated, zone_names)
             if updated != policy:
+                changed_fields = {field for field in set(policy) | set(updated) if policy.get(field) != updated.get(field)}
+                validate_policy_references(updated, reference_catalog, changed_fields, allow_zone_freeform=profile["target_type"] == "panorama")
                 changes.append({"before": policy, "after": updated, "fingerprint": policy_fingerprint(policy)})
         if not changes: raise ValueError("De gekozen bulkbewerking veroorzaakt geen wijzigingen.")
         draft_id = secrets.token_urlsafe(18)
@@ -3913,6 +4398,11 @@ def policy_single_preview(profile_id):
         updated = apply_single_replacements(policy, replacements)
         if profile["target_type"] != "panorama" and (updated.get("from") != policy.get("from") or updated.get("to") != policy.get("to")):
             validate_policy_zones(updated, {item.get("name", "") for item in fetch_scm_objects(profile, "zones")})
+        changed_fields = {field for field in set(policy) | set(updated) if policy.get(field) != updated.get(field)}
+        validate_policy_references(
+            updated, extend_policy_catalog_with_current(fetch_object_catalog(profile, "policy-picker"), current), changed_fields,
+            allow_zone_freeform=profile["target_type"] == "panorama",
+        )
         if updated == policy: raise ValueError("De policy bevat geen wijzigingen.")
         draft_id = secrets.token_urlsafe(18)
         changes = [{"before": policy, "after": updated, "fingerprint": policy_fingerprint(policy)}]
@@ -3965,6 +4455,7 @@ def object_preview(profile_id, object_type):
         else:
             payload = scm_object_payload(object_type, request.form, container)
             validate_object_payload(payload, object_type, existing, object_id)
+            validate_object_references(payload, object_type, fetch_object_catalog(profile, object_type))
         draft_id = secrets.token_urlsafe(18)
         draft = {"profile_id": profile_id, "created_at": now(), "object_type": object_type, "operation": "update" if before else "create", "payload": payload, "before": before, "fingerprint": object_fingerprint(before) if before else "", "scope_xpath": before.get("_scope_xpath", "") if before else ""}
         path = OBJECT_DRAFTS / f"{draft_id}.json"; path.write_text(json.dumps(draft)); path.chmod(0o600)
@@ -4026,14 +4517,25 @@ def object_push(draft_id):
                 before = entry["value"]; live = next((item for item in current if str(item.get("id", "")) == str(before.get("id", ""))), None)
                 if not live or object_fingerprint(live) != entry["fingerprint"]: raise RuntimeError(f"Object {before['name']} is intussen gewijzigd; Delete gestopt.")
         else: raise RuntimeError("Onbekende objectbewerking")
+        if operation in {"create", "update"} and not metadata.get("generic"):
+            validate_object_references(
+                draft["payload"], object_type, fetch_object_catalog(profile, object_type)
+            )
         if profile["target_type"] == "scm":
             scm, token, _, _ = scm_client(profile)
             service = metadata.get("service") or ("network" if object_type == "zones" else "objects")
             endpoint_name = metadata.get("endpoint", object_type)
             root = policy_api.scm_api_root(scm.scm_api_base) + f"/config/{service}/v1"
             container = policy_api.scm_container(folder=scm.scm_folder if object_type == "zones" else scm.scm_object_folder, snippet=scm.scm_snippet, device=scm.scm_device)
-            if operation == "create": policy_api.scm_http_request("POST", f"{root}/{endpoint_name}", token, payload=draft["payload"])
-            elif operation == "update": policy_api.scm_http_request("PUT", f"{root}/{endpoint_name}/{draft['before']['id']}", token, payload=draft["payload"])
+            payload = copy.deepcopy(draft.get("payload") or {})
+            if object_type == "log-forwarding":
+                payload.pop("enhanced_application_logging", None)
+                for match in payload.get("match_list", []):
+                    match.pop("send_to_panorama", None)
+                    match.pop("quarantine", None)
+                    match.pop("actions", None)
+            if operation == "create": policy_api.scm_http_request("POST", f"{root}/{endpoint_name}", token, payload=payload)
+            elif operation == "update": policy_api.scm_http_request("PUT", f"{root}/{endpoint_name}/{draft['before']['id']}", token, payload=payload)
             else:
                 for entry in draft["objects"]: policy_api.scm_http_request("DELETE", f"{root}/{endpoint_name}/{entry['value']['id']}", token, params=container)
         else:

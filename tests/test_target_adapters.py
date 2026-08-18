@@ -41,6 +41,91 @@ class TargetAdapterTests(unittest.TestCase):
         defaults.update(settings)
         return {"target_type": target, "settings_json": json.dumps(defaults), "secret_blob": b""}
 
+    def test_log_forwarding_payload_has_panos_fields_and_reference_guards(self):
+        matches = [{
+            "name": "traffic", "action_desc": "All traffic", "log_type": "traffic",
+            "filter": "", "send_syslog": ["siem"], "send_email": [],
+            "send_snmptrap": [], "send_http": [], "send_to_panorama": True,
+            "quarantine": False, "actions": [{
+                "name": "tag-source", "type": "tagging", "action": "add-tag",
+                "target": "source-address", "registration": "localhost",
+                "timeout": "60", "tags": ["investigate"],
+            }],
+        }]
+        payload = main.scm_object_payload("log-forwarding", {
+            "name": "forward-all", "description": "SIEM",
+            "enhanced_application_logging": "on", "match_list_json": json.dumps(matches),
+        }, {})
+        self.assertTrue(payload["enhanced_application_logging"])
+        self.assertEqual(payload["match_list"][0]["send_syslog"], ["siem"])
+        xml = main.object_payload_xml(payload)
+        self.assertIn('<entry name="forward-all">', xml)
+        self.assertIn('<send-syslog><member>siem</member></send-syslog>', xml)
+        self.assertIn('<actions><entry name="tag-source"><type><tagging>', xml)
+        catalog = [
+            {"name": "siem", "kind": "syslog-server-profiles"},
+            {"name": "investigate", "kind": "tags"},
+        ]
+        main.validate_object_references(payload, "log-forwarding", catalog)
+        with self.assertRaisesRegex(ValueError, "niet-bestaande"):
+            main.validate_object_references(payload, "log-forwarding", [])
+
+    def test_policy_reference_validation_rejects_unknown_and_multiple_scalar_values(self):
+        catalog = [{"name": "forward-all", "kind": "log-forwarding"}]
+        policy = {"log_setting": "forward-all"}
+        main.validate_policy_references(policy, catalog, {"log_setting"})
+        with self.assertRaisesRegex(ValueError, "niet-bestaande"):
+            main.validate_policy_references({"log_setting": "missing"}, catalog, {"log_setting"})
+        with self.assertRaisesRegex(ValueError, "maximaal één"):
+            main.validate_policy_references({"log_setting": "one,two"}, catalog, {"log_setting"})
+
+    def test_nat_and_zone_reference_fields_require_existing_objects(self):
+        catalog = [
+            {"name": "ethernet1/1", "kind": "interfaces"},
+            {"name": "public-nat", "kind": "addresses"},
+            {"name": "strict", "kind": "zone-protection-profiles"},
+            {"name": "forward-all", "kind": "log-forwarding"},
+        ]
+        main.validate_policy_references({
+            "to_interface": "ethernet1/1", "source_translation_address": "public-nat",
+        }, catalog, {"to_interface", "source_translation_address"})
+        main.validate_object_references({
+            "name": "Internet", "network": {"layer3": ["ethernet1/1"]},
+            "zone_protection_profile": "strict", "log_setting": "forward-all",
+        }, "zones", catalog)
+        with self.assertRaisesRegex(ValueError, "Maak deze eerst aan"):
+            main.validate_policy_references(
+                {"destination_translation_address": "missing"}, catalog,
+                {"destination_translation_address"},
+            )
+        with self.assertRaisesRegex(ValueError, "Interfaces"):
+            main.validate_object_references(
+                {"name": "Internet", "network": {"layer3": ["ethernet1/9"]}},
+                "zones", catalog,
+            )
+
+    def test_panos_interface_reference_catalog_includes_physical_and_subinterfaces(self):
+        response = """<response status='success'><result><interface><ethernet>
+        <entry name='ethernet1/1'><layer3><units><entry name='ethernet1/1.100'/></units></layer3></entry>
+        </ethernet><loopback><units><entry name='loopback.1'/></units></loopback></interface></result></response>"""
+        with patch("app.main.panos_object_bases", return_value=["/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys2']"]), patch("app.main.panos_profile_context", return_value=({}, "https://example.invalid", "key", object())), patch("app.main.policy_api.api_get", return_value=response):
+            names = {item["name"] for item in main.fetch_network_reference_catalog(self.profile("panos"), "interfaces")}
+        self.assertEqual(names, {"ethernet1/1", "ethernet1/1.100", "loopback.1"})
+
+    def test_policy_and_object_reference_editors_are_picker_backed(self):
+        app_template = (pathlib.Path(__file__).parents[1] / "app/templates/app.html").read_text()
+        workspace_template = (pathlib.Path(__file__).parents[1] / "app/templates/workspace_editor.html").read_text()
+        javascript = (pathlib.Path(__file__).parents[1] / "app/static/app.js").read_text()
+        self.assertIn('data-picker-cardinality="one"', app_template)
+        self.assertIn('data-log-actions-supported', app_template)
+        self.assertIn('data-log-actions-supported', workspace_template)
+        self.assertIn('data-object-tag-entry placeholder="Klik om bestaande tags te kiezen"', app_template)
+        self.assertIn('data-zone-reference-kind="interfaces"', app_template)
+        self.assertIn('data-zone-reference-kind="zone-protection-profiles"', app_template)
+        self.assertIn('data-zone-reference-kind="log-forwarding"', app_template)
+        self.assertIn('function prepareBulkScalars()', javascript)
+        self.assertIn('Geen bestaande compatibele waarde gevonden.', javascript)
+
     def test_panorama_policy_xpath_uses_device_group_and_pre_rulebase(self):
         xpath = main.panos_policy_xpath(self.profile("panorama"), "nat")
         self.assertIn("device-group/entry[@name='Branches']/pre-rulebase/nat/rules", xpath)
@@ -838,7 +923,7 @@ class TargetAdapterTests(unittest.TestCase):
             )
             profile_id = cursor.lastrowid
             profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
-        xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase><security><rules><entry name="old-name"><from><member>Trust</member></from><to><member>Internet</member></to><source><member>any</member></source><destination><member>any</member></destination><application><member>web-browsing</member></application><service><member>application-default</member></service><action>allow</action><unknown>keep</unknown></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'''
+        xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><tag><entry name="edited"/></tag><rulebase><security><rules><entry name="old-name"><from><member>Trust</member></from><to><member>Internet</member></to><source><member>any</member></source><destination><member>any</member></destination><application><member>web-browsing</member></application><service><member>application-default</member></service><action>allow</action><unknown>keep</unknown></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'''
         workspace_id = main.store_config_workspace(profile, "policy", "config.xml", xml, "upload")
         client = main.app.test_client()
         with client.session_transaction(base_url="https://forge.test") as login:
@@ -891,7 +976,7 @@ class TargetAdapterTests(unittest.TestCase):
             )
             profile_id = cursor.lastrowid
             profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
-        xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase><security><rules><entry name="one"><from><member>Trust</member></from><source><member>any</member></source><destination><member>any</member></destination><application><member>ssl</member></application><service><member>application-default</member></service><action>allow</action></entry><entry name="two"><from><member>Trust</member></from><source><member>any</member></source><destination><member>any</member></destination><application><member>web-browsing</member></application><service><member>application-default</member></service><action>allow</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'''
+        xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><tag><entry name="bulk-edited"/></tag><application><entry name="dns"/></application><rulebase><security><rules><entry name="one"><from><member>Trust</member></from><source><member>any</member></source><destination><member>any</member></destination><application><member>ssl</member></application><service><member>application-default</member></service><action>allow</action></entry><entry name="two"><from><member>Trust</member></from><source><member>any</member></source><destination><member>any</member></destination><application><member>web-browsing</member></application><service><member>application-default</member></service><action>allow</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'''
         workspace_id = main.store_config_workspace(profile, "bulk", "config.xml", xml, "upload")
         client = main.app.test_client()
         with client.session_transaction(base_url="https://forge.test") as login:

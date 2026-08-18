@@ -41,7 +41,14 @@ OBJECT_NODES = {
     "file-blocking": "profiles/file-blocking", "wildfire-analysis": "profiles/wildfire-analysis",
     "dos-protection": "profiles/dos-protection",
     "schedules": "schedule", "security-profile-groups": "profile-group",
-    "log-forwarding": "log-settings", "authentication": "authentication-profile",
+    "log-forwarding": "log-settings/profiles", "authentication": "authentication-profile",
+}
+
+SERVER_PROFILE_NODES = {
+    "syslog-server-profiles": "syslog",
+    "email-server-profiles": "email",
+    "snmp-trap-server-profiles": "snmptrap",
+    "http-server-profiles": "http",
 }
 
 # Network and Device are represented by the same generic XML record model.  The
@@ -689,6 +696,44 @@ def object_record(entry: ET.Element, owner: str, editable: bool, object_type: st
             record["summary"] = rendered
             record["values"] = [rendered]
             break
+    elif object_type == "log-forwarding":
+        match_list = []
+        for match in entry.findall("./match-list/entry"):
+            actions = []
+            for action in match.findall("./actions/entry"):
+                tagging = action.find("./type/tagging")
+                integration = action.find("./type/integration")
+                if tagging is not None:
+                    actions.append({
+                        "name": action.get("name", ""), "type": "tagging",
+                        "action": tagging.findtext("./action", "add-tag"),
+                        "target": tagging.findtext("./target", "source-address"),
+                        "registration": tagging.findtext("./registration", "localhost"),
+                        "timeout": tagging.findtext("./timeout", ""),
+                        "tags": _members(tagging, "tags"),
+                    })
+                elif integration is not None:
+                    actions.append({
+                        "name": action.get("name", ""), "type": "integration",
+                        "integration_action": integration.findtext("./action", ""),
+                    })
+            match_list.append({
+                "name": match.get("name", ""),
+                "action_desc": match.findtext("./action-desc", ""),
+                "log_type": match.findtext("./log-type", "traffic") or "traffic",
+                "filter": match.findtext("./filter", ""),
+                "send_to_panorama": match.findtext("./send-to-panorama", "no") == "yes",
+                "send_syslog": _members(match, "send-syslog"),
+                "send_email": _members(match, "send-email"),
+                "send_snmptrap": _members(match, "send-snmptrap"),
+                "send_http": _members(match, "send-http"),
+                "quarantine": match.findtext("./quarantine", "no") == "yes",
+                "actions": actions,
+            })
+        record["match_list"] = match_list
+        record["enhanced_application_logging"] = entry.findtext("./enhanced-application-logging", "no") == "yes"
+        record["summary"] = f"{len(match_list)} match-list entr{'y' if len(match_list) == 1 else 'ies'}"
+        record["values"] = [item["name"] for item in match_list if item["name"]]
     return record
 
 
@@ -708,6 +753,26 @@ def scoped_objects(xml_bytes: bytes, scope: str, object_type: str, parsed=None) 
     return snapshot, records
 
 
+def scoped_server_profiles(xml_bytes: bytes, scope: str, parsed=None) -> list[dict]:
+    """Return server-profile names visible to a policy/log-forwarding scope."""
+    root, snapshot = parsed if parsed is not None else parse_snapshot(xml_bytes)
+    chain = _scope_chain(snapshot, scope) if snapshot.kind == "panorama" else (["Shared", scope] if root.find("./shared") is not None else [scope])
+    records = []
+    seen = set()
+    for owner in chain:
+        scope_root = _scope_root(root, snapshot, owner)
+        if scope_root is None:
+            continue
+        for kind, node in SERVER_PROFILE_NODES.items():
+            for entry in scope_root.findall(f"./server-profile/{node}/entry"):
+                name = entry.get("name", "").strip()
+                key = (kind, name)
+                if name and key not in seen:
+                    seen.add(key)
+                    records.append({"name": name, "kind": kind, "owner": owner})
+    return records
+
+
 EDITABLE_OBJECT_TAGS = {
     "addresses": {"description", "tag", "ip-netmask", "ip-range", "ip-wildcard", "fqdn"},
     "address-groups": {"description", "tag", "static", "dynamic"},
@@ -715,6 +780,7 @@ EDITABLE_OBJECT_TAGS = {
     "services": {"description", "tag", "protocol"},
     "service-groups": {"description", "tag", "members"},
     "tags": {"comments", "color"},
+    "log-forwarding": {"description", "enhanced-application-logging", "match-list"},
 }
 
 

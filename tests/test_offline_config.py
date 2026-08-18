@@ -10,6 +10,7 @@ from app.offline_config import (
     configuration_inventory, configuration_records, parse_snapshot,
     object_fingerprint, policy_fingerprint, render_set_commands, replace_policy_in_snapshot,
     referenced_template, scoped_objects, scoped_policies,
+    scoped_server_profiles,
 )
 
 
@@ -21,6 +22,19 @@ INHERITED = b'''<config version="12.1"><shared><address><entry name="shared-a"><
 
 
 class OfflineConfigTests(unittest.TestCase):
+    def test_log_forwarding_profiles_and_destinations_are_structured(self):
+        xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><tag><entry name="investigate"/></tag><server-profile><syslog><entry name="siem"/></syslog></server-profile><log-settings><profiles><entry name="forward-all"><description>SIEM</description><enhanced-application-logging>yes</enhanced-application-logging><match-list><entry name="traffic"><log-type>traffic</log-type><filter>(addr.src in 10.0.0.0/8)</filter><send-syslog><member>siem</member></send-syslog><actions><entry name="tag-source"><type><tagging><action>add-tag</action><target>source-address</target><registration>localhost</registration><timeout>60</timeout><tags><member>investigate</member></tags></tagging></type></entry></actions></entry></match-list></entry></profiles></log-settings></entry></vsys></entry></devices></config>'''
+        _, profiles = scoped_objects(xml, "vsys1", "log-forwarding")
+        self.assertEqual([item["name"] for item in profiles], ["forward-all"])
+        self.assertTrue(profiles[0]["enhanced_application_logging"])
+        match = profiles[0]["match_list"][0]
+        self.assertEqual(match["send_syslog"], ["siem"])
+        self.assertEqual(match["actions"][0]["tags"], ["investigate"])
+        self.assertEqual(
+            scoped_server_profiles(xml, "vsys1"),
+            [{"name": "siem", "kind": "syslog-server-profiles", "owner": "vsys1"}],
+        )
+
     def test_panorama_inventory_preserves_hierarchy_and_templates(self):
         _, snapshot = parse_snapshot(PANORAMA, expected_kind="panorama")
         self.assertEqual(snapshot.kind, "panorama")

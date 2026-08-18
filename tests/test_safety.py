@@ -149,7 +149,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_policy_freeform_input_closes_the_value_picker(self):
         script = (ROOT / "app/static/app.js").read_text()
-        self.assertIn('input.addEventListener("input", function () { if (pickerTarget === input) valuePicker.hidden = true; });', script)
+        self.assertIn('if (pickerTarget === input && !input.readOnly) valuePicker.hidden = true;', script)
 
     def test_ui_initializers_are_isolated_and_report_failures(self):
         script = (ROOT / "app/static/app.js").read_text()
