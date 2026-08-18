@@ -578,6 +578,37 @@ class CheckPointParser(BaseParser):
         values = value if isinstance(value, list) else [value]
         return unique(cls._name(item, lookup) for item in values) or list(default or ["any"])
 
+    @classmethod
+    def _split_rule_services(
+        cls,
+        value,
+        lookup: dict[str, str],
+        type_lookup: dict[str, str],
+    ) -> tuple[list[str], list[str]]:
+        application_reference_types = {
+            "application-site", "application-site-category", "application-site-group",
+            "service-icmp", "service-icmp6", "service-other",
+        }
+        raw_values = value if isinstance(value, list) else [value]
+        applications: list[str] = []
+        services: list[str] = []
+        for raw in raw_values:
+            object_type = (
+                str(raw.get("type", "")).lower()
+                if isinstance(raw, dict)
+                else type_lookup.get(str(raw), "")
+            )
+            name = cls._name(raw, lookup)
+            if object_type in application_reference_types:
+                applications.append(name)
+            else:
+                services.append(name)
+        applications = unique(applications)
+        services = unique(services)
+        if applications and not services:
+            services = ["application-default"]
+        return applications or ["any"], services or ["application-default"]
+
     @staticmethod
     def _append_address_variants(model: MigrationModel, name: str, variants: list[tuple[str, str, str]], description: str, ref: str) -> None:
         variants = [(suffix, value, value_type) for suffix, value, value_type in variants if value]
@@ -600,22 +631,43 @@ class CheckPointParser(BaseParser):
             str(item.get("uid")): str(item.get("name") or item.get("uid"))
             for item in items if item.get("uid")
         }
+        type_lookup = {
+            str(item.get("uid")): str(item.get("type", "")).lower()
+            for item in items if item.get("uid")
+        }
         services_by_name: dict[str, Service] = {}
+        exact_dns_domains: list[str] = []
         ignored_types = {
-            "rulebaseaction", "track", "gateway", "simple-gateway", "simple-cluster",
+            "rulebaseaction", "track", "gateway",
             "package", "access-layer", "nat-section", "access-section", "threat-layer", "cpmianyobject",
         }
+
         for item in items:
             typ = str(item.get("type", "")).lower()
             name = clean_name(item.get("name", item.get("uid", "item")))
             ref = str(item.get("uid", name))
             description = self._description(item)
-            if typ == "host":
-                ipv4 = str(item.get("ipv4-address", "")); ipv6 = str(item.get("ipv6-address", ""))
+            if typ in {"host", "checkpoint-host", "simple-gateway", "simple-cluster"} or (
+                not typ and item.get("ip-address")
+            ):
+                ipv4 = str(item.get("ipv4-address") or item.get("ip-address") or "")
+                ipv6 = str(item.get("ipv6-address", ""))
                 self._append_address_variants(model, name, [
                     ("ipv4", cidr(ipv4 + ("/32" if ipv4 and "/" not in ipv4 else "")), "ip_netmask"),
                     ("ipv6", cidr(ipv6 + ("/128" if ipv6 and "/" not in ipv6 else "")), "ip_netmask"),
                 ], description, ref)
+                if typ == "simple-cluster":
+                    for member in item.get("cluster-members", []):
+                        if not isinstance(member, dict):
+                            continue
+                        member_name = clean_name(member.get("name") or member.get("uid") or "cluster-member")
+                        member_ref = str(member.get("uid") or member_name)
+                        member_ipv4 = str(member.get("ip-address") or member.get("ipv4-address") or "")
+                        member_ipv6 = str(member.get("ipv6-address") or "")
+                        self._append_address_variants(model, member_name, [
+                            ("ipv4", cidr(member_ipv4 + ("/32" if member_ipv4 and "/" not in member_ipv4 else "")), "ip_netmask"),
+                            ("ipv6", cidr(member_ipv6 + ("/128" if member_ipv6 and "/" not in member_ipv6 else "")), "ip_netmask"),
+                        ], self._description(member), member_ref)
             elif typ == "network":
                 variants = []
                 if item.get("subnet4"):
@@ -637,11 +689,14 @@ class CheckPointParser(BaseParser):
                 if address and mask:
                     model.addresses.append(Address(name, f"{address}/{mask}", "ip_wildcard", description, source_ref=ref))
             elif typ == "dns-domain":
-                domain = str(item.get("domain") or item.get("name") or "").lstrip(".")
+                raw_domain = item.get("domain")
+                if not isinstance(raw_domain, str) or not raw_domain.strip():
+                    raw_domain = item.get("name") or ""
+                domain = str(raw_domain).lstrip(".")
                 if domain:
                     model.addresses.append(Address(name, domain, "fqdn", description, source_ref=ref))
-                    if str(item.get("domain") or item.get("name") or "").startswith("."):
-                        model.warnings.append(f"{ref}: DNS-domain {name} is als exacte PAN-OS FQDN geïmporteerd; controleer subdomeinsemantiek")
+                    if str(raw_domain).startswith("."):
+                        exact_dns_domains.append(name)
             elif typ in {"group", "network-group"}:
                 model.address_groups.append(AddressGroup(name, self._names(item.get("members", []), lookup, []), description, source_ref=ref))
             elif typ in {"service-tcp", "service-udp"}:
@@ -649,17 +704,25 @@ class CheckPointParser(BaseParser):
                 model.services.append(service); services_by_name[name] = service
             elif typ == "service-group":
                 model.service_groups.append(ServiceGroup(name, self._names(item.get("members", []), lookup, []), description, source_ref=ref))
-            elif typ in {"service-icmp", "service-icmp6", "service-other", "application-site", "application-site-group", "access-role"}:
+            elif typ in {"service-icmp", "service-icmp6", "service-other", "application-site", "application-site-category", "application-site-group", "access-role"}:
                 model.unsupported.append(f"{ref}: Check Point {typ} {name} vereist application/user mapping")
             elif typ and typ not in ignored_types:
                 model.unsupported.append(f"{ref}: Check Point objecttype {typ} {name} wordt nog niet geconverteerd")
+
+        if exact_dns_domains:
+            samples = ", ".join(exact_dns_domains[:8])
+            suffix = "" if len(exact_dns_domains) <= 8 else ", ..."
+            model.warnings.append(
+                f"{len(exact_dns_domains)} Check Point DNS-domain objecten zijn als exacte PAN-OS FQDN geïmporteerd; "
+                f"controleer subdomeinsemantiek ({samples}{suffix})"
+            )
 
         if isinstance(data, dict):
             access = data.get("rulebase", data.get("access-layers", []))
             nat = data.get("nat-rulebase", data.get("nat-rules", []))
         else:
             access, nat = data, []
-        self._walk_rules(access, model, lookup)
+        self._walk_rules(access, model, lookup, type_lookup)
         self._walk_nat_rules(nat, model, lookup, services_by_name)
         return deduplicate(model)
 
@@ -681,9 +744,10 @@ class CheckPointParser(BaseParser):
                 return numbered
             number += 1
 
-    def _walk_rules(self, value, model, lookup, source_file=""):
+    def _walk_rules(self, value, model, lookup, type_lookup=None, source_file=""):
+        type_lookup = type_lookup or {}
         if isinstance(value,list):
-            for item in value: self._walk_rules(item,model,lookup,source_file)
+            for item in value: self._walk_rules(item,model,lookup,type_lookup,source_file)
         elif isinstance(value,dict):
             typ=str(value.get("type","")).lower()
             current_source = str(value.get("_source_file") or source_file)
@@ -711,17 +775,19 @@ class CheckPointParser(BaseParser):
                         f"{value.get('uid','')}: niet-ondersteunde Check Point actie {action or 'onbekend'}; regel is disabled en vereist handmatige mapping"
                     )
                     description = "; ".join(filter(None, [f"REVIEW: actie {action or 'onbekend'} niet gemapt", description]))
+                applications, services = self._split_rule_services(value.get("service", []), lookup, type_lookup)
                 model.security_rules.append(Policy(
                     self._unique_rule_name(model.security_rules, value, current_source, "rule"),
                     source=self._names(value.get("source"), lookup, ["any"]),
                     destination=self._names(value.get("destination"), lookup, ["any"]),
-                    service=self._names(value.get("service"), lookup, ["application-default"]),
+                    application=applications,
+                    service=services,
                     action="allow" if supported_allow else "deny",
                     disabled=not bool(value.get("enabled",True)) or unsupported_action, description=description,
                     source_ref=f"{current_source}:{value.get('uid','')}".strip(":"), original=value,
                 ))
             for child in value.values():
-                if isinstance(child,(list,dict)): self._walk_rules(child,model,lookup,current_source)
+                if isinstance(child,(list,dict)): self._walk_rules(child,model,lookup,type_lookup,current_source)
 
     def _walk_nat_rules(self, value, model, lookup, services_by_name, source_file=""):
         if isinstance(value, list):
@@ -1407,7 +1473,15 @@ def migration_analysis(model: MigrationModel) -> dict:
     """Conservative project health analysis used by the Expedition-style toolbox."""
     address_names={item.name for item in model.addresses}; service_names={item.name for item in model.services}
     group_names={item.name for item in model.address_groups}; service_group_names={item.name for item in model.service_groups}
-    used_addresses=set(); used_services=set(); unresolved=set(); duplicate_rules=[]; rule_signatures={}
+    used_addresses=set(); used_services=set(); used_applications=set(); unresolved=set(); duplicate_rules=[]; rule_signatures={}
+    unsupported_applications = set()
+    for message in model.unsupported:
+        match = re.search(
+            r"Check Point (?:application-site(?:-category|-group)?|service-(?:icmp6?|other)) (.+?) vereist application/user mapping$",
+            message,
+        )
+        if match:
+            unsupported_applications.add(match.group(1))
 
     def translation_addresses(value) -> list[str]:
         found=[]
@@ -1420,15 +1494,18 @@ def migration_analysis(model: MigrationModel) -> dict:
             elif isinstance(child,dict): found.extend(translation_addresses(child))
         return found
 
-    for group in model.address_groups: used_addresses.update(group.members)
-    for group in model.service_groups: used_services.update(group.members)
+    for group in model.address_groups:
+        used_addresses.update(value for value in group.members if value not in {"any", "original"})
+    for group in model.service_groups:
+        used_services.update(value for value in group.members if value not in {"any", "application-default"})
     for attr in ("security_rules","nat_rules"):
         for rule in getattr(model,attr):
             used_addresses.update(value for value in rule.source+rule.destination if value!="any")
             if attr=="nat_rules":
-                used_addresses.update(translation_addresses(rule.source_translation))
-                used_addresses.update(translation_addresses(rule.destination_translation))
+                used_addresses.update(value for value in translation_addresses(rule.source_translation) if value not in {"any", "original"})
+                used_addresses.update(value for value in translation_addresses(rule.destination_translation) if value not in {"any", "original"})
             used_services.update(value for value in rule.service if value not in {"any","application-default"})
+            used_applications.update(value for value in rule.application if value != "any")
             signature=json.dumps({
                 "policy_type":rule.policy_type,"from":rule.from_zones,"to":rule.to_zones,
                 "source":rule.source,"destination":rule.destination,"application":rule.application,
@@ -1444,6 +1521,7 @@ def migration_analysis(model: MigrationModel) -> dict:
     known_services=service_names|service_group_names
     for value in used_services:
         if value not in known_services and not re.match(r"^(tcp|udp)-\d",value,re.I): unresolved.add(value)
+    unresolved.update(value for value in used_applications if value in unsupported_applications)
     return {
         "unused_addresses":sorted(address_names-used_addresses),
         "unused_address_groups":sorted(group_names-used_addresses),

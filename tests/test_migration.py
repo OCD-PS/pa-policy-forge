@@ -328,6 +328,53 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         with self.assertRaises(MigrationError):
             parse_vendor("checkpoint", payload.getvalue(), "show_package.tar")
 
+    def test_checkpoint_dns_hosts_and_applications_map_to_panos_families(self):
+        administrative_domain = {"uid": "domain-1", "name": "SMC User", "domain-type": "domain"}
+        data = {
+            "objects": [
+                {"type": "dns-domain", "uid": "dns-1", "name": ".example.com", "domain": administrative_domain},
+                {"type": "checkpoint-host", "uid": "mgmt-1", "name": "management", "ipv4-address": "192.0.2.10"},
+                {
+                    "type": "simple-cluster",
+                    "uid": "cluster-1",
+                    "name": "cluster",
+                    "ipv4-address": "192.0.2.20",
+                    "cluster-members": [
+                        {"uid": "nested-member-1", "name": "nested-member", "ip-address": "192.0.2.22"},
+                    ],
+                },
+                {"uid": "member-1", "name": "member", "ip-address": "192.0.2.21"},
+                {"type": "application-site", "uid": "app-1", "name": "Dropbox"},
+                {"type": "service-icmp", "uid": "icmp-1", "name": "echo-request"},
+            ],
+            "rulebase": [
+                {"type": "access-rule", "name": "Applications", "service": ["app-1", "icmp-1"], "action": "Accept"},
+            ],
+        }
+        model = parse_vendor("checkpoint", json.dumps(data).encode(), "checkpoint.json")
+        addresses = {item.name: item.value for item in model.addresses}
+        self.assertEqual(addresses["example.com"], "example.com")
+        self.assertEqual(addresses["management"], "192.0.2.10/32")
+        self.assertEqual(addresses["cluster"], "192.0.2.20/32")
+        self.assertEqual(addresses["member"], "192.0.2.21/32")
+        self.assertEqual(addresses["nested-member"], "192.0.2.22/32")
+        self.assertTrue(any("DNS-domain objecten" in warning for warning in model.warnings))
+        rule = model.security_rules[0]
+        self.assertEqual(rule.application, ["Dropbox", "echo-request"])
+        self.assertEqual(rule.service, ["application-default"])
+        analysis = migration_analysis(model)
+        self.assertIn("Dropbox", analysis["unresolved_references"])
+        self.assertIn("echo-request", analysis["unresolved_references"])
+
+    def test_migration_analysis_ignores_any_in_object_groups(self):
+        model = MigrationModel(
+            "checkpoint",
+            "checkpoint.json",
+            address_groups=[main.AddressGroup("address-any", ["any"])],
+            service_groups=[main.ServiceGroup("service-any", ["any", "application-default"])],
+        )
+        self.assertNotIn("any", migration_analysis(model)["unresolved_references"])
+
     def test_checkpoint_duplicate_long_rule_names_receive_bounded_suffixes(self):
         long_name = "A Check Point rule name that is deliberately longer than sixty three characters"
         documents = {
