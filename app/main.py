@@ -46,7 +46,7 @@ from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_sin
 from app.migration import (
     MIGRATION_KIND_LABELS, Address, AddressGroup, MigrationError, MigrationModel, PARSERS, Policy, Service, ServiceGroup,
     apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, migration_base_xml, migration_zone_names,
-    item_selector, merge_member_names, migration_analysis, migration_item_semantic, migration_review_findings, migration_search, model_collections, panos_fragment, parse_vendor, raw_item_payload, reconcile_model, scm_items,
+    item_selector, merge_member_names, migration_analysis, migration_item_semantic, migration_review_findings, migration_search, model_collections, panos_candidate_analysis, panos_fragment, parse_vendor, raw_item_payload, reconcile_model, scm_items,
 )
 from app.offline_config import (
     OBJECT_NODES, POLICY_NODES, OfflineConfigError, available_scopes, available_templates,
@@ -4168,17 +4168,22 @@ def migration_merge_apply(draft_id):
             outcome = f"{count} configuratie-items naar SCM candidate geschreven"
         else:
             workspace_id, plan = create_merged_workspace(profile, project, model)
-            analysis = migration_analysis(model)
+            source_analysis = migration_analysis(model)
+            candidate_analysis = panos_candidate_analysis(
+                workspace_config_path(workspace_row(workspace_id)).read_bytes()
+            )
+            candidate_unresolved = len(candidate_analysis["unresolved_references"])
             output_id = store_migration_output(
                 int(project["id"]),
                 workspace_id,
                 f"{project['name']} · PAN-OS candidate",
                 str(project["topology"] or "active-passive"),
                 sanity={
-                    "unresolved_references": len(analysis["unresolved_references"]),
-                    "duplicate_rules": len(analysis["duplicate_rules"]),
+                    "unresolved_references": candidate_unresolved,
+                    "unresolved_applications": len(candidate_analysis["unresolved_application_references"]),
+                    "duplicate_rules": len(candidate_analysis["duplicate_rules"]),
                     "unused_objects": sum(
-                        len(analysis[key])
+                        len(source_analysis[key])
                         for key in (
                             "unused_addresses",
                             "unused_address_groups",
@@ -4186,7 +4191,7 @@ def migration_merge_apply(draft_id):
                             "unused_service_groups",
                         )
                     ),
-                    "critical_findings": int(review["critical"]),
+                    "critical_findings": int(review["critical"]) + (1 if candidate_unresolved else 0),
                     "review_warnings": int(review["warnings"]),
                     "regenerate_required": False,
                 },

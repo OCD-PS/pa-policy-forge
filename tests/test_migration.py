@@ -12,7 +12,7 @@ os.environ.setdefault("PPF_DATA_DIR", tempfile.mkdtemp(prefix="forge-migration-t
 os.environ.setdefault("PPF_SYSLOG_PORT", "55149")
 os.environ.setdefault("PPF_BOOTSTRAP_PASSWORD", "unit-test-bootstrap-password")
 
-from app.migration import Address, MigrationModel, PARSERS, MigrationError, apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, migration_analysis, migration_base_xml, migration_collision_report, migration_review_findings, migration_zone_names, parse_vendor, panos_fragment, reconcile_model, scm_items, set_panos_ha_mode
+from app.migration import Address, MigrationModel, PARSERS, MigrationError, apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, migration_analysis, migration_base_xml, migration_collision_report, migration_review_findings, migration_zone_names, panos_candidate_analysis, parse_vendor, panos_fragment, reconcile_model, scm_items, set_panos_ha_mode
 from app import main
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -190,6 +190,14 @@ end'''
         model = parse_vendor("panos", source, "panos.xml")
         merged, _ = merge_model_into_panos_xml(source, model, "vsys1")
         self.assertIn(b"ENCRYPTED-PANOS-VALUE", merged)
+
+    def test_full_candidate_analysis_includes_broken_base_references(self):
+        candidate = b'''<config><predefined><application><entry name="ssl"/></application></predefined><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="server"><ip-netmask>192.0.2.10/32</ip-netmask></entry></address><rulebase><security><rules><entry name="base-broken"><from><member>any</member></from><to><member>any</member></to><source><member>missing-base-object</member></source><destination><member>server</member></destination><application><member>missing-base-app</member></application><service><member>application-default</member></service><action>allow</action></entry><entry name="valid"><from><member>any</member></from><to><member>any</member></to><source><member>any</member></source><destination><member>server</member></destination><application><member>ssl</member></application><service><member>application-default</member></service><action>allow</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'''
+        analysis = panos_candidate_analysis(candidate)
+        self.assertIn("missing-base-object", analysis["unresolved_references"])
+        self.assertIn("missing-base-app", analysis["unresolved_references"])
+        self.assertEqual(analysis["unresolved_application_references"], ["missing-base-app"])
+        self.assertNotIn("ssl", analysis["unresolved_references"])
 
     def test_asa_acl_and_object_are_parsed(self):
         model = parse_vendor("cisco-asa", b'''object network WEB

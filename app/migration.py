@@ -1778,6 +1778,53 @@ def migration_analysis(model: MigrationModel) -> dict:
     }
 
 
+def panos_candidate_analysis(content: bytes | str) -> dict:
+    """Validate references in the complete merged PAN-OS/Panorama candidate.
+
+    Project analysis only covers selected migration sources. A target base can
+    already contain broken references, so output sanity must inspect the final
+    XML rather than assuming that the base is commit-valid.
+    """
+    raw = content.encode() if isinstance(content, str) else content
+    model = parse_vendor("panos", raw, "candidate.xml")
+    analysis = migration_analysis(model)
+    try:
+        root = SafeET.fromstring(raw)
+    except Exception as exc:
+        raise MigrationError(f"Ongeldige PAN-OS candidate XML: {exc}") from exc
+
+    application_definitions = {"any"}
+    for path in (
+        "./predefined/application/entry",
+        "./predefined/application-container/entry",
+        "./shared/application/entry",
+        "./shared/application-group/entry",
+        "./shared/application-filter/entry",
+        "./devices/entry/vsys/entry/application/entry",
+        "./devices/entry/vsys/entry/application-group/entry",
+        "./devices/entry/vsys/entry/application-filter/entry",
+        "./devices/entry/device-group/entry/application/entry",
+        "./devices/entry/device-group/entry/application-group/entry",
+        "./devices/entry/device-group/entry/application-filter/entry",
+    ):
+        application_definitions.update(
+            entry.get("name", "") for entry in root.findall(path) if entry.get("name")
+        )
+    application_references = set()
+    for rulebase in ("rulebase", "pre-rulebase", "post-rulebase"):
+        application_references.update(
+            (member.text or "").strip()
+            for member in root.findall(f".//{rulebase}/*/rules/entry/application/member")
+            if (member.text or "").strip()
+        )
+    unresolved_applications = sorted(application_references - application_definitions)
+    analysis["unresolved_application_references"] = unresolved_applications
+    analysis["unresolved_references"] = sorted(
+        set(analysis["unresolved_references"]) | set(unresolved_applications)
+    )
+    return analysis
+
+
 def migration_review_findings(model: MigrationModel) -> dict:
     """Return the mandatory, conservative review gate for a migration model.
 
