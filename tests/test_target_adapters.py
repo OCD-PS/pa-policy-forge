@@ -232,6 +232,9 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertIn("loadObjectApplications", javascript)
         self.assertIn("function parseTagTokens", javascript)
         self.assertIn("tagQuoteOpen", javascript)
+        self.assertIn("objectValueAlreadyAssigned", javascript)
+        self.assertIn("activeField._offlineValues.has", javascript)
+        self.assertIn("pickerTarget._hasPickerValue", javascript)
         self.assertIn("data-single-tag-values", live_template)
         self.assertIn("data-single-tag-picker", live_template)
         self.assertNotIn('<label>Tags</label><input name="tags"', workspace_template)
@@ -540,6 +543,8 @@ class TargetAdapterTests(unittest.TestCase):
         scm_template = (pathlib.Path(main.__file__).parent / "templates" / "app.html").read_text()
         self.assertIn('name="direct_save" value="yes"', workspace_template)
         self.assertIn('name="direct_save" value="yes"', scm_template)
+        self.assertGreaterEqual(workspace_template.count('name="direct_save" value="yes"'), 5)
+        self.assertNotIn("Preview wijzigingen", workspace_template)
 
     def test_scm_direct_save_writer_updates_candidate_after_fingerprint_check(self):
         profile = {"id": 42, "target_type": "scm"}
@@ -804,6 +809,17 @@ class TargetAdapterTests(unittest.TestCase):
             self.assertNotEqual(latest["id"], workspace_id)
             _, objects = main.scoped_objects(main.workspace_config_path(latest).read_bytes(), "vsys1", "addresses")
             self.assertEqual([item["name"] for item in objects], ["existing", "added"])
+            direct = client.post(
+                f"/config-workspaces/{latest['id']}/objects/preview",
+                data={"csrf": "object-csrf", "direct_save": "yes", "scope": "vsys1", "object_type": "addresses", "name": "direct-added", "value_type": "ip_netmask", "value": "192.0.2.3/32", "description": "direct object"},
+                base_url="https://forge.test",
+            )
+            self.assertEqual(direct.status_code, 302)
+            with main.db() as conn:
+                direct_latest = conn.execute("SELECT * FROM config_workspaces WHERE profile_id=? ORDER BY id DESC LIMIT 1", (profile_id,)).fetchone()
+            self.assertNotEqual(direct_latest["id"], latest["id"])
+            _, direct_objects = main.scoped_objects(main.workspace_config_path(direct_latest).read_bytes(), "vsys1", "addresses")
+            self.assertEqual([item["name"] for item in direct_objects], ["existing", "added", "direct-added"])
         finally:
             with main.db() as conn:
                 workspaces = conn.execute("SELECT * FROM config_workspaces WHERE profile_id=?", (profile_id,)).fetchall()
@@ -1093,6 +1109,36 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertEqual(xml.findtext("./service"), "tcp-443")
         self.assertEqual(xml.findtext("./destination-translation/translated-address"), "private")
         self.assertEqual(xml.findtext("./destination-translation/translated-port"), "8443")
+
+    def test_offline_nat_editor_exposes_original_and_translated_packets(self):
+        xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase><nat><rules><entry name="NAT-1"><from><member>Trust</member></from><to><member>Untrust</member></to><source><member>any</member></source><destination><member>public</member></destination><service>tcp-443</service><nat-type>ipv4</nat-type><to-interface>ethernet1/1</to-interface><source-translation><dynamic-ip><translated-address><member>192.0.2.10</member></translated-address></dynamic-ip></source-translation><destination-translation><translated-address>private</translated-address><translated-port>8443</translated-port></destination-translation></entry></rules></nat></rulebase></entry></vsys></entry></devices></config>'''
+        _, policies = main.scoped_policies(xml, "vsys1", "nat", "standard")
+        policy = policies[0]
+        self.assertEqual(policy["service"], ["tcp-443"])
+        self.assertEqual(policy["to_interface"], "ethernet1/1")
+        self.assertEqual(policy["source_translation_mode"], "dynamic_ip")
+        self.assertEqual(policy["source_translation_address"], "192.0.2.10")
+        self.assertEqual(policy["destination_translation_address"], "private")
+        self.assertEqual(policy["destination_translation_port"], "8443")
+        no_translation_xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase><nat><rules><entry name="NAT-empty"><from><member>Trust</member></from><to><member>Untrust</member></to><source><member>any</member></source><destination><member>any</member></destination><service>any</service></entry></rules></nat></rulebase></entry></vsys></entry></devices></config>'''
+        _, no_translation = main.scoped_policies(no_translation_xml, "vsys1", "nat", "standard")
+        self.assertEqual(no_translation[0]["source_translation_summary"], "—")
+        self.assertEqual(no_translation[0]["destination_translation_summary"], "—")
+        policy.update(main.nat_translation_replacements({
+            "nat_type": "ipv4", "to_interface": "ethernet1/2",
+            "source_translation_mode": "none", "source_translation_address": "",
+            "source_translation_interface": "", "destination_translation_address": "private",
+            "destination_translation_port": "9443",
+        }))
+        updated = main.ET.fromstring(main.update_xml_policy(policy))
+        self.assertEqual(updated.findtext("./service"), "tcp-443")
+        self.assertIsNone(updated.find("./service/member"))
+        self.assertEqual(updated.findtext("./to-interface"), "ethernet1/2")
+        self.assertEqual(updated.findtext("./destination-translation/translated-port"), "9443")
+        template = (pathlib.Path(main.__file__).parent / "templates" / "workspace_editor.html").read_text()
+        self.assertIn("Original Packet", template)
+        self.assertIn("Translated Packet", template)
+        self.assertIn('name="nat_translation_editor" value="yes"', template)
 
 
 if __name__ == "__main__":

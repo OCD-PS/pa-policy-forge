@@ -386,6 +386,9 @@ def _set_walk(node: ET.Element, tokens: list[str], lines: list[str]) -> None:
     if not children and text:
         lines.append("set " + " ".join(shlex.quote(part) for part in current + [text]))
         return
+    if not children and node.tag in {"layer3", "layer2", "virtual-wire", "tap", "tunnel", "external"}:
+        lines.append("set " + " ".join(shlex.quote(part) for part in current))
+        return
     for child in children:
         _set_walk(child, current, lines)
 
@@ -455,6 +458,25 @@ def _members(entry: ET.Element, field: str) -> list[str]:
     return [node.text or "" for node in entry.findall(f"./{field}/member") if node.text]
 
 
+def _xml_payload(node: ET.Element | None):
+    if node is None:
+        return {}
+    children = list(node)
+    if not children:
+        return (node.text or "").strip()
+    if all(child.tag == "member" for child in children):
+        return [(child.text or "").strip() for child in children if (child.text or "").strip()]
+    payload = {}
+    for child in children:
+        value = _xml_payload(child)
+        if child.tag in payload:
+            existing = payload[child.tag]
+            payload[child.tag] = existing + [value] if isinstance(existing, list) else [existing, value]
+        else:
+            payload[child.tag] = value
+    return payload
+
+
 def policy_record(entry: ET.Element, kind: str, owner: str, rulebase: str, editable: bool) -> dict:
     record = {
         "id": entry.get("name", ""), "name": entry.get("name", ""), "kind": kind, "owner": owner,
@@ -465,10 +487,45 @@ def policy_record(entry: ET.Element, kind: str, owner: str, rulebase: str, edita
         "log_setting": entry.findtext("./log-setting", ""),
         "profile_group": entry.findtext("./profile-setting/group/member", ""),
         "schedule": entry.findtext("./schedule", ""),
+        "_policy_kind": kind,
         "_xml": ET.tostring(entry, encoding="unicode"),
     }
     for field in POLICY_LIST_FIELDS:
         record[field.replace("-", "_")] = _members(entry, field)
+    if kind == "nat":
+        source_translation = _xml_payload(entry.find("./source-translation"))
+        destination_translation = _xml_payload(entry.find("./destination-translation"))
+        source_mode_raw = next(iter(source_translation), "none") if isinstance(source_translation, dict) else "none"
+        source_mode = source_mode_raw.replace("-", "_")
+        source_details = source_translation.get(source_mode_raw, {}) if source_mode != "none" else {}
+        if not isinstance(source_details, dict):
+            source_details = {"translated-address": source_details}
+        translated_address = source_details.get("translated-address", [])
+        if not isinstance(translated_address, list):
+            translated_address = [translated_address] if translated_address not in (None, "") else []
+        interface_address = source_details.get("interface-address", {})
+        if not isinstance(interface_address, dict):
+            interface_address = {}
+        source_address_text = ", ".join(str(value) for value in translated_address)
+        source_interface_text = str(interface_address.get("interface", "") or "")
+        destination_address_text = str(destination_translation.get("translated-address", "") or "") if isinstance(destination_translation, dict) else ""
+        destination_port_text = str(destination_translation.get("translated-port", "") or "") if isinstance(destination_translation, dict) else ""
+        service_node = entry.find("./service")
+        service_value = (service_node.findtext("./member", "") if service_node is not None and service_node.find("./member") is not None else entry.findtext("./service", "any")).strip() or "any"
+        record.update({
+            "service": [service_value],
+            "nat_type": entry.findtext("./nat-type", "ipv4") or "ipv4",
+            "to_interface": entry.findtext("./to-interface", "any") or "any",
+            "source_translation": source_translation if isinstance(source_translation, dict) else {},
+            "destination_translation": destination_translation if isinstance(destination_translation, dict) else {},
+            "source_translation_mode": source_mode,
+            "source_translation_address": source_address_text,
+            "source_translation_interface": source_interface_text,
+            "destination_translation_address": destination_address_text,
+            "destination_translation_port": destination_port_text,
+            "source_translation_summary": " · ".join(value for value in (source_mode.replace("_", " "), source_address_text, source_interface_text) if value) if source_mode != "none" else "—",
+            "destination_translation_summary": " · ".join(value for value in (destination_address_text, destination_port_text) if value) or "—",
+        })
     return record
 
 
@@ -624,6 +681,13 @@ def object_record(entry: ET.Element, owner: str, editable: bool, object_type: st
                 value = (child.text or "").strip()
                 details[child.tag.replace("-", "_")] = value == "yes" if child.tag == "override" else value
             record["protocol"] = {protocol: details}
+            port = str(details.get("port", "")).strip()
+            source_port = str(details.get("source_port", "")).strip()
+            rendered = f"{protocol.upper()}/{port}" if port else protocol.upper()
+            if source_port:
+                rendered += f" · source {source_port}"
+            record["summary"] = rendered
+            record["values"] = [rendered]
             break
     return record
 
@@ -905,6 +969,8 @@ def configuration_records(
                         summary_values.extend(field.get("values", [])[:3])
                     elif field["kind"] != "protected" and str(field.get("value", "")).strip():
                         summary_values.append(str(field["value"]).strip())
+                    elif section == "zones" and field.get("label", "").startswith("Network / "):
+                        summary_values.append(field["label"].rsplit(" / ", 1)[-1])
                     if len(summary_values) >= 3:
                         break
                 record = {

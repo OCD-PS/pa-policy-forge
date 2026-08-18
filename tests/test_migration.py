@@ -12,7 +12,7 @@ os.environ.setdefault("PPF_DATA_DIR", tempfile.mkdtemp(prefix="forge-migration-t
 os.environ.setdefault("PPF_SYSLOG_PORT", "55149")
 os.environ.setdefault("PPF_BOOTSTRAP_PASSWORD", "unit-test-bootstrap-password")
 
-from app.migration import Address, MigrationModel, PARSERS, MigrationError, apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, migration_base_xml, migration_collision_report, migration_review_findings, migration_zone_names, parse_vendor, panos_fragment, reconcile_model, scm_items, set_panos_ha_mode
+from app.migration import Address, MigrationModel, PARSERS, MigrationError, apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, migration_analysis, migration_base_xml, migration_collision_report, migration_review_findings, migration_zone_names, parse_vendor, panos_fragment, reconcile_model, scm_items, set_panos_ha_mode
 from app import main
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -85,6 +85,35 @@ class MigrationTests(unittest.TestCase):
         transformed=apply_transform_rules(model,[{"operation":"rename","kind":"addresses","selector":"old-server|||A","value":"new-server"}])
         self.assertEqual(transformed.addresses[0].name,"new-server")
 
+    def test_saved_transform_survives_import_editor_source_ref_change(self):
+        model=MigrationModel(
+            "merged",
+            "source",
+            addresses=[Address("old-server","10.0.0.3/32",source_ref="VSYS vsys1")],
+            address_groups=[main.AddressGroup("servers",["old-server"])],
+            security_rules=[main.Policy("allow-to-server",destination=["old-server"])],
+        )
+        transformed=apply_transform_rules(model,[{"operation":"rename","kind":"addresses","selector":"old-server|||line 3","value":"new-server"}])
+        self.assertEqual(transformed.addresses[0].name,"new-server")
+        self.assertEqual(transformed.address_groups[0].members,["new-server"])
+        self.assertEqual(transformed.security_rules[0].destination,["new-server"])
+
+    def test_saved_merge_choice_survives_import_editor_source_ref_change(self):
+        model=MigrationModel(
+            "merged",
+            "source",
+            services=[
+                main.Service("dns-a","udp","53",source_ref="VSYS vsys1"),
+                main.Service("dns-b","udp","53",source_ref="VSYS vsys1"),
+            ],
+            service_groups=[main.ServiceGroup("dns-services",["dns-a","dns-b"])],
+            security_rules=[main.Policy("allow-dns",service=["dns-b"])],
+        )
+        merged=apply_merge_rules(model,[{"kind":"services","master":"dns-a|||line 10","members":["dns-a|||line 10","dns-b|||line 20"]}])
+        self.assertEqual([item.name for item in merged.services],["dns-a"])
+        self.assertEqual(merged.service_groups[0].members,["dns-a"])
+        self.assertEqual(merged.security_rules[0].service,["dns-a"])
+
     def test_fortinet_objects_and_policy_map_to_neutral_model_and_scm(self):
         config = b'''config firewall address
 edit "web01"
@@ -115,6 +144,8 @@ end'''
         self.assertEqual([item["kind"] for item in mapped], ["addresses", "services", "policy:security", "policy:nat"])
         self.assertEqual(mapped[-2]["payload"]["from"], ["trust"])
         self.assertIn("source_translation", mapped[-1]["payload"])
+        review = migration_review_findings(model)
+        self.assertTrue(any(item["code"] == "nat-interface-mapping" and item["severity"] == "critical" for item in review["findings"]))
 
     def test_fortinet_vip_maps_to_destination_nat_for_scm(self):
         model = parse_vendor("fortinet", b'''config firewall vip
@@ -125,6 +156,7 @@ set mappedport 443
 next
 end''', "forti.conf")
         self.assertEqual(len(model.nat_rules), 1)
+        self.assertEqual(model.nat_rules[0].service, ["any"])
         nat_item = next(item for item in scm_items(model) if item["kind"] == "policy:nat")
         self.assertEqual(nat_item["payload"]["destination_translation"]["translated_port"], "443")
 
@@ -196,6 +228,21 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         self.assertEqual(review["status"], "review_required")
         self.assertTrue(any(item["code"] == "engineer-review" for item in review["findings"]))
         self.assertTrue(any(item["code"] == "zone-mapping" for item in review["findings"]))
+
+    def test_nat_translation_addresses_are_counted_as_used(self):
+        model = MigrationModel(
+            "fortinet",
+            "nat-source",
+            addresses=[Address("public-mapped", "10.0.0.10/32")],
+            nat_rules=[main.Policy(
+                "dnat",
+                policy_type="nat",
+                destination_translation={"translated_address": "public-mapped", "translated_port": "8443"},
+            )],
+        )
+        analysis = migration_analysis(model)
+        self.assertNotIn("public-mapped", analysis["unused_addresses"])
+        self.assertNotIn("public-mapped", analysis["unresolved_references"])
 
     def test_checkpoint_rich_export_maps_dual_stack_access_and_nat(self):
         source = (FIXTURES / "checkpoint-rich.json").read_bytes()
@@ -521,6 +568,11 @@ end''', "atlas-a.conf")
     def test_migration_routes_and_templates_are_protected_and_compile(self):
         main.app.jinja_env.get_template("migration.html")
         main.app.jinja_env.get_template("migration_preview.html")
+        project_source, _, _ = main.app.jinja_env.loader.get_source(main.app.jinja_env, "migration.html")
+        self.assertIn("output.sanity.superseded", project_source)
+        self.assertIn("Er is een nieuwere candidate beschikbaar.", project_source)
+        preview_source, _, _ = main.app.jinja_env.loader.get_source(main.app.jinja_env, "migration_preview.html")
+        self.assertIn('name="review_acknowledged"', preview_source)
         client = main.app.test_client()
         for path in ("/migration", "/migration/projects/1"):
             response = client.get(path, base_url="https://forge.test")
@@ -588,6 +640,9 @@ end''', "atlas-a.conf")
         self.assertEqual(accepted.status_code, 302)
         with main.db() as conn:
             self.assertGreater(conn.execute("SELECT COUNT(*) FROM config_workspaces WHERE profile_id=?", (profile_id,)).fetchone()[0], before)
+            output = conn.execute("SELECT * FROM migration_outputs WHERE project_id=?", (project_id,)).fetchone()
+        self.assertIsNotNone(output)
+        self.assertIn("PAN-OS candidate", output["label"])
         self.assertFalse(draft_path.exists())
 
     def test_central_scm_application_catalog_settings_are_encrypted_and_reused(self):
@@ -625,8 +680,9 @@ end''', "atlas-a.conf")
         settings = main.application_catalog_configuration()
         self.assertEqual(settings["item_count"], 2)
         self.assertFalse(settings["last_error"])
-        with patch("app.main.refresh_catalog_async"):
+        with patch("app.main.refresh_catalog_async") as refresh:
             catalog = main.cached_application_catalog({"id": 987654, "target_type": "panos"})
+        refresh.assert_not_called()
         self.assertEqual([item["name"] for item in catalog["items"]], ["ssl", "web-browsing"])
 
     def test_imported_vendor_source_opens_full_workspace_editor_and_syncs_back(self):
@@ -690,11 +746,12 @@ end''', "editable-fortigate.conf")
         self.assertIn("+ Add", object_page)
         self.assertIn("− Delete", object_page)
 
-        preview = client.post(
+        saved = client.post(
             f"/config-workspaces/{workspace_id}/policies/preview",
             base_url="https://forge.test",
             data={
                 "csrf": "migration-test-csrf", "scope": "vsys1",
+                "direct_save": "yes",
                 "policy_kind": "security", "rulebase": "standard",
                 "policy_name": "allow-web", "name": "allow-web-edited",
                 "from": "Trust", "to": "DMZ", "source": "any",
@@ -705,15 +762,7 @@ end''', "editable-fortigate.conf")
                 "description": "edited before migration merge",
             },
         )
-        self.assertEqual(preview.status_code, 200)
-        draft_path = max(main.POLICY_DRAFTS.glob("offline-*.json"), key=lambda path: path.stat().st_mtime_ns)
-        draft_id = draft_path.stem.removeprefix("offline-")
-        applied = client.post(
-            f"/config-workspaces/policy-drafts/{draft_id}/apply",
-            base_url="https://forge.test",
-            data={"csrf": "migration-test-csrf"},
-        )
-        self.assertEqual(applied.status_code, 302)
+        self.assertEqual(saved.status_code, 302)
         with main.db() as conn:
             edited_source = conn.execute("SELECT * FROM migration_sources WHERE id=?", (source_id,)).fetchone()
         edited_workspace_id = int(edited_source["staging_workspace_id"])
@@ -841,6 +890,14 @@ end''', "editable-fortigate.conf")
         self.assertIn("Nieuwe configuratie (vanaf nul)", page)
         self.assertNotIn("Interfaces en zones zijn beschikbaar", page)
         self.assertNotIn("standaard alles geselecteerd", page)
+        cleared = client.post(
+            f"/migration/projects/{project_id}/base",
+            base_url="https://forge.test",
+            data={"csrf": "migration-test-csrf", "base_workspace_id": ""},
+        )
+        self.assertEqual(cleared.status_code, 302)
+        with main.db() as conn:
+            self.assertIsNone(conn.execute("SELECT base_workspace_id FROM migration_projects WHERE id=?", (project_id,)).fetchone()["base_workspace_id"])
 
 
 if __name__ == "__main__":

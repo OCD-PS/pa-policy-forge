@@ -376,7 +376,7 @@ class FortinetParser(BaseParser):
                     model.addresses.extend([Address(external, cidr(external_value[0] + ("/32" if "/" not in external_value[0] else "")), source_ref=ref), Address(mapped, cidr(mapped_value[0] + ("/32" if "/" not in mapped_value[0] else "")), source_ref=ref)])
                     translation = {"translated_address": mapped}
                     if values.get("mappedport"): translation["translated_port"] = values["mappedport"]
-                    model.nat_rules.append(Policy(clean_name(f"NAT-{current}"), policy_type="nat", from_zones=split_forti(values.get("extintf", "any"), any_alias="any"), destination=[external], destination_translation=translation, description=f"Imported Fortinet VIP {current}", source_ref=ref, original=dict(values)))
+                    model.nat_rules.append(Policy(clean_name(f"NAT-{current}"), policy_type="nat", from_zones=split_forti(values.get("extintf", "any"), any_alias="any"), destination=[external], service=["any"], destination_translation=translation, description=f"Imported Fortinet VIP {current}", source_ref=ref, original=dict(values)))
                 else:
                     model.unsupported.append(f"{ref}: VIP {current} mist extip/mappedip en vereist review")
             current = None; values = {}
@@ -1161,6 +1161,29 @@ def item_selector(item: dict) -> str:
     return f"{item.get('name','')}|||{item.get('source_ref','')}"
 
 
+def selector_item(collection: list, selector: str):
+    """Resolve a saved selector after an import workspace changed provenance.
+
+    Editing a vendor import through the PAN-OS workspace intentionally changes
+    ``source_ref`` (for example from ``line 3`` to ``VSYS vsys1``).  The item
+    name remains a safe fallback only when it is unique inside its collection.
+    Ambiguous same-name collisions still require an explicit new choice.
+    """
+    exact = []
+    for item in collection:
+        raw = asdict(item) if hasattr(item, "__dataclass_fields__") else item
+        if item_selector(raw) == selector:
+            exact.append(item)
+    if len(exact) == 1:
+        return exact[0]
+    name = selector.split("|||", 1)[0]
+    matches = [
+        item for item in collection
+        if (item.name if hasattr(item, "name") else str(item.get("name", ""))) == name
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def migration_item_semantic(item) -> str:
     """Stable value comparison that deliberately ignores source provenance."""
     raw = asdict(item) if hasattr(item, "__dataclass_fields__") else dict(item)
@@ -1296,30 +1319,33 @@ def apply_merge_rules(model: MigrationModel, rules: list[dict]) -> MigrationMode
     for rule in rules:
         master_selector=str(rule.get("master", "")); members=unique(rule.get("members", [])); kind=str(rule.get("kind", ""))
         collection=model_collections(result).get(kind,[])
-        master_item=next((item for item in collection if item_selector(asdict(item) if hasattr(item,"__dataclass_fields__") else item)==master_selector),None)
+        master_item=selector_item(collection,master_selector)
         master=(master_item.name if hasattr(master_item,"name") else str(master_item.get("name",""))) if master_item is not None else ""
         if not master or not members or kind not in model_collections(result): continue
+        member_items=[]
         for selector in members:
-            name=selector.split("|||",1)[0]
-            if name != master: rename[name]=master
+            resolved=selector_item(collection,selector)
+            if resolved is not None and all(resolved is not item for item in member_items): member_items.append(resolved)
+        member_ids={id(item) for item in member_items}
+        for item in member_items:
+            name=item.name if hasattr(item,"name") else str(item.get("name",""))
+            if item is not master_item and name != master: rename[name]=master
         filtered=[]; master_seen=False
         for item in collection:
-            name=item.name if hasattr(item,"name") else str(item.get("name", ""))
-            selector=item_selector(asdict(item) if hasattr(item,"__dataclass_fields__") else item)
-            if selector == master_selector:
+            if item is master_item:
                 if master_seen: continue
                 master_seen=True; filtered.append(item)
-            elif selector in members: continue
+            elif id(item) in member_ids: continue
             else: filtered.append(item)
         if kind in result.extras: result.extras[kind]=filtered
         else: setattr(result,kind,filtered)
     if not rename: return result
-    for group in result.address_groups: group.members=[rename.get(value,value) for value in group.members]
-    for group in result.service_groups: group.members=[rename.get(value,value) for value in group.members]
+    for group in result.address_groups: group.members=unique(rename.get(value,value) for value in group.members)
+    for group in result.service_groups: group.members=unique(rename.get(value,value) for value in group.members)
     for attr in ("security_rules","nat_rules"):
         for policy in getattr(result,attr):
             for field_name in ("source","destination","service","application","tags"):
-                setattr(policy,field_name,[rename.get(value,value) for value in getattr(policy,field_name)])
+                setattr(policy,field_name,unique(rename.get(value,value) for value in getattr(policy,field_name)))
     for kind, items in result.extras.items():
         for item in items:
             try:
@@ -1337,9 +1363,8 @@ def apply_transform_rules(model: MigrationModel, rules: list[dict]) -> Migration
         operation=str(rule.get("operation","")); kind=str(rule.get("kind","")); selector=str(rule.get("selector","")); value=str(rule.get("value",""))
         collection=model_collections(result).get(kind,[])
         if operation in {"rename","delete","disable","enable"}:
-            for item in list(collection):
-                raw=asdict(item) if hasattr(item,"__dataclass_fields__") else item
-                if item_selector(raw)!=selector: continue
+            item=selector_item(collection,selector)
+            if item is not None:
                 old=item.name if hasattr(item,"name") else str(item.get("name",""))
                 if operation=="delete": collection.remove(item)
                 elif operation=="rename" and value:
@@ -1354,12 +1379,12 @@ def apply_transform_rules(model: MigrationModel, rules: list[dict]) -> Migration
         elif operation=="replace_reference" and selector and value:
             replacements[selector]=value
     if replacements:
-        for group in result.address_groups: group.members=[replacements.get(v,v) for v in group.members]
-        for group in result.service_groups: group.members=[replacements.get(v,v) for v in group.members]
+        for group in result.address_groups: group.members=unique(replacements.get(v,v) for v in group.members)
+        for group in result.service_groups: group.members=unique(replacements.get(v,v) for v in group.members)
         for attr in ("security_rules","nat_rules"):
             for policy in getattr(result,attr):
                 for field_name in ("from_zones","to_zones","source","destination","service","application","tags"):
-                    setattr(policy,field_name,[replacements.get(v,v) for v in getattr(policy,field_name)])
+                    setattr(policy,field_name,unique(replacements.get(v,v) for v in getattr(policy,field_name)))
         for items in result.extras.values():
             for item in items:
                 try:
@@ -1383,11 +1408,26 @@ def migration_analysis(model: MigrationModel) -> dict:
     address_names={item.name for item in model.addresses}; service_names={item.name for item in model.services}
     group_names={item.name for item in model.address_groups}; service_group_names={item.name for item in model.service_groups}
     used_addresses=set(); used_services=set(); unresolved=set(); duplicate_rules=[]; rule_signatures={}
+
+    def translation_addresses(value) -> list[str]:
+        found=[]
+        if not isinstance(value,dict): return found
+        for key,child in value.items():
+            normalized=str(key).replace("-","_")
+            if normalized=="translated_address":
+                if isinstance(child,list): found.extend(str(item) for item in child if str(item))
+                elif child not in (None,""): found.append(str(child))
+            elif isinstance(child,dict): found.extend(translation_addresses(child))
+        return found
+
     for group in model.address_groups: used_addresses.update(group.members)
     for group in model.service_groups: used_services.update(group.members)
     for attr in ("security_rules","nat_rules"):
         for rule in getattr(model,attr):
             used_addresses.update(value for value in rule.source+rule.destination if value!="any")
+            if attr=="nat_rules":
+                used_addresses.update(translation_addresses(rule.source_translation))
+                used_addresses.update(translation_addresses(rule.destination_translation))
             used_services.update(value for value in rule.service if value not in {"any","application-default"})
             signature=json.dumps({
                 "policy_type":rule.policy_type,"from":rule.from_zones,"to":rule.to_zones,
@@ -1473,6 +1513,27 @@ def migration_review_findings(model: MigrationModel) -> dict:
             "warning", "nat-review", "NAT handmatig valideren",
             "Controleer volgorde, interfaces, vertaalmethode, adressen en poorten op het doel.", len(model.nat_rules),
         )
+        known_interfaces = {
+            str(item.get("name", "")).strip()
+            for item in model.interfaces
+            if str(item.get("name", "")).strip()
+        }
+        missing_nat_interfaces = []
+        for rule in model.nat_rules:
+            translation = rule.source_translation or {}
+            mode = next(iter(translation), "")
+            details = translation.get(mode, {}) if isinstance(translation, dict) else {}
+            interface_address = details.get("interface_address") or details.get("interface-address") or {} if isinstance(details, dict) else {}
+            interface_name = str(interface_address.get("interface", "") or "").strip() if isinstance(interface_address, dict) else ""
+            if interface_name and interface_name not in known_interfaces:
+                missing_nat_interfaces.append(f"{rule.name}: {interface_name}")
+        if missing_nat_interfaces:
+            analysis["unresolved_nat_interfaces"] = missing_nat_interfaces
+            add(
+                "critical", "nat-interface-mapping", "NAT-interface ontbreekt",
+                "Een source-NAT interface-address verwijst niet naar een gemigreerde PAN-OS-interface. Map eerst de doelinterface.",
+                len(missing_nat_interfaces),
+            )
 
     duplicate_rules = len(analysis["duplicate_rules"])
     if duplicate_rules:

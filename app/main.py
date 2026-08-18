@@ -1294,6 +1294,23 @@ def application_cache_path(profile_id: int) -> Path:
     return OBJECT_CACHE / f"{int(profile_id)}-applications-v2.json"
 
 
+def profile_has_live_application_source(profile) -> bool:
+    """Avoid a failing device refresh for imported/offline workspaces."""
+    try:
+        secret = profile["secret_blob"]
+    except (KeyError, IndexError):
+        secret = b""
+    if not secret:
+        return False
+    if profile["target_type"] == "scm":
+        return True
+    try:
+        settings = json.loads(profile["settings_json"] or "{}")
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+        return False
+    return bool(str(settings.get("endpoint", "")).strip())
+
+
 def cached_application_catalog(profile) -> dict:
     profile_id = int(profile["id"])
     cache_path = application_cache_path(profile_id)
@@ -1302,7 +1319,8 @@ def cached_application_catalog(profile) -> dict:
         try: items = json.loads(cache_path.read_text())
         except (OSError, json.JSONDecodeError): items = []
     stale = not cache_path.exists() or time.time() - cache_path.stat().st_mtime >= 1800
-    if stale: refresh_catalog_async(profile, "applications", cache_path)
+    if stale and profile_has_live_application_source(profile):
+        refresh_catalog_async(profile, "applications", cache_path)
     with _catalog_refresh_lock:
         refreshing = (profile_id, "applications") in _catalog_refreshing
         error = _catalog_errors.get((profile_id, "applications"), "")
@@ -1606,6 +1624,7 @@ def update_xml_policy(policy: dict) -> str:
             value = policy[field]
             if field == "service" and isinstance(value, list): value = value[0] if value else "any"
             if node is None: node = ET.SubElement(entry, tag)
+            node.clear()
             node.text = str(value)
         for field in ("source_translation", "destination_translation"):
             if field not in policy: continue
@@ -1650,7 +1669,12 @@ def _append_xml_payload(parent: ET.Element, value) -> None:
 def nat_translation_replacements(form) -> dict:
     mode = form.get("source_translation_mode", "none").strip()
     source_address = split_values(form.get("source_translation_address", ""))
-    source_interface = form.get("source_translation_interface", "").strip()
+    source_interfaces = split_values(form.get("source_translation_interface", ""))
+    to_interfaces = split_values(form.get("to_interface", ""))
+    destination_addresses = split_values(form.get("destination_translation_address", ""))
+    if len(source_interfaces) > 1 or len(to_interfaces) > 1 or len(destination_addresses) > 1:
+        raise ValueError("NAT-interface en destination translation accepteren elk maximaal één waarde")
+    source_interface = source_interfaces[0] if source_interfaces else ""
     if mode == "none":
         source_translation = {}
     elif mode in {"dynamic_ip", "static_ip"}:
@@ -1660,7 +1684,7 @@ def nat_translation_replacements(form) -> dict:
         source_translation = {mode: details}
     else:
         raise ValueError("Onbekend source translation type")
-    destination_address = form.get("destination_translation_address", "").strip()
+    destination_address = destination_addresses[0] if destination_addresses else ""
     destination_port = form.get("destination_translation_port", "").strip()
     destination_translation = {}
     if destination_address: destination_translation["translated_address"] = destination_address
@@ -1669,7 +1693,7 @@ def nat_translation_replacements(form) -> dict:
         destination_translation["translated_port"] = int(destination_port)
     return {
         "nat_type": form.get("nat_type", "ipv4").strip() or "ipv4",
-        "to_interface": form.get("to_interface", "any").strip() or "any",
+        "to_interface": to_interfaces[0] if to_interfaces else "any",
         "source_translation": source_translation,
         "destination_translation": destination_translation,
     }
@@ -1752,6 +1776,24 @@ def workspace_version_source(workspace) -> str:
         if str(workspace["source"]) in {"migration-staging", "migration-import", "migration-api"}
         else "edit"
     )
+
+
+def store_workspace_edit_version(workspace, new_xml: bytes, label: str) -> int:
+    """Store one immutable edit and advance any linked migration staging source."""
+    with db() as conn:
+        profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+    if not profile:
+        raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
+    new_id = store_config_workspace(
+        profile,
+        f"{workspace['name']} · {label} {now()}",
+        workspace["original_name"],
+        new_xml,
+        workspace_version_source(workspace),
+    )
+    if not advance_migration_staging_workspace(workspace["id"], new_id):
+        set_active_config_workspace(workspace["profile_id"], new_id)
+    return new_id
 
 
 def store_migration_output(
@@ -2291,6 +2333,8 @@ def config_workspace_editor(workspace_id):
             zone_inventory = configuration_inventory(xml_bytes, scope, policy_zone_template, parsed=(parsed_root, snapshot))["network"] if (snapshot.kind != "panorama" or policy_zone_template) else []
             zones = next((item.get("names", []) for item in zone_inventory if item["name"] == "Zones"), [])
             workspace_policy_catalog.extend({"name": name, "kind": "zones"} for name in zones)
+            interfaces = next((item.get("names", []) for item in zone_inventory if item["name"] == "Interfaces"), [])
+            workspace_policy_catalog.extend({"name": name, "kind": "interfaces"} for name in interfaces)
             application_state = cached_application_catalog(workspace_profile)
             existing_applications = {item["name"] for item in workspace_policy_catalog if item["kind"] == "applications"}
             workspace_policy_catalog.extend(item for item in application_state["items"] if item["name"] not in existing_applications)
@@ -2383,9 +2427,23 @@ def config_workspace_policy_preview(workspace_id):
         updated["profile_group"] = request.form.get("profile_group", "").strip()
         updated["schedule"] = request.form.get("schedule", "").strip()
         updated["disabled"] = request.form.get("disabled") == "yes"
+        if kind == "nat" and request.form.get("nat_translation_editor") == "yes":
+            updated.update(nat_translation_replacements(request.form))
         replacement_xml = update_xml_policy(updated)
         if replacement_xml == before["_xml"]:
             raise OfflineConfigError("Er zijn geen wijzigingen om te bewaren")
+        if request.form.get("direct_save") == "yes":
+            new_xml = replace_policy_in_snapshot(
+                workspace_config_path(workspace).read_bytes(), scope, kind, rulebase,
+                name, offline_policy_fingerprint(before), replacement_xml,
+            )
+            new_id = store_workspace_edit_version(workspace, new_xml, "policy edit")
+            audit("config-workspace-policy-edited", f"source={workspace['id']} workspace={new_id} scope={scope} policy={name}")
+            flash("Policy bewaard in een nieuwe workspaceversie.", "success")
+            return redirect(url_for(
+                "config_workspace_editor", workspace_id=new_id, scope=scope,
+                workspace_view="policies", policy_kind=kind, rulebase=rulebase,
+            ))
         draft_id = secrets.token_urlsafe(24)
         draft = {
             "workspace_id": workspace_id, "scope": scope, "kind": kind,
@@ -2436,6 +2494,20 @@ def config_workspace_policy_bulk_preview(workspace_id):
                 })
         if not changes:
             raise OfflineConfigError("De gekozen bulkbewerking veroorzaakt geen wijzigingen")
+        if request.form.get("direct_save") == "yes":
+            new_xml = workspace_config_path(workspace).read_bytes()
+            for change in changes:
+                new_xml = replace_policy_in_snapshot(
+                    new_xml, scope, kind, rulebase, change["policy_name"],
+                    change["fingerprint"], change["replacement_xml"],
+                )
+            new_id = store_workspace_edit_version(workspace, new_xml, "bulk edit")
+            audit("config-workspace-policy-bulk-edited", f"source={workspace['id']} workspace={new_id} scope={scope} rules={len(changes)}")
+            flash(f"{len(changes)} policies bewaard in een nieuwe workspaceversie.", "success")
+            return redirect(url_for(
+                "config_workspace_editor", workspace_id=new_id, scope=scope,
+                workspace_view="policies", policy_kind=kind, rulebase=rulebase,
+            ))
         draft_id = secrets.token_urlsafe(24)
         draft = {"workspace_id": workspace_id, "scope": scope, "kind": kind, "rulebase": rulebase, "changes": changes, "created_at": now()}
         draft_path = POLICY_DRAFTS / f"offline-bulk-{draft_id}.json"
@@ -2576,6 +2648,17 @@ def config_workspace_object_preview(workspace_id):
                 }),
             }], "created_at": now(),
         }
+        if request.form.get("direct_save") == "yes":
+            new_xml = apply_object_changes(
+                workspace_config_path(workspace).read_bytes(), scope, object_type, draft["changes"],
+            )
+            new_id = store_workspace_edit_version(workspace, new_xml, "object edit")
+            audit("config-workspace-object-edited", f"source={workspace['id']} workspace={new_id} scope={scope} type={object_type} operation={operation}")
+            flash("Objectwijziging bewaard in een nieuwe workspaceversie.", "success")
+            return redirect(url_for(
+                "config_workspace_editor", workspace_id=new_id, scope=scope,
+                workspace_view="objects", object_type=object_type,
+            ))
         draft_path = OBJECT_DRAFTS / f"offline-object-{draft_id}.json"
         draft_path.write_text(json.dumps(draft)); draft_path.chmod(0o600)
         return render_template("workspace_object_preview.html", workspace=workspace, draft=draft, draft_id=draft_id)
@@ -2609,6 +2692,17 @@ def config_workspace_object_delete_preview(workspace_id):
             "workspace_id": workspace_id, "scope": scope, "object_type": object_type,
             "operation": "delete", "objects": selected, "changes": changes, "created_at": now(),
         }
+        if request.form.get("direct_save") == "yes":
+            new_xml = apply_object_changes(
+                workspace_config_path(workspace).read_bytes(), scope, object_type, changes,
+            )
+            new_id = store_workspace_edit_version(workspace, new_xml, "object delete")
+            audit("config-workspace-object-edited", f"source={workspace['id']} workspace={new_id} scope={scope} type={object_type} operation=delete")
+            flash(f"{len(selected)} objecten verwijderd in een nieuwe workspaceversie.", "success")
+            return redirect(url_for(
+                "config_workspace_editor", workspace_id=new_id, scope=scope,
+                workspace_view="objects", object_type=object_type,
+            ))
         draft_path = OBJECT_DRAFTS / f"offline-object-{draft_id}.json"
         draft_path.write_text(json.dumps(draft)); draft_path.chmod(0o600)
         return render_template("workspace_object_preview.html", workspace=workspace, draft=draft, draft_id=draft_id)
@@ -3161,7 +3255,7 @@ def migration_project(project_id):
         source_rows = conn.execute("SELECT * FROM migration_sources WHERE project_id=? ORDER BY id", (project_id,)).fetchall()
         profiles = conn.execute("SELECT id,name,target_type FROM profiles ORDER BY name").fetchall()
         workspaces = conn.execute("SELECT id,name,source,created_at FROM config_workspaces WHERE profile_id=? ORDER BY id DESC", (project["target_profile_id"],)).fetchall()
-        output_rows = conn.execute("SELECT * FROM migration_outputs WHERE project_id=? ORDER BY id", (project_id,)).fetchall()
+        output_rows = conn.execute("SELECT * FROM migration_outputs WHERE project_id=? ORDER BY id DESC", (project_id,)).fetchall()
     sources = []
     for row in source_rows:
         source = dict(row); source["counts"] = json.loads(row["counts_json"]); source["messages"] = json.loads(row["warnings_json"]); sources.append(source)
@@ -3373,7 +3467,7 @@ def migration_base_select(project_id):
     project = migration_project_row(project_id)
     if not project: return "Not found", 404
     try:
-        workspace_id = int(request.form.get("base_workspace_id", "0"))
+        workspace_id = int(request.form.get("base_workspace_id", "0") or 0)
         with db() as conn:
             if workspace_id and not conn.execute("SELECT 1 FROM config_workspaces WHERE id=? AND profile_id=?", (workspace_id, project["target_profile_id"])).fetchone(): raise MigrationError("Base-workspace hoort niet bij het target")
             conn.execute("UPDATE migration_projects SET base_workspace_id=?,updated_at=? WHERE id=?", (workspace_id or None, now(), project_id))
@@ -3534,6 +3628,41 @@ def migration_merge_apply(draft_id):
             outcome = f"{count} configuratie-items naar SCM candidate geschreven"
         else:
             workspace_id, plan = create_merged_workspace(profile, project, model)
+            analysis = migration_analysis(model)
+            output_id = store_migration_output(
+                int(project["id"]),
+                workspace_id,
+                f"{project['name']} · PAN-OS candidate",
+                str(project["topology"] or "active-passive"),
+                sanity={
+                    "unresolved_references": len(analysis["unresolved_references"]),
+                    "duplicate_rules": len(analysis["duplicate_rules"]),
+                    "unused_objects": sum(
+                        len(analysis[key])
+                        for key in (
+                            "unused_addresses",
+                            "unused_address_groups",
+                            "unused_services",
+                            "unused_service_groups",
+                        )
+                    ),
+                    "critical_findings": int(review["critical"]),
+                    "review_warnings": int(review["warnings"]),
+                    "regenerate_required": False,
+                },
+            )
+            with db() as conn:
+                older_outputs = conn.execute(
+                    "SELECT id,sanity_json FROM migration_outputs WHERE project_id=? AND id<>?",
+                    (project["id"], output_id),
+                ).fetchall()
+                for older in older_outputs:
+                    older_sanity = json.loads(older["sanity_json"] or "{}")
+                    older_sanity.update({"regenerate_required": True, "superseded": True})
+                    conn.execute(
+                        "UPDATE migration_outputs SET sanity_json=? WHERE id=?",
+                        (json.dumps(older_sanity, sort_keys=True), older["id"]),
+                    )
             count = int(plan["create"])
             outcome = f"Werkruimte #{workspace_id} met {count} nieuwe configuratie-items gemaakt en geselecteerd"
         path.unlink(missing_ok=True)

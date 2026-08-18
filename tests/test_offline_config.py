@@ -52,6 +52,8 @@ class OfflineConfigTests(unittest.TestCase):
         commands = render_set_commands(PANOS)
         self.assertIn("set vsys vsys1 zone Trust", commands)
         self.assertIn("set vsys vsys1 rulebase security rules allow-web from Trust", commands)
+        layer3 = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><zone><entry name="Trust"><network><layer3/></network></entry></zone></entry></vsys></entry></devices></config>'''
+        self.assertIn("set vsys vsys1 zone Trust network layer3", render_set_commands(layer3))
 
     def test_scope_inventory_and_panorama_inheritance(self):
         _, snapshot = parse_snapshot(INHERITED)
@@ -206,6 +208,17 @@ class OfflineConfigTests(unittest.TestCase):
             "operation": "delete", "original_name": "new", "fingerprint": object_fingerprint(new),
         }])
         self.assertNotIn(b'<entry name="new">', deleted)
+
+    def test_service_inventory_shows_protocol_and_ports(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><service><entry name="web-alt"><protocol><tcp><source-port>1024-65535</source-port><port>8443</port></tcp></protocol></entry></service><rulebase/></entry></vsys></entry></devices></config>'''
+        _, services = scoped_objects(source, "vsys1", "services")
+        self.assertEqual(services[0]["values"], ["TCP/8443 · source 1024-65535"])
+        self.assertEqual(services[0]["summary"], "TCP/8443 · source 1024-65535")
+
+    def test_zone_inventory_shows_empty_layer3_type(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><network/><vsys><entry name="vsys1"><zone><entry name="Trust"><network><layer3/></network></entry></zone></entry></vsys></entry></devices></config>'''
+        _, zones = configuration_records(source, "vsys1", "", "network", "zones")
+        self.assertEqual(zones[0]["summary"], "Layer3")
 
     def test_generic_object_editor_updates_nested_fields_without_raw_xml_loss(self):
         source = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><region><entry name="Belgium" code="be"><address><member>192.0.2.0/24</member><member>198.51.100.0/24</member></address><enabled>yes</enabled><nested preserve="true"><label>old</label></nested></entry></region></entry></vsys></entry></devices></config>'''
