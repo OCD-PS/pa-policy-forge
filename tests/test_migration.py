@@ -747,6 +747,37 @@ end''', "atlas-a.conf")
         self.assertIn("Migratieprojecten", page)
         self.assertNotIn("Expedition-inspired", page)
 
+    def test_migration_project_renders_refreshed_catalogs(self):
+        stamp = main.now()
+        with main.db() as conn:
+            profile_id = conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("PANOS catalog render test", "panos", json.dumps({"vsys": "vsys1"}), stamp, stamp),
+            ).lastrowid
+            project_id = conn.execute(
+                "INSERT INTO migration_projects(name,target_profile_id,created_at,updated_at) VALUES(?,?,?,?)",
+                ("catalog-render", profile_id, stamp, stamp),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO migration_catalogs(project_id,kind,items_json,updated_at) VALUES(?,?,?,?)",
+                (project_id, "applications", json.dumps([{"name": "ssl"}]), stamp),
+            )
+        client = main.app.test_client()
+        with main.app.test_request_context("/", base_url="https://forge.test"):
+            cookie_name = main.app.config["SESSION_COOKIE_NAME"]
+            serializer = main.app.session_interface.get_signing_serializer(main.app)
+            client.set_cookie(
+                cookie_name,
+                serializer.dumps({"user_id": 1, "username": "admin", "csrf": "migration-test-csrf"}),
+                domain="forge.test",
+                secure=True,
+            )
+        response = client.get(f"/migration/projects/{project_id}", base_url="https://forge.test")
+        self.assertEqual(response.status_code, 200)
+        page = response.get_data(as_text=True)
+        self.assertIn("Applications", page)
+        self.assertIn("· 1", page)
+
     def test_candidate_apply_is_blocked_server_side_without_review_acknowledgement(self):
         stamp = main.now()
         with main.db() as conn:
