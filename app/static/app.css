@@ -91,6 +91,7 @@ h3 { margin-bottom: 10px; font-size: 16px; }
 .config-tree details > a.active { border-left: 3px solid var(--orange); background: var(--orange-soft); color: #fff; font-weight: 750; }
 .config-tree details > a.indented { padding-left: 34px; font-size: 12px; }
 .config-tree-disabled { color: #666; cursor: not-allowed; }
+.config-tree-group { display: block; padding: 12px 10px 5px 18px; color: var(--orange); font-size: .76rem; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
 .config-tree.is-collapsed { width: 58px; overflow: hidden; }
 .config-tree.is-collapsed strong, .config-tree.is-collapsed details { display: none; }
 .config-workspace-shell:has(.config-tree.is-collapsed) { grid-template-columns: 58px minmax(0,1fr); }

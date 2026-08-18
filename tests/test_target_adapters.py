@@ -424,6 +424,38 @@ class TargetAdapterTests(unittest.TestCase):
                 self.assertTrue(record["edit_fields"])
                 self.assertEqual(record["_raw"]["folder"], "Branch")
 
+    def test_reference_catalog_keeps_partial_results_when_one_endpoint_is_forbidden(self):
+        profile = {"id": 991122, "target_type": "scm"}
+        cache_paths = [
+            main.OBJECT_CACHE / f"{profile['id']}-{kind}.json"
+            for kind in (
+                "syslog-server-profiles", "email-server-profiles",
+                "snmp-trap-server-profiles", "http-server-profiles", "tags",
+            )
+        ]
+        for path in cache_paths:
+            path.unlink(missing_ok=True)
+
+        def fetch(_profile, kind):
+            if kind == "email-server-profiles":
+                raise RuntimeError("forbidden")
+            if kind == "log-forwarding":
+                return []
+            return [{"name": f"{kind}-ok"}]
+
+        try:
+            with patch.object(main, "fetch_scm_objects", side_effect=fetch):
+                catalog = main.fetch_object_catalog(profile, "log-forwarding")
+            kinds = {item["kind"] for item in catalog}
+            self.assertIn("syslog-server-profiles", kinds)
+            self.assertIn("snmp-trap-server-profiles", kinds)
+            self.assertIn("http-server-profiles", kinds)
+            self.assertIn("tags", kinds)
+            self.assertNotIn("email-server-profiles", kinds)
+        finally:
+            for path in cache_paths:
+                path.unlink(missing_ok=True)
+
     def test_workspace_generic_add_uses_server_side_create_schema(self):
         template = (main.BASE / "app" / "templates" / "workspace_editor.html").read_text()
         javascript = (main.BASE / "app" / "static" / "app.js").read_text()

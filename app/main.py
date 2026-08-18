@@ -1488,9 +1488,11 @@ def fetch_object_catalog(profile, object_type: str) -> list[dict]:
         if kind in {"interfaces", "zone-protection-profiles"}:
             try:
                 catalog.extend(fetch_network_reference_catalog(profile, kind))
-            except Exception:
-                if object_type != "policy-picker":
-                    raise
+            except Exception as exc:
+                app.logger.warning(
+                    "reference catalog unavailable for profile=%s kind=%s error=%s",
+                    profile["id"], kind, type(exc).__name__,
+                )
             continue
         cache_path = application_cache_path(profile["id"]) if kind == "applications" else OBJECT_CACHE / f"{profile['id']}-{kind}.json"
         cached = None
@@ -1504,8 +1506,13 @@ def fetch_object_catalog(profile, object_type: str) -> list[dict]:
             try:
                 cached = fetch_scm_objects(profile, kind)
                 cache_path.write_text(json.dumps(cached)); cache_path.chmod(0o600)
-            except Exception:
-                if cached is None and object_type != "policy-picker": raise
+            except Exception as exc:
+                app.logger.warning(
+                    "reference catalog unavailable for profile=%s kind=%s error=%s",
+                    profile["id"], kind, type(exc).__name__,
+                )
+                if cached is None:
+                    cached = []
         cached = cached or []
         catalog.extend({"name": item.get("name", ""), "kind": kind} for item in cached if item.get("name"))
     if object_type == "log-forwarding":
