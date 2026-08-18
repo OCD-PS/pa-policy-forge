@@ -1,6 +1,7 @@
 import json
 import io
 import os
+import re
 import tarfile
 import tempfile
 import unittest
@@ -1251,6 +1252,132 @@ end''', "editable-fortigate.conf")
         self.assertIn('name="force_disable_policies"', page)
         self.assertNotIn('name="force_disable_policies" value="yes" checked', page)
         self.assertIn("hun enabled/disabled-status uit de bronconfiguratie behouden", page)
+
+    def test_offline_project_builds_candidate_without_device_and_can_attach_target(self):
+        client = main.app.test_client()
+        with main.app.test_request_context("/", base_url="https://forge.test"):
+            serializer = main.app.session_interface.get_signing_serializer(main.app)
+            client.set_cookie(
+                main.app.config["SESSION_COOKIE_NAME"],
+                serializer.dumps({"user_id": 1, "username": "admin", "csrf": "migration-test-csrf"}),
+                domain="forge.test", secure=True,
+            )
+
+        created = client.post(
+            "/migration/projects", base_url="https://forge.test",
+            data={"csrf": "migration-test-csrf", "name": "offline-no-device", "target_profile_id": "offline-panos"},
+        )
+        self.assertEqual(created.status_code, 302)
+        with main.db() as conn:
+            project = conn.execute(
+                "SELECT migration_projects.*,profiles.system,profiles.target_type FROM migration_projects "
+                "JOIN profiles ON profiles.id=migration_projects.target_profile_id WHERE migration_projects.name=?",
+                ("offline-no-device",),
+            ).fetchone()
+        project_id = int(project["id"])
+        self.assertEqual(project["system"], 1)
+        self.assertEqual(project["target_type"], "panos")
+        self.assertNotIn("Offline PAN-OS", client.get("/", base_url="https://forge.test").get_data(as_text=True))
+
+        source = b'''name,type,value,source_zone,destination_zone,source,destination,application,service,action
+web,address,192.0.2.10/32,,,,,,,
+allow-web,security,,Trust,Untrust,any,web,ssl,application-default,allow
+'''
+        imported = client.post(
+            f"/migration/projects/{project_id}/source", base_url="https://forge.test",
+            data={
+                "csrf": "migration-test-csrf", "vendor": "panos-csv",
+                "config_file": (io.BytesIO(source), "offline.csv"),
+            },
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(imported.status_code, 302)
+        with main.db() as conn:
+            source_id = int(conn.execute(
+                "SELECT id FROM migration_sources WHERE project_id=?", (project_id,)
+            ).fetchone()["id"])
+        preview = client.post(
+            f"/migration/projects/{project_id}/preview", base_url="https://forge.test",
+            data={
+                "csrf": "migration-test-csrf", "source_id": str(source_id),
+                "kind": ["addresses", "security_rules"],
+            },
+        )
+        self.assertEqual(preview.status_code, 200)
+        match = re.search(r'action="/migration/drafts/([^/]+)/apply"', preview.get_data(as_text=True))
+        self.assertIsNotNone(match)
+        applied = client.post(
+            f"/migration/drafts/{match.group(1)}/apply", base_url="https://forge.test",
+            data={"csrf": "migration-test-csrf", "review_acknowledged": "reviewed"},
+        )
+        self.assertEqual(applied.status_code, 302)
+        with main.db() as conn:
+            output = conn.execute(
+                "SELECT migration_outputs.*,config_workspaces.profile_id,profiles.system FROM migration_outputs "
+                "JOIN config_workspaces ON config_workspaces.id=migration_outputs.workspace_id "
+                "JOIN profiles ON profiles.id=config_workspaces.profile_id WHERE migration_outputs.project_id=?",
+                (project_id,),
+            ).fetchone()
+        self.assertIsNotNone(output)
+        self.assertEqual(output["system"], 1)
+        exported = client.get(
+            f"/migration/projects/{project_id}/export-candidate/xml", base_url="https://forge.test"
+        )
+        self.assertEqual(exported.status_code, 200)
+        self.assertIn(b'entry name="allow-web"', exported.data)
+        workspace_page = client.get(
+            f"/config-workspaces/{output['workspace_id']}/edit", base_url="https://forge.test"
+        ).get_data(as_text=True)
+        self.assertIn("Geen push target", workspace_page)
+
+        stamp = main.now()
+        with main.db() as conn:
+            target_id = int(conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("Later PAN-OS target", "panos", json.dumps({"vsys": "vsys1"}), stamp, stamp),
+            ).lastrowid)
+        attached = client.post(
+            f"/migration/projects/{project_id}/target", base_url="https://forge.test",
+            data={"csrf": "migration-test-csrf", "target_profile_id": str(target_id)},
+        )
+        self.assertEqual(attached.status_code, 302)
+        with main.db() as conn:
+            updated = conn.execute(
+                "SELECT target_profile_id,base_workspace_id FROM migration_projects WHERE id=?", (project_id,)
+            ).fetchone()
+            source_row = conn.execute(
+                "SELECT staging_workspace_id FROM migration_sources WHERE id=?", (source_id,)
+            ).fetchone()
+            output_row = conn.execute(
+                "SELECT sanity_json FROM migration_outputs WHERE id=?", (output["id"],)
+            ).fetchone()
+        self.assertEqual(updated["target_profile_id"], target_id)
+        self.assertIsNone(updated["base_workspace_id"])
+        self.assertIsNone(source_row["staging_workspace_id"])
+        self.assertTrue(json.loads(output_row["sanity_json"])["target_changed"])
+
+    def test_offline_panorama_target_builds_full_xml_without_device(self):
+        with main.db() as conn:
+            profile = main.migration_target_profile(conn, "offline-panorama")
+        self.assertEqual(profile["system"], 1)
+        self.assertEqual(profile["target_type"], "panorama")
+        settings = main.profile_settings(profile)
+        model = MigrationModel(
+            "generic", "offline-panorama",
+            addresses=[Address("server", "192.0.2.10/32")],
+            security_rules=[main.Policy(
+                "allow-server", from_zones=["Trust"], to_zones=["DMZ"],
+                destination=["server"], disabled=False,
+            )],
+        )
+        base = migration_base_xml(model, settings["device_group"], panorama=True)
+        merged, plan = merge_model_into_panos_xml(
+            base, model, settings["device_group"], panorama=True, rulebase=settings["rulebase"]
+        )
+        self.assertGreater(plan["create"], 0)
+        root = ET.fromstring(merged)
+        self.assertIsNotNone(root.find("./devices/entry/device-group/entry[@name='Offline']"))
+        self.assertIsNotNone(root.find(".//pre-rulebase/security/rules/entry[@name='allow-server']"))
 
     def test_panos_upload_becomes_full_base_workspace_and_ui_defaults_are_checked(self):
         stamp = main.now()

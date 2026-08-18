@@ -352,6 +352,7 @@ def init_db() -> None:
         );
         CREATE TABLE IF NOT EXISTS profiles (
           id INTEGER PRIMARY KEY, name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+          system INTEGER NOT NULL DEFAULT 0,
           serial TEXT NOT NULL DEFAULT '', source_ip TEXT NOT NULL DEFAULT '',
           target_type TEXT NOT NULL DEFAULT 'scm', settings_json TEXT NOT NULL DEFAULT '{}',
           secret_blob BLOB NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -460,6 +461,9 @@ def init_db() -> None:
             conn.execute("ALTER TABLE migration_projects ADD COLUMN topology TEXT NOT NULL DEFAULT 'active-passive'")
         if "owner" not in project_columns:
             conn.execute("ALTER TABLE migration_projects ADD COLUMN owner TEXT NOT NULL DEFAULT 'admin'")
+        profile_columns = {row[1] for row in conn.execute("PRAGMA table_info(profiles)")}
+        if "system" not in profile_columns:
+            conn.execute("ALTER TABLE profiles ADD COLUMN system INTEGER NOT NULL DEFAULT 0")
         snippet_columns = {row[1] for row in conn.execute("PRAGMA table_info(migration_snippets)")}
         if "owner" not in snippet_columns:
             conn.execute("ALTER TABLE migration_snippets ADD COLUMN owner TEXT NOT NULL DEFAULT 'admin'")
@@ -480,6 +484,52 @@ _dummy_password_hash = password_hash(secrets.token_urlsafe(32))
 
 def now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+OFFLINE_MIGRATION_TARGETS = {
+    "offline-panos": {
+        "name": "Offline PAN-OS",
+        "target_type": "panos",
+        "settings": {"system_offline": True, "vsys": "vsys1"},
+    },
+    "offline-panorama": {
+        "name": "Offline Panorama",
+        "target_type": "panorama",
+        "settings": {"system_offline": True, "device_group": "Offline", "rulebase": "pre"},
+    },
+}
+
+
+def migration_target_profile(conn, choice: str):
+    """Resolve a real push target or a hidden local-only migration workspace."""
+    choice = str(choice or "offline-panos").strip() or "offline-panos"
+    offline = OFFLINE_MIGRATION_TARGETS.get(choice)
+    if offline:
+        profile = conn.execute(
+            "SELECT * FROM profiles WHERE system=1 AND target_type=? ORDER BY id LIMIT 1",
+            (offline["target_type"],),
+        ).fetchone()
+        if profile:
+            return profile
+        timestamp = now()
+        profile_id = int(conn.execute(
+            "INSERT INTO profiles(name,enabled,system,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            (
+                offline["name"], 0, 1, offline["target_type"],
+                json.dumps(offline["settings"], sort_keys=True), timestamp, timestamp,
+            ),
+        ).lastrowid)
+        return conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+    try:
+        profile_id = int(choice)
+    except ValueError as exc:
+        raise MigrationError("Ongeldig push target") from exc
+    profile = conn.execute(
+        "SELECT * FROM profiles WHERE id=? AND system=0", (profile_id,)
+    ).fetchone()
+    if not profile:
+        raise MigrationError("Push target bestaat niet")
+    return profile
 
 
 def audit(action: str, detail: str = "") -> None:
@@ -719,7 +769,7 @@ def settings_application_catalog_refresh():
 def stats() -> dict:
     result = flow_store.stats()
     with db() as conn:
-        result["profiles"] = conn.execute("SELECT COUNT(*) FROM profiles").fetchone()[0]
+        result["profiles"] = conn.execute("SELECT COUNT(*) FROM profiles WHERE system=0").fetchone()[0]
         result["sources"] = conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
         result["runs"] = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
     used = sum(p.stat().st_size for p in DATA.rglob("*") if p.is_file())
@@ -746,7 +796,7 @@ def profile_serials(profile) -> list[str]:
 def refresh_syslog_source_policy() -> None:
     configured_serials: set[str] = set()
     allowed_sources: dict[str, set[str]] = defaultdict(set)
-    with db() as conn: profiles = conn.execute("SELECT serial,source_ip,settings_json FROM profiles").fetchall()
+    with db() as conn: profiles = conn.execute("SELECT serial,source_ip,settings_json FROM profiles WHERE system=0").fetchall()
     for profile in profiles:
         settings = profile_settings(profile)
         pairs = ((profile["serial"], profile["source_ip"]), (settings.get("passive_serial", ""), settings.get("passive_source_ip", "")))
@@ -2333,7 +2383,7 @@ def write_target_policy(profile, policy_kind: str, policy: dict, original_name: 
 def workspace_row(workspace_id: int):
     with db() as conn:
         return conn.execute(
-            "SELECT config_workspaces.*,profiles.name profile_name,profiles.target_type,profiles.settings_json,profiles.secret_blob,profiles.updated_at profile_updated_at "
+            "SELECT config_workspaces.*,profiles.name profile_name,profiles.target_type,profiles.settings_json,profiles.secret_blob,profiles.system profile_system,profiles.updated_at profile_updated_at "
             "FROM config_workspaces JOIN profiles ON profiles.id=config_workspaces.profile_id WHERE config_workspaces.id=?",
             (workspace_id,),
         ).fetchone()
@@ -2496,7 +2546,7 @@ def migration_output_row(project_id: int, output_id: int):
 def migration_project_row(project_id: int):
     with db() as conn:
         project = conn.execute(
-            "SELECT migration_projects.*,profiles.name profile_name,profiles.target_type,profiles.settings_json "
+            "SELECT migration_projects.*,profiles.name profile_name,profiles.target_type,profiles.settings_json,profiles.system profile_system "
             "FROM migration_projects JOIN profiles ON profiles.id=migration_projects.target_profile_id "
             "WHERE migration_projects.id=?", (project_id,),
         ).fetchone()
@@ -3972,6 +4022,9 @@ def config_workspace_push_preview(workspace_id):
     if not workspace:
         return "Not found", 404
     output, block_reason = migration_output_push_block(workspace_id)
+    if int(workspace["profile_system"] or 0):
+        flash("Koppel eerst een push target aan het migratieproject.", "error")
+        return redirect(url_for("migration_project", project_id=output["project_id"])) if output else redirect(url_for("migration_home"))
     if block_reason:
         flash(f"API-load geblokkeerd: {block_reason}", "error")
         return redirect(url_for("migration_project", project_id=output["project_id"]))
@@ -3986,6 +4039,9 @@ def config_workspace_push(workspace_id):
     if not workspace:
         return "Not found", 404
     output, block_reason = migration_output_push_block(workspace_id)
+    if int(workspace["profile_system"] or 0):
+        flash("Koppel eerst een push target aan het migratieproject.", "error")
+        return redirect(url_for("migration_project", project_id=output["project_id"])) if output else redirect(url_for("migration_home"))
     if block_reason:
         flash(f"API-load geblokkeerd: {block_reason}", "error")
         return redirect(url_for("migration_project", project_id=output["project_id"]))
@@ -4050,7 +4106,7 @@ def config_workspace_delete(workspace_id):
 @login_required
 def index():
     with db() as conn:
-        profile_rows = conn.execute("SELECT * FROM profiles ORDER BY name").fetchall()
+        profile_rows = conn.execute("SELECT * FROM profiles WHERE system=0 ORDER BY name").fetchall()
         sources = conn.execute("SELECT * FROM sources ORDER BY last_seen DESC LIMIT 100").fetchall()
         audits = conn.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 20").fetchall()
     profiles = []
@@ -4168,13 +4224,13 @@ def index():
 def migration_home():
     with db() as conn:
         projects = conn.execute(
-            "SELECT migration_projects.*,profiles.name profile_name,profiles.target_type "
+            "SELECT migration_projects.*,profiles.name profile_name,profiles.target_type,profiles.system profile_system "
             "FROM migration_projects JOIN profiles ON profiles.id=migration_projects.target_profile_id "
             "WHERE migration_projects.owner=? OR EXISTS(SELECT 1 FROM migration_project_roles r WHERE r.project_id=migration_projects.id AND r.username=?) "
             "ORDER BY migration_projects.updated_at DESC",
             (session.get("username", ""), session.get("username", "")),
         ).fetchall()
-        profiles = conn.execute("SELECT id,name,target_type FROM profiles ORDER BY name").fetchall()
+        profiles = conn.execute("SELECT id,name,target_type FROM profiles WHERE system=0 ORDER BY name").fetchall()
     return render_template("migration.html", projects=projects, profiles=profiles, parsers=PARSERS, project=None)
 
 
@@ -4190,7 +4246,7 @@ def migration_project_export(project_id):
         mappings=conn.execute("SELECT source_id,kind,action,target_context FROM migration_family_mappings WHERE project_id=? ORDER BY source_id,kind",(project_id,)).fetchall()
         filters=conn.execute("SELECT name,join_mode,rules_json FROM migration_saved_filters WHERE project_id=? ORDER BY id",(project_id,)).fetchall()
     source_names={int(row["id"]):row["source_name"] for row in sources}
-    bundle={"schema":"pa-policy-forge-migration-v2","name":project["name"],"topology":project["topology"],"sources":[{"vendor":row["vendor"],"source_name":row["source_name"],"model":migration_model(row).as_dict()} for row in sources],"merge_rules":[{"kind":row["kind"],"master":row["master"],"members":json.loads(row["members_json"]),"mode":row["mode"]} for row in rules],"transform_rules":[dict(row) for row in transforms],"family_mappings":[{"source_name":source_names.get(int(row["source_id"]),""),"kind":row["kind"],"action":row["action"],"target_context":row["target_context"]} for row in mappings],"saved_filters":[{"name":row["name"],"join_mode":row["join_mode"],"rules":json.loads(row["rules_json"] or "[]")} for row in filters]}
+    bundle={"schema":"pa-policy-forge-migration-v2","name":project["name"],"topology":project["topology"],"target_type":project["target_type"],"sources":[{"vendor":row["vendor"],"source_name":row["source_name"],"model":migration_model(row).as_dict()} for row in sources],"merge_rules":[{"kind":row["kind"],"master":row["master"],"members":json.loads(row["members_json"]),"mode":row["mode"]} for row in rules],"transform_rules":[dict(row) for row in transforms],"family_mappings":[{"source_name":source_names.get(int(row["source_id"]),""),"kind":row["kind"],"action":row["action"],"target_context":row["target_context"]} for row in mappings],"saved_filters":[{"name":row["name"],"join_mode":row["join_mode"],"rules":json.loads(row["rules_json"] or "[]")} for row in filters]}
     safe="".join(char if char.isalnum() or char in "-_." else "-" for char in project["name"]).strip("-.") or f"migration-{project_id}"
     return Response(json.dumps(bundle,indent=2),mimetype="application/json",headers={"Content-Disposition":f'attachment; filename="{safe}.migration.json"'})
 
@@ -4199,14 +4255,17 @@ def migration_project_export(project_id):
 @login_required
 def migration_project_import():
     try:
-        profile_id=int(request.form.get("target_profile_id","0")); uploaded=request.files.get("project_file")
+        target_choice=request.form.get("target_profile_id","offline-panos"); uploaded=request.files.get("project_file")
         if not uploaded or not uploaded.filename: raise MigrationError("Kies een projectbestand")
         raw=uploaded.stream.read(100*1024*1024+1)
         if len(raw)>100*1024*1024: raise MigrationError("Projectbestand is groter dan 100 MiB")
         bundle=json.loads(raw)
         if bundle.get("schema")!="pa-policy-forge-migration-v2": raise MigrationError("Onbekend projectformaat")
+        if target_choice == "offline-auto":
+            target_choice = "offline-panorama" if bundle.get("target_type") == "panorama" else "offline-panos"
         with db() as conn:
-            if not conn.execute("SELECT 1 FROM profiles WHERE id=?",(profile_id,)).fetchone(): raise MigrationError("Targetprofiel bestaat niet")
+            profile=migration_target_profile(conn,target_choice)
+            profile_id=int(profile["id"])
             topology=str(bundle.get("topology","active-passive"))
             if topology not in {"active-passive","active-active"}: raise MigrationError("Ongeldige topologie in projectbestand")
             project_id=int(conn.execute("INSERT INTO migration_projects(name,target_profile_id,topology,owner,created_at,updated_at) VALUES(?,?,?,?,?,?)",(str(bundle.get("name") or uploaded.filename)[:120],profile_id,topology,session.get("username","admin"),now(),now())).lastrowid)
@@ -4331,17 +4390,61 @@ def migration_output_review_update(project_id, output_id, code):
 def migration_project_create():
     try:
         name = request.form.get("name", "").strip()
-        profile_id = int(request.form.get("target_profile_id", "0"))
+        target_choice = request.form.get("target_profile_id", "offline-panos")
         if not name: raise MigrationError("Projectnaam is verplicht")
         with db() as conn:
-            if not conn.execute("SELECT 1 FROM profiles WHERE id=?", (profile_id,)).fetchone(): raise MigrationError("Targetprofiel bestaat niet")
+            profile = migration_target_profile(conn, target_choice)
+            profile_id = int(profile["id"])
             cursor = conn.execute("INSERT INTO migration_projects(name,target_profile_id,owner,created_at,updated_at) VALUES(?,?,?,?,?)", (name[:120], profile_id,session.get("username","admin"), now(), now()))
             project_id = int(cursor.lastrowid)
-        audit("migration-project-created", f"project={project_id} profile={profile_id}")
+        mode = "offline" if int(profile["system"]) else "profile"
+        audit("migration-project-created", f"project={project_id} target={mode} profile={profile_id}")
         return redirect(url_for("migration_project", project_id=project_id))
     except Exception as exc:
         flash(f"Migratieproject niet aangemaakt: {exc}", "error")
         return redirect(url_for("migration_home"))
+
+
+@app.post("/migration/projects/<int:project_id>/target")
+@login_required
+def migration_project_attach_target(project_id):
+    project = migration_project_row(project_id)
+    if not project:
+        return "Not found", 404
+    try:
+        if not int(project["profile_system"] or 0):
+            raise MigrationError("Dit project heeft al een push target")
+        profile_id = int(request.form.get("target_profile_id", "0"))
+        with db() as conn:
+            profile = conn.execute(
+                "SELECT * FROM profiles WHERE id=? AND system=0", (profile_id,)
+            ).fetchone()
+            if not profile:
+                raise MigrationError("Push target bestaat niet")
+            if profile["target_type"] != project["target_type"]:
+                raise MigrationError("Kies een push target met hetzelfde doelformaat")
+            outputs = conn.execute(
+                "SELECT id,sanity_json FROM migration_outputs WHERE project_id=?", (project_id,)
+            ).fetchall()
+            for output in outputs:
+                sanity = json.loads(output["sanity_json"] or "{}")
+                sanity.update({"regenerate_required": True, "superseded": True, "target_changed": True})
+                conn.execute(
+                    "UPDATE migration_outputs SET sanity_json=? WHERE id=?",
+                    (json.dumps(sanity, sort_keys=True), output["id"]),
+                )
+            conn.execute(
+                "UPDATE migration_sources SET staging_workspace_id=NULL WHERE project_id=?", (project_id,)
+            )
+            conn.execute(
+                "UPDATE migration_projects SET target_profile_id=?,base_workspace_id=NULL,updated_at=? WHERE id=?",
+                (profile_id, now(), project_id),
+            )
+        audit("migration-target-attached", f"project={project_id} profile={profile_id}")
+        flash("Push target gekoppeld. Maak een nieuwe merge-preview voor deze target.", "success")
+    except Exception as exc:
+        flash(f"Push target niet gekoppeld: {exc}", "error")
+    return redirect(url_for("migration_project", project_id=project_id))
 
 
 @app.get("/migration/projects/<int:project_id>")
@@ -4351,7 +4454,7 @@ def migration_project(project_id):
     if not project: return "Not found", 404
     with db() as conn:
         source_rows = conn.execute("SELECT * FROM migration_sources WHERE project_id=? ORDER BY id", (project_id,)).fetchall()
-        profiles = conn.execute("SELECT id,name,target_type FROM profiles ORDER BY name").fetchall()
+        profiles = conn.execute("SELECT id,name,target_type FROM profiles WHERE system=0 ORDER BY name").fetchall()
         workspaces = conn.execute("SELECT id,name,source,created_at FROM config_workspaces WHERE profile_id=? ORDER BY id DESC", (project["target_profile_id"],)).fetchall()
         output_rows = conn.execute("SELECT * FROM migration_outputs WHERE project_id=? ORDER BY id DESC", (project_id,)).fetchall()
         output_resolution_rows = conn.execute(
@@ -5527,6 +5630,8 @@ def profile_save():
             with db() as conn:
                 existing_profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
             if existing_profile:
+                if int(existing_profile["system"] or 0):
+                    raise ValueError("Interne offline targets kunnen niet als deviceprofiel worden bewerkt")
                 preserved_workspace_id = active_config_workspace_id(existing_profile)
         target_type = request.form.get("target_type", "")
         if target_type not in TARGET_TYPES: raise ValueError("Onbekend targettype")
@@ -5592,8 +5697,9 @@ def profile_save():
 def profile_delete(profile_id):
     try:
         with db() as conn:
-            row = conn.execute("SELECT name FROM profiles WHERE id=?", (profile_id,)).fetchone()
+            row = conn.execute("SELECT name,system FROM profiles WHERE id=?", (profile_id,)).fetchone()
             if not row: return "Not found", 404
+            if int(row["system"] or 0): raise ValueError("Interne offline targets kunnen niet worden verwijderd")
             run_count = conn.execute("SELECT COUNT(*) FROM runs WHERE profile_id=?", (profile_id,)).fetchone()[0]
             if run_count: raise ValueError(f"Verwijder eerst de {run_count} policy run(s) van dit profiel")
             conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
