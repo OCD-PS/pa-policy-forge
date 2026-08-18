@@ -2782,6 +2782,12 @@ def apply_scm_migration(profile, model: MigrationModel) -> int:
     if unsupported:
         raise MigrationError("Nog geen veilige SCM-outputmapping voor: "+", ".join(MIGRATION_KIND_LABELS.get(kind,kind) for kind in unsupported))
     count = 0
+    # Referenced tags must exist before SCM accepts security rules that use them.
+    for item in model.extras.get("tags", []):
+        metadata=SCM_OBJECT_TYPES["tags"]; scm,token,container=migration_scm_container(profile,"tags")
+        service=metadata.get("service") or "objects"; endpoint_name=metadata.get("endpoint","tags")
+        endpoint=policy_api.scm_api_root(scm.scm_api_base)+f"/config/{service}/v1/{endpoint_name}"
+        policy_api.scm_http_request("POST",endpoint,token,payload={**raw_item_payload(item),**container}); count+=1
     for item in scm_items(model):
         kind = item["kind"]
         if kind.startswith("policy:"):
@@ -2802,6 +2808,8 @@ def apply_scm_migration(profile, model: MigrationModel) -> int:
             policy_api.scm_http_request("POST", endpoint, token, payload=payload)
         count += 1
     for kind,items in model.extras.items():
+        if kind == "tags":
+            continue
         for item in items:
             payload=raw_item_payload(item)
             if kind in MIGRATION_SCM_EXTRA_OBJECTS or kind == "security_profiles":
@@ -2842,7 +2850,12 @@ def apply_xml_migration(profile, model: MigrationModel) -> int:
         base = f"/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name={policy_api.xpath_literal(scope)}]"
     if source is None: raise MigrationError("Gegenereerde doelscope ontbreekt")
     count = 0
-    for child in source:
+    # Create tag objects before objects or policies that reference them.
+    ordered_children = sorted(
+        source,
+        key=lambda child: 0 if child.tag == "tag" else (2 if child.tag.endswith("rulebase") or child.tag == "rulebase" else 1),
+    )
+    for child in ordered_children:
         if child.tag.endswith("rulebase") or child.tag == "rulebase":
             for policy_type in child:
                 rules = policy_type.find("rules")

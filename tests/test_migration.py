@@ -367,6 +367,8 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         self.assertIn("db", model.address_groups[0].description)
         self.assertEqual(model.security_rules[0].action, "allow")
         self.assertFalse(model.security_rules[0].disabled)
+        self.assertEqual(model.security_rules[0].tags, [])
+        self.assertNotIn("tags", model.extras)
 
     def test_checkpoint_unknown_action_is_disabled_and_blocks_review(self):
         data = {"rulebase": [{"type": "access-rule", "uid": "layer-1", "name": "Nested Layer", "action": "Inner Layer"}]}
@@ -374,9 +376,38 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         self.assertTrue(model.security_rules[0].disabled)
         self.assertEqual(model.security_rules[0].action, "deny")
         self.assertIn("REVIEW:", model.security_rules[0].description)
+        tag_name = "OCD-Review-Unsupported-Action"
+        self.assertEqual(model.security_rules[0].tags, [tag_name])
+        self.assertEqual([item["name"] for item in model.extras["tags"]], [tag_name])
         self.assertTrue(any("niet-ondersteunde Check Point actie" in message for message in model.warnings))
         review = migration_review_findings(model)
         self.assertTrue(any(item["code"] == "unsupported-actions" and item["severity"] == "critical" for item in review["findings"]))
+        fragment = ET.fromstring(panos_fragment(model))
+        self.assertIsNotNone(fragment.find(f"./devices/entry/vsys/entry/tag/entry[@name='{tag_name}']"))
+        self.assertEqual(
+            fragment.findtext("./devices/entry/vsys/entry/rulebase/security/rules/entry/tag/member"), tag_name
+        )
+        security_item = next(item for item in scm_items(model) if item["kind"] == "policy:security")
+        self.assertEqual(security_item["payload"]["tag"], [tag_name])
+        api_plan = migration_api_plan(model, "scm", "folder")
+        self.assertEqual(api_plan[0]["kind"], "tags")
+        self.assertLess(
+            next(index for index, item in enumerate(api_plan) if item["kind"] == "tags"),
+            next(index for index, item in enumerate(api_plan) if item["kind"] == "policy:security"),
+        )
+
+    def test_scm_creates_checkpoint_review_tag_before_tagged_policy(self):
+        data = {"rulebase": [{"type": "access-rule", "uid": "layer-1", "name": "Nested Layer", "action": "Inner Layer"}]}
+        model = parse_vendor("checkpoint", json.dumps(data).encode(), "checkpoint.json")
+        scm = type("SCM", (), {"scm_api_base": "https://api.example", "scm_rulebase": "pre"})()
+        with patch.object(main, "migration_scm_container", return_value=(scm, "token", {"folder": "Shared"})), \
+             patch.object(main.policy_api, "scm_http_request") as request_call, \
+             patch.object(main, "invalidate_profile_caches"):
+            count = main.apply_scm_migration({"id": 42}, model)
+        self.assertEqual(count, 2)
+        payloads = [call.kwargs["payload"] for call in request_call.call_args_list]
+        self.assertEqual(payloads[0]["name"], "OCD-Review-Unsupported-Action")
+        self.assertEqual(payloads[1]["tag"], ["OCD-Review-Unsupported-Action"])
 
     def test_review_findings_always_require_engineer_acknowledgement(self):
         model = MigrationModel("generic", "source", security_rules=[main.Policy("allow-any", disabled=False)])

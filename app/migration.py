@@ -448,6 +448,8 @@ class CheckPointParser(BaseParser):
     vendor = "checkpoint"
     label = "Check Point"
     extensions = (".json", ".xml", ".txt", ".tar")
+    UNSUPPORTED_ACTION_TAG = "OCD-Review-Unsupported-Action"
+    UNSUPPORTED_ACTION_TAG_COMMENT = "Automatisch gemarkeerd: Check Point-actie vereist handmatige PAN-OS-mapping."
     # Mappings verified against the PAN-OS 12.1 predefined application catalog.
     # Keep this deliberately small: an uncertain mapping must remain a review
     # item instead of silently broadening a Check Point rule.
@@ -489,6 +491,21 @@ class CheckPointParser(BaseParser):
         "windows-update": "ms-update",
         "zabbix": "zabbix",
     }
+
+    @classmethod
+    def _ensure_unsupported_action_tag(cls, model: MigrationModel) -> None:
+        tags = model.extras.setdefault("tags", [])
+        if any(str(item.get("name", "")) == cls.UNSUPPORTED_ACTION_TAG for item in tags):
+            return
+        entry = ET.Element("entry", {"name": cls.UNSUPPORTED_ACTION_TAG})
+        ET.SubElement(entry, "comments").text = cls.UNSUPPORTED_ACTION_TAG_COMMENT
+        tags.append({
+            "name": cls.UNSUPPORTED_ACTION_TAG,
+            "target_path": "tag",
+            "xml": ET.tostring(entry, encoding="unicode"),
+            "payload": {"comments": cls.UNSUPPORTED_ACTION_TAG_COMMENT},
+            "source_ref": "generated:checkpoint-unsupported-action",
+        })
 
     def parse_bytes(self, content: bytes, source_name: str) -> MigrationModel:
         """Parse a Check Point show-package archive with one global UID dictionary."""
@@ -1022,6 +1039,7 @@ class CheckPointParser(BaseParser):
                 for field in ("source-negate", "destination-negate", "service-negate"):
                     if value.get(field): model.warnings.append(f"{value.get('uid','')}: access-rule {value.get('name','')} gebruikt {field}; handmatige review vereist")
                 if unsupported_action:
+                    self._ensure_unsupported_action_tag(model)
                     model.warnings.append(
                         f"{value.get('uid','')}: niet-ondersteunde Check Point actie {action or 'onbekend'}; regel is disabled en vereist handmatige mapping"
                     )
@@ -1035,6 +1053,7 @@ class CheckPointParser(BaseParser):
                     service=services,
                     action="allow" if supported_allow else "deny",
                     disabled=not bool(value.get("enabled",True)) or unsupported_action, description=description,
+                    tags=[self.UNSUPPORTED_ACTION_TAG] if unsupported_action else [],
                     source_ref=f"{current_source}:{value.get('uid','')}".strip(":"), original=value,
                 ))
             for child in value.values():
@@ -2440,6 +2459,14 @@ def panos_fragment(model: MigrationModel, scope: str = "vsys1", panorama: bool =
         e=ET.SubElement(service_groups,"entry",{"name":item.name}); members(ET.SubElement(e,"members"),item.members)
         if item.description: ET.SubElement(e,"description").text=item.description
         if item.tags: members(ET.SubElement(e,"tag"),item.tags)
+    tag_items=model.extras.get("tags",[])
+    if tag_items:
+        tags=ET.SubElement(target,"tag")
+        for item in tag_items:
+            try: entry=SafeET.fromstring(str(item.get("xml", "")))
+            except Exception as exc: raise MigrationError(f"Ongeldige tag XML voor {item.get('name','')}: {exc}") from exc
+            entry.set("name",str(item.get("name",entry.get("name",""))))
+            tags.append(copy.deepcopy(entry))
     def replace_members(entry, tag, values):
         for child in list(entry.findall(f"./{tag}")): entry.remove(child)
         members(ET.SubElement(entry,tag),values)
@@ -2499,6 +2526,7 @@ def scm_items(model: MigrationModel) -> list[dict]:
             payload={"name":rule.name,"from":rule.from_zones,"to":rule.to_zones,"source":rule.source,"destination":rule.destination,"service":rule.service if kind=="security" else (rule.service or ["any"])[0],"disabled":rule.disabled}
             if kind=="security": payload.update({"application":rule.application,"action":rule.action})
             else: payload.update({"nat_type":rule.nat_type,"to_interface":rule.to_interface})
+            if rule.tags: payload["tag"]=rule.tags
             if kind=="nat" and rule.source_translation: payload["source_translation"]=rule.source_translation
             if kind=="nat" and rule.destination_translation: payload["destination_translation"]=rule.destination_translation
             if rule.description: payload["description"]=rule.description
@@ -2510,6 +2538,11 @@ def migration_api_plan(model: MigrationModel, target_type: str, target_context: 
     """Create a review-only output plan; it never performs a target write."""
     actions = []
     if target_type == "scm":
+        for item in model.extras.get("tags", []):
+            actions.append({
+                "method": "POST", "kind": "tags", "name": str(item.get("name", "")),
+                "target": target_context, "payload": raw_item_payload(item), "status": "staged",
+            })
         for item in scm_items(model):
             kind = item["kind"]
             actions.append({
@@ -2517,6 +2550,8 @@ def migration_api_plan(model: MigrationModel, target_type: str, target_context: 
                 "target": target_context, "payload": item["payload"], "status": "staged",
             })
         for kind, items in model.extras.items():
+            if kind == "tags":
+                continue
             for item in items:
                 actions.append({
                     "method": "POST", "kind": kind, "name": str(item.get("name", "")),
