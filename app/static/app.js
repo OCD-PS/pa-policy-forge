@@ -154,6 +154,63 @@
     });
   }
 
+  function setupMigrationFilterTypes() {
+    all("[data-migration-filter-condition]").forEach(function (condition) {
+      var field = condition.querySelector("[data-migration-filter-field]");
+      var operator = condition.querySelector("[data-migration-filter-operator]");
+      var textValue = condition.querySelector("[data-migration-filter-text]");
+      var booleanValue = condition.querySelector("[data-migration-filter-boolean]");
+      if (!field || !operator || !textValue || !booleanValue) return;
+      var locked = field.disabled;
+      function update() {
+        var isBoolean = field.value === "disabled";
+        textValue.hidden = isBoolean;
+        textValue.disabled = locked || isBoolean;
+        booleanValue.hidden = !isBoolean;
+        booleanValue.disabled = locked || !isBoolean;
+        all("option", operator).forEach(function (option) {
+          option.disabled = isBoolean && option.value !== "equals";
+        });
+        if (isBoolean) operator.value = "equals";
+      }
+      field.addEventListener("change", update);
+      update();
+    });
+  }
+
+  function setupMigrationZoneMapping() {
+    all("[data-migration-zone-form]").forEach(function (form) {
+      all('select[name="from_zone"], select[name="to_zone"]', form).forEach(function (select) {
+        select.multiple = true;
+        select.size = Math.min(Math.max(select.options.length, 2), 6);
+        select.addEventListener("mousedown", function (event) {
+          if (event.target.tagName !== "OPTION") return;
+          event.preventDefault();
+          event.target.selected = !event.target.selected;
+          select.focus();
+        });
+      });
+      var checks = all("[data-migration-zone-select]", form);
+      var master = form.querySelector("[data-migration-zone-select-visible]");
+      var count = form.querySelector("[data-migration-zone-count]");
+      var save = form.querySelector("[data-migration-zone-save]");
+      function update() {
+        var selected = checks.filter(function (check) { return check.checked; }).length;
+        if (count) count.textContent = selected;
+        if (save) save.disabled = selected === 0;
+      }
+      if (master) master.addEventListener("change", function () {
+        checks.forEach(function (check) {
+          var row = check.closest("tr");
+          if (!row || !row.hidden) check.checked = master.checked;
+        });
+        update();
+      });
+      checks.forEach(function (check) { check.addEventListener("change", update); });
+      update();
+    });
+  }
+
   function setupConditionalTargets() {
     all("[data-target-select]").forEach(function (select) {
       var form = select.closest("form");
@@ -1036,6 +1093,8 @@
     runSetup("flashes", setupFlashes);
     runSetup("bulk-selection", setupBulkSelection);
     runSetup("filters", setupFilters);
+    runSetup("migration-filter-types", setupMigrationFilterTypes);
+    runSetup("migration-zone-mapping", setupMigrationZoneMapping);
     runSetup("targets", setupConditionalTargets);
     runSetup("push-options", setupPushOptions);
     runSetup("policy-management", setupPolicyManagement);

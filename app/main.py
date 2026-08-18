@@ -410,6 +410,12 @@ def init_db() -> None:
           FOREIGN KEY(project_id) REFERENCES migration_projects(id),
           FOREIGN KEY(workspace_id) REFERENCES config_workspaces(id)
         );
+        CREATE TABLE IF NOT EXISTS migration_output_resolutions (
+          output_id INTEGER NOT NULL, code TEXT NOT NULL, note TEXT NOT NULL,
+          resolved_by TEXT NOT NULL, resolved_at TEXT NOT NULL,
+          PRIMARY KEY(output_id,code),
+          FOREIGN KEY(output_id) REFERENCES migration_outputs(id)
+        );
         CREATE TABLE IF NOT EXISTS migration_family_mappings (
           id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, source_id INTEGER NOT NULL DEFAULT 0,
           kind TEXT NOT NULL, action TEXT NOT NULL DEFAULT 'map', target_context TEXT NOT NULL DEFAULT '',
@@ -2387,6 +2393,46 @@ def workspace_version_source(workspace) -> str:
     )
 
 
+def advance_migration_output_workspace(
+    previous_workspace_id: int,
+    new_workspace_id: int,
+    new_xml: bytes,
+) -> bool:
+    """Keep safety metadata attached to edited migration candidate versions."""
+    with db() as conn:
+        outputs = conn.execute(
+            "SELECT id,sanity_json FROM migration_outputs WHERE workspace_id=?",
+            (previous_workspace_id,),
+        ).fetchall()
+        if not outputs:
+            return False
+        candidate = panos_candidate_analysis(new_xml)
+        candidate_unresolved = len(candidate["unresolved_references"])
+        for output in outputs:
+            sanity = json.loads(output["sanity_json"] or "{}")
+            critical_codes = sanity.get("critical_review_codes", {})
+            resolved_codes = {
+                row["code"]
+                for row in conn.execute(
+                    "SELECT code FROM migration_output_resolutions WHERE output_id=?",
+                    (output["id"],),
+                ).fetchall()
+            }
+            unresolved_codes = set(critical_codes) - resolved_codes if isinstance(critical_codes, dict) else set()
+            sanity.update({
+                "unresolved_references": candidate_unresolved,
+                "candidate_unresolved_references": candidate_unresolved,
+                "unresolved_applications": len(candidate["unresolved_application_references"]),
+                "duplicate_rules": len(candidate["duplicate_rules"]),
+                "critical_findings": len(unresolved_codes) + (1 if candidate_unresolved else 0),
+            })
+            conn.execute(
+                "UPDATE migration_outputs SET workspace_id=?,sanity_json=? WHERE id=?",
+                (new_workspace_id, json.dumps(sanity, sort_keys=True), output["id"]),
+            )
+    return True
+
+
 def store_workspace_edit_version(workspace, new_xml: bytes, label: str) -> int:
     """Store one immutable edit and advance any linked migration staging source."""
     with db() as conn:
@@ -2401,6 +2447,7 @@ def store_workspace_edit_version(workspace, new_xml: bytes, label: str) -> int:
         workspace_version_source(workspace),
     )
     if not advance_migration_staging_workspace(workspace["id"], new_id):
+        advance_migration_output_workspace(workspace["id"], new_id, new_xml)
         set_active_config_workspace(workspace["profile_id"], new_id)
     return new_id
 
@@ -2790,7 +2837,12 @@ def apply_xml_migration(profile, model: MigrationModel) -> int:
     return count
 
 
-def create_merged_workspace(profile, project, model: MigrationModel) -> tuple[int, dict]:
+def create_merged_workspace(
+    profile,
+    project,
+    model: MigrationModel,
+    approved_reuses: set[str] | None = None,
+) -> tuple[int, dict]:
     base_id = int(project["base_workspace_id"] or 0)
     settings = profile_settings(profile)
     panorama = profile["target_type"] == "panorama"
@@ -2815,7 +2867,8 @@ def create_merged_workspace(profile, project, model: MigrationModel) -> tuple[in
     if not workspace or int(workspace["profile_id"]) != int(profile["id"]):
         raise MigrationError("De gekozen base-workspace hoort niet bij het targetprofiel")
     merged_xml, plan = merge_model_into_panos_xml(
-        workspace_config_path(workspace).read_bytes(), model, scope, panorama, settings.get("rulebase", "pre")
+        workspace_config_path(workspace).read_bytes(), model, scope, panorama,
+        settings.get("rulebase", "pre"), approved_reuses,
     )
     workspace_id = store_config_workspace(
         profile, f"{project['name']} · merged {now()}", workspace["original_name"], merged_xml, "migration-merge"
@@ -3191,11 +3244,7 @@ def config_workspace_editor(workspace_id):
         edit_policy = next((item for item in policies if item["name"] == edit_name and item["editable"]), None)
         migration_output_sanity = json.loads(migration_output["sanity_json"] or "{}") if migration_output else {}
         migration_output_push_blocked = bool(
-            migration_output and (
-                migration_output_sanity.get("regenerate_required")
-                or int(migration_output_sanity.get("critical_findings", 0) or 0) > 0
-                or int(migration_output_sanity.get("unresolved_references", 0) or 0) > 0
-            )
+            migration_output and migration_output_push_block(workspace["id"])[1]
         )
         return render_template(
             "workspace_editor.html", workspace=workspace, snapshot=snapshot,
@@ -3860,14 +3909,24 @@ def migration_output_push_block(workspace_id: int):
             "WHERE migration_outputs.workspace_id=? ORDER BY migration_outputs.id DESC LIMIT 1",
             (workspace_id,),
         ).fetchone()
+        resolved_codes = {
+            row["code"]
+            for row in conn.execute(
+                "SELECT code FROM migration_output_resolutions WHERE output_id=?",
+                (output["id"],),
+            ).fetchall()
+        } if output else set()
     if not output:
         return None, ""
     sanity = json.loads(output["sanity_json"] or "{}")
     if sanity.get("regenerate_required"):
         return output, "Deze migratiecandidate is verouderd; maak eerst een nieuwe merge."
-    if int(sanity.get("unresolved_references", 0) or 0) > 0:
+    if int(sanity.get("candidate_unresolved_references", sanity.get("unresolved_references", 0)) or 0) > 0:
         return output, "Deze migratiecandidate bevat nog onopgeloste referenties."
-    if int(sanity.get("critical_findings", 0) or 0) > 0:
+    critical_codes = sanity.get("critical_review_codes", {})
+    if isinstance(critical_codes, dict) and set(critical_codes) - resolved_codes:
+        return output, "Deze migratiecandidate bevat nog onbehandelde kritieke reviewpunten."
+    if int(sanity.get("critical_findings", 0) or 0) > 0 and not critical_codes:
         return output, "Deze migratiecandidate bevat nog kritieke reviewpunten."
     return output, ""
 
@@ -4178,6 +4237,61 @@ def migration_output_export(project_id, output_id, kind):
     return Response(render_set_commands(xml_bytes), mimetype="text/plain", headers={"Content-Disposition": f'attachment; filename="{safe}.set.txt"'})
 
 
+@app.post("/migration/projects/<int:project_id>/outputs/<int:output_id>/review/<code>")
+@login_required
+def migration_output_review_update(project_id, output_id, code):
+    project = migration_project_row(project_id)
+    output = migration_output_row(project_id, output_id)
+    if not project or not output:
+        return "Not found", 404
+    if migration_project_role(project_id) not in {"owner", "editor"}:
+        return "Forbidden", 403
+    try:
+        sanity = json.loads(output["sanity_json"] or "{}")
+        critical_codes = sanity.get("critical_review_codes", {})
+        if not isinstance(critical_codes, dict) or code not in critical_codes:
+            raise MigrationError("Dit reviewpunt hoort niet bij deze candidate")
+        action = request.form.get("action", "resolve")
+        with db() as conn:
+            if action == "reopen":
+                conn.execute(
+                    "DELETE FROM migration_output_resolutions WHERE output_id=? AND code=?",
+                    (output_id, code),
+                )
+                audit_action = "migration-review-reopened"
+            else:
+                note = request.form.get("note", "").strip()
+                if len(note) < 3:
+                    raise MigrationError("Geef kort aan hoe dit reviewpunt is behandeld")
+                conn.execute(
+                    "INSERT INTO migration_output_resolutions(output_id,code,note,resolved_by,resolved_at) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(output_id,code) DO UPDATE SET note=excluded.note,resolved_by=excluded.resolved_by,resolved_at=excluded.resolved_at",
+                    (output_id, code, note[:500], session.get("username", "admin"), now()),
+                )
+                audit_action = "migration-review-resolved"
+            resolved = {
+                row["code"]
+                for row in conn.execute(
+                    "SELECT code FROM migration_output_resolutions WHERE output_id=?",
+                    (output_id,),
+                ).fetchall()
+            }
+            remaining = set(critical_codes) - resolved
+            candidate_unresolved = int(
+                sanity.get("candidate_unresolved_references", sanity.get("unresolved_references", 0)) or 0
+            )
+            sanity["critical_findings"] = len(remaining) + (1 if candidate_unresolved else 0)
+            conn.execute(
+                "UPDATE migration_outputs SET sanity_json=? WHERE id=?",
+                (json.dumps(sanity, sort_keys=True), output_id),
+            )
+        audit(audit_action, f"project={project_id} output={output_id} code={code}")
+        flash("Reviewstatus bijgewerkt.", "success")
+    except Exception as exc:
+        flash(f"Reviewstatus niet bijgewerkt: {exc}", "error")
+    return redirect(url_for("migration_project", project_id=project_id) + "#migration-outputs")
+
+
 @app.post("/migration/projects")
 @login_required
 def migration_project_create():
@@ -4206,17 +4320,39 @@ def migration_project(project_id):
         profiles = conn.execute("SELECT id,name,target_type FROM profiles ORDER BY name").fetchall()
         workspaces = conn.execute("SELECT id,name,source,created_at FROM config_workspaces WHERE profile_id=? ORDER BY id DESC", (project["target_profile_id"],)).fetchall()
         output_rows = conn.execute("SELECT * FROM migration_outputs WHERE project_id=? ORDER BY id DESC", (project_id,)).fetchall()
+        output_resolution_rows = conn.execute(
+            "SELECT migration_output_resolutions.* FROM migration_output_resolutions "
+            "JOIN migration_outputs ON migration_outputs.id=migration_output_resolutions.output_id "
+            "WHERE migration_outputs.project_id=? ORDER BY resolved_at DESC",
+            (project_id,),
+        ).fetchall()
         profile = conn.execute("SELECT * FROM profiles WHERE id=?", (project["target_profile_id"],)).fetchone()
     family_mappings = ensure_migration_family_mappings(project_id, source_rows)
     sources = []
     for row in source_rows:
         source = dict(row); source["counts"] = json.loads(row["counts_json"]); source["messages"] = json.loads(row["warnings_json"]); sources.append(source)
     outputs = []
+    resolutions_by_output = defaultdict(dict)
+    for row in output_resolution_rows:
+        resolutions_by_output[int(row["output_id"])][row["code"]] = dict(row)
     for row in output_rows:
         output = dict(row)
         output["collisions"] = json.loads(row["collision_json"] or "{}")
         output["sanity"] = json.loads(row["sanity_json"] or "{}")
         output["conflict_total"] = sum(int(item.get("conflicts", 0)) for item in output["collisions"].values() if isinstance(item, dict))
+        output["resolutions"] = resolutions_by_output.get(int(row["id"]), {})
+        critical_codes = output["sanity"].get("critical_review_codes", {})
+        output["critical_review_codes"] = critical_codes if isinstance(critical_codes, dict) else {}
+        output["unresolved_review_codes"] = {
+            code: details for code, details in output["critical_review_codes"].items()
+            if code not in output["resolutions"]
+        }
+        output["push_blocked"] = bool(
+            output["sanity"].get("regenerate_required")
+            or int(output["sanity"].get("candidate_unresolved_references", output["sanity"].get("unresolved_references", 0)) or 0) > 0
+            or output["unresolved_review_codes"]
+            or (int(output["sanity"].get("critical_findings", 0) or 0) > 0 and not output["critical_review_codes"])
+        )
         outputs.append(output)
     source_ids=[int(row["id"]) for row in source_rows]
     combined=selected_migration_model(project_id,source_ids) if source_ids else MigrationModel("merged","")
@@ -4260,6 +4396,23 @@ def migration_project(project_id):
         "zones":sorted({str(item.get("name","")) for item in target_model.zones if str(item.get("name",""))}),
         "interfaces":sorted({str(item.get("name","")) for item in target_model.interfaces if str(item.get("name",""))}),
     }
+    target_zones = sorted(set(topology_targets["zones"]) | set(profile_settings_value.get("zones", {})))
+    policy_zone_items = []
+    for kind, rules in (("security_rules", combined.security_rules), ("nat_rules", combined.nat_rules)):
+        for rule in rules:
+            if "any" not in rule.from_zones and "any" not in rule.to_zones:
+                continue
+            raw = rule.__dict__
+            policy_zone_items.append({
+                "kind": kind,
+                "name": rule.name,
+                "selector": item_selector(raw),
+                "source_ref": rule.source_ref,
+                "from_zones": rule.from_zones,
+                "to_zones": rule.to_zones,
+                "source": rule.source,
+                "destination": rule.destination,
+            })
     health=migration_health_dashboard(combined)
     best_practices=migration_best_practices(combined)
     discovery=migration_discovery(combined)
@@ -4273,8 +4426,11 @@ def migration_project(project_id):
         configuration_items=configuration_items, outputs=outputs, family_mappings=family_mappings,
         mappings_by_source=mappings_by_source, mapping_actions=MIGRATION_MAPPING_ACTIONS,
         topology_rules=topology_rules, topology_targets=topology_targets,
+        target_zones=target_zones, policy_zone_items=policy_zone_items,
+        zone_freeform_allowed=bool(project["target_type"] == "panorama" and not target_zones),
         saved_filters=saved_filters, selected_filter=selected_filter, filter_results=filter_results,
-        filter_fields=sorted(MIGRATION_FILTER_FIELDS), filter_operators=sorted(MIGRATION_FILTER_OPERATORS),
+        filter_fields=["name", "kind", "value", "source_ref", "references", "disabled"],
+        filter_operators=["contains", "equals", "not_contains", "starts_with", "ends_with", "regex"],
         migration_health=health, best_practices=best_practices, discovery=discovery,
         staged_actions=staged_actions, catalogs=catalogs, snippets=snippets,
         project_roles=role_rows, project_users=users, current_project_role=migration_project_role(project_id),
@@ -4352,6 +4508,91 @@ def migration_topology_mapping_save(project_id):
         flash("Topologiemapping bijgewerkt.", "success")
     except Exception as exc:
         flash(f"Topologiemapping niet opgeslagen: {exc}", "error")
+    return redirect(url_for("migration_project", project_id=project_id) + "#topology-mapping")
+
+
+@app.post("/migration/projects/<int:project_id>/policy-zones")
+@login_required
+def migration_policy_zone_mapping_save(project_id):
+    project = migration_project_row(project_id)
+    if not project:
+        return "Not found", 404
+    try:
+        policy_keys = list(dict.fromkeys(request.form.getlist("policy_key")))
+        from_zones = list(dict.fromkeys(
+            value.strip() for value in request.form.getlist("from_zone") if value.strip()
+        ))
+        to_zones = list(dict.fromkeys(
+            value.strip() for value in request.form.getlist("to_zone") if value.strip()
+        ))
+        if not policy_keys:
+            raise MigrationError("Selecteer minstens één policy")
+        if not from_zones and not to_zones:
+            raise MigrationError("Kies minstens een source- of destinationzone")
+        with db() as conn:
+            profile = conn.execute(
+                "SELECT * FROM profiles WHERE id=?", (project["target_profile_id"],)
+            ).fetchone()
+            source_ids = [
+                int(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM migration_sources WHERE project_id=?", (project_id,)
+                ).fetchall()
+            ]
+        if not profile or not source_ids:
+            raise MigrationError("Targetprofiel of migratiebron ontbreekt")
+        target_model = MigrationModel("panos", "target")
+        if project["base_workspace_id"]:
+            base_workspace = workspace_row(int(project["base_workspace_id"]))
+            if base_workspace:
+                target_model = cached_migration_workspace_model(
+                    base_workspace["config_path"], base_workspace["sha256"]
+                )
+        settings = profile_settings(profile)
+        target_zones = set(migration_zone_names(target_model)) | set(settings.get("zones", {}))
+        freeform_allowed = profile["target_type"] == "panorama" and not target_zones
+        for zone in [*from_zones, *to_zones]:
+            if not freeform_allowed and zone not in target_zones:
+                raise MigrationError(
+                    f"Zone {zone} bestaat niet in de gekozen targetconfiguratie"
+                )
+            if freeform_allowed and not re.fullmatch(r"[A-Za-z0-9._ -]{1,63}", zone):
+                raise MigrationError("Ongeldige zonenaam")
+        model = selected_migration_model(project_id, source_ids)
+        available = {
+            f"{kind}|||{item_selector(rule.__dict__)}": (kind, item_selector(rule.__dict__))
+            for kind, rules in (("security_rules", model.security_rules), ("nat_rules", model.nat_rules))
+            for rule in rules
+        }
+        selected = []
+        for key in policy_keys:
+            if key not in available:
+                raise MigrationError("Een geselecteerde policy bestaat niet meer")
+            selected.append(available[key])
+        timestamp = now()
+        with db() as conn:
+            for kind, selector in selected:
+                for operation, zones in (("set_from_zones", from_zones), ("set_to_zones", to_zones)):
+                    if not zones:
+                        continue
+                    conn.execute(
+                        "DELETE FROM migration_transform_rules WHERE project_id=? AND operation=? AND kind=? AND selector=?",
+                        (project_id, operation, kind, selector),
+                    )
+                    conn.execute(
+                        "INSERT INTO migration_transform_rules(project_id,operation,kind,selector,value,created_at) VALUES(?,?,?,?,?,?)",
+                        (project_id, operation, kind, selector, json.dumps(zones), timestamp),
+                    )
+            conn.execute(
+                "UPDATE migration_projects SET updated_at=? WHERE id=?", (timestamp, project_id)
+            )
+        audit(
+            "migration-policy-zones",
+            f"project={project_id} policies={len(selected)} from={len(from_zones)} to={len(to_zones)}",
+        )
+        flash(f"Zones voor {len(selected)} policies bijgewerkt.", "success")
+    except Exception as exc:
+        flash(f"Policyzones niet opgeslagen: {exc}", "error")
     return redirect(url_for("migration_project", project_id=project_id) + "#topology-mapping")
 
 
@@ -4702,6 +4943,44 @@ def migration_source_profile(project_id):
     return redirect(url_for("migration_project",project_id=project_id))
 
 
+def ensure_migration_source_workspace(project, source) -> int:
+    existing_workspace_id = int(source["staging_workspace_id"] or 0)
+    if existing_workspace_id and workspace_row(existing_workspace_id):
+        return existing_workspace_id
+    with db() as conn:
+        profile = conn.execute("SELECT * FROM profiles WHERE id=?", (project["target_profile_id"],)).fetchone()
+    if not profile:
+        raise MigrationError("Targetprofiel bestaat niet meer")
+    model = migration_model(source)
+    settings = profile_settings(profile)
+    panorama = profile["target_type"] == "panorama"
+    scope = settings.get("device_group", "") if panorama else settings.get("vsys", "vsys1") or "vsys1"
+    base_xml = migration_base_xml(model, scope, panorama)
+    merged_xml, _ = merge_model_into_panos_xml(
+        base_xml, model, scope, panorama, settings.get("rulebase", "pre")
+    )
+    safe_source_name = re.sub(
+        r"[^A-Za-z0-9._-]+", "-", Path(source["source_name"]).stem
+    ).strip("-") or "migration-source"
+    workspace_id = store_config_workspace(
+        profile,
+        f"{source['source_name']} · import editor",
+        f"{safe_source_name}.xml",
+        merged_xml,
+        "migration-staging",
+    )
+    with db() as conn:
+        conn.execute(
+            "UPDATE migration_sources SET staging_workspace_id=? WHERE id=?",
+            (workspace_id, source["id"]),
+        )
+    audit(
+        "migration-source-editor-created",
+        f"project={project['id']} source={source['id']} workspace={workspace_id}",
+    )
+    return workspace_id
+
+
 @app.post("/migration/projects/<int:project_id>/sources/<int:source_id>/edit")
 @login_required
 def migration_source_edit(project_id, source_id):
@@ -4710,40 +4989,70 @@ def migration_source_edit(project_id, source_id):
     if not project or not source or int(source["project_id"]) != project_id:
         return "Not found", 404
     try:
-        existing_workspace_id = int(source["staging_workspace_id"] or 0)
-        if existing_workspace_id and workspace_row(existing_workspace_id):
-            return redirect(url_for("config_workspace_editor", workspace_id=existing_workspace_id, workspace_view="policies"))
-        with db() as conn:
-            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (project["target_profile_id"],)).fetchone()
-        if not profile:
-            raise MigrationError("Targetprofiel bestaat niet meer")
-        model = migration_model(source)
-        settings = profile_settings(profile)
-        panorama = profile["target_type"] == "panorama"
-        scope = settings.get("device_group", "") if panorama else settings.get("vsys", "vsys1") or "vsys1"
-        base_xml = migration_base_xml(model, scope, panorama)
-        merged_xml, _ = merge_model_into_panos_xml(
-            base_xml, model, scope, panorama, settings.get("rulebase", "pre")
-        )
-        safe_source_name = re.sub(
-            r"[^A-Za-z0-9._-]+", "-", Path(source["source_name"]).stem
-        ).strip("-") or "migration-source"
-        workspace_id = store_config_workspace(
-            profile,
-            f"{source['source_name']} · import editor",
-            f"{safe_source_name}.xml",
-            merged_xml,
-            "migration-staging",
-        )
-        with db() as conn:
-            conn.execute(
-                "UPDATE migration_sources SET staging_workspace_id=? WHERE id=?",
-                (workspace_id, source_id),
-            )
-        audit("migration-source-editor-created", f"project={project_id} source={source_id} workspace={workspace_id}")
+        workspace_id = ensure_migration_source_workspace(project, source)
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, workspace_view="policies"))
     except Exception as exc:
         flash(f"Importeditor niet geopend: {exc}", "error")
+        return redirect(url_for("migration_project", project_id=project_id))
+
+
+@app.post("/migration/projects/<int:project_id>/review/open")
+@login_required
+def migration_review_open(project_id):
+    project = migration_project_row(project_id)
+    if not project:
+        return "Not found", 404
+    try:
+        kind = request.form.get("kind", "").strip()
+        name = request.form.get("name", "").strip()
+        source_ref = request.form.get("source_ref", "").strip()
+        if not name or kind not in MIGRATION_KIND_LABELS:
+            raise MigrationError("Het reviewitem bestaat niet meer")
+        with db() as conn:
+            source_rows = conn.execute(
+                "SELECT * FROM migration_sources WHERE project_id=? ORDER BY id",
+                (project_id,),
+            ).fetchall()
+        matched_source = None
+        for source in source_rows:
+            items = model_collections(migration_model(source)).get(kind, [])
+            for item in items:
+                raw = item.__dict__ if hasattr(item, "__dict__") else item
+                if str(raw.get("name", "")) == name and (
+                    not source_ref or str(raw.get("source_ref", "")) == source_ref
+                ):
+                    matched_source = source
+                    break
+            if matched_source:
+                break
+        if not matched_source:
+            raise MigrationError("Het reviewitem kon niet meer aan een importbron worden gekoppeld")
+        workspace_id = ensure_migration_source_workspace(project, matched_source)
+        if kind in {"security_rules", "nat_rules"}:
+            return redirect(url_for(
+                "config_workspace_editor",
+                workspace_id=workspace_id,
+                workspace_view="policies",
+                policy_kind="security" if kind == "security_rules" else "nat",
+                edit_policy=name,
+            ))
+        object_type = {
+            "addresses": "addresses",
+            "address_groups": "address-groups",
+            "services": "services",
+            "service_groups": "service-groups",
+        }.get(kind)
+        if object_type:
+            return redirect(url_for(
+                "config_workspace_editor",
+                workspace_id=workspace_id,
+                workspace_view="objects",
+                object_type=object_type,
+                edit_object=name,
+            ))
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
+    except Exception as exc:
+        flash(f"Reviewitem niet geopend: {exc}", "error")
         return redirect(url_for("migration_project", project_id=project_id))
 
 
@@ -5038,6 +5347,14 @@ def migration_merge_apply(draft_id):
         if request.form.get("review_acknowledged") != "reviewed":
             audit("migration-review-blocked", f"project={project['id']} draft={draft_id}")
             raise MigrationError("Bevestig eerst dat de volledige configuratie handmatig is nagekeken")
+        approved_reuses = set(request.form.getlist("approved_reuse"))
+        allowed_reuses = {
+            str(item.get("key", ""))
+            for item in draft.get("plan", {}).get("suggested_reuses", [])
+            if str(item.get("key", ""))
+        }
+        if not approved_reuses.issubset(allowed_reuses):
+            raise MigrationError("De gekozen objecthergebruikbeslissing hoort niet bij deze preview")
         audit("migration-review-acknowledged", f"project={project['id']} draft={draft_id} findings={len(review['findings'])}")
         with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (draft["target_profile_id"],)).fetchone()
         if not profile: raise MigrationError("Targetprofiel bestaat niet meer")
@@ -5054,7 +5371,10 @@ def migration_merge_apply(draft_id):
             if not hmac.compare_digest(current_base_hash, str(draft.get("base_fingerprint", ""))):
                 raise MigrationError("De base-configuratie is gewijzigd; maak een nieuwe preview")
         if profile["target_type"] == "scm":
-            model, plan = reconcile_model(model, migration_target_inventory(profile))
+            if int(review.get("critical", 0)) > 0:
+                audit("migration-scm-push-blocked", f"project={project['id']} critical={review['critical']}")
+                raise MigrationError("SCM candidate-write geblokkeerd: los eerst de kritieke reviewpunten op")
+            model, plan = reconcile_model(model, migration_target_inventory(profile), approved_reuses)
             plan["create"] += sum(len(items) for items in model.extras.values())
             if int(plan.get("create", 0)) == 0:
                 raise MigrationError("De target is gewijzigd en de selectie veroorzaakt geen nieuwe candidatewijziging")
@@ -5068,16 +5388,25 @@ def migration_merge_apply(draft_id):
             current_base = workspace_row(base_id) if base_id else None
             preflight_xml = workspace_config_path(current_base).read_bytes() if current_base else migration_base_xml(model, scope, panorama)
             _, preflight_plan = merge_model_into_panos_xml(
-                preflight_xml, model, scope, panorama, settings.get("rulebase", "pre")
+                preflight_xml, model, scope, panorama, settings.get("rulebase", "pre"), approved_reuses
             )
             if int(preflight_plan.get("create", 0)) == 0:
                 raise MigrationError("De selectie veroorzaakt geen wijziging aan de target candidate")
-            workspace_id, plan = create_merged_workspace(profile, project, model)
+            workspace_id, plan = create_merged_workspace(profile, project, model, approved_reuses)
             source_analysis = migration_analysis(model)
             candidate_analysis = panos_candidate_analysis(
                 workspace_config_path(workspace_row(workspace_id)).read_bytes()
             )
             candidate_unresolved = len(candidate_analysis["unresolved_references"])
+            critical_review_codes = {
+                str(finding["code"]): {
+                    "title": str(finding["title"]),
+                    "detail": str(finding["detail"]),
+                    "count": int(finding.get("count", 0) or 0),
+                }
+                for finding in review["findings"]
+                if finding["severity"] == "critical"
+            }
             output_id = store_migration_output(
                 int(project["id"]),
                 workspace_id,
@@ -5085,6 +5414,7 @@ def migration_merge_apply(draft_id):
                 str(project["topology"] or "active-passive"),
                 sanity={
                     "unresolved_references": candidate_unresolved,
+                    "candidate_unresolved_references": candidate_unresolved,
                     "unresolved_applications": len(candidate_analysis["unresolved_application_references"]),
                     "duplicate_rules": len(candidate_analysis["duplicate_rules"]),
                     "unused_objects": sum(
@@ -5096,7 +5426,8 @@ def migration_merge_apply(draft_id):
                             "unused_service_groups",
                         )
                     ),
-                    "critical_findings": int(review["critical"]) + (1 if candidate_unresolved else 0),
+                    "critical_findings": len(critical_review_codes) + (1 if candidate_unresolved else 0),
+                    "critical_review_codes": critical_review_codes,
                     "review_warnings": int(review["warnings"]),
                     "regenerate_required": False,
                 },

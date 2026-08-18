@@ -1657,6 +1657,9 @@ def migration_filter_inventory(
         value = str(rule.get("value", ""))
         if field not in MIGRATION_FILTER_FIELDS or operator not in MIGRATION_FILTER_OPERATORS:
             raise MigrationError("Ongeldige migratiefilter")
+        if field == "disabled":
+            if operator != "equals" or value.casefold() not in {"yes", "no"}:
+                raise MigrationError("Disabled gebruikt alleen Equals met Ja of Neen")
         if not value and field != "disabled":
             continue
         normalized.append((field, operator, value))
@@ -1875,6 +1878,16 @@ def apply_transform_rules(model: MigrationModel, rules: list[dict]) -> Migration
                 collection.remove(item)
             elif operation == "topology_review":
                 result.warnings.append(f"Topologiemapping vereist review: {kind} {old}")
+        elif operation in {"set_from_zones", "set_to_zones"} and kind in {"security_rules", "nat_rules"}:
+            item = selector_item(collection, selector)
+            if item is None:
+                continue
+            try:
+                zones = unique(str(zone).strip() for zone in json.loads(value or "[]") if str(zone).strip())
+            except (json.JSONDecodeError, TypeError):
+                zones = unique(zone.strip() for zone in value.split(",") if zone.strip())
+            if zones:
+                setattr(item, "from_zones" if operation == "set_from_zones" else "to_zones", zones)
         elif operation=="replace_reference" and selector and value:
             replacements[selector]=value
     if replacements:
@@ -2123,20 +2136,50 @@ def migration_review_findings(model: MigrationModel) -> dict:
     analysis = migration_analysis(model)
     findings: list[dict[str, object]] = []
 
-    def add(severity: str, code: str, title: str, detail: str, count: int = 0) -> None:
+    def review_item(kind: str, item) -> dict[str, str]:
+        raw = asdict(item) if hasattr(item, "__dataclass_fields__") else dict(item)
+        return {
+            "kind": kind,
+            "name": str(raw.get("name", "")),
+            "source_ref": str(raw.get("source_ref", "")),
+            "selector": item_selector(raw),
+        }
+
+    def add(
+        severity: str,
+        code: str,
+        title: str,
+        detail: str,
+        count: int = 0,
+        affected: list[dict[str, str]] | None = None,
+        anchor: str = "best-practices",
+    ) -> None:
         findings.append({
             "severity": severity,
             "code": code,
             "title": title,
             "detail": detail,
             "count": int(count),
+            "affected": (affected or [])[:100],
+            "anchor": anchor,
         })
 
     unresolved = len(analysis["unresolved_references"])
     if unresolved:
+        unresolved_names = set(analysis["unresolved_references"])
+        affected = []
+        for kind, groups in (("address_groups", model.address_groups), ("service_groups", model.service_groups)):
+            affected.extend(review_item(kind, group) for group in groups if unresolved_names.intersection(group.members))
+        for kind, rules in (("security_rules", model.security_rules), ("nat_rules", model.nat_rules)):
+            affected.extend(
+                review_item(kind, rule)
+                for rule in rules
+                if unresolved_names.intersection([*rule.source, *rule.destination, *rule.service, *rule.application])
+            )
         add(
             "critical", "unresolved-references", "Onopgeloste referenties",
             "Objecten, services of groepen ontbreken nog op het doel en moeten worden gemapt.", unresolved,
+            affected,
         )
 
     if model.unsupported:
@@ -2150,10 +2193,15 @@ def migration_review_findings(model: MigrationModel) -> dict:
         1 for message in model.warnings if "niet-ondersteunde Check Point actie" in message
     )
     if unsupported_actions:
+        affected = [
+            review_item("security_rules", rule)
+            for rule in model.security_rules
+            if "REVIEW: actie" in rule.description
+        ]
         add(
             "critical", "unsupported-actions", "Policy-acties niet gemapt",
             "Deze regels zijn veiligheidshalve disabled; kies voor elke regel bewust de correcte actie.",
-            unsupported_actions,
+            unsupported_actions, affected,
         )
 
     policies = [*model.security_rules, *model.nat_rules]
@@ -2163,9 +2211,16 @@ def migration_review_findings(model: MigrationModel) -> dict:
     )
     if any_zone_rules:
         severity = "critical" if policies and any_zone_rules == len(policies) else "warning"
+        affected = [
+            review_item(kind, rule)
+            for kind, rules in (("security_rules", model.security_rules), ("nat_rules", model.nat_rules))
+            for rule in rules
+            if "any" in rule.from_zones or "any" in rule.to_zones
+        ]
         add(
             severity, "zone-mapping", "Zone-mapping nakijken",
             "Policies met een bron- of doelzone 'any' kunnen uit ontbrekende vendorcontext komen.", any_zone_rules,
+            affected, "topology-mapping",
         )
 
     if model.nat_rules:
@@ -2189,17 +2244,26 @@ def migration_review_findings(model: MigrationModel) -> dict:
                 missing_nat_interfaces.append(f"{rule.name}: {interface_name}")
         if missing_nat_interfaces:
             analysis["unresolved_nat_interfaces"] = missing_nat_interfaces
+            missing_rule_names = {item.split(":", 1)[0] for item in missing_nat_interfaces}
             add(
                 "critical", "nat-interface-mapping", "NAT-interface ontbreekt",
                 "Een source-NAT interface-address verwijst niet naar een gemigreerde PAN-OS-interface. Map eerst de doelinterface.",
                 len(missing_nat_interfaces),
+                [review_item("nat_rules", rule) for rule in model.nat_rules if rule.name in missing_rule_names],
+                "topology-mapping",
             )
 
     duplicate_rules = len(analysis["duplicate_rules"])
     if duplicate_rules:
+        duplicate_names = {item["duplicate"] for item in analysis["duplicate_rules"]}
         add(
             "warning", "duplicate-policies", "Mogelijk dubbele policies",
             "Exact gelijke signatures worden getoond, maar worden niet automatisch verwijderd.", duplicate_rules,
+            [
+                review_item(kind, rule)
+                for kind, rules in (("security_rules", model.security_rules), ("nat_rules", model.nat_rules))
+                for rule in rules if rule.name in duplicate_names
+            ],
         )
 
     skipped_crypto = any("Fortinet cryptomateriaal overgeslagen" in message for message in model.warnings)
@@ -2225,6 +2289,11 @@ def migration_review_findings(model: MigrationModel) -> dict:
         add(
             "info", "disabled-policies", "Disabled policies",
             "Controleer of deze regels disabled moeten blijven op het doel.", disabled_rules,
+            [
+                review_item(kind, rule)
+                for kind, rules in (("security_rules", model.security_rules), ("nat_rules", model.nat_rules))
+                for rule in rules if rule.disabled
+            ],
         )
 
     add(
@@ -2463,10 +2532,38 @@ def migration_api_plan(model: MigrationModel, target_type: str, target_context: 
     return actions
 
 
-def reconcile_model(model: MigrationModel, existing: dict[str, list[dict]]) -> tuple[MigrationModel, dict]:
-    """Reuse exact/equivalent target objects and block incompatible name collisions."""
+def reuse_decision_key(kind: str, imported: str, existing: str, semantic: str) -> str:
+    return hashlib.sha256(
+        json.dumps([kind, imported, existing, semantic], separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def reuse_value_summary(value) -> str:
+    if isinstance(value, ET.Element):
+        parts = [
+            f"{node.tag}={node.text.strip()}"
+            for node in value.iter()
+            if len(node) == 0 and node.text and node.text.strip()
+        ]
+        return " · ".join(parts)[:500]
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)[:500]
+
+
+def reconcile_model(
+    model: MigrationModel,
+    existing: dict[str, list[dict]],
+    approved_reuses: set[str] | None = None,
+) -> tuple[MigrationModel, dict]:
+    """Reuse same-name matches and require approval for cross-name equivalence."""
     result = MigrationModel.from_dict(model.as_dict())
-    plan = {"create": 0, "reuse": 0, "conflicts": [], "renamed_references": {}}
+    approved_reuses = set(approved_reuses or set())
+    plan = {
+        "create": 0,
+        "reuse": 0,
+        "conflicts": [],
+        "renamed_references": {},
+        "suggested_reuses": [],
+    }
     reference_map: dict[str, str] = {}
     object_fields = {
         "addresses": ("ip_netmask", "ip_range", "ip_wildcard", "fqdn"),
@@ -2500,10 +2597,21 @@ def reconcile_model(model: MigrationModel, existing: dict[str, list[dict]]) -> t
             continue
         equivalent = by_signature.get(wanted)
         if equivalent:
-            reference_map[name] = str(equivalent["name"])
-            plan["renamed_references"][name] = reference_map[name]
-            plan["reuse"] += 1
-            continue
+            existing_name = str(equivalent["name"])
+            decision_key = reuse_decision_key(kind, name, existing_name, wanted)
+            suggestion = {
+                "key": decision_key,
+                "kind": kind,
+                "imported": name,
+                "existing": existing_name,
+                "summary": reuse_value_summary({field: payload.get(field) for field in fields}),
+            }
+            plan["suggested_reuses"].append(suggestion)
+            if decision_key in approved_reuses:
+                reference_map[name] = existing_name
+                plan["renamed_references"][name] = existing_name
+                plan["reuse"] += 1
+                continue
         mapped[kind].append(name); plan["create"] += 1
 
     for attr in ("address_groups", "service_groups"):
@@ -2532,10 +2640,21 @@ def reconcile_model(model: MigrationModel, existing: dict[str, list[dict]]) -> t
             continue
         equivalent = by_signature.get(wanted)
         if equivalent:
-            reference_map[name] = str(equivalent["name"])
-            plan["renamed_references"][name] = reference_map[name]
-            plan["reuse"] += 1
-            continue
+            existing_name = str(equivalent["name"])
+            decision_key = reuse_decision_key(kind, name, existing_name, wanted)
+            suggestion = {
+                "key": decision_key,
+                "kind": kind,
+                "imported": name,
+                "existing": existing_name,
+                "summary": reuse_value_summary({field: payload.get(field) for field in fields}),
+            }
+            plan["suggested_reuses"].append(suggestion)
+            if decision_key in approved_reuses:
+                reference_map[name] = existing_name
+                plan["renamed_references"][name] = existing_name
+                plan["reuse"] += 1
+                continue
         mapped[kind].append(name); plan["create"] += 1
 
     for attr in ("security_rules", "nat_rules"):
@@ -2582,11 +2701,12 @@ def merge_model_into_panos_xml(
     scope: str,
     panorama: bool = False,
     rulebase: str = "pre",
+    approved_reuses: set[str] | None = None,
 ) -> tuple[bytes, dict]:
     """Merge a neutral model into a full PAN-OS/Panorama config without a live write.
 
-    Equal named entries are reused, equivalent address/service objects are reused under
-    their existing name, and incompatible name collisions stop the merge.
+    Equal named entries are reused. Equivalent objects with another name are proposed
+    for explicit engineer approval; incompatible name collisions stop the merge.
     """
     try:
         root = SafeET.fromstring(xml_bytes)
@@ -2605,14 +2725,22 @@ def merge_model_into_panos_xml(
     source = _named_scope(fragment_root, scope_path, scope)
     if source is None:
         raise MigrationError("Gegenereerde migratiescope ontbreekt")
-    plan = {"create": 0, "reuse": 0, "conflicts": [], "renamed_references": {}}
+    approved_reuses = set(approved_reuses or set())
+    plan = {
+        "create": 0,
+        "reuse": 0,
+        "conflicts": [],
+        "renamed_references": {},
+        "suggested_reuses": [],
+    }
     reference_map: dict[str, str] = {}
 
     def container(parent: ET.Element, tag: str) -> ET.Element:
         node = parent.find(f"./{tag}")
         return node if node is not None else ET.SubElement(parent, tag)
 
-    # Addresses and services can safely reuse an equivalent object with another name.
+    # A different object name may carry different intent even when its value matches.
+    # Keep it separate unless the engineer explicitly approves the proposed reuse.
     for tag in ("address", "service"):
         incoming = source.find(f"./{tag}")
         if incoming is None:
@@ -2632,10 +2760,20 @@ def merge_model_into_panos_xml(
                 continue
             equivalent = by_signature.get(signature)
             if equivalent is not None:
-                reference_map[name] = equivalent.get("name", name)
-                plan["renamed_references"][name] = reference_map[name]
-                plan["reuse"] += 1
-                continue
+                existing_name = equivalent.get("name", name)
+                decision_key = reuse_decision_key(tag, name, existing_name, signature)
+                plan["suggested_reuses"].append({
+                    "key": decision_key,
+                    "kind": tag,
+                    "imported": name,
+                    "existing": existing_name,
+                    "summary": reuse_value_summary(entry),
+                })
+                if decision_key in approved_reuses:
+                    reference_map[name] = existing_name
+                    plan["renamed_references"][name] = existing_name
+                    plan["reuse"] += 1
+                    continue
             clone = copy.deepcopy(entry)
             destination.append(clone); by_name[name] = clone; by_signature[signature] = clone
             plan["create"] += 1
@@ -2664,10 +2802,20 @@ def merge_model_into_panos_xml(
                 continue
             equivalent = by_signature.get(signature)
             if equivalent is not None:
-                reference_map[name] = equivalent.get("name", name)
-                plan["renamed_references"][name] = reference_map[name]
-                plan["reuse"] += 1
-                continue
+                existing_name = equivalent.get("name", name)
+                decision_key = reuse_decision_key(tag, name, existing_name, signature)
+                plan["suggested_reuses"].append({
+                    "key": decision_key,
+                    "kind": tag,
+                    "imported": name,
+                    "existing": existing_name,
+                    "summary": reuse_value_summary(entry),
+                })
+                if decision_key in approved_reuses:
+                    reference_map[name] = existing_name
+                    plan["renamed_references"][name] = existing_name
+                    plan["reuse"] += 1
+                    continue
             clone = copy.deepcopy(entry)
             destination.append(clone); by_name[name] = clone; by_signature[signature] = clone
             plan["create"] += 1

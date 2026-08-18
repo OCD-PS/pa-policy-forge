@@ -129,6 +129,91 @@ class MigrationTests(unittest.TestCase):
         ],"or")
         self.assertEqual({item["name"] for item in result},{"test-db","allow-prod"})
 
+    def test_disabled_filter_accepts_only_explicit_yes_or_no(self):
+        model = MigrationModel(
+            "generic", "source", security_rules=[main.Policy("allow", disabled=True)]
+        )
+        with self.assertRaises(MigrationError):
+            migration_filter_inventory(model, [
+                {"field": "disabled", "operator": "equals", "value": "true"},
+            ])
+        with self.assertRaises(MigrationError):
+            migration_filter_inventory(model, [
+                {"field": "disabled", "operator": "contains", "value": "yes"},
+            ])
+        result = migration_filter_inventory(model, [
+            {"field": "disabled", "operator": "equals", "value": "yes"},
+        ])
+        self.assertEqual([item["name"] for item in result], ["allow"])
+
+    def test_policy_zone_transform_replaces_only_selected_side(self):
+        model = MigrationModel(
+            "checkpoint", "source",
+            security_rules=[main.Policy("allow", from_zones=["any"], to_zones=["any"], source_ref="rule-1")],
+        )
+        transformed = apply_transform_rules(model, [{
+            "operation": "set_from_zones",
+            "kind": "security_rules",
+            "selector": "allow|||rule-1",
+            "value": json.dumps(["Trust"]),
+        }])
+        self.assertEqual(transformed.security_rules[0].from_zones, ["Trust"])
+        self.assertEqual(transformed.security_rules[0].to_zones, ["any"])
+
+    def test_review_findings_expose_affected_policy_items(self):
+        model = MigrationModel(
+            "checkpoint", "source",
+            security_rules=[main.Policy("allow", from_zones=["any"], to_zones=["any"], source_ref="rule-1")],
+        )
+        review = migration_review_findings(model)
+        finding = next(item for item in review["findings"] if item["code"] == "zone-mapping")
+        self.assertEqual(finding["anchor"], "topology-mapping")
+        self.assertEqual(finding["affected"][0]["name"], "allow")
+
+    def test_policy_zone_mapping_route_uses_existing_target_zone(self):
+        stamp = main.now()
+        with main.db() as conn:
+            profile_id = conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("PANOS zone mapping", "panos", json.dumps({"vsys": "vsys1"}), stamp, stamp),
+            ).lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        base = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><zone><entry name="Trust"><network><layer3/></network></entry><entry name="DMZ"><network><layer3/></network></entry></zone><rulebase/></entry></vsys></entry></devices></config>'''
+        workspace_id = main.store_config_workspace(profile, "Zone base", "base.xml", base, "test")
+        with main.db() as conn:
+            project_id = conn.execute(
+                "INSERT INTO migration_projects(name,target_profile_id,base_workspace_id,owner,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                ("zone-map", profile_id, workspace_id, "admin", stamp, stamp),
+            ).lastrowid
+        source_id = main.store_migration_source(
+            project_id, "checkpoint", "source.tar",
+            MigrationModel(
+                "checkpoint", "source.tar",
+                security_rules=[main.Policy("allow", from_zones=["any"], to_zones=["any"], source_ref="rule-1")],
+            ),
+        )
+        client = main.app.test_client()
+        with main.app.test_request_context("/", base_url="https://forge.test"):
+            serializer = main.app.session_interface.get_signing_serializer(main.app)
+            client.set_cookie(
+                main.app.config["SESSION_COOKIE_NAME"],
+                serializer.dumps({"user_id": 1, "username": "admin", "csrf": "migration-test-csrf"}),
+                domain="forge.test", secure=True,
+            )
+        response = client.post(
+            f"/migration/projects/{project_id}/policy-zones",
+            base_url="https://forge.test",
+            data={
+                "csrf": "migration-test-csrf",
+                "policy_key": "security_rules|||allow|||rule-1",
+                "from_zone": ["Trust", "DMZ"],
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        mapped = main.selected_migration_model(project_id, [source_id])
+        self.assertEqual(mapped.security_rules[0].from_zones, ["Trust", "DMZ"])
+        self.assertEqual(mapped.security_rules[0].to_zones, ["any"])
+
     def test_health_best_practices_discovery_and_api_plan_are_review_only(self):
         model=MigrationModel(
             "generic","source",
@@ -588,7 +673,7 @@ set security policies from-zone trust to-zone untrust policy web then permit''',
         self.assertIn('<device-group><entry name="Branches"><post-rulebase>', panorama)
         self.assertIn('<vsys><entry name="vsys2"><rulebase>', standalone)
 
-    def test_scm_reconciliation_reuses_equivalent_address_and_rewrites_policy(self):
+    def test_scm_reconciliation_requires_approval_for_cross_name_reuse(self):
         model = parse_vendor("fortinet", b'''config firewall address
 edit "old-web"
 set subnet 192.0.2.10 255.255.255.255
@@ -607,9 +692,18 @@ end''', "forti.conf")
             "address-groups": [], "services": [], "service-groups": [],
             "policy:security": [], "policy:nat": [],
         })
-        self.assertEqual(reconciled.addresses, [])
-        self.assertEqual(reconciled.security_rules[0].destination, ["existing-web"])
-        self.assertEqual(plan["reuse"], 1)
+        self.assertEqual([item.name for item in reconciled.addresses], ["old-web"])
+        self.assertEqual(reconciled.security_rules[0].destination, ["old-web"])
+        self.assertEqual(plan["reuse"], 0)
+        self.assertEqual(len(plan["suggested_reuses"]), 1)
+        approved, approved_plan = reconcile_model(model, {
+            "addresses": [{"name": "existing-web", "ip_netmask": "192.0.2.10/32"}],
+            "address-groups": [], "services": [], "service-groups": [],
+            "policy:security": [], "policy:nat": [],
+        }, {plan["suggested_reuses"][0]["key"]})
+        self.assertEqual(approved.addresses, [])
+        self.assertEqual(approved.security_rules[0].destination, ["existing-web"])
+        self.assertEqual(approved_plan["reuse"], 1)
 
     def test_scm_reconciliation_reuses_equivalent_group_after_member_rewrite(self):
         model = parse_vendor("fortinet", b'''config firewall address
@@ -630,11 +724,16 @@ set dstaddr "imported-servers"
 set service "ALL"
 next
 end''', "forti.conf")
-        reconciled, plan = reconcile_model(model, {
+        target = {
             "addresses": [{"name": "existing-web", "ip_netmask": "192.0.2.10/32"}],
             "address-groups": [{"name": "existing-servers", "static": ["existing-web"]}],
             "services": [], "service-groups": [], "policy:security": [], "policy:nat": [],
-        })
+        }
+        _, first_plan = reconcile_model(model, target)
+        address_key = first_plan["suggested_reuses"][0]["key"]
+        _, second_plan = reconcile_model(model, target, {address_key})
+        group_key = next(item["key"] for item in second_plan["suggested_reuses"] if item["kind"] == "address-groups")
+        reconciled, plan = reconcile_model(model, target, {address_key, group_key})
         self.assertEqual(reconciled.addresses, [])
         self.assertEqual(reconciled.address_groups, [])
         self.assertEqual(reconciled.security_rules[0].destination, ["existing-servers"])
@@ -645,8 +744,14 @@ end''', "forti.conf")
         equivalent = parse_vendor("generic", b'[{"name":"imported","value":"192.0.2.10/32"}]', "generic.json")
         merged, plan = merge_model_into_panos_xml(base, equivalent, "vsys1")
         self.assertIn(b'name="existing"', merged)
-        self.assertNotIn(b'name="imported"', merged)
-        self.assertEqual(plan["renamed_references"], {"imported": "existing"})
+        self.assertIn(b'name="imported"', merged)
+        self.assertEqual(plan["renamed_references"], {})
+        self.assertEqual(len(plan["suggested_reuses"]), 1)
+        approved, approved_plan = merge_model_into_panos_xml(
+            base, equivalent, "vsys1", approved_reuses={plan["suggested_reuses"][0]["key"]}
+        )
+        self.assertNotIn(b'name="imported"', approved)
+        self.assertEqual(approved_plan["renamed_references"], {"imported": "existing"})
         conflict = parse_vendor("generic", b'[{"name":"existing","value":"198.51.100.1/32"}]', "generic.json")
         with self.assertRaises(MigrationError):
             merge_model_into_panos_xml(base, conflict, "vsys1")
@@ -1008,7 +1113,7 @@ end''', "editable-fortigate.conf")
         self.assertEqual(page.status_code, 200)
         self.assertIn("AA node 1", page.get_data(as_text=True))
         self.assertIn("AA node 2", page.get_data(as_text=True))
-        self.assertIn("2 conflicten", page.get_data(as_text=True))
+        self.assertIn("Collision report · 2", page.get_data(as_text=True))
         for output_id in (output_a, output_b):
             self.assertEqual(client.get(f"/migration/projects/{project_id}/outputs/{output_id}/xml", base_url="https://forge.test").status_code, 200)
             self.assertEqual(client.get(f"/migration/projects/{project_id}/outputs/{output_id}/set", base_url="https://forge.test").status_code, 200)
@@ -1198,6 +1303,44 @@ end''', "editable-fortigate.conf")
         self.assertEqual(response.status_code,200)
         self.assertIn("geen wijziging aan de target candidate",response.get_data(as_text=True))
 
+    def test_merge_preview_renders_cross_name_reuse_as_opt_in(self):
+        stamp = main.now()
+        with main.db() as conn:
+            profile_id = conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("PANOS reuse preview", "panos", json.dumps({"vsys": "vsys1"}), stamp, stamp),
+            ).lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        base = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="existing"><ip-netmask>192.0.2.20/32</ip-netmask></entry></address><rulebase/></entry></vsys></entry></devices></config>'''
+        workspace_id = main.store_config_workspace(profile, "Reuse base", "reuse.xml", base, "test")
+        with main.db() as conn:
+            project_id = conn.execute(
+                "INSERT INTO migration_projects(name,target_profile_id,base_workspace_id,owner,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                ("reuse-preview", profile_id, workspace_id, "admin", stamp, stamp),
+            ).lastrowid
+        source_id = main.store_migration_source(
+            project_id, "generic", "source.json",
+            MigrationModel("generic", "source.json", addresses=[Address("imported", "192.0.2.20/32")]),
+        )
+        client = main.app.test_client()
+        with main.app.test_request_context("/", base_url="https://forge.test"):
+            serializer = main.app.session_interface.get_signing_serializer(main.app)
+            client.set_cookie(
+                main.app.config["SESSION_COOKIE_NAME"],
+                serializer.dumps({"user_id": 1, "username": "admin", "csrf": "migration-test-csrf"}),
+                domain="forge.test", secure=True,
+            )
+        response = client.post(
+            f"/migration/projects/{project_id}/preview",
+            base_url="https://forge.test",
+            data={"csrf": "migration-test-csrf", "source_id": str(source_id), "kind": "addresses"},
+        )
+        self.assertEqual(response.status_code, 200)
+        page = response.get_data(as_text=True)
+        self.assertIn("Voorgesteld objecthergebruik", page)
+        self.assertIn('name="approved_reuse"', page)
+        self.assertNotIn('name="approved_reuse" checked', page)
+
     def test_migration_output_workspace_links_back_and_blocks_push_when_review_fails(self):
         stamp = main.now()
         with main.db() as conn:
@@ -1232,6 +1375,55 @@ end''', "editable-fortigate.conf")
         )
         self.assertEqual(blocked.status_code, 302)
         self.assertIn(f"/migration/projects/{project_id}", blocked.headers["Location"])
+
+    def test_review_gate_follows_candidate_edits_and_requires_audited_resolution(self):
+        stamp = main.now()
+        with main.db() as conn:
+            profile_id = conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("PANOS persistent gate", "panos", json.dumps({"vsys": "vsys1"}), stamp, stamp),
+            ).lastrowid
+            project_id = conn.execute(
+                "INSERT INTO migration_projects(name,target_profile_id,owner,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("persistent-gate", profile_id, "admin", stamp, stamp),
+            ).lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase/></entry></vsys></entry></devices></config>'''
+        workspace_id = main.store_config_workspace(profile, "Candidate", "candidate.xml", xml, "migration-merge")
+        output_id = main.store_migration_output(
+            project_id, workspace_id, "Candidate",
+            sanity={
+                "critical_findings": 1,
+                "candidate_unresolved_references": 0,
+                "critical_review_codes": {
+                    "unsupported-actions": {"title": "Policy-acties", "detail": "Controleer acties", "count": 1},
+                },
+                "regenerate_required": False,
+            },
+        )
+        edited_id = main.store_workspace_edit_version(
+            main.workspace_row(workspace_id), xml, "policy edit"
+        )
+        with main.db() as conn:
+            output = conn.execute("SELECT * FROM migration_outputs WHERE id=?", (output_id,)).fetchone()
+        self.assertEqual(int(output["workspace_id"]), edited_id)
+        self.assertIn("kritieke", main.migration_output_push_block(edited_id)[1])
+
+        client = main.app.test_client()
+        with main.app.test_request_context("/", base_url="https://forge.test"):
+            serializer = main.app.session_interface.get_signing_serializer(main.app)
+            client.set_cookie(
+                main.app.config["SESSION_COOKIE_NAME"],
+                serializer.dumps({"user_id": 1, "username": "admin", "csrf": "migration-test-csrf"}),
+                domain="forge.test", secure=True,
+            )
+        response = client.post(
+            f"/migration/projects/{project_id}/outputs/{output_id}/review/unsupported-actions",
+            base_url="https://forge.test",
+            data={"csrf": "migration-test-csrf", "note": "Actie in candidate gecontroleerd"},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(main.migration_output_push_block(edited_id)[1], "")
 
 
 if __name__ == "__main__":
