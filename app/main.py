@@ -25,6 +25,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache, wraps
 
@@ -251,12 +252,17 @@ _catalog_refresh_lock = threading.Lock()
 _catalog_errors: dict[tuple[int, str], str] = {}
 _catalog_retry_after: dict[tuple[int, str], float] = {}
 CATALOG_RETRY_SECONDS = 60
+LIVE_PAGE_CACHE_SECONDS = max(5, int(os.getenv("PPF_LIVE_PAGE_CACHE_SECONDS", "30")))
+SCM_TOKEN_CACHE_SECONDS = max(60, int(os.getenv("PPF_SCM_TOKEN_CACHE_SECONDS", "600")))
+WORKSPACE_OBJECT_PAGE_SIZE = max(50, min(1000, int(os.getenv("PPF_WORKSPACE_OBJECT_PAGE_SIZE", "250"))))
 DEFAULT_APPLICATION_CACHE = OBJECT_CACHE / "default-applications-v2.json"
 DEFAULT_CATALOG_INITIAL_DELAY = max(30, int(os.getenv("PPF_APP_CATALOG_INITIAL_DELAY", "60")))
 _default_catalog_refresh_lock = threading.RLock()
 _default_catalog_refreshing = False
 _panos_key_cache: dict[int, tuple[str, str, str, float]] = {}
 _panos_key_cache_lock = threading.Lock()
+_scm_token_cache: dict[int, tuple[str, str, float]] = {}
+_scm_token_cache_lock = threading.Lock()
 PANOS_KEY_CACHE_SECONDS = 900
 
 
@@ -738,7 +744,27 @@ def scm_client(profile):
         settings.get("folder", ""), settings.get("object_folder") or settings.get("folder", ""),
         settings.get("snippet", ""), settings.get("device", ""), settings.get("rulebase", "pre"), settings.get("log_profile", ""),
     )
-    token = policy_api.get_scm_token(scm)
+    try:
+        profile_id = int(profile["id"] or 0)
+    except (KeyError, TypeError, ValueError):
+        profile_id = 0
+    try:
+        profile_version = str(profile["updated_at"] or "")
+    except (KeyError, TypeError, IndexError):
+        profile_version = ""
+    token = ""
+    if profile_id:
+        with _scm_token_cache_lock:
+            cached = _scm_token_cache.get(profile_id)
+            if cached and cached[0] == profile_version and cached[2] > time.time():
+                token = cached[1]
+            if not token:
+                token = policy_api.get_scm_token(scm)
+                _scm_token_cache[profile_id] = (
+                    profile_version, token, time.time() + SCM_TOKEN_CACHE_SECONDS,
+                )
+    else:
+        token = policy_api.get_scm_token(scm)
     endpoint = policy_api.scm_api_root(scm.scm_api_base) + "/config/security/v1/security-rules"
     container = policy_api.scm_container(folder=scm.scm_folder, snippet=scm.scm_snippet, device=scm.scm_device)
     return scm, token, endpoint, container
@@ -914,6 +940,8 @@ def invalidate_profile_caches(profile_id: int) -> None:
             _catalog_retry_after.pop(key, None)
     with _panos_key_cache_lock:
         _panos_key_cache.pop(profile_id, None)
+    with _scm_token_cache_lock:
+        _scm_token_cache.pop(profile_id, None)
 
 
 def panos_api_post(endpoint: str, params: dict, ctx: ssl.SSLContext) -> str:
@@ -995,6 +1023,50 @@ def fetch_scm_objects(profile, object_type: str) -> list[dict]:
         record["_raw"] = raw
         records.append(record)
     return records
+
+
+def _read_json_cache(cache_path: Path, max_age: int | None = None):
+    try:
+        if not cache_path.exists():
+            return None
+        if max_age is not None and time.time() - cache_path.stat().st_mtime > max_age:
+            return None
+        return json.loads(cache_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_json_cache(cache_path: Path, items) -> None:
+    temporary = cache_path.with_name(
+        f"{cache_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    temporary.write_text(json.dumps(items))
+    temporary.chmod(0o600)
+    temporary.replace(cache_path)
+
+
+def cached_live_items(profile, cache_key: str, loader, force: bool = False):
+    """Short-lived page cache; all write paths invalidate it immediately."""
+    safe_key = re.sub(r"[^a-zA-Z0-9_.-]+", "-", cache_key)
+    cache_path = OBJECT_CACHE / f"{int(profile['id'])}-live-{safe_key}.json"
+    if not force:
+        cached = _read_json_cache(cache_path, LIVE_PAGE_CACHE_SECONDS)
+        if cached is not None:
+            return cached
+    items = loader()
+    _write_json_cache(cache_path, items)
+    return items
+
+
+def cached_object_page(profile, object_type: str, force: bool = False) -> list[dict]:
+    cache_path = OBJECT_CACHE / f"{int(profile['id'])}-{object_type}.json"
+    if not force:
+        cached = _read_json_cache(cache_path, LIVE_PAGE_CACHE_SECONDS)
+        if cached is not None:
+            return cached
+    items = fetch_scm_objects(profile, object_type)
+    _write_json_cache(cache_path, items)
+    return items
 
 
 def _scm_config_protected(key: str) -> bool:
@@ -1483,43 +1555,68 @@ def fetch_object_catalog(profile, object_type: str) -> list[dict]:
             "custom-url-categories", "schedules", "security-profile-groups", "log-forwarding", "interfaces",
         ),
     }.get(object_type, ())
+    profile_id = int(profile["id"])
+
+    def catalog_kind(kind: str) -> list[dict]:
+        if kind == "applications":
+            return cached_application_catalog(profile)["items"]
+        network_reference = kind in {"interfaces", "zone-protection-profiles"}
+        cache_path = (
+            OBJECT_CACHE / f"{profile_id}-reference-{kind}.json"
+            if network_reference else OBJECT_CACHE / f"{profile_id}-{kind}.json"
+        )
+        cached = _read_json_cache(cache_path)
+        stale = cached is None or time.time() - cache_path.stat().st_mtime >= 1800
+        if cached is not None:
+            if stale and not network_reference:
+                refresh_catalog_async(profile, kind, cache_path)
+            source = cached
+        else:
+            retry_key = (profile_id, f"reference:{kind}")
+            with _catalog_refresh_lock:
+                retry_later = _catalog_retry_after.get(retry_key, 0) > time.monotonic()
+            if retry_later:
+                return []
+            try:
+                source = (
+                    fetch_network_reference_catalog(profile, kind)
+                    if network_reference else fetch_scm_objects(profile, kind)
+                )
+                _write_json_cache(cache_path, source)
+                with _catalog_refresh_lock:
+                    _catalog_errors.pop(retry_key, None)
+                    _catalog_retry_after.pop(retry_key, None)
+            except Exception as exc:
+                with _catalog_refresh_lock:
+                    _catalog_errors[retry_key] = f"{type(exc).__name__}: ophalen mislukt"
+                    _catalog_retry_after[retry_key] = time.monotonic() + CATALOG_RETRY_SECONDS
+                app.logger.warning(
+                    "reference catalog unavailable for profile=%s kind=%s error=%s",
+                    profile_id, kind, type(exc).__name__,
+                )
+                return []
+        if network_reference:
+            return [
+                {"name": item.get("name", ""), "kind": item.get("kind", kind)}
+                for item in source if item.get("name")
+            ]
+        return [
+            {"name": item.get("name", ""), "kind": kind}
+            for item in source if item.get("name")
+        ]
+
     catalog = []
-    for kind in related:
-        if kind in {"interfaces", "zone-protection-profiles"}:
-            try:
-                catalog.extend(fetch_network_reference_catalog(profile, kind))
-            except Exception as exc:
-                app.logger.warning(
-                    "reference catalog unavailable for profile=%s kind=%s error=%s",
-                    profile["id"], kind, type(exc).__name__,
-                )
-            continue
-        cache_path = application_cache_path(profile["id"]) if kind == "applications" else OBJECT_CACHE / f"{profile['id']}-{kind}.json"
-        cached = None
-        if cache_path.exists():
-            try: cached = json.loads(cache_path.read_text())
-            except (OSError, json.JSONDecodeError): cached = None
-        stale = not cache_path.exists() or time.time() - cache_path.stat().st_mtime >= 1800
-        if kind == "applications" and stale:
-            refresh_catalog_async(profile, kind, cache_path)
-        elif cached is None or stale:
-            try:
-                cached = fetch_scm_objects(profile, kind)
-                cache_path.write_text(json.dumps(cached)); cache_path.chmod(0o600)
-            except Exception as exc:
-                app.logger.warning(
-                    "reference catalog unavailable for profile=%s kind=%s error=%s",
-                    profile["id"], kind, type(exc).__name__,
-                )
-                if cached is None:
-                    cached = []
-        cached = cached or []
-        catalog.extend({"name": item.get("name", ""), "kind": kind} for item in cached if item.get("name"))
+    if related:
+        with ThreadPoolExecutor(max_workers=min(8, len(related)), thread_name_prefix="catalog") as pool:
+            for items in pool.map(catalog_kind, related):
+                catalog.extend(items)
     if object_type == "log-forwarding":
-        try:
-            profiles = fetch_scm_objects(profile, "log-forwarding")
-        except Exception:
-            profiles = []
+        profiles = _read_json_cache(OBJECT_CACHE / f"{profile_id}-log-forwarding.json")
+        if profiles is None:
+            try:
+                profiles = fetch_scm_objects(profile, "log-forwarding")
+            except Exception:
+                profiles = []
         known = {(item["name"], item["kind"]) for item in catalog}
         for profile_item in profiles:
             for match in profile_item.get("match_list", []) or []:
@@ -2854,6 +2951,11 @@ def config_workspace_editor(workspace_id):
         object_type = request.args.get("object_type", "addresses")
         if object_type not in OBJECT_NODES:
             object_type = "addresses"
+        object_query = request.args.get("object_query", "").strip()[:200]
+        object_page = max(1, request.args.get("object_page", default=1, type=int) or 1)
+        object_total = 0
+        object_page_count = 1
+        edit_object_name = request.args.get("edit_object", "")
         config_section = request.args.get("config_section", "").strip()
         templates = available_templates(snapshot)
         requested_template = request.args.get("template", "").strip()
@@ -2882,7 +2984,29 @@ def config_workspace_editor(workspace_id):
             )
             workspace_policy_catalog = extend_policy_catalog_with_current(workspace_policy_catalog, policies)
         elif workspace_view == "objects":
-            _, objects = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
+            _, all_objects = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
+            if object_query:
+                needle = object_query.casefold()
+                all_objects = [
+                    item for item in all_objects
+                    if needle in " ".join([
+                        str(item.get("name", "")), str(item.get("owner", "")),
+                        " ".join(str(value) for value in item.get("values", [])),
+                        str(item.get("description", "")), str(item.get("comments", "")),
+                    ]).casefold()
+                ]
+            object_total = len(all_objects)
+            object_page_count = max(1, (object_total + WORKSPACE_OBJECT_PAGE_SIZE - 1) // WORKSPACE_OBJECT_PAGE_SIZE)
+            if edit_object_name:
+                edit_index = next(
+                    (index for index, item in enumerate(all_objects) if item.get("name") == edit_object_name),
+                    None,
+                )
+                if edit_index is not None:
+                    object_page = edit_index // WORKSPACE_OBJECT_PAGE_SIZE + 1
+            object_page = min(object_page, object_page_count)
+            offset = (object_page - 1) * WORKSPACE_OBJECT_PAGE_SIZE
+            objects = all_objects[offset:offset + WORKSPACE_OBJECT_PAGE_SIZE]
             workspace_object_create_template = object_create_record(object_type, scope)
             workspace_object_catalog = workspace_object_reference_catalog(
                 xml_bytes, scope, object_type, (parsed_root, snapshot), workspace_profile
@@ -2902,7 +3026,6 @@ def config_workspace_editor(workspace_id):
                 )
         edit_name = request.args.get("edit_policy", "")
         edit_policy = next((item for item in policies if item["name"] == edit_name and item["editable"]), None)
-        edit_object_name = request.args.get("edit_object", "")
         migration_output_sanity = json.loads(migration_output["sanity_json"] or "{}") if migration_output else {}
         migration_output_push_blocked = bool(
             migration_output and (
@@ -2920,6 +3043,9 @@ def config_workspace_editor(workspace_id):
             alternate_policy_count=alternate_policy_count,
             object_type=object_type, object_nodes=OBJECT_NODES, objects=objects,
             edit_object_name=edit_object_name,
+            object_query=object_query, object_page=object_page,
+            object_page_count=object_page_count, object_total=object_total,
+            workspace_object_page_size=WORKSPACE_OBJECT_PAGE_SIZE,
             workspace_object_catalog=workspace_object_catalog,
             workspace_object_create_template=workspace_object_create_template,
             workspace_policy_catalog=workspace_policy_catalog,
@@ -3711,6 +3837,7 @@ def index():
                 flows = conn.execute(f"SELECT * FROM flows WHERE serial IN ({placeholders}) ORDER BY last_seen DESC LIMIT 100", serials).fetchall()
     policy_profile = None; policies = []; policy_error = ""; policy_objects = []; object_catalog = []; policy_catalog = []; policy_workspaces = []; live_application_state = {}; scm_config_records = []; object_create_template = None
     policy_source = request.args.get("policy_source", "").strip()
+    force_live_refresh = request.args.get("refresh") == "1"
     policy_view = request.args.get("policy_view", "policies")
     if policy_view not in {"policies", "objects", "network", "device"}: policy_view = "policies"
     config_section = request.args.get("config_section", "").strip()
@@ -3724,6 +3851,8 @@ def index():
     if policy_profile_id:
         policy_profile = next((profile for profile in profiles if profile["id"] == policy_profile_id), None)
         if policy_profile:
+            if force_live_refresh and policy_profile["target_type"] == "scm":
+                invalidate_profile_caches(int(policy_profile["id"]))
             if policy_profile["target_type"] in {"panorama", "panos"}:
                 with db() as conn:
                     policy_workspaces = conn.execute(
@@ -3740,7 +3869,11 @@ def index():
             if policy_source == "live":
                 try:
                     if policy_view in {"network", "device"}:
-                        scm_config_records = fetch_scm_configuration_records(policy_profile, policy_view, config_section)
+                        scm_config_records = cached_live_items(
+                            policy_profile, f"config-{policy_view}-{config_section}",
+                            lambda: fetch_scm_configuration_records(policy_profile, policy_view, config_section),
+                            force=force_live_refresh,
+                        )
                     elif policy_view == "objects":
                         if object_type == "applications":
                             live_application_state = cached_application_catalog(policy_profile)
@@ -3749,7 +3882,9 @@ def index():
                                 for item in live_application_state["items"]
                             ]
                         else:
-                            policy_objects = fetch_scm_objects(policy_profile, object_type)
+                            policy_objects = cached_object_page(
+                                policy_profile, object_type, force=force_live_refresh
+                            )
                         if SCM_OBJECT_TYPES[object_type].get("generic"):
                             object_create_template = scm_generic_create_record(
                                 object_type,
@@ -3760,7 +3895,11 @@ def index():
                             )
                         object_catalog = fetch_object_catalog(policy_profile, object_type)
                     else:
-                        policies = fetch_scm_policy_type(policy_profile, policy_kind)
+                        policies = cached_live_items(
+                            policy_profile, f"policies-{policy_kind}",
+                            lambda: fetch_scm_policy_type(policy_profile, policy_kind),
+                            force=force_live_refresh,
+                        )
                         policy_catalog = extend_policy_catalog_with_current(
                             fetch_object_catalog(policy_profile, "policy-picker"), policies
                         )

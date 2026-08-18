@@ -456,6 +456,44 @@ class TargetAdapterTests(unittest.TestCase):
             for path in cache_paths:
                 path.unlink(missing_ok=True)
 
+    def test_scm_token_is_reused_and_invalidated(self):
+        profile = {
+            "id": 991123, "updated_at": "version-1", "target_type": "scm",
+            "settings_json": json.dumps({"folder": "Branch"}), "secret_blob": b"",
+        }
+        main.invalidate_profile_caches(profile["id"])
+        with patch.object(main.policy_api, "get_scm_token", side_effect=["token-1", "token-2"]) as get_token:
+            self.assertEqual(main.scm_client(profile)[1], "token-1")
+            self.assertEqual(main.scm_client(profile)[1], "token-1")
+            self.assertEqual(get_token.call_count, 1)
+            main.invalidate_profile_caches(profile["id"])
+            self.assertEqual(main.scm_client(profile)[1], "token-2")
+            self.assertEqual(get_token.call_count, 2)
+
+    def test_live_page_cache_supports_fast_reuse_and_explicit_refresh(self):
+        profile = {"id": 991124}
+        main.invalidate_profile_caches(profile["id"])
+        calls = []
+
+        def loader():
+            calls.append(len(calls) + 1)
+            return [{"name": f"value-{calls[-1]}"}]
+
+        first = main.cached_live_items(profile, "policies-security", loader)
+        second = main.cached_live_items(profile, "policies-security", loader)
+        refreshed = main.cached_live_items(profile, "policies-security", loader, force=True)
+        self.assertEqual(first, second)
+        self.assertEqual(len(calls), 2)
+        self.assertNotEqual(second, refreshed)
+        main.invalidate_profile_caches(profile["id"])
+
+    def test_large_workspace_object_lists_are_paginated_and_globally_searchable(self):
+        template = (main.BASE / "app" / "templates" / "workspace_editor.html").read_text()
+        self.assertGreaterEqual(main.WORKSPACE_OBJECT_PAGE_SIZE, 50)
+        self.assertIn('name="object_query"', template)
+        self.assertIn("object_page_count>1", template)
+        self.assertIn("Zoek in alle objecten", template)
+
     def test_workspace_generic_add_uses_server_side_create_schema(self):
         template = (main.BASE / "app" / "templates" / "workspace_editor.html").read_text()
         javascript = (main.BASE / "app" / "static" / "app.js").read_text()
