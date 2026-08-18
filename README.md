@@ -178,6 +178,14 @@ live profile pulls, portable project bundles, full XML export, and set-command e
 SCM mappings are preflighted before candidate writes so an unsupported selected family
 cannot result in a silent partial migration.
 
+The Migration Control Center adds an explicit source-family decision (`map`, `create`,
+`ignore`, or `review`), mandatory per-item topology mapping, saved AND/OR filters, bulk
+rename refactors, project-health and best-practice checks, offline discovery, cached
+application/URL/region catalogs, reusable migration snippets, project roles, and a
+project-scoped audit trail. A staged API plan can be downloaded for review but performs no
+write. Preview drafts are bound to the exact project, profile, and base configuration;
+unresolved topology, merge conflicts, stale previews, and zero-delta candidates are blocked.
+
 ## Policy management
 
 The **Policybeheer** page uses an Expedition-inspired filter, selection, and

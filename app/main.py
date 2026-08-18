@@ -45,9 +45,14 @@ from app.certificates import (
 from vendor.paloalto_light_syslog import FlowStore, parse_panos_syslog
 from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_single_replacements
 from app.migration import (
-    MIGRATION_KIND_LABELS, Address, AddressGroup, MigrationError, MigrationModel, PARSERS, Policy, Service, ServiceGroup,
-    apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, migration_base_xml, migration_zone_names,
-    item_selector, merge_member_names, migration_analysis, migration_item_semantic, migration_review_findings, migration_search, model_collections, panos_candidate_analysis, panos_fragment, parse_vendor, raw_item_payload, reconcile_model, scm_items,
+    MIGRATION_FILTER_FIELDS, MIGRATION_FILTER_OPERATORS, MIGRATION_KIND_LABELS, MIGRATION_MAPPING_ACTIONS,
+    MIGRATION_TOPOLOGY_KINDS, Address, AddressGroup, MigrationError, MigrationModel, PARSERS, Policy, Service, ServiceGroup,
+    apply_family_mappings, apply_merge_rules, apply_topology_mappings, apply_transform_rules, merge_inventory,
+    merge_model_into_panos_xml, migration_api_plan, migration_base_xml, migration_best_practices,
+    migration_discovery, migration_filter_inventory, migration_health_dashboard, migration_zone_names,
+    item_selector, merge_member_names, migration_analysis, migration_item_semantic, migration_review_findings,
+    migration_search, model_collections, panos_candidate_analysis, panos_fragment, parse_vendor, raw_item_payload,
+    reconcile_model, scm_items,
 )
 from app.offline_config import (
     OBJECT_NODES, POLICY_NODES, OfflineConfigError, available_scopes, available_templates,
@@ -405,6 +410,40 @@ def init_db() -> None:
           FOREIGN KEY(project_id) REFERENCES migration_projects(id),
           FOREIGN KEY(workspace_id) REFERENCES config_workspaces(id)
         );
+        CREATE TABLE IF NOT EXISTS migration_family_mappings (
+          id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, source_id INTEGER NOT NULL DEFAULT 0,
+          kind TEXT NOT NULL, action TEXT NOT NULL DEFAULT 'map', target_context TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          UNIQUE(project_id,source_id,kind),
+          FOREIGN KEY(project_id) REFERENCES migration_projects(id),
+          FOREIGN KEY(source_id) REFERENCES migration_sources(id)
+        );
+        CREATE TABLE IF NOT EXISTS migration_saved_filters (
+          id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL,
+          join_mode TEXT NOT NULL DEFAULT 'and', rules_json TEXT NOT NULL DEFAULT '[]',
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          FOREIGN KEY(project_id) REFERENCES migration_projects(id)
+        );
+        CREATE TABLE IF NOT EXISTS migration_catalogs (
+          project_id INTEGER NOT NULL, kind TEXT NOT NULL, items_json TEXT NOT NULL DEFAULT '[]',
+          updated_at TEXT NOT NULL, PRIMARY KEY(project_id,kind),
+          FOREIGN KEY(project_id) REFERENCES migration_projects(id)
+        );
+        CREATE TABLE IF NOT EXISTS migration_snippets (
+          id INTEGER PRIMARY KEY, owner TEXT NOT NULL DEFAULT 'admin', name TEXT NOT NULL,
+          settings_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          UNIQUE(owner,name), FOREIGN KEY(owner) REFERENCES users(username)
+        );
+        CREATE TABLE IF NOT EXISTS migration_project_roles (
+          project_id INTEGER NOT NULL, username TEXT NOT NULL, role TEXT NOT NULL,
+          created_at TEXT NOT NULL, PRIMARY KEY(project_id,username),
+          FOREIGN KEY(project_id) REFERENCES migration_projects(id),
+          FOREIGN KEY(username) REFERENCES users(username)
+        );
+        CREATE TABLE IF NOT EXISTS migration_analysis_runs (
+          id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, analysis_json TEXT NOT NULL,
+          created_at TEXT NOT NULL, FOREIGN KEY(project_id) REFERENCES migration_projects(id)
+        );
         CREATE TABLE IF NOT EXISTS system_settings (
           setting_key TEXT PRIMARY KEY, settings_json TEXT NOT NULL DEFAULT '{}',
           secret_blob BLOB NOT NULL DEFAULT '', updated_at TEXT NOT NULL
@@ -413,6 +452,11 @@ def init_db() -> None:
         project_columns = {row[1] for row in conn.execute("PRAGMA table_info(migration_projects)")}
         if "topology" not in project_columns:
             conn.execute("ALTER TABLE migration_projects ADD COLUMN topology TEXT NOT NULL DEFAULT 'active-passive'")
+        if "owner" not in project_columns:
+            conn.execute("ALTER TABLE migration_projects ADD COLUMN owner TEXT NOT NULL DEFAULT 'admin'")
+        snippet_columns = {row[1] for row in conn.execute("PRAGMA table_info(migration_snippets)")}
+        if "owner" not in snippet_columns:
+            conn.execute("ALTER TABLE migration_snippets ADD COLUMN owner TEXT NOT NULL DEFAULT 'admin'")
         source_columns = {row[1] for row in conn.execute("PRAGMA table_info(migration_sources)")}
         if "staging_workspace_id" not in source_columns:
             conn.execute("ALTER TABLE migration_sources ADD COLUMN staging_workspace_id INTEGER")
@@ -2404,11 +2448,88 @@ def migration_output_row(project_id: int, output_id: int):
 
 def migration_project_row(project_id: int):
     with db() as conn:
-        return conn.execute(
+        project = conn.execute(
             "SELECT migration_projects.*,profiles.name profile_name,profiles.target_type,profiles.settings_json "
             "FROM migration_projects JOIN profiles ON profiles.id=migration_projects.target_profile_id "
             "WHERE migration_projects.id=?", (project_id,),
         ).fetchone()
+        if not project or not has_request_context():
+            return project
+        username = str(session.get("username", ""))
+        if username == str(project["owner"] or "admin"):
+            role = "owner"
+        else:
+            assignment = conn.execute(
+                "SELECT role FROM migration_project_roles WHERE project_id=? AND username=?",
+                (project_id, username),
+            ).fetchone()
+            role = str(assignment["role"]) if assignment else ""
+        if role not in {"owner", "editor", "reviewer", "viewer"}:
+            return None
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and role not in {"owner", "editor"}:
+            return None
+        return project
+
+
+def migration_project_role(project_id: int) -> str:
+    username = str(session.get("username", ""))
+    with db() as conn:
+        project = conn.execute("SELECT owner FROM migration_projects WHERE id=?", (project_id,)).fetchone()
+        if not project:
+            return ""
+        if username == str(project["owner"] or "admin"):
+            return "owner"
+        row = conn.execute(
+            "SELECT role FROM migration_project_roles WHERE project_id=? AND username=?",
+            (project_id, username),
+        ).fetchone()
+        return str(row["role"]) if row else ""
+
+
+def migration_project_revision(project_id: int) -> str:
+    """Bind a preview to every persisted input that can alter its candidate."""
+    with db() as conn:
+        project = conn.execute(
+            "SELECT target_profile_id,base_workspace_id,topology FROM migration_projects WHERE id=?",
+            (project_id,),
+        ).fetchone()
+        if not project:
+            return ""
+        profile = conn.execute(
+            "SELECT target_type,settings_json FROM profiles WHERE id=?",
+            (project["target_profile_id"],),
+        ).fetchone()
+        state = {
+            "project": dict(project),
+            "profile": dict(profile) if profile else {},
+            "sources": [
+                tuple(row) for row in conn.execute(
+                    "SELECT id,fingerprint,staging_workspace_id FROM migration_sources WHERE project_id=? ORDER BY id",
+                    (project_id,),
+                ).fetchall()
+            ],
+            "mappings": [
+                tuple(row) for row in conn.execute(
+                    "SELECT source_id,kind,action,target_context FROM migration_family_mappings WHERE project_id=? ORDER BY source_id,kind",
+                    (project_id,),
+                ).fetchall()
+            ],
+            "merges": [
+                tuple(row) for row in conn.execute(
+                    "SELECT kind,master,members_json,mode FROM migration_merge_rules WHERE project_id=? ORDER BY id",
+                    (project_id,),
+                ).fetchall()
+            ],
+            "transforms": [
+                tuple(row) for row in conn.execute(
+                    "SELECT operation,kind,selector,value FROM migration_transform_rules WHERE project_id=? ORDER BY id",
+                    (project_id,),
+                ).fetchall()
+            ],
+        }
+    return hashlib.sha256(
+        json.dumps(state, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
 
 
 def migration_source_row(source_id: int):
@@ -2425,6 +2546,15 @@ def migration_model(source) -> MigrationModel:
     return MigrationModel.from_dict(json.loads(raw.decode()))
 
 
+@lru_cache(maxsize=16)
+def cached_migration_workspace_model(config_path: str, sha256: str) -> MigrationModel:
+    path = safe_workspace_path(CONFIG_WORKSPACES, config_path)
+    raw = path.read_bytes()
+    if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), sha256):
+        raise MigrationError("De base-workspace is gewijzigd of beschadigd")
+    return parse_vendor("panos", raw, Path(config_path).name)
+
+
 def store_migration_source(project_id: int, vendor: str, source_name: str, model: MigrationModel) -> int:
     raw = json.dumps(model.as_dict(), sort_keys=True, separators=(",", ":")).encode()
     token = secrets.token_hex(16)
@@ -2437,11 +2567,36 @@ def store_migration_source(project_id: int, vendor: str, source_name: str, model
                 (project_id, vendor, source_name[:255], str(path), hashlib.sha256(raw).hexdigest(), json.dumps(model.counts()), json.dumps(model.warnings + model.unsupported), now()),
             )
             source_id = int(cursor.lastrowid)
+            for kind, items in model_collections(model).items():
+                if not items:
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO migration_family_mappings(project_id,source_id,kind,action,target_context,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                    (project_id, source_id, kind, "map", "", now(), now()),
+                )
             conn.execute("UPDATE migration_projects SET updated_at=? WHERE id=?", (now(), project_id))
         return source_id
     except Exception:
         path.unlink(missing_ok=True)
         raise
+
+
+def ensure_migration_family_mappings(project_id: int, source_rows) -> list[dict]:
+    """Backfill safe default map decisions for projects created before mapping support."""
+    with db() as conn:
+        for source in source_rows:
+            model = migration_model(source)
+            for kind, items in model_collections(model).items():
+                if items:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO migration_family_mappings(project_id,source_id,kind,action,target_context,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                        (project_id, int(source["id"]), kind, "map", "", now(), now()),
+                    )
+        rows = conn.execute(
+            "SELECT * FROM migration_family_mappings WHERE project_id=? ORDER BY source_id,kind",
+            (project_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def replace_migration_source_model(source, model: MigrationModel) -> None:
@@ -2473,11 +2628,19 @@ def selected_migration_model(project_id: int, source_ids: list[int]) -> Migratio
             f"SELECT * FROM migration_sources WHERE project_id=? AND id IN ({','.join('?' for _ in source_ids)}) ORDER BY id",
             (project_id, *source_ids),
         ).fetchall() if source_ids else []
+        mapping_rows = conn.execute(
+            "SELECT source_id,kind,action,target_context FROM migration_family_mappings WHERE project_id=?",
+            (project_id,),
+        ).fetchall()
     if len(rows) != len(set(source_ids)):
         raise MigrationError("Niet alle geselecteerde bronnen behoren tot dit project")
     merged = MigrationModel("merged", " + ".join(row["source_name"] for row in rows))
     for row in rows:
         model = migration_model(row)
+        model = apply_family_mappings(
+            model,
+            [dict(mapping) for mapping in mapping_rows if int(mapping["source_id"]) == int(row["id"])],
+        )
         for field in ("addresses", "address_groups", "services", "service_groups", "security_rules", "nat_rules", "interfaces", "zones", "warnings", "unsupported"):
             getattr(merged, field).extend(getattr(model, field))
         for kind, items in model.extras.items():
@@ -3913,7 +4076,10 @@ def migration_home():
     with db() as conn:
         projects = conn.execute(
             "SELECT migration_projects.*,profiles.name profile_name,profiles.target_type "
-            "FROM migration_projects JOIN profiles ON profiles.id=migration_projects.target_profile_id ORDER BY migration_projects.updated_at DESC"
+            "FROM migration_projects JOIN profiles ON profiles.id=migration_projects.target_profile_id "
+            "WHERE migration_projects.owner=? OR EXISTS(SELECT 1 FROM migration_project_roles r WHERE r.project_id=migration_projects.id AND r.username=?) "
+            "ORDER BY migration_projects.updated_at DESC",
+            (session.get("username", ""), session.get("username", "")),
         ).fetchall()
         profiles = conn.execute("SELECT id,name,target_type FROM profiles ORDER BY name").fetchall()
     return render_template("migration.html", projects=projects, profiles=profiles, parsers=PARSERS, project=None)
@@ -3928,7 +4094,10 @@ def migration_project_export(project_id):
         sources=conn.execute("SELECT * FROM migration_sources WHERE project_id=? ORDER BY id",(project_id,)).fetchall()
         rules=conn.execute("SELECT kind,master,members_json,mode FROM migration_merge_rules WHERE project_id=? ORDER BY id",(project_id,)).fetchall()
         transforms=conn.execute("SELECT operation,kind,selector,value FROM migration_transform_rules WHERE project_id=? ORDER BY id",(project_id,)).fetchall()
-    bundle={"schema":"pa-policy-forge-migration-v2","name":project["name"],"topology":project["topology"],"sources":[{"vendor":row["vendor"],"source_name":row["source_name"],"model":migration_model(row).as_dict()} for row in sources],"merge_rules":[{"kind":row["kind"],"master":row["master"],"members":json.loads(row["members_json"]),"mode":row["mode"]} for row in rules],"transform_rules":[dict(row) for row in transforms]}
+        mappings=conn.execute("SELECT source_id,kind,action,target_context FROM migration_family_mappings WHERE project_id=? ORDER BY source_id,kind",(project_id,)).fetchall()
+        filters=conn.execute("SELECT name,join_mode,rules_json FROM migration_saved_filters WHERE project_id=? ORDER BY id",(project_id,)).fetchall()
+    source_names={int(row["id"]):row["source_name"] for row in sources}
+    bundle={"schema":"pa-policy-forge-migration-v2","name":project["name"],"topology":project["topology"],"sources":[{"vendor":row["vendor"],"source_name":row["source_name"],"model":migration_model(row).as_dict()} for row in sources],"merge_rules":[{"kind":row["kind"],"master":row["master"],"members":json.loads(row["members_json"]),"mode":row["mode"]} for row in rules],"transform_rules":[dict(row) for row in transforms],"family_mappings":[{"source_name":source_names.get(int(row["source_id"]),""),"kind":row["kind"],"action":row["action"],"target_context":row["target_context"]} for row in mappings],"saved_filters":[{"name":row["name"],"join_mode":row["join_mode"],"rules":json.loads(row["rules_json"] or "[]")} for row in filters]}
     safe="".join(char if char.isalnum() or char in "-_." else "-" for char in project["name"]).strip("-.") or f"migration-{project_id}"
     return Response(json.dumps(bundle,indent=2),mimetype="application/json",headers={"Content-Disposition":f'attachment; filename="{safe}.migration.json"'})
 
@@ -3947,14 +4116,21 @@ def migration_project_import():
             if not conn.execute("SELECT 1 FROM profiles WHERE id=?",(profile_id,)).fetchone(): raise MigrationError("Targetprofiel bestaat niet")
             topology=str(bundle.get("topology","active-passive"))
             if topology not in {"active-passive","active-active"}: raise MigrationError("Ongeldige topologie in projectbestand")
-            project_id=int(conn.execute("INSERT INTO migration_projects(name,target_profile_id,topology,created_at,updated_at) VALUES(?,?,?,?,?)",(str(bundle.get("name") or uploaded.filename)[:120],profile_id,topology,now(),now())).lastrowid)
+            project_id=int(conn.execute("INSERT INTO migration_projects(name,target_profile_id,topology,owner,created_at,updated_at) VALUES(?,?,?,?,?,?)",(str(bundle.get("name") or uploaded.filename)[:120],profile_id,topology,session.get("username","admin"),now(),now())).lastrowid)
+        imported_sources={}
         for source in bundle.get("sources",[]):
-            model=MigrationModel.from_dict(source["model"]); store_migration_source(project_id,str(source.get("vendor",model.vendor)),str(source.get("source_name",model.source_name)),model)
+            model=MigrationModel.from_dict(source["model"]); source_name=str(source.get("source_name",model.source_name)); imported_sources[source_name]=store_migration_source(project_id,str(source.get("vendor",model.vendor)),source_name,model)
         with db() as conn:
             for rule in bundle.get("merge_rules",[]):
                 conn.execute("INSERT INTO migration_merge_rules(project_id,kind,master,members_json,mode,created_at) VALUES(?,?,?,?,?,?)",(project_id,str(rule["kind"]),str(rule["master"]),json.dumps(rule.get("members",[])),str(rule.get("mode","selection")),now()))
             for rule in bundle.get("transform_rules",[]):
                 conn.execute("INSERT INTO migration_transform_rules(project_id,operation,kind,selector,value,created_at) VALUES(?,?,?,?,?,?)",(project_id,str(rule.get("operation","")),str(rule.get("kind","")),str(rule.get("selector","")),str(rule.get("value","")),now()))
+            for mapping in bundle.get("family_mappings",[]):
+                source_id=imported_sources.get(str(mapping.get("source_name","")))
+                if source_id and str(mapping.get("action","map")) in MIGRATION_MAPPING_ACTIONS:
+                    conn.execute("UPDATE migration_family_mappings SET action=?,target_context=?,updated_at=? WHERE project_id=? AND source_id=? AND kind=?",(str(mapping.get("action","map")),str(mapping.get("target_context",""))[:255],now(),project_id,source_id,str(mapping.get("kind",""))))
+            for item in bundle.get("saved_filters",[]):
+                conn.execute("INSERT INTO migration_saved_filters(project_id,name,join_mode,rules_json,created_at,updated_at) VALUES(?,?,?,?,?,?)",(project_id,str(item.get("name","Filter"))[:80],str(item.get("join_mode","and")),json.dumps(item.get("rules",[])),now(),now()))
         audit("migration-project-imported",f"project={project_id} sources={len(bundle.get('sources',[]))}")
         flash("Migratieproject geïmporteerd.","success"); return redirect(url_for("migration_project",project_id=project_id))
     except Exception as exc:
@@ -3990,6 +4166,8 @@ def migration_candidate_export(project_id,kind):
 @app.get("/migration/projects/<int:project_id>/outputs/<int:output_id>/<kind>")
 @login_required
 def migration_output_export(project_id, output_id, kind):
+    if not migration_project_row(project_id):
+        return "Not found", 404
     output = migration_output_row(project_id, output_id)
     if not output or kind not in {"xml", "set"}:
         return "Not found", 404
@@ -4009,7 +4187,7 @@ def migration_project_create():
         if not name: raise MigrationError("Projectnaam is verplicht")
         with db() as conn:
             if not conn.execute("SELECT 1 FROM profiles WHERE id=?", (profile_id,)).fetchone(): raise MigrationError("Targetprofiel bestaat niet")
-            cursor = conn.execute("INSERT INTO migration_projects(name,target_profile_id,created_at,updated_at) VALUES(?,?,?,?)", (name[:120], profile_id, now(), now()))
+            cursor = conn.execute("INSERT INTO migration_projects(name,target_profile_id,owner,created_at,updated_at) VALUES(?,?,?,?,?)", (name[:120], profile_id,session.get("username","admin"), now(), now()))
             project_id = int(cursor.lastrowid)
         audit("migration-project-created", f"project={project_id} profile={profile_id}")
         return redirect(url_for("migration_project", project_id=project_id))
@@ -4028,6 +4206,8 @@ def migration_project(project_id):
         profiles = conn.execute("SELECT id,name,target_type FROM profiles ORDER BY name").fetchall()
         workspaces = conn.execute("SELECT id,name,source,created_at FROM config_workspaces WHERE profile_id=? ORDER BY id DESC", (project["target_profile_id"],)).fetchall()
         output_rows = conn.execute("SELECT * FROM migration_outputs WHERE project_id=? ORDER BY id DESC", (project_id,)).fetchall()
+        profile = conn.execute("SELECT * FROM profiles WHERE id=?", (project["target_profile_id"],)).fetchone()
+    family_mappings = ensure_migration_family_mappings(project_id, source_rows)
     sources = []
     for row in source_rows:
         source = dict(row); source["counts"] = json.loads(row["counts_json"]); source["messages"] = json.loads(row["warnings_json"]); sources.append(source)
@@ -4049,6 +4229,40 @@ def migration_project(project_id):
     with db() as conn:
         merge_rules=[dict(row) for row in conn.execute("SELECT * FROM migration_merge_rules WHERE project_id=? ORDER BY id DESC",(project_id,)).fetchall()]
         transform_rules=[dict(row) for row in conn.execute("SELECT * FROM migration_transform_rules WHERE project_id=? ORDER BY id DESC",(project_id,)).fetchall()]
+        saved_filters=[dict(row) for row in conn.execute("SELECT * FROM migration_saved_filters WHERE project_id=? ORDER BY name",(project_id,)).fetchall()]
+        catalogs={row["kind"]:{"items":json.loads(row["items_json"] or "[]"),"updated_at":row["updated_at"]} for row in conn.execute("SELECT * FROM migration_catalogs WHERE project_id=? ORDER BY kind",(project_id,)).fetchall()}
+        snippets=[dict(row) for row in conn.execute("SELECT id,name,updated_at FROM migration_snippets WHERE owner=? ORDER BY name",(session.get("username",""),)).fetchall()]
+        role_rows=[dict(row) for row in conn.execute("SELECT username,role,created_at FROM migration_project_roles WHERE project_id=? ORDER BY username",(project_id,)).fetchall()]
+        users=[row["username"] for row in conn.execute("SELECT username FROM users ORDER BY username").fetchall()]
+        audit_candidates=[dict(row) for row in conn.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 1000").fetchall()]
+        latest_analysis=conn.execute("SELECT * FROM migration_analysis_runs WHERE project_id=? ORDER BY id DESC LIMIT 1",(project_id,)).fetchone()
+    selected_filter_id=int(request.args.get("saved_filter","0") or 0)
+    project_audits=[
+        row for row in audit_candidates
+        if re.search(rf"(?:^|\s)project={project_id}(?:\s|$)",str(row.get("detail","")))
+    ][:100]
+    selected_filter=next((item for item in saved_filters if int(item["id"])==selected_filter_id),None)
+    filter_results=[]
+    if selected_filter:
+        filter_results=migration_filter_inventory(combined,json.loads(selected_filter["rules_json"] or "[]"),selected_filter["join_mode"])
+    target_model=MigrationModel("panos","target")
+    if project["base_workspace_id"]:
+        base_workspace=workspace_row(int(project["base_workspace_id"]))
+        if base_workspace:
+            target_model=cached_migration_workspace_model(base_workspace["config_path"],base_workspace["sha256"])
+    profile_settings_value=profile_settings(profile) if profile else {}
+    target_context=(profile_settings_value.get("folder") or profile_settings_value.get("snippet") or profile_settings_value.get("device") or profile_settings_value.get("device_group") or profile_settings_value.get("vsys") or "target")
+    staged_actions=migration_api_plan(combined,project["target_type"],str(target_context)) if source_ids else []
+    mappings_by_source=defaultdict(list)
+    for mapping in family_mappings: mappings_by_source[int(mapping["source_id"])].append(mapping)
+    topology_rules=[rule for rule in transform_rules if str(rule["operation"]).startswith("topology_")]
+    topology_targets={
+        "zones":sorted({str(item.get("name","")) for item in target_model.zones if str(item.get("name",""))}),
+        "interfaces":sorted({str(item.get("name","")) for item in target_model.interfaces if str(item.get("name",""))}),
+    }
+    health=migration_health_dashboard(combined)
+    best_practices=migration_best_practices(combined)
+    discovery=migration_discovery(combined)
     return render_template(
         "migration.html", projects=[], profiles=profiles, parsers=PARSERS, project=project,
         sources=sources, workspaces=workspaces, migration_kind_labels=MIGRATION_KIND_LABELS,
@@ -4056,8 +4270,355 @@ def migration_project(project_id):
         merge_inventory=inventory, merge_rules=merge_rules, migration_analysis=migration_analysis(combined),
         migration_review=migration_review_findings(combined) if source_ids else None,
         merge_query=merge_query, search_results=migration_search(combined,merge_query), transform_rules=transform_rules,
-        configuration_items=configuration_items, outputs=outputs,
+        configuration_items=configuration_items, outputs=outputs, family_mappings=family_mappings,
+        mappings_by_source=mappings_by_source, mapping_actions=MIGRATION_MAPPING_ACTIONS,
+        topology_rules=topology_rules, topology_targets=topology_targets,
+        saved_filters=saved_filters, selected_filter=selected_filter, filter_results=filter_results,
+        filter_fields=sorted(MIGRATION_FILTER_FIELDS), filter_operators=sorted(MIGRATION_FILTER_OPERATORS),
+        migration_health=health, best_practices=best_practices, discovery=discovery,
+        staged_actions=staged_actions, catalogs=catalogs, snippets=snippets,
+        project_roles=role_rows, project_users=users, current_project_role=migration_project_role(project_id),
+        project_audits=project_audits,
+        latest_analysis=json.loads(latest_analysis["analysis_json"]) if latest_analysis else None,
     )
+
+
+@app.post("/migration/projects/<int:project_id>/mappings")
+@login_required
+def migration_family_mapping_save(project_id):
+    project = migration_project_row(project_id)
+    if not project: return "Not found", 404
+    try:
+        source_id = int(request.form.get("source_id", "0"))
+        kind = request.form.get("kind", "").strip()
+        action = request.form.get("action", "map").strip()
+        target_context = request.form.get("target_context", "").strip()[:255]
+        with db() as conn:
+            source = conn.execute(
+                "SELECT * FROM migration_sources WHERE id=? AND project_id=?", (source_id, project_id)
+            ).fetchone()
+        if not source or kind not in model_collections(migration_model(source)):
+            raise MigrationError("De bronfamilie bestaat niet")
+        if action not in MIGRATION_MAPPING_ACTIONS:
+            raise MigrationError("Ongeldige mappingactie")
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO migration_family_mappings(project_id,source_id,kind,action,target_context,created_at,updated_at) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(project_id,source_id,kind) DO UPDATE SET action=excluded.action,target_context=excluded.target_context,updated_at=excluded.updated_at",
+                (project_id, source_id, kind, action, target_context, now(), now()),
+            )
+            conn.execute("UPDATE migration_projects SET updated_at=? WHERE id=?", (now(), project_id))
+        audit("migration-family-mapping", f"project={project_id} source={source_id} kind={kind} action={action}")
+        flash("Mapping bijgewerkt.", "success")
+    except Exception as exc:
+        flash(f"Mapping niet opgeslagen: {exc}", "error")
+    return redirect(url_for("migration_project", project_id=project_id) + "#source-mapping")
+
+
+@app.post("/migration/projects/<int:project_id>/topology")
+@login_required
+def migration_topology_mapping_save(project_id):
+    project = migration_project_row(project_id)
+    if not project: return "Not found", 404
+    try:
+        kind = request.form.get("kind", "").strip()
+        selector = request.form.get("selector", "").strip()
+        action = request.form.get("action", "review").strip()
+        target = request.form.get("target", "").strip()
+        operation = f"topology_{action}"
+        if kind not in MIGRATION_TOPOLOGY_KINDS or action not in {"map", "create", "ignore", "review"}:
+            raise MigrationError("Ongeldige topologiemapping")
+        if action == "map" and not target:
+            raise MigrationError("Kies een bestaande targetwaarde")
+        with db() as conn:
+            source_rows = conn.execute("SELECT * FROM migration_sources WHERE project_id=?", (project_id,)).fetchall()
+        available = set()
+        for source in source_rows:
+            for item in model_collections(migration_model(source)).get(kind, []):
+                available.add(item_selector(item if isinstance(item, dict) else item.__dict__))
+        if selector not in available:
+            raise MigrationError("De bronwaarde bestaat niet meer")
+        with db() as conn:
+            conn.execute(
+                "DELETE FROM migration_transform_rules WHERE project_id=? AND kind=? AND selector=? AND operation LIKE 'topology_%'",
+                (project_id, kind, selector),
+            )
+            conn.execute(
+                "INSERT INTO migration_transform_rules(project_id,operation,kind,selector,value,created_at) VALUES(?,?,?,?,?,?)",
+                (project_id, operation, kind, selector, target, now()),
+            )
+            conn.execute("UPDATE migration_projects SET updated_at=? WHERE id=?", (now(), project_id))
+        audit("migration-topology-mapping", f"project={project_id} kind={kind} action={action}")
+        flash("Topologiemapping bijgewerkt.", "success")
+    except Exception as exc:
+        flash(f"Topologiemapping niet opgeslagen: {exc}", "error")
+    return redirect(url_for("migration_project", project_id=project_id) + "#topology-mapping")
+
+
+@app.post("/migration/projects/<int:project_id>/filters")
+@login_required
+def migration_filter_save(project_id):
+    project = migration_project_row(project_id)
+    if not project: return "Not found", 404
+    try:
+        name = request.form.get("name", "").strip()[:80]
+        join_mode = request.form.get("join_mode", "and").strip()
+        rules = []
+        for field, operator, value in zip(
+            request.form.getlist("field"), request.form.getlist("operator"), request.form.getlist("filter_value")
+        ):
+            if value.strip() or field == "disabled":
+                rules.append({"field": field, "operator": operator, "value": value.strip()})
+        if not name or not rules or join_mode not in {"and", "or"}:
+            raise MigrationError("Geef een naam en minstens één filtervoorwaarde op")
+        source_ids = []
+        with db() as conn:
+            source_ids = [int(row["id"]) for row in conn.execute("SELECT id FROM migration_sources WHERE project_id=?", (project_id,)).fetchall()]
+        migration_filter_inventory(selected_migration_model(project_id, source_ids), rules, join_mode)
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO migration_saved_filters(project_id,name,join_mode,rules_json,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                (project_id, name, join_mode, json.dumps(rules), now(), now()),
+            )
+        audit("migration-filter-saved", f"project={project_id} name={name} rules={len(rules)}")
+        flash("Filter opgeslagen.", "success")
+    except Exception as exc:
+        flash(f"Filter niet opgeslagen: {exc}", "error")
+    return redirect(url_for("migration_project", project_id=project_id) + "#filter-builder")
+
+
+@app.post("/migration/projects/<int:project_id>/filters/<int:filter_id>/delete")
+@login_required
+def migration_filter_delete(project_id, filter_id):
+    if not migration_project_row(project_id): return "Not found", 404
+    with db() as conn:
+        deleted = conn.execute("DELETE FROM migration_saved_filters WHERE id=? AND project_id=?", (filter_id, project_id)).rowcount
+    if deleted:
+        audit("migration-filter-deleted", f"project={project_id} filter={filter_id}")
+        flash("Filter verwijderd.", "success")
+    return redirect(url_for("migration_project", project_id=project_id) + "#filter-builder")
+
+
+@app.post("/migration/projects/<int:project_id>/bulk-rename")
+@login_required
+def migration_bulk_rename(project_id):
+    if not migration_project_row(project_id): return "Not found", 404
+    try:
+        kind = request.form.get("kind", "").strip()
+        settings = {
+            "query": request.form.get("query", "").strip(),
+            "prefix": request.form.get("prefix", "").strip(),
+            "suffix": request.form.get("suffix", "").strip(),
+            "search": request.form.get("search", ""),
+            "replace": request.form.get("replace", ""),
+        }
+        if kind not in MIGRATION_KIND_LABELS or not any(settings.values()):
+            raise MigrationError("Kies een type en minstens één wijziging")
+        with db() as conn:
+            source_ids = [int(row["id"]) for row in conn.execute("SELECT id FROM migration_sources WHERE project_id=?", (project_id,)).fetchall()]
+        model = selected_migration_model(project_id, source_ids)
+        candidates = [
+            item for item in model_collections(model).get(kind, [])
+            if not settings["query"] or settings["query"].casefold() in str(item.name if hasattr(item, "name") else item.get("name", "")).casefold()
+        ]
+        if not candidates:
+            raise MigrationError("De bulkbewerking matcht geen items")
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO migration_transform_rules(project_id,operation,kind,selector,value,created_at) VALUES(?,?,?,?,?,?)",
+                (project_id, "bulk_rename", kind, settings["query"], json.dumps(settings), now()),
+            )
+            conn.execute("UPDATE migration_projects SET updated_at=? WHERE id=?", (now(), project_id))
+        audit("migration-bulk-rename-staged", f"project={project_id} kind={kind} matches={len(candidates)}")
+        flash(f"Bulk rename voor {len(candidates)} items in de reviewqueue geplaatst.", "success")
+    except Exception as exc:
+        flash(f"Bulk rename niet opgeslagen: {exc}", "error")
+    return redirect(url_for("migration_project", project_id=project_id) + "#bulk-refactor")
+
+
+@app.post("/migration/projects/<int:project_id>/analysis")
+@login_required
+def migration_analysis_run(project_id):
+    if not migration_project_row(project_id): return "Not found", 404
+    with db() as conn:
+        source_ids = [int(row["id"]) for row in conn.execute("SELECT id FROM migration_sources WHERE project_id=?", (project_id,)).fetchall()]
+    result = migration_best_practices(selected_migration_model(project_id, source_ids))
+    with db() as conn:
+        conn.execute("INSERT INTO migration_analysis_runs(project_id,analysis_json,created_at) VALUES(?,?,?)", (project_id, json.dumps(result), now()))
+    audit("migration-best-practice-analysis", f"project={project_id} failed={result['failed']}")
+    flash("Best-practiceanalyse vernieuwd.", "success")
+    return redirect(url_for("migration_project", project_id=project_id) + "#best-practices")
+
+
+@app.post("/migration/projects/<int:project_id>/analysis/disable-imported")
+@login_required
+def migration_disable_imported(project_id):
+    if not migration_project_row(project_id): return "Not found", 404
+    with db() as conn:
+        source_ids = [int(row["id"]) for row in conn.execute("SELECT id FROM migration_sources WHERE project_id=?", (project_id,)).fetchall()]
+    model = selected_migration_model(project_id, source_ids)
+    enabled = [("security_rules", rule) for rule in model.security_rules if not rule.disabled] + [("nat_rules", rule) for rule in model.nat_rules if not rule.disabled]
+    with db() as conn:
+        for kind, rule in enabled:
+            conn.execute(
+                "INSERT INTO migration_transform_rules(project_id,operation,kind,selector,value,created_at) VALUES(?,?,?,?,?,?)",
+                (project_id, "disable", kind, item_selector(rule.__dict__), "", now()),
+            )
+        if enabled:
+            conn.execute("UPDATE migration_projects SET updated_at=? WHERE id=?", (now(), project_id))
+    audit("migration-disable-imported-staged", f"project={project_id} rules={len(enabled)}")
+    flash(f"{len(enabled)} policies disabled in de reviewqueue.", "success")
+    return redirect(url_for("migration_project", project_id=project_id) + "#best-practices")
+
+
+@app.post("/migration/projects/<int:project_id>/catalogs/refresh")
+@login_required
+def migration_catalog_refresh(project_id):
+    project = migration_project_row(project_id)
+    if not project: return "Not found", 404
+    try:
+        with db() as conn:
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (project["target_profile_id"],)).fetchone()
+        if not profile:
+            raise MigrationError("Targetprofiel bestaat niet meer")
+        catalogs = {"applications": cached_application_catalog(profile)["items"]}
+        if profile["target_type"] == "scm":
+            for kind in ("regions", "custom-url-categories"):
+                catalogs[kind] = [
+                    {"name": item.get("name", ""), "kind": kind}
+                    for item in fetch_scm_objects(profile, kind) if item.get("name")
+                ]
+        else:
+            target = None
+            if project["base_workspace_id"]:
+                workspace = workspace_row(int(project["base_workspace_id"]))
+                if workspace:
+                    target = cached_migration_workspace_model(workspace["config_path"], workspace["sha256"])
+            if target:
+                for kind in ("regions", "custom_url_categories"):
+                    catalogs[kind.replace("_", "-")] = [
+                        {"name": item.get("name", ""), "kind": kind}
+                        for item in target.extras.get(kind, []) if item.get("name")
+                    ]
+        with db() as conn:
+            for kind, items in catalogs.items():
+                conn.execute(
+                    "INSERT INTO migration_catalogs(project_id,kind,items_json,updated_at) VALUES(?,?,?,?) "
+                    "ON CONFLICT(project_id,kind) DO UPDATE SET items_json=excluded.items_json,updated_at=excluded.updated_at",
+                    (project_id, kind, json.dumps(items), now()),
+                )
+        audit("migration-catalogs-refreshed", f"project={project_id} kinds={len(catalogs)}")
+        flash("Application-, URL- en region-catalogi bijgewerkt.", "success")
+    except Exception as exc:
+        flash(f"Catalogi niet bijgewerkt: {exc}", "error")
+    return redirect(url_for("migration_project", project_id=project_id) + "#enrichment")
+
+
+@app.get("/migration/projects/<int:project_id>/api-plan")
+@login_required
+def migration_api_plan_export(project_id):
+    project = migration_project_row(project_id)
+    if not project: return "Not found", 404
+    with db() as conn:
+        source_ids = [int(row["id"]) for row in conn.execute("SELECT id FROM migration_sources WHERE project_id=?", (project_id,)).fetchall()]
+    actions = migration_api_plan(selected_migration_model(project_id, source_ids), project["target_type"], project["profile_name"])
+    payload = {"schema": "pa-policy-forge-api-plan-v1", "project": project["name"], "target": project["profile_name"], "write_performed": False, "actions": actions}
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", project["name"]).strip("-.") or f"migration-{project_id}"
+    return Response(json.dumps(payload, indent=2), mimetype="application/json", headers={"Content-Disposition": f'attachment; filename="{safe}-api-plan.json"'})
+
+
+@app.post("/migration/projects/<int:project_id>/snippets")
+@login_required
+def migration_snippet_save(project_id):
+    if not migration_project_row(project_id): return "Not found", 404
+    try:
+        name = request.form.get("name", "").strip()[:80]
+        if not name:
+            raise MigrationError("Naam ontbreekt")
+        with db() as conn:
+            mappings = [dict(row) for row in conn.execute("SELECT kind,action,target_context FROM migration_family_mappings WHERE project_id=? ORDER BY kind", (project_id,)).fetchall()]
+            transforms = [dict(row) for row in conn.execute("SELECT operation,kind,selector,value FROM migration_transform_rules WHERE project_id=? AND operation='bulk_rename' ORDER BY id", (project_id,)).fetchall()]
+            filters = [dict(row) for row in conn.execute("SELECT name,join_mode,rules_json FROM migration_saved_filters WHERE project_id=? ORDER BY id", (project_id,)).fetchall()]
+            settings = {"mappings": mappings, "transforms": transforms, "filters": filters}
+            conn.execute(
+                "INSERT INTO migration_snippets(owner,name,settings_json,created_at,updated_at) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(owner,name) DO UPDATE SET settings_json=excluded.settings_json,updated_at=excluded.updated_at",
+                (session.get("username",""), name, json.dumps(settings), now(), now()),
+            )
+        audit("migration-snippet-saved", f"project={project_id} name={name}")
+        flash("Migratiesnippet opgeslagen.", "success")
+    except Exception as exc:
+        flash(f"Snippet niet opgeslagen: {exc}", "error")
+    return redirect(url_for("migration_project", project_id=project_id) + "#project-tools")
+
+
+@app.post("/migration/projects/<int:project_id>/snippets/<int:snippet_id>/apply")
+@login_required
+def migration_snippet_apply(project_id, snippet_id):
+    if not migration_project_row(project_id): return "Not found", 404
+    try:
+        with db() as conn:
+            snippet = conn.execute("SELECT * FROM migration_snippets WHERE id=? AND owner=?", (snippet_id,session.get("username",""))).fetchone()
+            sources = conn.execute("SELECT * FROM migration_sources WHERE project_id=?", (project_id,)).fetchall()
+        if not snippet:
+            raise MigrationError("Snippet bestaat niet")
+        settings = json.loads(snippet["settings_json"] or "{}")
+        mapping_by_kind = {item["kind"]: item for item in settings.get("mappings", [])}
+        with db() as conn:
+            for source in sources:
+                for kind, items in model_collections(migration_model(source)).items():
+                    mapping = mapping_by_kind.get(kind)
+                    if items and mapping:
+                        conn.execute(
+                            "INSERT INTO migration_family_mappings(project_id,source_id,kind,action,target_context,created_at,updated_at) VALUES(?,?,?,?,?,?,?) "
+                            "ON CONFLICT(project_id,source_id,kind) DO UPDATE SET action=excluded.action,target_context=excluded.target_context,updated_at=excluded.updated_at",
+                            (project_id, source["id"], kind, mapping["action"], mapping.get("target_context", ""), now(), now()),
+                        )
+            for rule in settings.get("transforms", []):
+                conn.execute("INSERT INTO migration_transform_rules(project_id,operation,kind,selector,value,created_at) VALUES(?,?,?,?,?,?)", (project_id, rule["operation"], rule["kind"], rule.get("selector", ""), rule.get("value", ""), now()))
+            for item in settings.get("filters", []):
+                conn.execute("INSERT INTO migration_saved_filters(project_id,name,join_mode,rules_json,created_at,updated_at) VALUES(?,?,?,?,?,?)", (project_id, item["name"], item["join_mode"], item["rules_json"], now(), now()))
+            conn.execute("UPDATE migration_projects SET updated_at=? WHERE id=?", (now(), project_id))
+        audit("migration-snippet-applied", f"project={project_id} snippet={snippet_id}")
+        flash("Migratiesnippet toegepast.", "success")
+    except Exception as exc:
+        flash(f"Snippet niet toegepast: {exc}", "error")
+    return redirect(url_for("migration_project", project_id=project_id) + "#project-tools")
+
+
+@app.post("/migration/projects/<int:project_id>/roles")
+@login_required
+def migration_role_save(project_id):
+    if migration_project_role(project_id) != "owner": return "Not found", 404
+    try:
+        username = request.form.get("username", "").strip()
+        role = request.form.get("role", "viewer").strip()
+        if role not in {"editor", "reviewer", "viewer"}:
+            raise MigrationError("Ongeldige projectrol")
+        with db() as conn:
+            if not conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+                raise MigrationError("Gebruiker bestaat niet")
+            conn.execute(
+                "INSERT INTO migration_project_roles(project_id,username,role,created_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(project_id,username) DO UPDATE SET role=excluded.role",
+                (project_id, username, role, now()),
+            )
+        audit("migration-role-saved", f"project={project_id} username={username} role={role}")
+        flash("Projectrol bijgewerkt.", "success")
+    except Exception as exc:
+        flash(f"Projectrol niet opgeslagen: {exc}", "error")
+    return redirect(url_for("migration_project", project_id=project_id) + "#project-tools")
+
+
+@app.post("/migration/projects/<int:project_id>/roles/<username>/delete")
+@login_required
+def migration_role_delete(project_id, username):
+    if migration_project_role(project_id) != "owner": return "Not found", 404
+    with db() as conn:
+        conn.execute("DELETE FROM migration_project_roles WHERE project_id=? AND username=?", (project_id, username))
+    audit("migration-role-deleted", f"project={project_id} username={username}")
+    flash("Projectrol verwijderd.", "success")
+    return redirect(url_for("migration_project", project_id=project_id) + "#project-tools")
 
 
 @app.post("/migration/projects/<int:project_id>/source")
@@ -4284,6 +4845,7 @@ def migration_merge_rule_create(project_id):
 @app.post("/migration/projects/<int:project_id>/merge-rules/<int:rule_id>/delete")
 @login_required
 def migration_merge_rule_delete(project_id,rule_id):
+    if not migration_project_row(project_id): return "Not found",404
     with db() as conn:
         deleted=conn.execute("DELETE FROM migration_merge_rules WHERE id=? AND project_id=?",(rule_id,project_id)).rowcount
     if deleted:
@@ -4320,6 +4882,7 @@ def migration_transform_create(project_id):
 @app.post("/migration/projects/<int:project_id>/transforms/<int:rule_id>/delete")
 @login_required
 def migration_transform_delete(project_id,rule_id):
+    if not migration_project_row(project_id): return "Not found",404
     with db() as conn: deleted=conn.execute("DELETE FROM migration_transform_rules WHERE id=? AND project_id=?",(rule_id,project_id)).rowcount
     if deleted: audit("migration-transform-deleted",f"project={project_id} rule={rule_id}"); flash("Transformatie verwijderd.","success")
     return redirect(url_for("migration_project",project_id=project_id))
@@ -4332,15 +4895,60 @@ def migration_merge_preview(project_id):
     if not project: return "Not found", 404
     try:
         source_ids = [int(value) for value in request.form.getlist("source_id")]
+        if not source_ids:
+            raise MigrationError("Selecteer minstens één bronconfiguratie")
+        with db() as conn:
+            unresolved_families = conn.execute(
+                f"SELECT kind FROM migration_family_mappings WHERE project_id=? AND action='review' "
+                f"AND source_id IN ({','.join('?' for _ in source_ids)}) LIMIT 12",
+                (project_id, *source_ids),
+            ).fetchall()
+            topology_decision_rows = conn.execute(
+                "SELECT kind,selector,operation FROM migration_transform_rules "
+                "WHERE project_id=? AND operation LIKE 'topology_%'",
+                (project_id,),
+            ).fetchall()
+            selected_source_rows = conn.execute(
+                f"SELECT * FROM migration_sources WHERE project_id=? "
+                f"AND id IN ({','.join('?' for _ in source_ids)})",
+                (project_id, *source_ids),
+            ).fetchall()
+        if unresolved_families:
+            labels = ", ".join(
+                MIGRATION_KIND_LABELS.get(row["kind"], row["kind"])
+                for row in unresolved_families
+            )
+            raise MigrationError(f"Beslis eerst de bronmapping voor: {labels}")
         model = selected_migration_model(project_id, source_ids)
         selected_kinds = set(request.form.getlist("kind"))
         if not selected_kinds: raise MigrationError("Selecteer minstens één configuratietype")
+        topology_decisions = {
+            (row["kind"], row["selector"]): row["operation"]
+            for row in topology_decision_rows
+        }
+        pending_topology = []
+        for source in selected_source_rows:
+            source_model = migration_model(source)
+            for kind in MIGRATION_TOPOLOGY_KINDS & selected_kinds:
+                for item in model_collections(source_model).get(kind, []):
+                    raw = item if isinstance(item, dict) else item.__dict__
+                    selector = item_selector(raw)
+                    operation = topology_decisions.get((kind, selector), "topology_review")
+                    if operation == "topology_review":
+                        pending_topology.append(
+                            f"{MIGRATION_KIND_LABELS.get(kind, kind)}: {raw.get('name', '')}"
+                        )
+        if pending_topology:
+            raise MigrationError(
+                "Beslis eerst de topologiemapping voor: " + ", ".join(pending_topology[:12])
+            )
         for attr in ("addresses", "address_groups", "services", "service_groups", "security_rules", "nat_rules", "interfaces", "zones"):
             if attr not in selected_kinds: setattr(model, attr, [])
         model.extras={kind:items for kind,items in model.extras.items() if kind in selected_kinds}
         with db() as conn:
             profile = conn.execute("SELECT * FROM profiles WHERE id=?", (project["target_profile_id"],)).fetchone()
         if not profile: raise MigrationError("Targetprofiel bestaat niet meer")
+        base_fingerprint = ""
         if profile["target_type"] == "scm":
             if model.interfaces or model.zones:
                 raise MigrationError("PAN-OS interfaces en zones kunnen alleen naar een Panorama/PAN-OS XML-workspace worden gemerged; SCM-netwerkmapping is nog niet beschikbaar")
@@ -4356,17 +4964,48 @@ def migration_merge_preview(project_id):
             settings = profile_settings(profile); panorama = profile["target_type"] == "panorama"
             scope = settings.get("device_group", "") if panorama else settings.get("vsys", "vsys1")
             base_xml = workspace_config_path(workspace).read_bytes() if workspace else migration_base_xml(model, scope, panorama)
+            base_fingerprint = hashlib.sha256(base_xml).hexdigest()
             _, plan = merge_model_into_panos_xml(
                 base_xml, model, scope, panorama, settings.get("rulebase", "pre")
             )
+        if int(plan.get("create", 0)) == 0:
+            raise MigrationError("De selectie veroorzaakt geen wijziging aan de target candidate")
+        family_delta = []
+        for kind, items in model_collections(model).items():
+            if items:
+                family_delta.append({
+                    "kind": kind,
+                    "label": MIGRATION_KIND_LABELS.get(kind, kind.replace("_", " ").title()),
+                    "selected": len(items),
+                })
+        plan["family_delta"] = family_delta
         draft_id = secrets.token_urlsafe(18)
         review = migration_review_findings(model)
-        draft = {"project_id": project_id, "target_profile_id": project["target_profile_id"], "source_ids": source_ids, "model": model.as_dict(), "fingerprint": model.fingerprint(), "plan": plan, "review": review, "created_at": now()}
+        draft = {
+            "project_id": project_id,
+            "target_profile_id": project["target_profile_id"],
+            "source_ids": source_ids,
+            "model": model.as_dict(),
+            "fingerprint": model.fingerprint(),
+            "plan": plan,
+            "review": review,
+            "project_revision": migration_project_revision(project_id),
+            "project_updated_at": project["updated_at"],
+            "profile_settings_fingerprint": hashlib.sha256(
+                str(profile["settings_json"] or "{}").encode()
+            ).hexdigest(),
+            "base_workspace_id": int(project["base_workspace_id"] or 0),
+            "base_fingerprint": base_fingerprint,
+            "created_at": now(),
+        }
         path = OBJECT_DRAFTS / f"migration-{draft_id}.json"; path.write_text(json.dumps(draft)); path.chmod(0o600)
         counts = model.counts()
         if profile["target_type"] != "scm" and not workspace:
             counts["zones"] = len(migration_zone_names(model))
-        return render_template("migration_preview.html", project=project, model=model, counts=counts, plan=plan, review=review, draft_id=draft_id)
+        return render_template(
+            "migration_preview.html", project=project, model=model, counts=counts,
+            plan=plan, review=review, family_delta=family_delta, draft_id=draft_id,
+        )
     except Exception as exc:
         flash(f"Merge-preview mislukt: {exc}", "error")
         return redirect(url_for("migration_project", project_id=project_id))
@@ -4383,6 +5022,12 @@ def migration_merge_apply(draft_id):
     try:
         model = MigrationModel.from_dict(draft["model"])
         if not hmac.compare_digest(model.fingerprint(), draft["fingerprint"]): raise MigrationError("Merge-draft is gewijzigd")
+        if not hmac.compare_digest(
+            migration_project_revision(int(project["id"])), str(draft.get("project_revision", ""))
+        ):
+            raise MigrationError("Het migratieproject is gewijzigd; maak een nieuwe preview")
+        if not hmac.compare_digest(str(project["updated_at"]), str(draft.get("project_updated_at", ""))):
+            raise MigrationError("Het migratieproject is gewijzigd; maak een nieuwe preview")
         review = migration_review_findings(model)
         stored_review = draft.get("review")
         if stored_review and not hmac.compare_digest(
@@ -4396,11 +5041,37 @@ def migration_merge_apply(draft_id):
         audit("migration-review-acknowledged", f"project={project['id']} draft={draft_id} findings={len(review['findings'])}")
         with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (draft["target_profile_id"],)).fetchone()
         if not profile: raise MigrationError("Targetprofiel bestaat niet meer")
+        current_profile_fingerprint = hashlib.sha256(
+            str(profile["settings_json"] or "{}").encode()
+        ).hexdigest()
+        if not hmac.compare_digest(current_profile_fingerprint, str(draft.get("profile_settings_fingerprint", ""))):
+            raise MigrationError("De targetcontext is gewijzigd; maak een nieuwe preview")
+        if int(project["base_workspace_id"] or 0) != int(draft.get("base_workspace_id", 0)):
+            raise MigrationError("De base-workspace is gewijzigd; maak een nieuwe preview")
+        if profile["target_type"] != "scm" and int(project["base_workspace_id"] or 0):
+            current_base = workspace_row(int(project["base_workspace_id"]))
+            current_base_hash = hashlib.sha256(workspace_config_path(current_base).read_bytes()).hexdigest() if current_base else ""
+            if not hmac.compare_digest(current_base_hash, str(draft.get("base_fingerprint", ""))):
+                raise MigrationError("De base-configuratie is gewijzigd; maak een nieuwe preview")
         if profile["target_type"] == "scm":
             model, plan = reconcile_model(model, migration_target_inventory(profile))
+            plan["create"] += sum(len(items) for items in model.extras.values())
+            if int(plan.get("create", 0)) == 0:
+                raise MigrationError("De target is gewijzigd en de selectie veroorzaakt geen nieuwe candidatewijziging")
             count = apply_scm_migration(profile, model)
             outcome = f"{count} configuratie-items naar SCM candidate geschreven"
         else:
+            settings = profile_settings(profile)
+            panorama = profile["target_type"] == "panorama"
+            scope = settings.get("device_group", "") if panorama else settings.get("vsys", "vsys1")
+            base_id = int(project["base_workspace_id"] or 0)
+            current_base = workspace_row(base_id) if base_id else None
+            preflight_xml = workspace_config_path(current_base).read_bytes() if current_base else migration_base_xml(model, scope, panorama)
+            _, preflight_plan = merge_model_into_panos_xml(
+                preflight_xml, model, scope, panorama, settings.get("rulebase", "pre")
+            )
+            if int(preflight_plan.get("create", 0)) == 0:
+                raise MigrationError("De selectie veroorzaakt geen wijziging aan de target candidate")
             workspace_id, plan = create_merged_workspace(profile, project, model)
             source_analysis = migration_analysis(model)
             candidate_analysis = panos_candidate_analysis(

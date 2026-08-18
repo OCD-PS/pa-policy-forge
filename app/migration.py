@@ -196,6 +196,11 @@ MIGRATION_KIND_LABELS = {
     "device_configuration": "Device configuration",
 }
 
+MIGRATION_MAPPING_ACTIONS = {"map", "create", "ignore", "review"}
+MIGRATION_TOPOLOGY_KINDS = {"interfaces", "zones", "vlans", "virtual_routers", "logical_routers"}
+MIGRATION_FILTER_FIELDS = {"kind", "name", "value", "source_ref", "references", "disabled"}
+MIGRATION_FILTER_OPERATORS = {"contains", "equals", "starts_with", "ends_with", "regex", "not_contains"}
+
 
 PANOS_EXTRA_PATHS = {
     "applications": ("./application/entry", "application"),
@@ -1611,6 +1616,146 @@ def migration_search(model: MigrationModel, query: str) -> list[dict]:
     return results[:1000]
 
 
+def migration_inventory_rows(model: MigrationModel) -> list[dict]:
+    """Flatten every migration family for filters, dashboards and API staging."""
+    rows = []
+    for kind, items in model_collections(model).items():
+        for item in items:
+            raw = asdict(item) if hasattr(item, "__dataclass_fields__") else dict(item)
+            references = []
+            for key in (
+                "members", "from_zones", "to_zones", "source", "destination",
+                "application", "service", "tags",
+            ):
+                value = raw.get(key, [])
+                references.extend(value if isinstance(value, list) else [value] if value else [])
+            rows.append({
+                "kind": kind,
+                "name": str(raw.get("name", "")),
+                "value": str(raw.get("value", raw.get("port", ""))),
+                "source_ref": str(raw.get("source_ref", "")),
+                "references": " ".join(str(value) for value in references),
+                "disabled": bool(raw.get("disabled", False)),
+                "selector": item_selector(raw),
+                "raw": raw,
+            })
+    return rows
+
+
+def migration_filter_inventory(
+    model: MigrationModel,
+    rules: list[dict],
+    join_mode: str = "and",
+) -> list[dict]:
+    """Apply a small, deterministic Expedition-style AND/OR filter builder."""
+    if join_mode not in {"and", "or"}:
+        raise MigrationError("Onbekende filtercombinatie")
+    normalized = []
+    for rule in rules:
+        field = str(rule.get("field", "name"))
+        operator = str(rule.get("operator", "contains"))
+        value = str(rule.get("value", ""))
+        if field not in MIGRATION_FILTER_FIELDS or operator not in MIGRATION_FILTER_OPERATORS:
+            raise MigrationError("Ongeldige migratiefilter")
+        if not value and field != "disabled":
+            continue
+        normalized.append((field, operator, value))
+    if not normalized:
+        return []
+
+    def matches(row: dict, rule: tuple[str, str, str]) -> bool:
+        field, operator, wanted = rule
+        actual = "yes" if row[field] is True else "no" if row[field] is False else str(row.get(field, ""))
+        actual_folded = actual.casefold()
+        wanted_folded = wanted.casefold()
+        if operator == "contains":
+            return wanted_folded in actual_folded
+        if operator == "not_contains":
+            return wanted_folded not in actual_folded
+        if operator == "equals":
+            return actual_folded == wanted_folded
+        if operator == "starts_with":
+            return actual_folded.startswith(wanted_folded)
+        if operator == "ends_with":
+            return actual_folded.endswith(wanted_folded)
+        try:
+            return re.search(wanted, actual, re.IGNORECASE) is not None
+        except re.error as exc:
+            raise MigrationError(f"Ongeldige reguliere expressie: {exc}") from exc
+
+    result = []
+    for row in migration_inventory_rows(model):
+        outcomes = [matches(row, rule) for rule in normalized]
+        if (join_mode == "and" and all(outcomes)) or (join_mode == "or" and any(outcomes)):
+            result.append(row)
+    return result[:5000]
+
+
+def apply_family_mappings(model: MigrationModel, mappings: list[dict]) -> MigrationModel:
+    """Apply explicit per-family map/create/ignore/review decisions."""
+    result = MigrationModel.from_dict(model.as_dict())
+    for mapping in mappings:
+        kind = str(mapping.get("kind", ""))
+        action = str(mapping.get("action", "map"))
+        if kind not in model_collections(result) or action not in MIGRATION_MAPPING_ACTIONS:
+            continue
+        if action == "ignore":
+            if kind in result.extras:
+                result.extras[kind] = []
+            else:
+                setattr(result, kind, [])
+        elif action == "review":
+            result.warnings.append(
+                f"Mapping voor {MIGRATION_KIND_LABELS.get(kind, kind)} vereist nog een beslissing"
+            )
+    return result
+
+
+def apply_topology_mappings(model: MigrationModel, mappings: list[dict]) -> MigrationModel:
+    """Map source topology names to existing targets without copying source definitions."""
+    result = MigrationModel.from_dict(model.as_dict())
+    replacements: dict[str, str] = {}
+    for mapping in mappings:
+        kind = str(mapping.get("kind", ""))
+        source = str(mapping.get("source", "")).strip()
+        action = str(mapping.get("action", "review"))
+        target = str(mapping.get("target", "")).strip()
+        if kind not in MIGRATION_TOPOLOGY_KINDS or not source or action not in MIGRATION_MAPPING_ACTIONS:
+            continue
+        collection = model_collections(result).get(kind, [])
+        matching = [
+            item for item in collection
+            if (item.get("name", "") if isinstance(item, dict) else item.name) == source
+        ]
+        if action == "map" and target:
+            replacements[source] = target
+            for item in matching:
+                collection.remove(item)
+        elif action == "ignore":
+            for item in matching:
+                collection.remove(item)
+        elif action == "review":
+            result.warnings.append(f"Topologiemapping vereist review: {kind} {source}")
+
+    if replacements:
+        for rule in [*result.security_rules, *result.nat_rules]:
+            rule.from_zones = unique(replacements.get(value, value) for value in rule.from_zones)
+            rule.to_zones = unique(replacements.get(value, value) for value in rule.to_zones)
+            if rule.to_interface in replacements:
+                rule.to_interface = replacements[rule.to_interface]
+        for items in result.extras.values():
+            for item in items:
+                try:
+                    entry = SafeET.fromstring(str(item.get("xml", "")))
+                    for node in entry.iter():
+                        if node.text in replacements:
+                            node.text = replacements[node.text]
+                    item["xml"] = ET.tostring(entry, encoding="unicode")
+                except Exception:
+                    continue
+    return result
+
+
 def merge_member_names(model: MigrationModel, kind: str, master: str, mode: str, selected: list[str] | None = None) -> list[str]:
     items=model_collections(model).get(kind,[])
     raw=[asdict(item) if hasattr(item,"__dataclass_fields__") else dict(item) for item in items]
@@ -1689,6 +1834,47 @@ def apply_transform_rules(model: MigrationModel, rules: list[dict]) -> Migration
                         except Exception: pass
                     replacements[old]=value
                 elif hasattr(item,"disabled"): item.disabled=operation=="disable"
+        elif operation == "bulk_rename" and kind in model_collections(result):
+            try:
+                settings = json.loads(value or "{}")
+            except json.JSONDecodeError:
+                continue
+            query = str(settings.get("query", "")).casefold()
+            prefix = str(settings.get("prefix", ""))
+            suffix = str(settings.get("suffix", ""))
+            search = str(settings.get("search", ""))
+            replace = str(settings.get("replace", ""))
+            for item in list(collection):
+                old = item.name if hasattr(item, "name") else str(item.get("name", ""))
+                if query and query not in old.casefold():
+                    continue
+                middle = old.replace(search, replace) if search else old
+                new = f"{prefix}{middle}{suffix}"[:63]
+                if not new or new == old:
+                    continue
+                if hasattr(item, "name"):
+                    item.name = new
+                else:
+                    item["name"] = new
+                    try:
+                        entry = SafeET.fromstring(item.get("xml", ""))
+                        entry.set("name", new)
+                        item["xml"] = ET.tostring(entry, encoding="unicode")
+                    except Exception:
+                        pass
+                replacements[old] = new
+        elif operation in {"topology_map", "topology_create", "topology_ignore", "topology_review"}:
+            item = selector_item(collection, selector)
+            if item is None:
+                continue
+            old = item.name if hasattr(item, "name") else str(item.get("name", ""))
+            if operation == "topology_map" and value:
+                replacements[old] = value
+                collection.remove(item)
+            elif operation == "topology_ignore":
+                collection.remove(item)
+            elif operation == "topology_review":
+                result.warnings.append(f"Topologiemapping vereist review: {kind} {old}")
         elif operation=="replace_reference" and selector and value:
             replacements[selector]=value
     if replacements:
@@ -1775,6 +1961,108 @@ def migration_analysis(model: MigrationModel) -> dict:
         "unused_services":sorted(service_names-used_services),
         "unused_service_groups":sorted(service_group_names-used_services),
         "unresolved_references":sorted(unresolved), "duplicate_rules":duplicate_rules,
+    }
+
+
+def migration_health_dashboard(model: MigrationModel) -> dict:
+    """Project-wide health counters with stable filter anchors for the UI."""
+    analysis = migration_analysis(model)
+    duplicates = merge_inventory(model)
+    unused = sum(
+        len(analysis[key])
+        for key in (
+            "unused_addresses", "unused_address_groups",
+            "unused_services", "unused_service_groups",
+        )
+    )
+    disabled = sum(rule.disabled for rule in [*model.security_rules, *model.nat_rules])
+    counters = {
+        "duplicates": len(duplicates),
+        "disabled": disabled,
+        "unused": unused,
+        "invalid": len(analysis["unresolved_references"]),
+        "ghost": len(model.unsupported),
+        "warnings": len(model.warnings),
+    }
+    return {
+        "counters": counters,
+        "total": sum(len(items) for items in model_collections(model).values()),
+        "status": "blocked" if counters["invalid"] or counters["ghost"] else "review",
+        "analysis": analysis,
+    }
+
+
+def migration_best_practices(model: MigrationModel) -> dict:
+    """Conservative post-parse checks; these never claim the candidate is safe."""
+    policies = [*model.security_rules, *model.nat_rules]
+    checks = []
+
+    def add(code: str, title: str, passed: bool, detail: str, count: int = 0, remediable: bool = False):
+        checks.append({
+            "code": code, "title": title, "passed": bool(passed),
+            "detail": detail, "count": int(count), "remediable": bool(remediable),
+        })
+
+    enabled = sum(not rule.disabled for rule in policies)
+    add(
+        "imported-disabled", "Imported policies disabled",
+        enabled == 0, "Nieuwe migratieregels blijven disabled tot een engineer ze bewust activeert.",
+        enabled, True,
+    )
+    any_service = sum("any" in rule.service for rule in model.security_rules)
+    add(
+        "service-any", "Geen brede service any",
+        any_service == 0, "Vervang brede services waar applicatie-default of een expliciete service mogelijk is.",
+        any_service,
+    )
+    any_application = sum("any" in rule.application for rule in model.security_rules)
+    add(
+        "application-any", "App-ID beoordeeld",
+        any_application == 0, "Rules met application any vereisen App-ID review of een bewuste uitzondering.",
+        any_application,
+    )
+    any_zone = sum("any" in rule.from_zones or "any" in rule.to_zones for rule in policies)
+    add(
+        "zone-specific", "Zones expliciet gemapt",
+        any_zone == 0, "Rules met zone any kunnen op ontbrekende vendorcontext wijzen.", any_zone,
+    )
+    unnamed = sum(not rule.description.strip() for rule in model.security_rules)
+    add(
+        "descriptions", "Security rules beschreven",
+        unnamed == 0, "Een migratiebeschrijving maakt intentie en review achteraf traceerbaar.", unnamed,
+    )
+    analysis = migration_analysis(model)
+    add(
+        "references", "Alle referenties opgelost",
+        not analysis["unresolved_references"], "Object-, service- en application-referenties moeten bestaan op het target.",
+        len(analysis["unresolved_references"]),
+    )
+    return {
+        "checks": checks,
+        "passed": sum(item["passed"] for item in checks),
+        "failed": sum(not item["passed"] for item in checks),
+        "remediable": sum(item["remediable"] and not item["passed"] for item in checks),
+    }
+
+
+def migration_discovery(model: MigrationModel) -> dict:
+    """Offline discovery hints from the imported configuration itself."""
+    networks = set()
+    fqdns = set()
+    for item in model.addresses:
+        try:
+            network = ipaddress.ip_network(item.value, strict=False)
+            networks.add(str(network))
+        except ValueError:
+            if item.value_type == "fqdn" or re.search(r"[A-Za-z]", item.value):
+                fqdns.add(item.value)
+    applications = sorted({value for rule in model.security_rules for value in rule.application if value != "any"})
+    zones = sorted({value for rule in [*model.security_rules, *model.nat_rules] for value in [*rule.from_zones, *rule.to_zones] if value != "any"})
+    return {
+        "networks": sorted(networks, key=lambda value: (ipaddress.ip_network(value).version, ipaddress.ip_network(value).network_address, ipaddress.ip_network(value).prefixlen)),
+        "fqdns": sorted(fqdns, key=str.casefold),
+        "applications": applications,
+        "zones": zones,
     }
 
 
@@ -2150,6 +2438,31 @@ def scm_items(model: MigrationModel) -> list[dict]:
     return items
 
 
+def migration_api_plan(model: MigrationModel, target_type: str, target_context: str = "") -> list[dict]:
+    """Create a review-only output plan; it never performs a target write."""
+    actions = []
+    if target_type == "scm":
+        for item in scm_items(model):
+            kind = item["kind"]
+            actions.append({
+                "method": "POST", "kind": kind, "name": item["name"],
+                "target": target_context, "payload": item["payload"], "status": "staged",
+            })
+        for kind, items in model.extras.items():
+            for item in items:
+                actions.append({
+                    "method": "POST", "kind": kind, "name": str(item.get("name", "")),
+                    "target": target_context, "payload": raw_item_payload(item), "status": "staged",
+                })
+    else:
+        for row in migration_inventory_rows(model):
+            actions.append({
+                "method": "SET", "kind": row["kind"], "name": row["name"],
+                "target": target_context, "status": "staged",
+            })
+    return actions
+
+
 def reconcile_model(model: MigrationModel, existing: dict[str, list[dict]]) -> tuple[MigrationModel, dict]:
     """Reuse exact/equivalent target objects and block incompatible name collisions."""
     result = MigrationModel.from_dict(model.as_dict())
@@ -2252,6 +2565,10 @@ def reconcile_model(model: MigrationModel, existing: dict[str, list[dict]]) -> t
 def _entry_signature(entry: ET.Element) -> str:
     clone = copy.deepcopy(entry)
     clone.attrib.pop("name", None)
+    for node in clone.iter():
+        node.tail = None
+        if node.text is not None:
+            node.text = node.text.strip() or None
     return ET.tostring(clone, encoding="unicode")
 
 

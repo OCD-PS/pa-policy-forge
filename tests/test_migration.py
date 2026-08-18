@@ -12,7 +12,7 @@ os.environ.setdefault("PPF_DATA_DIR", tempfile.mkdtemp(prefix="forge-migration-t
 os.environ.setdefault("PPF_SYSLOG_PORT", "55149")
 os.environ.setdefault("PPF_BOOTSTRAP_PASSWORD", "unit-test-bootstrap-password")
 
-from app.migration import Address, MigrationModel, PARSERS, MigrationError, apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, migration_analysis, migration_base_xml, migration_collision_report, migration_review_findings, migration_zone_names, panos_candidate_analysis, parse_vendor, panos_fragment, reconcile_model, scm_items, set_panos_ha_mode
+from app.migration import Address, MigrationModel, PARSERS, MigrationError, apply_family_mappings, apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, migration_analysis, migration_api_plan, migration_base_xml, migration_best_practices, migration_collision_report, migration_discovery, migration_filter_inventory, migration_health_dashboard, migration_review_findings, migration_zone_names, panos_candidate_analysis, parse_vendor, panos_fragment, reconcile_model, scm_items, set_panos_ha_mode
 from app import main
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -84,6 +84,68 @@ class MigrationTests(unittest.TestCase):
         model=MigrationModel("merged","source",addresses=[Address("old-server","10.0.0.3/32",source_ref="A")])
         transformed=apply_transform_rules(model,[{"operation":"rename","kind":"addresses","selector":"old-server|||A","value":"new-server"}])
         self.assertEqual(transformed.addresses[0].name,"new-server")
+
+    def test_family_mapping_can_ignore_or_require_review(self):
+        model=MigrationModel(
+            "generic","source",
+            addresses=[Address("server","10.0.0.3/32")],
+            services=[main.Service("https","tcp","443")],
+        )
+        mapped=apply_family_mappings(model,[
+            {"kind":"addresses","action":"ignore"},
+            {"kind":"services","action":"review"},
+        ])
+        self.assertEqual(mapped.addresses,[])
+        self.assertEqual(len(mapped.services),1)
+        self.assertTrue(any("Services" in item for item in mapped.warnings))
+
+    def test_topology_mapping_rewrites_policy_and_removes_source_definition(self):
+        model=MigrationModel(
+            "panos","source",
+            zones=[{"name":"inside","source_ref":"source","xml":'<entry name="inside"><network><layer3/></network></entry>'}],
+            security_rules=[main.Policy("allow",from_zones=["inside"],to_zones=["outside"])],
+        )
+        selector="inside|||source"
+        transformed=apply_transform_rules(model,[
+            {"operation":"topology_map","kind":"zones","selector":selector,"value":"Trust"}
+        ])
+        self.assertEqual(transformed.zones,[])
+        self.assertEqual(transformed.security_rules[0].from_zones,["Trust"])
+
+    def test_expedition_style_filters_support_and_or_and_regex(self):
+        model=MigrationModel(
+            "generic","source",
+            addresses=[Address("prod-web","10.0.0.3/32",source_ref="fw-a"),Address("test-db","10.0.1.3/32",source_ref="fw-b")],
+            security_rules=[main.Policy("allow-prod",source=["prod-web"],disabled=True)],
+        )
+        result=migration_filter_inventory(model,[
+            {"field":"name","operator":"starts_with","value":"prod"},
+            {"field":"source_ref","operator":"equals","value":"fw-a"},
+        ],"and")
+        self.assertEqual([item["name"] for item in result],["prod-web"])
+        result=migration_filter_inventory(model,[
+            {"field":"name","operator":"regex","value":"^test"},
+            {"field":"disabled","operator":"equals","value":"yes"},
+        ],"or")
+        self.assertEqual({item["name"] for item in result},{"test-db","allow-prod"})
+
+    def test_health_best_practices_discovery_and_api_plan_are_review_only(self):
+        model=MigrationModel(
+            "generic","source",
+            addresses=[Address("web","192.0.2.10/32"),Address("fqdn","portal.example.net",value_type="fqdn")],
+            security_rules=[main.Policy("allow-web",destination=["web"],application=["any"],service=["any"],disabled=False)],
+        )
+        health=migration_health_dashboard(model)
+        practices=migration_best_practices(model)
+        discovery=migration_discovery(model)
+        api_plan=migration_api_plan(model,"panos","vsys1")
+        self.assertGreaterEqual(health["total"],3)
+        self.assertGreater(practices["failed"],0)
+        self.assertIn("192.0.2.10/32",discovery["networks"])
+        self.assertIn("portal.example.net",discovery["fqdns"])
+        self.assertTrue(api_plan)
+        self.assertTrue(all(item["status"]=="staged" for item in api_plan))
+        self.assertTrue(all(item["method"]=="SET" for item in api_plan))
 
     def test_saved_transform_survives_import_editor_source_ref_change(self):
         model=MigrationModel(
@@ -708,6 +770,13 @@ end''', "atlas-a.conf")
             "fingerprint": model.fingerprint(),
             "plan": {},
             "review": migration_review_findings(model),
+            "project_revision": main.migration_project_revision(project_id),
+            "project_updated_at": stamp,
+            "profile_settings_fingerprint": __import__("hashlib").sha256(
+                json.dumps({"vsys": "vsys1"}).encode()
+            ).hexdigest(),
+            "base_workspace_id": 0,
+            "base_fingerprint": "",
             "created_at": stamp,
         }))
         client = main.app.test_client()
@@ -973,6 +1042,13 @@ end''', "editable-fortigate.conf")
 
         page = client.get(f"/migration/projects/{project_id}", base_url="https://forge.test").get_data(as_text=True)
         self.assertIn("Palo Alto PAN-OS / Panorama XML", page)
+        self.assertIn("Migration Control Center", page)
+        self.assertIn("Bron- en doelmapping", page)
+        self.assertIn("Interfaces, zones en routing mappen", page)
+        self.assertIn("Filters en selecties", page)
+        self.assertIn("Bulk refactor", page)
+        self.assertIn("Catalogi en discovery", page)
+        self.assertIn("Snippets, rollen en audit", page)
         self.assertIn('class="migration-kind-menu"', page)
         self.assertNotIn('class="migration-kind-menu" open', page)
         self.assertIn("<summary>Configuratie</summary>", page)
@@ -1055,6 +1131,41 @@ end''', "editable-fortigate.conf")
         self.assertEqual(response.data, main.workspace_config_path(main.workspace_row(workspace_id)).read_bytes())
         self.assertIn(b"latest-output", response.data)
         self.assertNotIn(b"wrong-object", response.data)
+
+    def test_merge_preview_blocks_when_target_delta_is_zero(self):
+        stamp=main.now()
+        with main.db() as conn:
+            profile_id=conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("PANOS zero delta test","panos",json.dumps({"vsys":"vsys1"}),stamp,stamp),
+            ).lastrowid
+            profile=conn.execute("SELECT * FROM profiles WHERE id=?",(profile_id,)).fetchone()
+        base=b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="same"><ip-netmask>192.0.2.20/32</ip-netmask></entry></address><rulebase/></entry></vsys></entry></devices></config>'''
+        workspace_id=main.store_config_workspace(profile,"Zero delta base","zero.xml",base,"test")
+        with main.db() as conn:
+            project_id=conn.execute(
+                "INSERT INTO migration_projects(name,target_profile_id,base_workspace_id,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("zero-delta",profile_id,workspace_id,stamp,stamp),
+            ).lastrowid
+        source_id=main.store_migration_source(
+            project_id,"generic","same.json",
+            MigrationModel("generic","same.json",addresses=[Address("same","192.0.2.20/32")]),
+        )
+        client=main.app.test_client()
+        with main.app.test_request_context("/",base_url="https://forge.test"):
+            serializer=main.app.session_interface.get_signing_serializer(main.app)
+            client.set_cookie(
+                main.app.config["SESSION_COOKIE_NAME"],
+                serializer.dumps({"user_id":1,"username":"admin","csrf":"migration-test-csrf"}),
+                domain="forge.test",secure=True,
+            )
+        response=client.post(
+            f"/migration/projects/{project_id}/preview",base_url="https://forge.test",
+            data={"csrf":"migration-test-csrf","source_id":str(source_id),"kind":"addresses"},
+            follow_redirects=True,
+        )
+        self.assertEqual(response.status_code,200)
+        self.assertIn("geen wijziging aan de target candidate",response.get_data(as_text=True))
 
     def test_migration_output_workspace_links_back_and_blocks_push_when_review_fails(self):
         stamp = main.now()
