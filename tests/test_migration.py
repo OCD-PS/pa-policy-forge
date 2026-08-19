@@ -1714,6 +1714,99 @@ allow-web,security,,Trust,Untrust,any,web,ssl,application-default,allow
         self.assertEqual(response.status_code, 302)
         self.assertEqual(main.migration_output_push_block(edited_id)[1], "")
 
+    def test_bulk_review_resolves_critical_and_warning_codes_with_one_audit_note(self):
+        stamp = main.now()
+        with main.db() as conn:
+            profile_id = conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("PANOS bulk review", "panos", json.dumps({"vsys": "vsys1"}), stamp, stamp),
+            ).lastrowid
+            project_id = conn.execute(
+                "INSERT INTO migration_projects(name,target_profile_id,owner,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("bulk-review", profile_id, "admin", stamp, stamp),
+            ).lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase/></entry></vsys></entry></devices></config>'''
+        workspace_id = main.store_config_workspace(profile, "Candidate", "candidate.xml", xml, "migration-merge")
+        critical = {
+            "zone-mapping": {
+                "title": "Zone-mapping",
+                "detail": "Controleer zones",
+                "count": 2,
+                "severity": "critical",
+            }
+        }
+        review_codes = {
+            **critical,
+            "duplicate-policies": {
+                "title": "Dubbele policies",
+                "detail": "Controleer duplicaten",
+                "count": 3,
+                "severity": "warning",
+            },
+        }
+        output_id = main.store_migration_output(
+            project_id,
+            workspace_id,
+            "Candidate",
+            sanity={
+                "critical_findings": 1,
+                "candidate_unresolved_references": 0,
+                "critical_review_codes": critical,
+                "review_codes": review_codes,
+                "regenerate_required": False,
+            },
+        )
+        client = main.app.test_client()
+        with main.app.test_request_context("/", base_url="https://forge.test"):
+            serializer = main.app.session_interface.get_signing_serializer(main.app)
+            client.set_cookie(
+                main.app.config["SESSION_COOKIE_NAME"],
+                serializer.dumps({"user_id": 1, "username": "admin", "csrf": "migration-test-csrf"}),
+                domain="forge.test",
+                secure=True,
+            )
+        page = client.get(f"/migration/projects/{project_id}", base_url="https://forge.test")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn(b"Bulk engineer review", page.data)
+        self.assertIn(b"Dubbele policies", page.data)
+        resolved = client.post(
+            f"/migration/projects/{project_id}/outputs/{output_id}/review-bulk",
+            base_url="https://forge.test",
+            data={
+                "csrf": "migration-test-csrf",
+                "review_code": ["zone-mapping", "duplicate-policies"],
+                "note": "Zones en duplicaten in candidate gecontroleerd",
+                "action": "resolve",
+            },
+        )
+        self.assertEqual(resolved.status_code, 302)
+        with main.db() as conn:
+            rows = conn.execute(
+                "SELECT code,note FROM migration_output_resolutions WHERE output_id=? ORDER BY code",
+                (output_id,),
+            ).fetchall()
+        self.assertEqual([row["code"] for row in rows], ["duplicate-policies", "zone-mapping"])
+        self.assertTrue(all(row["note"] == "Zones en duplicaten in candidate gecontroleerd" for row in rows))
+        self.assertEqual(main.migration_output_push_block(workspace_id)[1], "")
+        reopened = client.post(
+            f"/migration/projects/{project_id}/outputs/{output_id}/review-bulk",
+            base_url="https://forge.test",
+            data={
+                "csrf": "migration-test-csrf",
+                "review_code": ["duplicate-policies"],
+                "action": "reopen",
+            },
+        )
+        self.assertEqual(reopened.status_code, 302)
+        self.assertEqual(main.migration_output_push_block(workspace_id)[1], "")
+        with main.db() as conn:
+            remaining = conn.execute(
+                "SELECT code FROM migration_output_resolutions WHERE output_id=? ORDER BY code",
+                (output_id,),
+            ).fetchall()
+        self.assertEqual([row["code"] for row in remaining], ["zone-mapping"])
+
 
 if __name__ == "__main__":
     unittest.main()

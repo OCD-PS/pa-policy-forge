@@ -262,6 +262,7 @@ CATALOG_RETRY_SECONDS = 60
 LIVE_PAGE_CACHE_SECONDS = max(5, int(os.getenv("PPF_LIVE_PAGE_CACHE_SECONDS", "30")))
 SCM_TOKEN_CACHE_SECONDS = max(60, int(os.getenv("PPF_SCM_TOKEN_CACHE_SECONDS", "600")))
 WORKSPACE_OBJECT_PAGE_SIZE = max(50, min(1000, int(os.getenv("PPF_WORKSPACE_OBJECT_PAGE_SIZE", "250"))))
+WORKSPACE_POLICY_PAGE_SIZE = max(25, min(500, int(os.getenv("PPF_WORKSPACE_POLICY_PAGE_SIZE", "100"))))
 DEFAULT_APPLICATION_CACHE = OBJECT_CACHE / "default-applications-v2.json"
 DEFAULT_CATALOG_INITIAL_DELAY = max(30, int(os.getenv("PPF_APP_CATALOG_INITIAL_DELAY", "60")))
 _default_catalog_refresh_lock = threading.RLock()
@@ -3369,6 +3370,13 @@ def config_workspace_editor(workspace_id):
         rulebase = request.args.get("rulebase", "pre" if snapshot.kind == "panorama" else "standard")
         if snapshot.kind == "panorama" and rulebase not in {"pre", "post"}:
             rulebase = "pre"
+        policy_query = request.args.get("policy_query", "").strip()[:200]
+        policy_page = max(1, request.args.get("policy_page", default=1, type=int) or 1)
+        policy_total = 0
+        policy_inventory_total = 0
+        policy_page_count = 1
+        edit_name = request.args.get("edit_policy", "")
+        edit_policy = None
         object_type = request.args.get("object_type", "addresses")
         if object_type not in OBJECT_NODES:
             object_type = "addresses"
@@ -3395,7 +3403,44 @@ def config_workspace_editor(workspace_id):
         inventory = {"network": [], "device": []}
         config_records = []
         if workspace_view == "policies":
-            _, policies = scoped_policies(xml_bytes, scope, policy_kind, rulebase, parsed=(parsed_root, snapshot))
+            _, all_policies = scoped_policies(xml_bytes, scope, policy_kind, rulebase, parsed=(parsed_root, snapshot))
+            policy_inventory_total = len(all_policies)
+            edit_policy = next(
+                (item for item in all_policies if item["name"] == edit_name and item["editable"]),
+                None,
+            )
+            filtered_policies = all_policies
+            if policy_query:
+                needle = policy_query.casefold()
+
+                def policy_search_text(item):
+                    values = []
+                    for key, value in item.items():
+                        if str(key).startswith("_"):
+                            continue
+                        if isinstance(value, (str, int, float, bool)):
+                            values.append(str(value))
+                        elif isinstance(value, list):
+                            values.extend(str(entry) for entry in value if not isinstance(entry, (dict, list)))
+                    return " ".join(values).casefold()
+
+                filtered_policies = [
+                    item for item in all_policies if needle in policy_search_text(item)
+                ]
+            policy_total = len(filtered_policies)
+            policy_page_count = max(
+                1, (policy_total + WORKSPACE_POLICY_PAGE_SIZE - 1) // WORKSPACE_POLICY_PAGE_SIZE
+            )
+            if edit_name:
+                edit_index = next(
+                    (index for index, item in enumerate(filtered_policies) if item["name"] == edit_name),
+                    None,
+                )
+                if edit_index is not None:
+                    policy_page = edit_index // WORKSPACE_POLICY_PAGE_SIZE + 1
+            policy_page = min(policy_page, policy_page_count)
+            offset = (policy_page - 1) * WORKSPACE_POLICY_PAGE_SIZE
+            policies = filtered_policies[offset:offset + WORKSPACE_POLICY_PAGE_SIZE]
             if snapshot.kind == "panorama":
                 other_rulebase = "post" if rulebase == "pre" else "pre"
                 _, alternate_policies = scoped_policies(xml_bytes, scope, policy_kind, other_rulebase, parsed=(parsed_root, snapshot))
@@ -3403,7 +3448,7 @@ def config_workspace_editor(workspace_id):
             workspace_policy_catalog, application_state = workspace_policy_reference_catalog(
                 xml_bytes, scope, (parsed_root, snapshot), workspace_profile
             )
-            workspace_policy_catalog = extend_policy_catalog_with_current(workspace_policy_catalog, policies)
+            workspace_policy_catalog = extend_policy_catalog_with_current(workspace_policy_catalog, all_policies)
         elif workspace_view == "objects":
             _, all_objects = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
             if object_query:
@@ -3445,8 +3490,6 @@ def config_workspace_editor(workspace_id):
                     xml_bytes, scope, template, workspace_view, config_section,
                     parsed=(parsed_root, snapshot),
                 )
-        edit_name = request.args.get("edit_policy", "")
-        edit_policy = next((item for item in policies if item["name"] == edit_name and item["editable"]), None)
         new_policy = bool(workspace_view == "policies" and request.args.get("add_policy") == "1")
         if new_policy:
             edit_policy = policy_create_record(policy_kind, scope, rulebase)
@@ -3461,6 +3504,10 @@ def config_workspace_editor(workspace_id):
             policy_kind=policy_kind, policy_nodes=POLICY_NODES,
             rulebase=rulebase, policies=policies, edit_policy=edit_policy,
             new_policy=new_policy,
+            policy_query=policy_query, policy_page=policy_page,
+            policy_page_count=policy_page_count, policy_total=policy_total,
+            policy_inventory_total=policy_inventory_total,
+            workspace_policy_page_size=WORKSPACE_POLICY_PAGE_SIZE,
             alternate_policy_count=alternate_policy_count,
             object_type=object_type, object_nodes=OBJECT_NODES, objects=objects,
             edit_object_name=edit_object_name,
@@ -4546,7 +4593,8 @@ def migration_output_review_update(project_id, output_id, code):
     try:
         sanity = json.loads(output["sanity_json"] or "{}")
         critical_codes = sanity.get("critical_review_codes", {})
-        if not isinstance(critical_codes, dict) or code not in critical_codes:
+        review_codes = sanity.get("review_codes", critical_codes)
+        if not isinstance(review_codes, dict) or code not in review_codes:
             raise MigrationError("Dit reviewpunt hoort niet bij deze candidate")
         action = request.form.get("action", "resolve")
         with db() as conn:
@@ -4584,6 +4632,74 @@ def migration_output_review_update(project_id, output_id, code):
             )
         audit(audit_action, f"project={project_id} output={output_id} code={code}")
         flash("Reviewstatus bijgewerkt.", "success")
+    except Exception as exc:
+        flash(f"Reviewstatus niet bijgewerkt: {exc}", "error")
+    return redirect(url_for("migration_project", project_id=project_id) + "#migration-outputs")
+
+
+@app.post("/migration/projects/<int:project_id>/outputs/<int:output_id>/review-bulk")
+@login_required
+def migration_output_review_bulk_update(project_id, output_id):
+    project = migration_project_row(project_id)
+    output = migration_output_row(project_id, output_id)
+    if not project or not output:
+        return "Not found", 404
+    if migration_project_role(project_id) not in {"owner", "editor"}:
+        return "Forbidden", 403
+    try:
+        sanity = json.loads(output["sanity_json"] or "{}")
+        critical_codes = sanity.get("critical_review_codes", {})
+        review_codes = sanity.get("review_codes", critical_codes)
+        if not isinstance(review_codes, dict):
+            raise MigrationError("Deze candidate heeft geen reviewpunten")
+        codes = list(dict.fromkeys(request.form.getlist("review_code")))
+        if not codes:
+            raise MigrationError("Selecteer minstens één reviewpunt")
+        unknown = [code for code in codes if code not in review_codes]
+        if unknown:
+            raise MigrationError("Een geselecteerd reviewpunt hoort niet bij deze candidate")
+        action = request.form.get("action", "resolve")
+        if action not in {"resolve", "reopen"}:
+            raise MigrationError("Ongeldige reviewactie")
+        note = request.form.get("note", "").strip()
+        if action == "resolve" and len(note) < 3:
+            raise MigrationError("Geef kort aan hoe de geselecteerde reviewpunten zijn behandeld")
+        with db() as conn:
+            if action == "reopen":
+                conn.executemany(
+                    "DELETE FROM migration_output_resolutions WHERE output_id=? AND code=?",
+                    [(output_id, code) for code in codes],
+                )
+            else:
+                conn.executemany(
+                    "INSERT INTO migration_output_resolutions(output_id,code,note,resolved_by,resolved_at) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(output_id,code) DO UPDATE SET note=excluded.note,resolved_by=excluded.resolved_by,resolved_at=excluded.resolved_at",
+                    [
+                        (output_id, code, note[:500], session.get("username", "admin"), now())
+                        for code in codes
+                    ],
+                )
+            resolved = {
+                row["code"]
+                for row in conn.execute(
+                    "SELECT code FROM migration_output_resolutions WHERE output_id=?",
+                    (output_id,),
+                ).fetchall()
+            }
+            remaining_critical = (
+                set(critical_codes) - resolved if isinstance(critical_codes, dict) else set()
+            )
+            candidate_unresolved = int(
+                sanity.get("candidate_unresolved_references", sanity.get("unresolved_references", 0)) or 0
+            )
+            sanity["critical_findings"] = len(remaining_critical) + (1 if candidate_unresolved else 0)
+            conn.execute(
+                "UPDATE migration_outputs SET sanity_json=? WHERE id=?",
+                (json.dumps(sanity, sort_keys=True), output_id),
+            )
+        audit_action = "migration-review-bulk-reopened" if action == "reopen" else "migration-review-bulk-resolved"
+        audit(audit_action, f"project={project_id} output={output_id} codes={','.join(codes)}")
+        flash(f"{len(codes)} reviewpunten bijgewerkt.", "success")
     except Exception as exc:
         flash(f"Reviewstatus niet bijgewerkt: {exc}", "error")
     return redirect(url_for("migration_project", project_id=project_id) + "#migration-outputs")
@@ -4701,8 +4817,14 @@ def migration_project(project_id):
         output["resolutions"] = resolutions_by_output.get(int(row["id"]), {})
         critical_codes = output["sanity"].get("critical_review_codes", {})
         output["critical_review_codes"] = critical_codes if isinstance(critical_codes, dict) else {}
+        review_codes = output["sanity"].get("review_codes", output["critical_review_codes"])
+        output["review_codes"] = review_codes if isinstance(review_codes, dict) else output["critical_review_codes"]
         output["unresolved_review_codes"] = {
             code: details for code, details in output["critical_review_codes"].items()
+            if code not in output["resolutions"]
+        }
+        output["unresolved_all_review_codes"] = {
+            code: details for code, details in output["review_codes"].items()
             if code not in output["resolutions"]
         }
         output["push_blocked"] = bool(
@@ -5853,9 +5975,20 @@ def migration_merge_apply(draft_id):
                     "title": str(finding["title"]),
                     "detail": str(finding["detail"]),
                     "count": int(finding.get("count", 0) or 0),
+                    "severity": "critical",
                 }
                 for finding in review["findings"]
                 if finding["severity"] == "critical"
+            }
+            review_codes = {
+                str(finding["code"]): {
+                    "title": str(finding["title"]),
+                    "detail": str(finding["detail"]),
+                    "count": int(finding.get("count", 0) or 0),
+                    "severity": str(finding["severity"]),
+                }
+                for finding in review["findings"]
+                if finding["severity"] in {"critical", "warning"}
             }
             output_id = store_migration_output(
                 int(project["id"]),
@@ -5878,6 +6011,7 @@ def migration_merge_apply(draft_id):
                     ),
                     "critical_findings": len(critical_review_codes) + (1 if candidate_unresolved else 0),
                     "critical_review_codes": critical_review_codes,
+                    "review_codes": review_codes,
                     "review_warnings": int(review["warnings"]),
                     "regenerate_required": False,
                 },

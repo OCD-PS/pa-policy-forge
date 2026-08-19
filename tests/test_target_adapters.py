@@ -495,6 +495,60 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertIn("object_page_count>1", template)
         self.assertIn("Zoek in alle objecten", template)
 
+    def test_large_workspace_policy_lists_are_paginated_and_globally_searchable(self):
+        count = main.WORKSPACE_POLICY_PAGE_SIZE + 5
+        entries = "".join(
+            f'<entry name="rule-{index:03d}"><from><member>Trust</member></from>'
+            '<to><member>Internet</member></to><source><member>any</member></source>'
+            '<destination><member>any</member></destination><application><member>ssl</member></application>'
+            '<service><member>application-default</member></service><action>allow</action></entry>'
+            for index in range(count)
+        )
+        xml = (
+            '<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            f'<rulebase><security><rules>{entries}</rules></security></rulebase>'
+            '</entry></vsys></entry></devices></config>'
+        ).encode()
+        stamp = main.now()
+        with main.db() as conn:
+            profile_id = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("policy-pagination", 1, "", "", "panos", "{}", b"", stamp, stamp),
+            ).lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        workspace_id = main.store_config_workspace(profile, "policies", "config.xml", xml, "upload")
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1
+            login["username"] = "test"
+            login["must_change"] = False
+        try:
+            first = client.get(
+                f"/config-workspaces/{workspace_id}/edit?workspace_view=policies&policy_kind=security",
+                base_url="https://forge.test",
+            )
+            self.assertEqual(first.status_code, 200)
+            self.assertIn(b"rule-000", first.data)
+            self.assertNotIn(f"rule-{count - 1:03d}".encode(), first.data)
+            self.assertIn(b"Pagina 1 / 2", first.data)
+            second = client.get(
+                f"/config-workspaces/{workspace_id}/edit?workspace_view=policies&policy_kind=security&policy_page=2",
+                base_url="https://forge.test",
+            )
+            self.assertIn(f"rule-{count - 1:03d}".encode(), second.data)
+            searched = client.get(
+                f"/config-workspaces/{workspace_id}/edit?workspace_view=policies&policy_kind=security&policy_query=rule-{count - 1:03d}",
+                base_url="https://forge.test",
+            )
+            self.assertIn(f"rule-{count - 1:03d}".encode(), searched.data)
+            self.assertNotIn(b"rule-000", searched.data)
+            self.assertIn(f"1 / {count} regels".encode(), searched.data)
+        finally:
+            main.workspace_config_path(main.workspace_row(workspace_id)).unlink(missing_ok=True)
+            with main.db() as conn:
+                conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
     def test_workspace_generic_add_uses_server_side_create_schema(self):
         template = (main.BASE / "app" / "templates" / "workspace_editor.html").read_text()
         javascript = (main.BASE / "app" / "static" / "app.js").read_text()
