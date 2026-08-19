@@ -20,6 +20,12 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
 class MigrationTests(unittest.TestCase):
+    def test_management_invariants_read_root_level_administrators(self):
+        config = b'''<config><mgt-config><users><entry name="admin"><phash>hash-a</phash></entry></users></mgt-config><devices><entry name="localhost.localdomain"><deviceconfig><system><hostname>lab-fw</hostname><ip-address>192.0.2.10</ip-address><netmask>255.255.255.0</netmask><default-gateway>192.0.2.1</default-gateway></system></deviceconfig></entry></devices></config>'''
+        values = main.panos_management_invariants(config)
+        self.assertEqual(values["ip-address"], "192.0.2.10")
+        self.assertEqual(values["administrators"], {"admin": "hash-a"})
+
     def test_all_approved_vendor_adapters_are_registered(self):
         self.assertEqual(set(PARSERS), {"panos", "panos-csv", "cisco-asa", "cisco-ios", "checkpoint", "fortinet", "juniper-srx", "algosec", "stonesoft", "generic"})
 

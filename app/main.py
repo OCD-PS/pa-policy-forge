@@ -4283,7 +4283,7 @@ def panos_management_invariants(xml_bytes: bytes) -> dict[str, object]:
     ):
         values[path] = (system.findtext(path) or "").strip() if system is not None else ""
     administrators = {}
-    for entry in device.findall("./mgt-config/users/entry"):
+    for entry in root.findall("./mgt-config/users/entry"):
         name = entry.get("name", "")
         if name:
             administrators[name] = (entry.findtext("phash") or entry.findtext("password") or "").strip()
