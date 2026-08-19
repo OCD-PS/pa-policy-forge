@@ -34,6 +34,11 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(model.services, [])
         self.assertEqual(model.security_rules[0].application, ["ms-rdp", "ssh"])
         self.assertEqual(model.security_rules[0].service, ["application-default"])
+        candidate, _ = merge_model_into_panos_xml(
+            b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"/></vsys></entry></devices></config>',
+            model, "vsys1",
+        )
+        self.assertEqual(panos_candidate_analysis(candidate)["unresolved_application_references"], [])
 
     def test_management_invariants_read_root_level_administrators(self):
         config = b'''<config><mgt-config><users><entry name="admin"><phash>hash-a</phash></entry></users></mgt-config><devices><entry name="localhost.localdomain"><deviceconfig><system><hostname>lab-fw</hostname><ip-address>192.0.2.10</ip-address><netmask>255.255.255.0</netmask><default-gateway>192.0.2.1</default-gateway></system></deviceconfig></entry></devices></config>'''

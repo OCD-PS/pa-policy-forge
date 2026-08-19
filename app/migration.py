@@ -509,6 +509,7 @@ class CheckPointParser(BaseParser):
         "sharepoint-online-upload": "sharepoint-online-uploading",
         "sharepoint-wiki": "sharepoint-wiki",
         "skype": "skype",
+        "ssh": "ssh",
         "spotify": "spotify",
         "symantec-update": "symantec-av-update",
         "teamviewer": "teamviewer-base",
