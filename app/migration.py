@@ -784,6 +784,21 @@ class CheckPointParser(BaseParser):
         model.addresses = valid_addresses
 
         address_names = {item.name for item in model.addresses}
+        protocol_signature_apps = {
+            "remote_desktop_protocol_udp-protocol-signature": "ms-rdp",
+            "remote_desktop_protocol-protocol-signature": "ms-rdp",
+            "ssh_version_2-protocol-signature": "ssh",
+        }
+        signature_service_names = {
+            item.name: protocol_signature_apps[item.name.casefold()]
+            for item in model.services if item.name.casefold() in protocol_signature_apps
+        }
+        if signature_service_names:
+            model.services = [item for item in model.services if item.name not in signature_service_names]
+            for source_name, app_id in signature_service_names.items():
+                model.warnings.append(
+                    f"Check Point protocol-signature {source_name} gemapt naar PAN-OS App-ID {app_id}"
+                )
         service_names = {item.name for item in model.services}
 
         # Repeat because pruning an empty child group can invalidate a parent.
@@ -903,6 +918,12 @@ class CheckPointParser(BaseParser):
             if removed:
                 notes.append("destination references not converted: " + ", ".join(removed))
 
+            signature_applications = unique(
+                signature_service_names[value]
+                for value in rule.service if value in signature_service_names
+            )
+            if signature_applications:
+                rule.service = [value for value in rule.service if value not in signature_service_names]
             applications: list[str] = []
             removed_applications: list[str] = []
             for application in rule.application:
@@ -914,6 +935,9 @@ class CheckPointParser(BaseParser):
                     applications.append(mapped)
                 else:
                     removed_applications.append(application)
+            applications.extend(signature_applications)
+            if signature_applications:
+                applications = [value for value in applications if value != "any"]
             rule.application = unique(applications) or ["any"]
             if removed_applications:
                 notes.append("applications/categories not converted: " + ", ".join(unique(removed_applications)))

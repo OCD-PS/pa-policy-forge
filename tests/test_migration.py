@@ -20,6 +20,21 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
 class MigrationTests(unittest.TestCase):
+    def test_checkpoint_protocol_signatures_become_app_ids(self):
+        source = json.dumps({
+            "objects": [
+                {"uid": "svc-rdp", "type": "service-tcp", "name": "Remote_Desktop_Protocol-Protocol-Signature", "port": "Any"},
+                {"uid": "svc-ssh", "type": "service-tcp", "name": "ssh_version_2-Protocol-Signature", "port": "Any"},
+            ],
+            "rulebase": [
+                {"uid": "rule-1", "type": "access-rule", "name": "allow-admin", "action": "Accept", "enabled": True, "service": ["svc-rdp", "svc-ssh"]},
+            ],
+        }).encode()
+        model = parse_vendor("checkpoint", source, "policy.json")
+        self.assertEqual(model.services, [])
+        self.assertEqual(model.security_rules[0].application, ["ms-rdp", "ssh"])
+        self.assertEqual(model.security_rules[0].service, ["application-default"])
+
     def test_management_invariants_read_root_level_administrators(self):
         config = b'''<config><mgt-config><users><entry name="admin"><phash>hash-a</phash></entry></users></mgt-config><devices><entry name="localhost.localdomain"><deviceconfig><system><hostname>lab-fw</hostname><ip-address>192.0.2.10</ip-address><netmask>255.255.255.0</netmask><default-gateway>192.0.2.1</default-gateway></system></deviceconfig></entry></devices></config>'''
         values = main.panos_management_invariants(config)
