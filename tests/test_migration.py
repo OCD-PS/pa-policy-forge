@@ -100,6 +100,43 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(len(mapped.services),1)
         self.assertTrue(any("Services" in item for item in mapped.warnings))
 
+    def test_family_mapping_annotates_create_and_map_target_context(self):
+        model=MigrationModel(
+            "generic","source",
+            addresses=[Address("server","10.0.0.3/32")],
+            services=[main.Service("https","tcp","443")],
+        )
+        mapped=apply_family_mappings(model,[
+            {"kind":"addresses","action":"create","target_context":"vsys2"},
+            {"kind":"services","action":"map","target_context":"Shared"},
+        ])
+        self.assertEqual(mapped.addresses[0].mapping_action,"create")
+        self.assertEqual(mapped.addresses[0].target_context,"vsys2")
+        self.assertEqual(mapped.services[0].mapping_action,"map")
+        self.assertEqual(mapped.services[0].target_context,"Shared")
+
+    def test_panos_merge_routes_create_and_map_to_their_selected_contexts(self):
+        base = b'''<config><shared><address><entry name="shared-server"><ip-netmask>10.0.0.3/32</ip-netmask></entry></address></shared><devices><entry name="localhost.localdomain"><device-group><entry name="Existing"/></device-group></entry></devices></config>'''
+        model = MigrationModel("generic", "source", addresses=[
+            Address("legacy-server", "10.0.0.3/32", target_context="Shared", mapping_action="map"),
+            Address("new-server", "10.0.0.4/32", target_context="New-DG", mapping_action="create"),
+        ])
+        merged, plan = merge_model_into_panos_xml(base, model, "Existing", panorama=True)
+        root = ET.fromstring(merged)
+        self.assertIsNone(root.find('./shared/address/entry[@name="legacy-server"]'))
+        self.assertIsNotNone(root.find('./shared/address/entry[@name="shared-server"]'))
+        self.assertIsNotNone(root.find('./devices/entry/device-group/entry[@name="New-DG"]/address/entry[@name="new-server"]'))
+        self.assertEqual(plan["reuse"], 1)
+        self.assertEqual(plan["target_contexts"], ["Shared", "New-DG"])
+
+    def test_map_mapping_refuses_to_create_a_missing_target(self):
+        base = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase/></entry></vsys></entry></devices></config>'''
+        model = MigrationModel("generic", "source", addresses=[
+            Address("missing", "10.0.0.9/32", target_context="vsys1", mapping_action="map"),
+        ])
+        with self.assertRaises(MigrationError):
+            merge_model_into_panos_xml(base, model, "vsys1")
+
     def test_topology_mapping_rewrites_policy_and_removes_source_definition(self):
         model=MigrationModel(
             "panos","source",
@@ -623,6 +660,24 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         self.assertEqual(len(model.security_rules), 3)
         self.assertEqual(len({rule.name for rule in model.security_rules}), 3)
         self.assertTrue(all(len(rule.name) <= 63 for rule in model.security_rules))
+
+    def test_checkpoint_uuid_only_rule_names_become_readable(self):
+        documents = {
+            "Standard_objects.json": [{"type": "rulebaseaction", "uid": "accept", "name": "Accept"}],
+            "Network-Management_server.json": [
+                {"type": "access-rule", "uid": "f6ebaf22-70e8-4af4-a227-955cd1f2c51f", "action": "accept"},
+                {"type": "access-rule", "uid": "172ee45c-50fd-4ef4-83b5-364d55c9c42a", "action": "accept"},
+            ],
+        }
+        payload = io.BytesIO()
+        with tarfile.open(fileobj=payload, mode="w") as archive:
+            for name, document in documents.items():
+                raw = json.dumps(document).encode()
+                info = tarfile.TarInfo(name)
+                info.size = len(raw)
+                archive.addfile(info, io.BytesIO(raw))
+        model = parse_vendor("checkpoint", payload.getvalue(), "show_package.tar")
+        self.assertEqual([rule.name for rule in model.security_rules], ["Access-Network-1", "Access-Network-2"])
 
     def test_panos_to_panos_rich_config_preserves_every_supported_family(self):
         base = (FIXTURES / "panos-rich-base.xml").read_bytes()
@@ -1426,7 +1481,7 @@ allow-web,security,,Trust,Untrust,any,web,ssl,application-default,allow
         self.assertIn('name="kind" value="zones" checked', page)
         self.assertIn('name="source_id"', page)
         self.assertIn("XML", page)
-        self.assertIn("Set commands", page)
+        self.assertNotIn("Set commands", page)
         self.assertIn("Nieuwe configuratie (vanaf nul)", page)
         self.assertNotIn("Interfaces en zones zijn beschikbaar", page)
         self.assertNotIn("standaard alles geselecteerd", page)

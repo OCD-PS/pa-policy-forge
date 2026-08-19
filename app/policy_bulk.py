@@ -21,7 +21,12 @@ def apply_bulk_operations(policy: dict, operations: dict) -> dict:
             if value not in current:
                 current.append(value)
         changed[field] = current or (["any"] if field != "tag" else [])
-    for field in ("action", "disabled", "log_setting", "profile_group"):
+    for field in (
+        "action", "disabled", "log_setting", "profile_group", "schedule",
+        "nat_type", "to_interface", "source_translation", "destination_translation",
+        "source_translation_mode", "source_translation_address", "source_translation_interface",
+        "destination_translation_address", "destination_translation_port",
+    ):
         if operations.get(field) is not None:
             changed[field] = operations[field]
     description_append = (operations.get("description_append") or "").strip()

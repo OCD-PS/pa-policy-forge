@@ -154,6 +154,33 @@
     });
   }
 
+  function setupMigrationReviewSearch() {
+    all("[data-migration-review-search]").forEach(function (input) {
+      var container = input.closest(".migration-review-gate, .migration-output-review");
+      if (!container) return;
+      input.addEventListener("input", function () {
+        var query = input.value.toLocaleLowerCase().trim();
+        all("[data-migration-review-item]", container).forEach(function (item) {
+          var text = item.getAttribute("data-review-text") || item.textContent || "";
+          item.hidden = Boolean(query) && !text.toLocaleLowerCase().includes(query);
+        });
+      });
+    });
+  }
+
+  function setupObjectSearchSubmit() {
+    all('.workspace-object-search input[name="object_query"]').forEach(function (input) {
+      var form = input.form;
+      var submit = form && form.querySelector('button[type="submit"]:not([formaction])');
+      if (!form || !submit) return;
+      input.addEventListener("keydown", function (event) {
+        if (event.key !== "Enter") return;
+        event.preventDefault();
+        form.requestSubmit(submit);
+      });
+    });
+  }
+
   function setupMigrationFilterTypes() {
     all("[data-migration-filter-condition]").forEach(function (condition) {
       var field = condition.querySelector("[data-migration-filter-field]");
@@ -376,6 +403,7 @@
       var count = all("[data-policy-select]:checked").length;
       var node = document.querySelector("[data-policy-action-count]");
       if (node) node.textContent = count;
+      all("[data-policy-selection-action]").forEach(function (button) { button.disabled = !count; });
     }
     rows.forEach(function (row, rowIndex) {
       var checkbox = row.querySelector("[data-policy-select]");
@@ -551,6 +579,7 @@
       input.addEventListener("keydown", function (event) { var tagDelimiter = fieldNode.dataset.bulkField === "tag" && (event.key === "," || (event.key === " " && !tagQuoteOpen(input.value))); if (event.key === "Enter" || tagDelimiter) { event.preventDefault(); addValue(); } });
     });
     var policyBulkForm = document.querySelector("[data-policy-bulk-form]"); if (policyBulkForm) policyBulkForm.addEventListener("submit", function () { all("[data-bulk-field]", dialog).forEach(function (fieldNode) { var entry = fieldNode.querySelector("[data-bulk-entry]"); if (entry && entry.value.trim()) fieldNode._addBulkValue(); }); });
+    var policyDelete = document.querySelector("[data-policy-delete]"); if (policyDelete) policyDelete.addEventListener("click", function (event) { if (!window.confirm("Geselecteerde policies verwijderen?")) event.preventDefault(); });
     all("[data-policy-tab]", dialog).forEach(function (tab) {
       tab.addEventListener("click", function () {
         all("[data-policy-tab]", dialog).forEach(function (item) { item.classList.toggle("is-active", item === tab); });
@@ -851,7 +880,7 @@
         if (!row || !link || !kind || !workspaceMatch) { if (row) row.hidden = true; return; }
         link.href = "/config-workspaces/" + workspaceMatch[1] + "/edit?scope=" + encodeURIComponent(scope ? scope.value : "") + "&workspace_view=" + (kind === "zones" ? "network&config_section=zones" : "objects&object_type=" + encodeURIComponent(kind) + "&add_object=1"); row.hidden = false;
       }
-      function openOfflinePicker(field) { var entry = field.querySelector("[data-offline-policy-entry]"); activeField = field; selected.clear(); picker.hidden = false; var status = picker.querySelector("[data-policy-picker-status]"); if (status) status.textContent = ""; var filter = picker.querySelector("[data-offline-policy-picker-filter]"); filter.value = ""; updateOfflineCreateLink(field); renderPicker(""); if (entry.dataset.offlinePolicyKinds.includes("applications")) { applicationPolls = 0; loadWorkspaceApplications(); } }
+      function openOfflinePicker(field) { var entry = field.querySelector("[data-offline-policy-entry]"); activeField = field; selected.clear(); if (offlineDialog && picker.parentElement !== offlineDialog) offlineDialog.appendChild(picker); picker.hidden = false; var status = picker.querySelector("[data-policy-picker-status]"); if (status) status.textContent = ""; var filter = picker.querySelector("[data-offline-policy-picker-filter]"); filter.value = ""; updateOfflineCreateLink(field); renderPicker(""); window.requestAnimationFrame(function () { filter.focus(); }); if (entry.dataset.offlinePolicyKinds.includes("applications")) { applicationPolls = 0; loadWorkspaceApplications(); } }
       fields.forEach(function (field) { var entry = field.querySelector("[data-offline-policy-entry]"); entry.addEventListener("focus", function () { openOfflinePicker(field); }); var choose = field.querySelector("[data-offline-policy-add]"); if (choose && entry.readOnly) choose.addEventListener("click", function () { openOfflinePicker(field); }); });
       picker.querySelector("[data-offline-policy-picker-filter]").addEventListener("input", function (event) { renderPicker(event.target.value.toLocaleLowerCase().trim()); });
       picker.querySelector("[data-offline-policy-picker-close]").addEventListener("click", function () { picker.hidden = true; });
@@ -1093,6 +1122,8 @@
     runSetup("flashes", setupFlashes);
     runSetup("bulk-selection", setupBulkSelection);
     runSetup("filters", setupFilters);
+    runSetup("migration-review-search", setupMigrationReviewSearch);
+    runSetup("object-search", setupObjectSearchSubmit);
     runSetup("migration-filter-types", setupMigrationFilterTypes);
     runSetup("migration-zone-mapping", setupMigrationZoneMapping);
     runSetup("targets", setupConditionalTargets);

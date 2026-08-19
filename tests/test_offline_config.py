@@ -8,7 +8,8 @@ sys.path.insert(0, str(ROOT))
 from app.offline_config import (
     OfflineConfigError, apply_configuration_changes, apply_object_changes, available_scopes, available_templates,
     configuration_inventory, configuration_records, parse_snapshot,
-    object_create_record, object_fingerprint, policy_fingerprint, render_set_commands, replace_policy_in_snapshot,
+    delete_policies_from_snapshot, insert_policy_in_snapshot, move_policies_in_snapshot,
+    object_create_record, object_fingerprint, policy_create_record, policy_fingerprint, render_set_commands, replace_policy_in_snapshot,
     referenced_template, scoped_objects, scoped_policies,
     scoped_server_profiles,
 )
@@ -116,6 +117,19 @@ class OfflineConfigTests(unittest.TestCase):
                 duplicate_source, "Child", "security", "pre", "child-rule",
                 policy_fingerprint(original), duplicate,
             )
+
+    def test_policy_crud_and_move_preserve_rulebase_order(self):
+        seed = policy_create_record("security", "vsys1", "pre")
+        new_xml = seed["_xml"].replace('name=""', 'name="new-rule"')
+        inserted = insert_policy_in_snapshot(PANOS, "vsys1", "security", "pre", new_xml, "top")
+        _, policies = scoped_policies(inserted, "vsys1", "security", "pre")
+        self.assertEqual([item["name"] for item in policies], ["new-rule", "allow-web"])
+        moved = move_policies_in_snapshot(inserted, "vsys1", "security", "pre", {"new-rule"}, "down")
+        _, policies = scoped_policies(moved, "vsys1", "security", "pre")
+        self.assertEqual([item["name"] for item in policies], ["allow-web", "new-rule"])
+        deleted = delete_policies_from_snapshot(moved, "vsys1", "security", "pre", {"new-rule"})
+        _, policies = scoped_policies(deleted, "vsys1", "security", "pre")
+        self.assertEqual([item["name"] for item in policies], ["allow-web"])
 
     def test_standalone_network_inventory_uses_device_and_vsys_contexts(self):
         inventory = configuration_inventory(PANOS, "vsys1")

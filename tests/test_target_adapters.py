@@ -326,7 +326,8 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertNotIn('<label>Tags</label><input name="tags"', live_template)
         for template in (workspace_template, live_template):
             self.assertRegex(template, re.compile(r"data-object-picker-add-selected.*data-member-results", re.S))
-            self.assertRegex(template, re.compile(r"data-policy-picker-add-selected.*data-policy-picker-results", re.S))
+        self.assertRegex(workspace_template, re.compile(r"data-policy-picker-add-selected.*data-offline-policy-picker-results", re.S))
+        self.assertRegex(live_template, re.compile(r"data-policy-picker-add-selected.*data-policy-picker-results", re.S))
         self.assertIn('row.addEventListener("click", toggleSelection)', javascript)
 
     def test_multivalue_controls_use_one_integrated_token_input(self):

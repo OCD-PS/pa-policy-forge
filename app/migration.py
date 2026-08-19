@@ -49,6 +49,8 @@ class Address:
     description: str = ""
     tags: list[str] = field(default_factory=list)
     source_ref: str = ""
+    target_context: str = ""
+    mapping_action: str = "create"
 
 
 @dataclass
@@ -58,6 +60,8 @@ class AddressGroup:
     description: str = ""
     tags: list[str] = field(default_factory=list)
     source_ref: str = ""
+    target_context: str = ""
+    mapping_action: str = "create"
 
 
 @dataclass
@@ -69,6 +73,8 @@ class Service:
     description: str = ""
     tags: list[str] = field(default_factory=list)
     source_ref: str = ""
+    target_context: str = ""
+    mapping_action: str = "create"
 
 
 @dataclass
@@ -78,6 +84,8 @@ class ServiceGroup:
     description: str = ""
     tags: list[str] = field(default_factory=list)
     source_ref: str = ""
+    target_context: str = ""
+    mapping_action: str = "create"
 
 
 @dataclass
@@ -100,6 +108,8 @@ class Policy:
     to_interface: str = "any"
     source_ref: str = ""
     original: dict = field(default_factory=dict)
+    target_context: str = ""
+    mapping_action: str = "create"
 
 
 def policy_state(rule: Policy) -> dict:
@@ -996,7 +1006,18 @@ class CheckPointParser(BaseParser):
 
     @staticmethod
     def _unique_rule_name(rules: list[Policy], value: dict, source_file: str, fallback: str) -> str:
-        base = clean_name(value.get("name") or value.get("uid") or fallback)
+        raw_name = str(value.get("name") or "").strip()
+        uuid_name = bool(re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            raw_name,
+        ))
+        if not raw_name or uuid_name:
+            layer = PurePosixPath(source_file).stem.replace("-Management_server", "") if source_file else "rulebase"
+            layer = clean_name(layer, "rulebase")
+            ordinal = value.get("rule-number") or value.get("rule_number") or len(rules) + 1
+            prefix = "NAT" if fallback.startswith("nat") else "Access"
+            raw_name = f"{prefix}-{layer}-{ordinal}"
+        base = clean_name(raw_name or value.get("uid") or fallback)
         existing = {rule.name for rule in rules}
         if base not in existing:
             return base
@@ -1525,7 +1546,7 @@ def migration_item_semantic(item) -> str:
     raw = asdict(item) if hasattr(item, "__dataclass_fields__") else dict(item)
     semantic = {
         key: value for key, value in raw.items()
-        if key not in {"source_ref", "original", "selector"}
+        if key not in {"source_ref", "original", "selector", "target_context", "mapping_action"}
     }
     return json.dumps(semantic, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -1631,7 +1652,7 @@ def migration_search(model: MigrationModel, query: str) -> list[dict]:
             raw=asdict(item) if hasattr(item,"__dataclass_fields__") else dict(item)
             if needle in json.dumps(raw,sort_keys=True,default=str).casefold():
                 results.append({"kind":kind,"name":str(raw.get("name","")),"source_ref":str(raw.get("source_ref","")),"value":str(raw.get("value",raw.get("port","")))})
-    return results[:1000]
+    return results[:250]
 
 
 def migration_inventory_rows(model: MigrationModel) -> list[dict]:
@@ -1709,15 +1730,21 @@ def migration_filter_inventory(
         outcomes = [matches(row, rule) for rule in normalized]
         if (join_mode == "and" and all(outcomes)) or (join_mode == "or" and any(outcomes)):
             result.append(row)
-    return result[:5000]
+    return result[:500]
 
 
 def apply_family_mappings(model: MigrationModel, mappings: list[dict]) -> MigrationModel:
-    """Apply explicit per-family map/create/ignore/review decisions."""
+    """Apply and retain explicit per-family destination decisions.
+
+    ``create`` allows missing items to be created in the selected target context.
+    ``map`` only permits reuse of an equivalent item that already exists there.
+    The merge adapters consume the retained metadata; it is not presentation-only.
+    """
     result = MigrationModel.from_dict(model.as_dict())
     for mapping in mappings:
         kind = str(mapping.get("kind", ""))
         action = str(mapping.get("action", "map"))
+        target_context = str(mapping.get("target_context", "")).strip()
         if kind not in model_collections(result) or action not in MIGRATION_MAPPING_ACTIONS:
             continue
         if action == "ignore":
@@ -1729,6 +1756,18 @@ def apply_family_mappings(model: MigrationModel, mappings: list[dict]) -> Migrat
             result.warnings.append(
                 f"Mapping voor {MIGRATION_KIND_LABELS.get(kind, kind)} vereist nog een beslissing"
             )
+        else:
+            if not target_context:
+                raise MigrationError(
+                    f"Doelcontext ontbreekt voor {MIGRATION_KIND_LABELS.get(kind, kind)}"
+                )
+            for item in model_collections(result)[kind]:
+                if hasattr(item, "target_context"):
+                    item.target_context = target_context
+                    item.mapping_action = action
+                elif isinstance(item, dict):
+                    item["target_context"] = target_context
+                    item["mapping_action"] = action
     return result
 
 
@@ -2433,7 +2472,11 @@ def unquote(value: str) -> str:
 def panos_fragment(model: MigrationModel, scope: str = "vsys1", panorama: bool = False, rulebase: str = "pre") -> bytes:
     config=ET.Element("config",{"version":"11.0.0"}); devices=ET.SubElement(config,"devices"); device=ET.SubElement(devices,"entry",{"name":"localhost.localdomain"})
     if panorama:
-        groups=ET.SubElement(device,"device-group"); target=ET.SubElement(groups,"entry",{"name":scope}); rb=ET.SubElement(target,f"{rulebase}-rulebase")
+        if scope == "Shared":
+            target=ET.SubElement(config,"shared")
+        else:
+            groups=ET.SubElement(device,"device-group"); target=ET.SubElement(groups,"entry",{"name":scope})
+        rb=ET.SubElement(target,f"{rulebase}-rulebase")
     else:
         vsyses=ET.SubElement(device,"vsys"); target=ET.SubElement(vsyses,"entry",{"name":scope}); rb=ET.SubElement(target,"rulebase")
     def members(parent,values):
@@ -2517,10 +2560,15 @@ def _append_xml_dict(parent: ET.Element, value) -> None:
 
 def scm_items(model: MigrationModel) -> list[dict]:
     items=[]
-    for item in model.addresses: items.append({"kind":"addresses","name":item.name,"payload":{"name":item.name,item.value_type:item.value,**({"description":item.description} if item.description else {})}})
-    for item in model.address_groups: items.append({"kind":"address-groups","name":item.name,"payload":{"name":item.name,"static":item.members}})
-    for item in model.services: items.append({"kind":"services","name":item.name,"payload":{"name":item.name,"protocol":{item.protocol:{"port":item.port}}}})
-    for item in model.service_groups: items.append({"kind":"service-groups","name":item.name,"payload":{"name":item.name,"members":item.members}})
+    def route(item) -> dict:
+        return {
+            "target_context": str(getattr(item, "target_context", "")),
+            "mapping_action": str(getattr(item, "mapping_action", "create") or "create"),
+        }
+    for item in model.addresses: items.append({"kind":"addresses","name":item.name,"payload":{"name":item.name,item.value_type:item.value,**({"description":item.description} if item.description else {})},**route(item)})
+    for item in model.address_groups: items.append({"kind":"address-groups","name":item.name,"payload":{"name":item.name,"static":item.members},**route(item)})
+    for item in model.services: items.append({"kind":"services","name":item.name,"payload":{"name":item.name,"protocol":{item.protocol:{"port":item.port}}},**route(item)})
+    for item in model.service_groups: items.append({"kind":"service-groups","name":item.name,"payload":{"name":item.name,"members":item.members},**route(item)})
     for kind,rules in (("security",model.security_rules),("nat",model.nat_rules)):
         for rule in rules:
             payload={"name":rule.name,"from":rule.from_zones,"to":rule.to_zones,"source":rule.source,"destination":rule.destination,"service":rule.service if kind=="security" else (rule.service or ["any"])[0],"disabled":rule.disabled}
@@ -2530,7 +2578,7 @@ def scm_items(model: MigrationModel) -> list[dict]:
             if kind=="nat" and rule.source_translation: payload["source_translation"]=rule.source_translation
             if kind=="nat" and rule.destination_translation: payload["destination_translation"]=rule.destination_translation
             if rule.description: payload["description"]=rule.description
-            items.append({"kind":f"policy:{kind}","name":rule.name,"payload":payload})
+            items.append({"kind":f"policy:{kind}","name":rule.name,"payload":payload,**route(rule)})
     return items
 
 
@@ -2541,13 +2589,13 @@ def migration_api_plan(model: MigrationModel, target_type: str, target_context: 
         for item in model.extras.get("tags", []):
             actions.append({
                 "method": "POST", "kind": "tags", "name": str(item.get("name", "")),
-                "target": target_context, "payload": raw_item_payload(item), "status": "staged",
+                "target": str(item.get("target_context") or target_context), "payload": raw_item_payload(item), "status": "staged",
             })
         for item in scm_items(model):
             kind = item["kind"]
             actions.append({
                 "method": "POST", "kind": kind, "name": item["name"],
-                "target": target_context, "payload": item["payload"], "status": "staged",
+                "target": str(item.get("target_context") or target_context), "payload": item["payload"], "status": "staged",
             })
         for kind, items in model.extras.items():
             if kind == "tags":
@@ -2555,13 +2603,13 @@ def migration_api_plan(model: MigrationModel, target_type: str, target_context: 
             for item in items:
                 actions.append({
                     "method": "POST", "kind": kind, "name": str(item.get("name", "")),
-                    "target": target_context, "payload": raw_item_payload(item), "status": "staged",
+                    "target": str(item.get("target_context") or target_context), "payload": raw_item_payload(item), "status": "staged",
                 })
     else:
         for row in migration_inventory_rows(model):
             actions.append({
                 "method": "SET", "kind": row["kind"], "name": row["name"],
-                "target": target_context, "status": "staged",
+                "target": str(row["raw"].get("target_context") or target_context), "status": "staged",
             })
     return actions
 
@@ -2599,6 +2647,17 @@ def reconcile_model(
         "suggested_reuses": [],
     }
     reference_map: dict[str, str] = {}
+
+    def mapping_action(kind: str, name: str) -> str:
+        for item in model_collections(model).get(kind, []):
+            raw_name = item.name if hasattr(item, "name") else str(item.get("name", ""))
+            if raw_name != name:
+                continue
+            action = getattr(item, "mapping_action", None)
+            if action is None and isinstance(item, dict):
+                action = item.get("mapping_action")
+            return str(action or "create")
+        return "create"
     object_fields = {
         "addresses": ("ip_netmask", "ip_range", "ip_wildcard", "fqdn"),
         "address-groups": ("static", "dynamic"),
@@ -2623,6 +2682,7 @@ def reconcile_model(
         by_name = {str(value.get("name", "")): value for value in target_items}
         by_signature = {signature(value, fields): value for value in target_items}
         name = item["name"]; payload = item["payload"]; wanted = signature(payload, fields)
+        mapping_action = str(item.get("mapping_action") or "create")
         if name in by_name:
             if signature(by_name[name], fields) != wanted:
                 plan["conflicts"].append(f"{kind}: {name}")
@@ -2632,6 +2692,11 @@ def reconcile_model(
         equivalent = by_signature.get(wanted)
         if equivalent:
             existing_name = str(equivalent["name"])
+            if mapping_action == "map":
+                reference_map[name] = existing_name
+                plan["renamed_references"][name] = existing_name
+                plan["reuse"] += 1
+                continue
             decision_key = reuse_decision_key(kind, name, existing_name, wanted)
             suggestion = {
                 "key": decision_key,
@@ -2646,7 +2711,10 @@ def reconcile_model(
                 plan["renamed_references"][name] = existing_name
                 plan["reuse"] += 1
                 continue
-        mapped[kind].append(name); plan["create"] += 1
+        if mapping_action == "map":
+            plan["conflicts"].append(f"{kind} mapping target ontbreekt: {name}")
+        else:
+            mapped[kind].append(name); plan["create"] += 1
 
     for attr in ("address_groups", "service_groups"):
         for group in getattr(result, attr):
@@ -2666,6 +2734,7 @@ def reconcile_model(
         by_name = {str(value.get("name", "")): value for value in target_items}
         by_signature = {signature(value, fields): value for value in target_items}
         name = item["name"]; payload = item["payload"]; wanted = signature(payload, fields)
+        mapping_action = str(item.get("mapping_action") or "create")
         if name in by_name:
             if signature(by_name[name], fields) != wanted:
                 plan["conflicts"].append(f"{kind}: {name}")
@@ -2675,6 +2744,11 @@ def reconcile_model(
         equivalent = by_signature.get(wanted)
         if equivalent:
             existing_name = str(equivalent["name"])
+            if mapping_action == "map":
+                reference_map[name] = existing_name
+                plan["renamed_references"][name] = existing_name
+                plan["reuse"] += 1
+                continue
             decision_key = reuse_decision_key(kind, name, existing_name, wanted)
             suggestion = {
                 "key": decision_key,
@@ -2689,7 +2763,10 @@ def reconcile_model(
                 plan["renamed_references"][name] = existing_name
                 plan["reuse"] += 1
                 continue
-        mapped[kind].append(name); plan["create"] += 1
+        if mapping_action == "map":
+            plan["conflicts"].append(f"{kind} mapping target ontbreekt: {name}")
+        else:
+            mapped[kind].append(name); plan["create"] += 1
 
     for attr in ("security_rules", "nat_rules"):
         for rule in getattr(result, attr):
@@ -2703,10 +2780,26 @@ def reconcile_model(
     for kind, attr in (("security", "security_rules"), ("nat", "nat_rules")):
         target_items = existing.get(f"policy:{kind}", [])
         by_name = {str(value.get("name", "")): value for value in target_items}
+        def policy_signature(value: dict) -> str:
+            return json.dumps({
+                key: value.get(key)
+                for key in ("from", "to", "source", "destination", "application", "service", "action", "disabled")
+            }, sort_keys=True, separators=(",", ":"))
+        by_signature = {policy_signature(value): value for value in target_items}
         kept = []
         for rule in getattr(result, attr):
             if rule.name in by_name:
-                plan["conflicts"].append(f"{kind} policy: {rule.name}")
+                payload = next(item["payload"] for item in scm_items(result) if item["kind"] == f"policy:{kind}" and item["name"] == rule.name)
+                if policy_signature(by_name[rule.name]) == policy_signature(payload):
+                    plan["reuse"] += 1
+                else:
+                    plan["conflicts"].append(f"{kind} policy: {rule.name}")
+            elif rule.mapping_action == "map":
+                payload = next(item["payload"] for item in scm_items(result) if item["kind"] == f"policy:{kind}" and item["name"] == rule.name)
+                if policy_signature(payload) in by_signature:
+                    plan["reuse"] += 1
+                else:
+                    plan["conflicts"].append(f"{kind} policy mapping target ontbreekt: {rule.name}")
             else:
                 kept.append(rule); plan["create"] += 1
         setattr(result, attr, kept)
@@ -2729,7 +2822,7 @@ def _named_scope(root: ET.Element, path: str, name: str) -> ET.Element | None:
     return next((entry for entry in root.findall(path) if entry.get("name") == name), None)
 
 
-def merge_model_into_panos_xml(
+def _merge_model_into_panos_xml_scope(
     xml_bytes: bytes,
     model: MigrationModel,
     scope: str,
@@ -2751,12 +2844,12 @@ def merge_model_into_panos_xml(
     if root is None:
         raise MigrationError("Geen PAN-OS <config>-root in de base gevonden")
     scope_path = "./devices/entry/device-group/entry" if panorama else "./devices/entry/vsys/entry"
-    target = _named_scope(root, scope_path, scope)
+    target = root.find("./shared") if panorama and scope == "Shared" else _named_scope(root, scope_path, scope)
     if target is None:
         raise MigrationError(f"Doelscope {scope} bestaat niet in de gekozen base-configuratie")
 
     fragment_root = SafeET.fromstring(panos_fragment(model, scope, panorama, rulebase))
-    source = _named_scope(fragment_root, scope_path, scope)
+    source = fragment_root.find("./shared") if panorama and scope == "Shared" else _named_scope(fragment_root, scope_path, scope)
     if source is None:
         raise MigrationError("Gegenereerde migratiescope ontbreekt")
     approved_reuses = set(approved_reuses or set())
@@ -2773,9 +2866,21 @@ def merge_model_into_panos_xml(
         node = parent.find(f"./{tag}")
         return node if node is not None else ET.SubElement(parent, tag)
 
+    def mapping_action(kind: str, name: str) -> str:
+        for item in model_collections(model).get(kind, []):
+            raw_name = item.name if hasattr(item, "name") else str(item.get("name", ""))
+            if raw_name != name:
+                continue
+            action = getattr(item, "mapping_action", None)
+            if action is None and isinstance(item, dict):
+                action = item.get("mapping_action")
+            return str(action or "create")
+        return "create"
+
     # A different object name may carry different intent even when its value matches.
     # Keep it separate unless the engineer explicitly approves the proposed reuse.
     for tag in ("address", "service"):
+        kind = {"address": "addresses", "service": "services"}[tag]
         incoming = source.find(f"./{tag}")
         if incoming is None:
             continue
@@ -2795,6 +2900,11 @@ def merge_model_into_panos_xml(
             equivalent = by_signature.get(signature)
             if equivalent is not None:
                 existing_name = equivalent.get("name", name)
+                if mapping_action(kind, name) == "map":
+                    reference_map[name] = existing_name
+                    plan["renamed_references"][name] = existing_name
+                    plan["reuse"] += 1
+                    continue
                 decision_key = reuse_decision_key(tag, name, existing_name, signature)
                 plan["suggested_reuses"].append({
                     "key": decision_key,
@@ -2808,6 +2918,9 @@ def merge_model_into_panos_xml(
                     plan["renamed_references"][name] = existing_name
                     plan["reuse"] += 1
                     continue
+            if mapping_action(kind, name) == "map":
+                plan["conflicts"].append(f"{tag} mapping target ontbreekt: {name}")
+                continue
             clone = copy.deepcopy(entry)
             destination.append(clone); by_name[name] = clone; by_signature[signature] = clone
             plan["create"] += 1
@@ -2818,6 +2931,7 @@ def merge_model_into_panos_xml(
             node.text = reference_map[node.text]
 
     for tag in ("address-group", "service-group"):
+        kind = {"address-group": "address_groups", "service-group": "service_groups"}[tag]
         incoming = source.find(f"./{tag}")
         if incoming is None:
             continue
@@ -2837,6 +2951,11 @@ def merge_model_into_panos_xml(
             equivalent = by_signature.get(signature)
             if equivalent is not None:
                 existing_name = equivalent.get("name", name)
+                if mapping_action(kind, name) == "map":
+                    reference_map[name] = existing_name
+                    plan["renamed_references"][name] = existing_name
+                    plan["reuse"] += 1
+                    continue
                 decision_key = reuse_decision_key(tag, name, existing_name, signature)
                 plan["suggested_reuses"].append({
                     "key": decision_key,
@@ -2850,6 +2969,9 @@ def merge_model_into_panos_xml(
                     plan["renamed_references"][name] = existing_name
                     plan["reuse"] += 1
                     continue
+            if mapping_action(kind, name) == "map":
+                plan["conflicts"].append(f"{tag} mapping target ontbreekt: {name}")
+                continue
             clone = copy.deepcopy(entry)
             destination.append(clone); by_name[name] = clone; by_signature[signature] = clone
             plan["create"] += 1
@@ -2862,12 +2984,14 @@ def merge_model_into_panos_xml(
     target_rb = container(target, f"{rulebase}-rulebase" if panorama else "rulebase")
     if source_rb is not None:
         for policy_type in source_rb:
+            policy_kind = f"{policy_type.tag}_rules"
             incoming_rules = policy_type.find("./rules")
             if incoming_rules is None:
                 continue
             target_policy = container(target_rb, policy_type.tag)
             destination = container(target_policy, "rules")
             by_name = {entry.get("name", ""): entry for entry in destination.findall("./entry")}
+            by_signature = {_entry_signature(entry): entry for entry in destination.findall("./entry")}
             for entry in incoming_rules.findall("./entry"):
                 name = entry.get("name", "")
                 if name in by_name:
@@ -2875,6 +2999,13 @@ def merge_model_into_panos_xml(
                         plan["conflicts"].append(f"{policy_type.tag} policy: {name}")
                     else:
                         plan["reuse"] += 1
+                    continue
+                if mapping_action(policy_kind, name) == "map":
+                    equivalent = by_signature.get(_entry_signature(entry))
+                    if equivalent is not None:
+                        plan["reuse"] += 1
+                    else:
+                        plan["conflicts"].append(f"{policy_type.tag} policy mapping target ontbreekt: {name}")
                     continue
                 destination.append(copy.deepcopy(entry)); plan["create"] += 1
 
@@ -2916,6 +3047,9 @@ def merge_model_into_panos_xml(
                 if _entry_signature(existing[name]) != _entry_signature(entry): plan["conflicts"].append(f"interface: {name}")
                 else: plan["reuse"] += 1
             else:
+                if mapping_action("interfaces", name) == "map":
+                    plan["conflicts"].append(f"interface mapping target ontbreekt: {name}")
+                    continue
                 destination.append(copy.deepcopy(entry)); plan["create"] += 1
 
     if model.zones:
@@ -2929,6 +3063,9 @@ def merge_model_into_panos_xml(
                 if _entry_signature(existing[name]) != _entry_signature(entry): plan["conflicts"].append(f"zone: {name}")
                 else: plan["reuse"] += 1
             else:
+                if mapping_action("zones", name) == "map":
+                    plan["conflicts"].append(f"zone mapping target ontbreekt: {name}")
+                    continue
                 destination.append(copy.deepcopy(entry)); plan["create"] += 1
 
     def ensure_path(owner: ET.Element, path: str) -> ET.Element:
@@ -2963,9 +3100,120 @@ def merge_model_into_panos_xml(
                 if _entry_signature(existing[name]) != _entry_signature(entry): plan["conflicts"].append(f"{kind}: {name}")
                 else: plan["reuse"] += 1
             else:
+                if mapping_action(kind, name) == "map":
+                    plan["conflicts"].append(f"{kind} mapping target ontbreekt: {name}")
+                    continue
                 destination.append(copy.deepcopy(entry)); plan["create"] += 1
     if plan["conflicts"]:
         raise MigrationError("Mergeconflicten: " + ", ".join(plan["conflicts"][:12]))
     ET.indent(root, space="  ")
     merged = b'<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="utf-8") + b"\n"
     return merged, plan
+
+
+def _routed_models(model: MigrationModel, default_scope: str) -> list[tuple[str, MigrationModel]]:
+    """Split a neutral model by the target context retained on every item."""
+    routed: dict[str, MigrationModel] = {}
+
+    def bucket(context: str) -> MigrationModel:
+        context = context.strip() or default_scope
+        if not context:
+            raise MigrationError("Doelscope ontbreekt")
+        if context not in routed:
+            routed[context] = MigrationModel(model.vendor, model.source_name)
+        return routed[context]
+
+    for attr in (
+        "addresses", "address_groups", "services", "service_groups",
+        "security_rules", "nat_rules", "interfaces", "zones",
+    ):
+        for item in getattr(model, attr):
+            context = (
+                str(getattr(item, "target_context", ""))
+                if hasattr(item, "target_context")
+                else str(item.get("target_context", ""))
+            )
+            getattr(bucket(context), attr).append(copy.deepcopy(item))
+    for kind, items in model.extras.items():
+        for item in items:
+            context = str(item.get("target_context", ""))
+            bucket(context).extras.setdefault(kind, []).append(copy.deepcopy(item))
+    if not routed:
+        routed[default_scope] = MigrationModel(model.vendor, model.source_name)
+    return list(routed.items())
+
+
+def _ensure_migration_scope(
+    xml_bytes: bytes,
+    scope: str,
+    panorama: bool,
+    routed_model: MigrationModel,
+) -> bytes:
+    """Create an explicitly selected context only for ``create`` mappings."""
+    root = SafeET.fromstring(xml_bytes)
+    if root.tag != "config":
+        root = root.find(".//config")
+    if root is None:
+        raise MigrationError("Geen PAN-OS <config>-root in de base gevonden")
+    if panorama and scope == "Shared":
+        current = root.find("./shared")
+    else:
+        path = "./devices/entry/device-group/entry" if panorama else "./devices/entry/vsys/entry"
+        current = _named_scope(root, path, scope)
+    if current is not None:
+        return xml_bytes
+    actions = {
+        str(getattr(item, "mapping_action", item.get("mapping_action", "create") if isinstance(item, dict) else "create") or "create")
+        for items in model_collections(routed_model).values()
+        for item in items
+    }
+    if "map" in actions:
+        raise MigrationError(f"Doelcontext {scope} bestaat niet; gebruik Create of kies een bestaande context")
+    if panorama and scope == "Shared":
+        ET.SubElement(root, "shared")
+    else:
+        device = root.find("./devices/entry")
+        if device is None:
+            devices = root.find("./devices")
+            if devices is None:
+                devices = ET.SubElement(root, "devices")
+            device = ET.SubElement(devices, "entry", {"name": "localhost.localdomain"})
+        parent_tag = "device-group" if panorama else "vsys"
+        parent = device.find(f"./{parent_tag}")
+        if parent is None:
+            parent = ET.SubElement(device, parent_tag)
+        ET.SubElement(parent, "entry", {"name": scope})
+    ET.indent(root, space="  ")
+    return b'<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="utf-8") + b"\n"
+
+
+def merge_model_into_panos_xml(
+    xml_bytes: bytes,
+    model: MigrationModel,
+    scope: str,
+    panorama: bool = False,
+    rulebase: str = "pre",
+    approved_reuses: set[str] | None = None,
+) -> tuple[bytes, dict]:
+    """Merge every family into its persisted target context."""
+    merged = xml_bytes
+    combined = {
+        "create": 0, "reuse": 0, "conflicts": [],
+        "renamed_references": {}, "suggested_reuses": [],
+        "target_contexts": [],
+    }
+    for target_context, routed_model in _routed_models(model, scope):
+        merged = _ensure_migration_scope(merged, target_context, panorama, routed_model)
+        merged, plan = _merge_model_into_panos_xml_scope(
+            merged, routed_model, target_context, panorama, rulebase, approved_reuses,
+        )
+        combined["create"] += int(plan.get("create", 0))
+        combined["reuse"] += int(plan.get("reuse", 0))
+        combined["conflicts"].extend(plan.get("conflicts", []))
+        combined["suggested_reuses"].extend(plan.get("suggested_reuses", []))
+        combined["renamed_references"].update(plan.get("renamed_references", {}))
+        combined["target_contexts"].append(target_context)
+        if plan.get("network_target"):
+            combined["network_target"] = plan["network_target"]
+    combined["target_contexts"] = unique(combined["target_contexts"])
+    return merged, combined

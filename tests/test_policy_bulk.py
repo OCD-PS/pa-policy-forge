@@ -52,5 +52,22 @@ class PolicyBulkTests(unittest.TestCase):
         self.assertEqual(changed["source_translation"], policy["source_translation"])
         self.assertEqual(changed["destination_translation"], policy["destination_translation"])
 
+    def test_nat_bulk_replaces_only_explicit_translation_fields(self):
+        policy = {
+            "id": "nat-1", "name": "NAT-1", "from": ["Trust"], "to": ["Internet"],
+            "source": ["any"], "destination": ["public-ip"], "service": ["any"],
+            "nat_type": "ipv4", "to_interface": "ethernet1/1",
+            "source_translation": {"dynamic_ip_and_port": {"interface_address": {}}},
+            "destination_translation": {"translated_address": "server-1", "translated_port": 443},
+        }
+        changed = apply_bulk_operations(policy, {
+            "source_translation": {"dynamic_ip": {"translated_address": ["pool-1"]}},
+            "destination_translation": {"translated_address": "server-2", "translated_port": 8443},
+        })
+        self.assertEqual(changed["source_translation"], {"dynamic_ip": {"translated_address": ["pool-1"]}})
+        self.assertEqual(changed["destination_translation"]["translated_address"], "server-2")
+        self.assertEqual(changed["from"], ["Trust"])
+        self.assertEqual(changed["to_interface"], "ethernet1/1")
+
 
 if __name__ == "__main__": unittest.main()

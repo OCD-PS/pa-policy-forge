@@ -612,6 +612,37 @@ def policy_record(entry: ET.Element, kind: str, owner: str, rulebase: str, edita
     return record
 
 
+def policy_create_record(kind: str, owner: str, rulebase: str) -> dict:
+    """Return a PAN-OS-shaped editable seed for every policy family."""
+    if kind not in POLICY_NODES:
+        raise OfflineConfigError(f"Onbekend policytype: {kind}")
+    entry = ET.Element("entry", {"name": ""})
+
+    def members(tag: str, values: list[str]) -> None:
+        node = ET.SubElement(entry, tag)
+        for value in values:
+            ET.SubElement(node, "member").text = value
+
+    for field in ("from", "to", "source", "destination"):
+        members(field, ["any"])
+    if kind in {"security", "qos", "pbf", "application-override"}:
+        members("application", ["any"])
+    if kind == "nat":
+        ET.SubElement(entry, "service").text = "any"
+        ET.SubElement(entry, "nat-type").text = "ipv4"
+        ET.SubElement(entry, "to-interface").text = "any"
+    elif kind in {"security", "qos", "pbf", "authentication"}:
+        members("service", ["application-default"])
+    if kind == "security":
+        ET.SubElement(entry, "action").text = "allow"
+    elif kind == "decryption":
+        ET.SubElement(entry, "action").text = "no-decrypt"
+    ET.SubElement(entry, "disabled").text = "no"
+    record = policy_record(entry, kind, owner, rulebase, True)
+    record["create_template"] = True
+    return record
+
+
 def scoped_policies(xml_bytes: bytes, scope: str, kind: str, rulebase: str = "pre", parsed=None) -> tuple[ConfigSnapshot, list[dict]]:
     root, snapshot = parsed if parsed is not None else parse_snapshot(xml_bytes)
     if kind not in POLICY_NODES:
@@ -1328,6 +1359,86 @@ def replace_policy_in_snapshot(xml_bytes: bytes, scope: str, kind: str, rulebase
     index = list(rules).index(current)
     rules.remove(current)
     rules.insert(index, replacement)
+    return normalized_config_xml(root)
+
+
+def _policy_rules_root(root: ET.Element, snapshot: ConfigSnapshot, scope: str, kind: str, rulebase: str) -> ET.Element:
+    if kind not in POLICY_NODES:
+        raise OfflineConfigError(f"Onbekend policytype: {kind}")
+    scope_root = _scope_root(root, snapshot, scope)
+    if scope_root is None:
+        raise OfflineConfigError("De gekozen scope bestaat niet meer")
+    base_tag = f"{rulebase}-rulebase" if snapshot.kind == "panorama" else "rulebase"
+    base = scope_root.find(f"./{base_tag}")
+    if base is None:
+        base = ET.SubElement(scope_root, base_tag)
+    policy = base.find(f"./{POLICY_NODES[kind]}")
+    if policy is None:
+        policy = ET.SubElement(base, POLICY_NODES[kind])
+    rules = policy.find("./rules")
+    return rules if rules is not None else ET.SubElement(policy, "rules")
+
+
+def insert_policy_in_snapshot(
+    xml_bytes: bytes, scope: str, kind: str, rulebase: str,
+    policy_xml: str, position: str = "bottom",
+) -> bytes:
+    root, snapshot = parse_snapshot(xml_bytes)
+    rules = _policy_rules_root(root, snapshot, scope, kind, rulebase)
+    entry = SafeET.fromstring(policy_xml)
+    name = str(entry.get("name", "")).strip()
+    if entry.tag != "entry" or not name:
+        raise OfflineConfigError("Ongeldige nieuwe policy")
+    if any(current.get("name") == name for current in rules.findall("./entry")):
+        raise OfflineConfigError(f"Policy {name} bestaat al in deze rulebase")
+    if position == "top":
+        rules.insert(0, entry)
+    elif position == "bottom":
+        rules.append(entry)
+    else:
+        raise OfflineConfigError("Ongeldige insertpositie")
+    return normalized_config_xml(root)
+
+
+def delete_policies_from_snapshot(
+    xml_bytes: bytes, scope: str, kind: str, rulebase: str, names: set[str],
+) -> bytes:
+    root, snapshot = parse_snapshot(xml_bytes)
+    rules = _policy_rules_root(root, snapshot, scope, kind, rulebase)
+    current = {entry.get("name", ""): entry for entry in rules.findall("./entry")}
+    missing = sorted(names - set(current))
+    if missing:
+        raise OfflineConfigError("Policies bestaan niet meer: " + ", ".join(missing[:12]))
+    for name in names:
+        rules.remove(current[name])
+    return normalized_config_xml(root)
+
+
+def move_policies_in_snapshot(
+    xml_bytes: bytes, scope: str, kind: str, rulebase: str,
+    names: set[str], direction: str,
+) -> bytes:
+    root, snapshot = parse_snapshot(xml_bytes)
+    rules = _policy_rules_root(root, snapshot, scope, kind, rulebase)
+    entries = list(rules.findall("./entry"))
+    available = {entry.get("name", "") for entry in entries}
+    missing = sorted(names - available)
+    if missing:
+        raise OfflineConfigError("Policies bestaan niet meer: " + ", ".join(missing[:12]))
+    if direction == "up":
+        for index in range(1, len(entries)):
+            if entries[index].get("name") in names and entries[index - 1].get("name") not in names:
+                entries[index - 1], entries[index] = entries[index], entries[index - 1]
+    elif direction == "down":
+        for index in range(len(entries) - 2, -1, -1):
+            if entries[index].get("name") in names and entries[index + 1].get("name") not in names:
+                entries[index], entries[index + 1] = entries[index + 1], entries[index]
+    else:
+        raise OfflineConfigError("Ongeldige move-richting")
+    for entry in list(rules):
+        rules.remove(entry)
+    for entry in entries:
+        rules.append(entry)
     return normalized_config_xml(root)
 
 

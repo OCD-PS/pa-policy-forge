@@ -59,11 +59,13 @@ from app.offline_config import (
     apply_configuration_changes, apply_object_changes, configuration_inventory,
     configuration_records as scoped_configuration_records,
     normalized_config_xml, parse_snapshot,
-    object_create_record,
+    object_create_record, policy_create_record,
     object_fingerprint as offline_object_fingerprint,
     policy_fingerprint as offline_policy_fingerprint, render_set_commands,
     panos_ui_decorate_record, scoped_server_profiles,
-    replace_policy_in_snapshot, safe_workspace_path, scoped_objects,
+    replace_policy_in_snapshot, insert_policy_in_snapshot,
+    delete_policies_from_snapshot, move_policies_in_snapshot,
+    safe_workspace_path, scoped_objects,
     scoped_policies, snapshot_sha256, referenced_template,
 )
 
@@ -2364,6 +2366,76 @@ def nat_translation_replacements(form) -> dict:
     }
 
 
+def nat_bulk_replacements(form) -> dict:
+    """Return only NAT fields explicitly selected in the bulk editor."""
+    result = {}
+    nat_type = form.get("nat_type_bulk", "").strip()
+    if nat_type:
+        if nat_type not in {"ipv4", "nat64", "nptv6"}:
+            raise ValueError("Onbekend NAT type")
+        result["nat_type"] = nat_type
+    to_interface = split_values(form.get("to_interface_bulk", ""))
+    if len(to_interface) > 1:
+        raise ValueError("Destination interface accepteert maximaal één waarde")
+    if to_interface:
+        result["to_interface"] = to_interface[0]
+
+    source_mode = form.get("source_translation_mode_bulk", "").strip()
+    if source_mode:
+        source_addresses = split_values(form.get("source_translation_address_add", ""))
+        source_interfaces = split_values(form.get("source_translation_interface_bulk", ""))
+        if len(source_interfaces) > 1:
+            raise ValueError("Source translation interface accepteert maximaal één waarde")
+        source_interface = source_interfaces[0] if source_interfaces else ""
+        if source_mode == "none":
+            source_translation = {}
+        elif source_mode in {"dynamic_ip", "static_ip"}:
+            if not source_addresses:
+                raise ValueError("Geef minstens één translated source address op")
+            translated = source_addresses if source_mode == "dynamic_ip" else source_addresses[0]
+            source_translation = {source_mode: {"translated_address": translated}}
+        elif source_mode == "dynamic_ip_and_port":
+            if source_interface:
+                source_translation = {source_mode: {"interface_address": {"interface": source_interface}}}
+            elif source_addresses:
+                source_translation = {source_mode: {"translated_address": source_addresses}}
+            else:
+                raise ValueError("Geef een translated source address of interface op")
+        else:
+            raise ValueError("Onbekend source translation type")
+        result.update({
+            "source_translation": source_translation,
+            "source_translation_mode": source_mode,
+            "source_translation_address": ", ".join(source_addresses),
+            "source_translation_interface": source_interface,
+        })
+
+    destination_mode = form.get("destination_translation_mode_bulk", "").strip()
+    if destination_mode:
+        destination_addresses = split_values(form.get("destination_translation_address_bulk", ""))
+        if len(destination_addresses) > 1:
+            raise ValueError("Destination translation accepteert maximaal één address")
+        destination_port = form.get("destination_translation_port_bulk", "").strip()
+        if destination_port and (not destination_port.isdigit() or not 1 <= int(destination_port) <= 65535):
+            raise ValueError("Translated port moet tussen 1 en 65535 liggen")
+        if destination_mode == "clear":
+            destination_translation = {}
+        elif destination_mode == "set" and (destination_addresses or destination_port):
+            destination_translation = {}
+            if destination_addresses:
+                destination_translation["translated_address"] = destination_addresses[0]
+            if destination_port:
+                destination_translation["translated_port"] = int(destination_port)
+        else:
+            raise ValueError("Geef een translated destination address of port op")
+        result.update({
+            "destination_translation": destination_translation,
+            "destination_translation_address": destination_addresses[0] if destination_addresses else "",
+            "destination_translation_port": destination_port,
+        })
+    return result
+
+
 def write_target_policy(profile, policy_kind: str, policy: dict, original_name: str | None = None) -> None:
     if profile["target_type"] == "scm":
         scm, token, _, container = scm_client(profile)
@@ -2673,6 +2745,36 @@ def apply_migration_import_policy_status(model: MigrationModel, force_disabled: 
     }
 
 
+def migration_profile_target_context(profile, kind: str = "") -> str:
+    """Return the concrete default context used by the selected target adapter."""
+    settings = profile_settings(profile)
+    if profile["target_type"] == "panorama":
+        return str(settings.get("device_group") or "Shared")
+    if profile["target_type"] == "panos":
+        return str(settings.get("vsys") or "vsys1")
+    if kind == "zones":
+        return str(settings.get("folder") or settings.get("snippet") or settings.get("device") or "")
+    return str(
+        settings.get("object_folder") or settings.get("folder")
+        or settings.get("snippet") or settings.get("device") or ""
+    )
+
+
+def migration_project_target_context(project_id: int, kind: str = "", connection=None) -> str:
+    query = (
+        "SELECT profiles.* FROM migration_projects JOIN profiles "
+        "ON profiles.id=migration_projects.target_profile_id WHERE migration_projects.id=?"
+    )
+    if connection is None:
+        with db() as conn:
+            profile = conn.execute(query, (project_id,)).fetchone()
+    else:
+        profile = connection.execute(query, (project_id,)).fetchone()
+    if not profile:
+        raise MigrationError("Migratietarget bestaat niet meer")
+    return migration_profile_target_context(profile, kind)
+
+
 def store_migration_source(project_id: int, vendor: str, source_name: str, model: MigrationModel) -> int:
     raw = json.dumps(model.as_dict(), sort_keys=True, separators=(",", ":")).encode()
     token = secrets.token_hex(16)
@@ -2688,9 +2790,12 @@ def store_migration_source(project_id: int, vendor: str, source_name: str, model
             for kind, items in model_collections(model).items():
                 if not items:
                     continue
+                target_context = migration_project_target_context(project_id, kind, conn)
+                if not target_context:
+                    raise MigrationError(f"Doelcontext ontbreekt voor {MIGRATION_KIND_LABELS.get(kind, kind)}")
                 conn.execute(
                     "INSERT OR IGNORE INTO migration_family_mappings(project_id,source_id,kind,action,target_context,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-                    (project_id, source_id, kind, "map", "", now(), now()),
+                    (project_id, source_id, kind, "create", target_context, now(), now()),
                 )
             conn.execute("UPDATE migration_projects SET updated_at=? WHERE id=?", (now(), project_id))
         return source_id
@@ -2700,15 +2805,23 @@ def store_migration_source(project_id: int, vendor: str, source_name: str, model
 
 
 def ensure_migration_family_mappings(project_id: int, source_rows) -> list[dict]:
-    """Backfill safe default map decisions for projects created before mapping support."""
+    """Backfill concrete create decisions for projects from the cosmetic mapping era."""
     with db() as conn:
         for source in source_rows:
             model = migration_model(source)
             for kind, items in model_collections(model).items():
                 if items:
+                    target_context = migration_project_target_context(project_id, kind, conn)
+                    if not target_context:
+                        raise MigrationError(f"Doelcontext ontbreekt voor {MIGRATION_KIND_LABELS.get(kind, kind)}")
                     conn.execute(
                         "INSERT OR IGNORE INTO migration_family_mappings(project_id,source_id,kind,action,target_context,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-                        (project_id, int(source["id"]), kind, "map", "", now(), now()),
+                        (project_id, int(source["id"]), kind, "create", target_context, now(), now()),
+                    )
+                    conn.execute(
+                        "UPDATE migration_family_mappings SET action='create',target_context=?,updated_at=? "
+                        "WHERE project_id=? AND source_id=? AND kind=? AND target_context=''",
+                        (target_context, now(), project_id, int(source["id"]), kind),
                     )
         rows = conn.execute(
             "SELECT * FROM migration_family_mappings WHERE project_id=? ORDER BY source_id,kind",
@@ -2767,17 +2880,20 @@ def selected_migration_model(project_id: int, source_ids: list[int]) -> Migratio
     for field in ("addresses", "address_groups", "services", "service_groups", "security_rules", "nat_rules"):
         values, seen = [], {}
         for item in getattr(merged, field):
-            if item.name in seen:
-                if migration_item_semantic(item) != migration_item_semantic(seen[item.name]):
+            identity = (item.name, item.target_context)
+            if identity in seen:
+                if migration_item_semantic(item) != migration_item_semantic(seen[identity]):
                     merged.warnings.append(f"Mergeconflict voor {field}: {item.name}; kies de master in Search & Merge")
                     values.append(item)
                 continue
-            seen[item.name] = item; values.append(item)
+            seen[identity] = item; values.append(item)
         setattr(merged, field, values)
     for field in ("interfaces", "zones"):
         values, seen = [], {}
         for item in getattr(merged, field):
-            key = (item.get("interface_type", ""), item.get("name", "")) if field == "interfaces" else item.get("name", "")
+            key = (
+                item.get("interface_type", ""), item.get("name", ""), item.get("target_context", "")
+            ) if field == "interfaces" else (item.get("name", ""), item.get("target_context", ""))
             if key in seen:
                 if item.get("xml") != seen[key].get("xml"):
                     merged.warnings.append(f"Mergeconflict voor {field}: {item.get('name', '')}; eerste definitie behouden")
@@ -2787,7 +2903,7 @@ def selected_migration_model(project_id: int, source_ids: list[int]) -> Migratio
     for kind, items in merged.extras.items():
         values=[]; seen=set()
         for item in items:
-            key=(item.get("target_path", ""), item.get("profile_type", ""), item.get("name", ""), item.get("xml", ""))
+            key=(item.get("target_path", ""), item.get("profile_type", ""), item.get("name", ""), item.get("xml", ""), item.get("target_context", ""))
             if key in seen: continue
             seen.add(key); values.append(item)
         merged.extras[kind]=values
@@ -2799,12 +2915,17 @@ def selected_migration_model(project_id: int, source_ids: list[int]) -> Migratio
     return apply_transform_rules(apply_merge_rules(merged,rules),transforms)
 
 
-def migration_scm_container(profile, object_type: str) -> tuple[object, str, dict]:
+def migration_scm_container(profile, object_type: str, target_context: str = "") -> tuple[object, str, dict]:
     scm, token, _, _ = scm_client(profile)
     container = policy_api.scm_container(
         folder=scm.scm_folder if object_type == "zones" else scm.scm_object_folder,
         snippet=scm.scm_snippet, device=scm.scm_device,
     )
+    if target_context:
+        key = next((name for name in ("folder", "snippet", "device") if container.get(name)), "")
+        if not key:
+            raise MigrationError("SCM-doelcontext kan niet aan folder, snippet of device worden gekoppeld")
+        container = {key: target_context}
     return scm, token, container
 
 
@@ -2834,7 +2955,7 @@ def apply_scm_migration(profile, model: MigrationModel) -> int:
     count = 0
     # Referenced tags must exist before SCM accepts security rules that use them.
     for item in model.extras.get("tags", []):
-        metadata=SCM_OBJECT_TYPES["tags"]; scm,token,container=migration_scm_container(profile,"tags")
+        metadata=SCM_OBJECT_TYPES["tags"]; scm,token,container=migration_scm_container(profile,"tags",str(item.get("target_context", "")))
         service=metadata.get("service") or "objects"; endpoint_name=metadata.get("endpoint","tags")
         endpoint=policy_api.scm_api_root(scm.scm_api_base)+f"/config/{service}/v1/{endpoint_name}"
         policy_api.scm_http_request("POST",endpoint,token,payload={**raw_item_payload(item),**container}); count+=1
@@ -2844,13 +2965,13 @@ def apply_scm_migration(profile, model: MigrationModel) -> int:
             policy_kind = kind.split(":", 1)[1]
             if policy_kind in SCM_UNAVAILABLE_POLICY_TYPES: raise MigrationError(f"{policy_kind} is niet beschikbaar in SCM")
             service, endpoint_name, _ = SCM_POLICY_TYPES[policy_kind]
-            scm, token, container = migration_scm_container(profile, "policies")
+            scm, token, container = migration_scm_container(profile, "policies", item.get("target_context", ""))
             payload = {**item["payload"], **container}
             endpoint = policy_api.scm_api_root(scm.scm_api_base) + f"/config/{service}/v1/{endpoint_name}"
             policy_api.scm_http_request("POST", endpoint, token, payload=payload, params={"position": scm.scm_rulebase})
         else:
             metadata = SCM_OBJECT_TYPES[kind]
-            scm, token, container = migration_scm_container(profile, kind)
+            scm, token, container = migration_scm_container(profile, kind, item.get("target_context", ""))
             payload = {**item["payload"], **container}
             service = metadata.get("service") or "objects"
             endpoint_name = metadata.get("endpoint", kind)
@@ -2867,18 +2988,18 @@ def apply_scm_migration(profile, model: MigrationModel) -> int:
                 if kind == "security_profiles": object_type=MIGRATION_SCM_SECURITY_PROFILES.get(str(item.get("profile_type", "")))
                 if not object_type or object_type not in SCM_OBJECT_TYPES:
                     raise MigrationError(f"Geen SCM security-profilemapping voor {item.get('profile_type','')}")
-                metadata=SCM_OBJECT_TYPES[object_type]; scm,token,container=migration_scm_container(profile,object_type)
+                metadata=SCM_OBJECT_TYPES[object_type]; scm,token,container=migration_scm_container(profile,object_type,str(item.get("target_context", "")))
                 service=metadata.get("service") or "objects"; endpoint_name=metadata.get("endpoint",object_type)
                 endpoint=policy_api.scm_api_root(scm.scm_api_base)+f"/config/{service}/v1/{endpoint_name}"
                 policy_api.scm_http_request("POST",endpoint,token,payload={**payload,**container}); count+=1
             elif kind in MIGRATION_SCM_EXTRA_POLICIES:
                 policy_kind=MIGRATION_SCM_EXTRA_POLICIES[kind]
                 if policy_kind in SCM_UNAVAILABLE_POLICY_TYPES: raise MigrationError(f"{policy_kind} is niet beschikbaar in SCM")
-                service,endpoint_name,_=SCM_POLICY_TYPES[policy_kind]; scm,token,container=migration_scm_container(profile,"policies")
+                service,endpoint_name,_=SCM_POLICY_TYPES[policy_kind]; scm,token,container=migration_scm_container(profile,"policies",str(item.get("target_context", "")))
                 endpoint=policy_api.scm_api_root(scm.scm_api_base)+f"/config/{service}/v1/{endpoint_name}"
                 policy_api.scm_http_request("POST",endpoint,token,payload={**payload,**container},params={"position":scm.scm_rulebase}); count+=1
             elif kind in MIGRATION_SCM_NETWORK_ENDPOINTS:
-                view,endpoint_name=MIGRATION_SCM_NETWORK_ENDPOINTS[kind]; scm,token,container=migration_scm_container(profile,"zones")
+                view,endpoint_name=MIGRATION_SCM_NETWORK_ENDPOINTS[kind]; scm,token,container=migration_scm_container(profile,"zones",str(item.get("target_context", "")))
                 endpoint=policy_api.scm_api_root(scm.scm_api_base)+f"/config/{view}/v1/{endpoint_name}"
                 policy_api.scm_http_request("POST",endpoint,token,payload={**payload,**container}); count+=1
     invalidate_profile_caches(profile["id"])
@@ -3326,6 +3447,9 @@ def config_workspace_editor(workspace_id):
                 )
         edit_name = request.args.get("edit_policy", "")
         edit_policy = next((item for item in policies if item["name"] == edit_name and item["editable"]), None)
+        new_policy = bool(workspace_view == "policies" and request.args.get("add_policy") == "1")
+        if new_policy:
+            edit_policy = policy_create_record(policy_kind, scope, rulebase)
         migration_output_sanity = json.loads(migration_output["sanity_json"] or "{}") if migration_output else {}
         migration_output_push_blocked = bool(
             migration_output and migration_output_push_block(workspace["id"])[1]
@@ -3336,6 +3460,7 @@ def config_workspace_editor(workspace_id):
             preferred_template=preferred_template, workspace_view=workspace_view,
             policy_kind=policy_kind, policy_nodes=POLICY_NODES,
             rulebase=rulebase, policies=policies, edit_policy=edit_policy,
+            new_policy=new_policy,
             alternate_policy_count=alternate_policy_count,
             object_type=object_type, object_nodes=OBJECT_NODES, objects=objects,
             edit_object_name=edit_object_name,
@@ -3381,8 +3506,15 @@ def config_workspace_policy_preview(workspace_id):
         kind = request.form.get("policy_kind", "security")
         rulebase = request.form.get("rulebase", "pre")
         name = request.form.get("policy_name", "")
+        operation = request.form.get("operation", "update")
+        if operation not in {"update", "create"}:
+            raise OfflineConfigError("Ongeldige policybewerking")
         _, policies = scoped_policies(xml_bytes, scope, kind, rulebase, parsed=(parsed_root, parsed_snapshot))
-        before = next((item for item in policies if item["name"] == name and item["editable"]), None)
+        before = (
+            policy_create_record(kind, scope, rulebase)
+            if operation == "create"
+            else next((item for item in policies if item["name"] == name and item["editable"]), None)
+        )
         if before is None:
             raise OfflineConfigError("Alleen een policy uit de geselecteerde scope kan hier worden gewijzigd")
         updated = copy.deepcopy(before)
@@ -3400,7 +3532,11 @@ def config_workspace_policy_preview(workspace_id):
         updated["disabled"] = request.form.get("disabled") == "yes"
         if kind == "nat" and request.form.get("nat_translation_editor") == "yes":
             updated.update(nat_translation_replacements(request.form))
-        changed_fields = {field for field in set(before) | set(updated) if before.get(field) != updated.get(field)}
+        changed_fields = (
+            set(POLICY_REFERENCE_KINDS)
+            if operation == "create"
+            else {field for field in set(before) | set(updated) if before.get(field) != updated.get(field)}
+        )
         reference_catalog, _ = workspace_policy_reference_catalog(
             xml_bytes, scope, (parsed_root, parsed_snapshot), workspace_profile
         )
@@ -3410,15 +3546,21 @@ def config_workspace_policy_preview(workspace_id):
             allow_zone_freeform=parsed_snapshot.kind == "panorama" and not referenced_template(parsed_snapshot, scope),
         )
         replacement_xml = update_xml_policy(updated)
-        if replacement_xml == before["_xml"]:
+        if operation == "update" and replacement_xml == before["_xml"]:
             raise OfflineConfigError("Er zijn geen wijzigingen om te bewaren")
         if request.form.get("direct_save") == "yes":
-            new_xml = replace_policy_in_snapshot(
-                workspace_config_path(workspace).read_bytes(), scope, kind, rulebase,
-                name, offline_policy_fingerprint(before), replacement_xml,
-            )
-            new_id = store_workspace_edit_version(workspace, new_xml, "policy edit")
-            audit("config-workspace-policy-edited", f"source={workspace['id']} workspace={new_id} scope={scope} policy={name}")
+            if operation == "create":
+                new_xml = insert_policy_in_snapshot(
+                    workspace_config_path(workspace).read_bytes(), scope, kind, rulebase,
+                    replacement_xml, request.form.get("position", "bottom"),
+                )
+            else:
+                new_xml = replace_policy_in_snapshot(
+                    workspace_config_path(workspace).read_bytes(), scope, kind, rulebase,
+                    name, offline_policy_fingerprint(before), replacement_xml,
+                )
+            new_id = store_workspace_edit_version(workspace, new_xml, "policy add" if operation == "create" else "policy edit")
+            audit("config-workspace-policy-created" if operation == "create" else "config-workspace-policy-edited", f"source={workspace['id']} workspace={new_id} scope={scope} policy={updated_name}")
             flash("Policy bewaard in een nieuwe workspaceversie.", "success")
             return redirect(url_for(
                 "config_workspace_editor", workspace_id=new_id, scope=scope,
@@ -3427,7 +3569,7 @@ def config_workspace_policy_preview(workspace_id):
         draft_id = secrets.token_urlsafe(24)
         draft = {
             "workspace_id": workspace_id, "scope": scope, "kind": kind,
-            "rulebase": rulebase, "policy_name": name,
+            "rulebase": rulebase, "policy_name": name, "operation": operation,
             "fingerprint": offline_policy_fingerprint(before),
             "before": before, "after": updated,
             "replacement_xml": replacement_xml, "created_at": now(),
@@ -3463,11 +3605,13 @@ def config_workspace_policy_bulk_preview(workspace_id):
         if len(selected) != len(selected_names):
             raise OfflineConfigError("Niet alle geselecteerde policies behoren nog tot deze scope")
         operations = {field: {"add": split_values(request.form.get(f"{field}_add", "")), "remove": split_values(request.form.get(f"{field}_remove", ""))} for field in OFFLINE_POLICY_FIELDS}
-        for field in ("action", "log_setting", "profile_group"):
+        for field in ("action", "log_setting", "profile_group", "schedule"):
             operations[field] = request.form.get(field) or None
         operations["description_append"] = request.form.get("description_append", "").strip()
         disabled = request.form.get("disabled", "")
         operations["disabled"] = disabled == "true" if disabled in {"true", "false"} else None
+        if kind == "nat":
+            operations.update(nat_bulk_replacements(request.form))
         reference_catalog, _ = workspace_policy_reference_catalog(
             xml_bytes, scope, (parsed_root, parsed_snapshot), workspace_profile
         )
@@ -3511,6 +3655,63 @@ def config_workspace_policy_bulk_preview(workspace_id):
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, scope=request.form.get("scope", ""), workspace_view="policies", policy_kind=request.form.get("policy_kind", "security"), rulebase=request.form.get("rulebase", "pre")))
 
 
+@app.post("/config-workspaces/<int:workspace_id>/policies/delete")
+@login_required
+def config_workspace_policy_delete(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    scope = request.form.get("scope", "")
+    kind = request.form.get("policy_kind", "security")
+    rulebase = request.form.get("rulebase", "pre")
+    try:
+        names = set(request.form.getlist("policy_name"))
+        if not names:
+            raise OfflineConfigError("Selecteer minstens één policy")
+        xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
+        _, policies = scoped_policies(xml_bytes, scope, kind, rulebase, parsed=(parsed_root, snapshot))
+        editable = {item["name"] for item in policies if item["editable"]}
+        if not names.issubset(editable):
+            raise OfflineConfigError("Alleen policies uit de geselecteerde scope kunnen worden verwijderd")
+        new_xml = delete_policies_from_snapshot(xml_bytes, scope, kind, rulebase, names)
+        new_id = store_workspace_edit_version(workspace, new_xml, "policy delete")
+        audit("config-workspace-policy-deleted", f"source={workspace_id} workspace={new_id} scope={scope} rules={len(names)}")
+        flash(f"{len(names)} policies verwijderd in een nieuwe workspaceversie.", "success")
+        return redirect(url_for("config_workspace_editor", workspace_id=new_id, scope=scope, workspace_view="policies", policy_kind=kind, rulebase=rulebase))
+    except Exception as exc:
+        flash(f"Policies niet verwijderd: {exc}", "error")
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, scope=scope, workspace_view="policies", policy_kind=kind, rulebase=rulebase))
+
+
+@app.post("/config-workspaces/<int:workspace_id>/policies/move")
+@login_required
+def config_workspace_policy_move(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    scope = request.form.get("scope", "")
+    kind = request.form.get("policy_kind", "security")
+    rulebase = request.form.get("rulebase", "pre")
+    try:
+        names = set(request.form.getlist("policy_name"))
+        direction = request.form.get("direction", "")
+        if not names:
+            raise OfflineConfigError("Selecteer minstens één policy")
+        xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
+        _, policies = scoped_policies(xml_bytes, scope, kind, rulebase, parsed=(parsed_root, snapshot))
+        editable = {item["name"] for item in policies if item["editable"]}
+        if not names.issubset(editable):
+            raise OfflineConfigError("Alleen policies uit de geselecteerde scope kunnen worden verplaatst")
+        new_xml = move_policies_in_snapshot(xml_bytes, scope, kind, rulebase, names, direction)
+        new_id = store_workspace_edit_version(workspace, new_xml, f"policy move {direction}")
+        audit("config-workspace-policy-moved", f"source={workspace_id} workspace={new_id} scope={scope} rules={len(names)} direction={direction}")
+        flash(f"{len(names)} policies verplaatst.", "success")
+        return redirect(url_for("config_workspace_editor", workspace_id=new_id, scope=scope, workspace_view="policies", policy_kind=kind, rulebase=rulebase))
+    except Exception as exc:
+        flash(f"Policies niet verplaatst: {exc}", "error")
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, scope=scope, workspace_view="policies", policy_kind=kind, rulebase=rulebase))
+
+
 @app.post("/config-workspaces/policy-bulk-drafts/<draft_id>/apply")
 @login_required
 def config_workspace_policy_bulk_apply(draft_id):
@@ -3552,10 +3753,16 @@ def config_workspace_policy_apply(draft_id):
         workspace = workspace_row(int(draft["workspace_id"]))
         if not workspace:
             raise OfflineConfigError("De bronworkspace bestaat niet meer")
-        new_xml = replace_policy_in_snapshot(
-            workspace_config_path(workspace).read_bytes(), draft["scope"], draft["kind"],
-            draft["rulebase"], draft["policy_name"], draft["fingerprint"], draft["replacement_xml"],
-        )
+        if draft.get("operation") == "create":
+            new_xml = insert_policy_in_snapshot(
+                workspace_config_path(workspace).read_bytes(), draft["scope"], draft["kind"],
+                draft["rulebase"], draft["replacement_xml"], "bottom",
+            )
+        else:
+            new_xml = replace_policy_in_snapshot(
+                workspace_config_path(workspace).read_bytes(), draft["scope"], draft["kind"],
+                draft["rulebase"], draft["policy_name"], draft["fingerprint"], draft["replacement_xml"],
+            )
         with db() as conn:
             profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
         if not profile:
@@ -4306,10 +4513,7 @@ def migration_candidate_export(project_id,kind):
     if latest_output:
         xml_bytes=workspace_config_path(latest_output).read_bytes()
     else:
-        model=selected_migration_model(project_id,source_ids); base_id=int(project["base_workspace_id"] or 0); workspace=workspace_row(base_id) if base_id else None
-        settings=json.loads(project["settings_json"] or "{}"); panorama=project["target_type"]=="panorama"; scope=settings.get("device_group","") if panorama else settings.get("vsys","vsys1")
-        base_xml=workspace_config_path(workspace).read_bytes() if workspace else migration_base_xml(model,scope,panorama)
-        xml_bytes,_=merge_model_into_panos_xml(base_xml,model,scope,panorama,settings.get("rulebase","pre"))
+        return "Maak en review eerst een candidate voordat je XML of set commands exporteert", 409
     safe="".join(char if char.isalnum() or char in "-_." else "-" for char in project["name"]).strip("-.") or f"migration-{project_id}"
     if kind=="xml": return Response(xml_bytes,mimetype="application/xml",headers={"Content-Disposition":f'attachment; filename="{safe}.xml"'})
     return Response(render_set_commands(xml_bytes),mimetype="text/plain",headers={"Content-Disposition":f'attachment; filename="{safe}.set.txt"'})
@@ -4416,6 +4620,9 @@ def migration_project_attach_target(project_id):
             raise MigrationError("Dit project heeft al een push target")
         profile_id = int(request.form.get("target_profile_id", "0"))
         with db() as conn:
+            previous_profile = conn.execute(
+                "SELECT * FROM profiles WHERE id=?", (project["target_profile_id"],)
+            ).fetchone()
             profile = conn.execute(
                 "SELECT * FROM profiles WHERE id=? AND system=0", (profile_id,)
             ).fetchone()
@@ -4436,6 +4643,20 @@ def migration_project_attach_target(project_id):
             conn.execute(
                 "UPDATE migration_sources SET staging_workspace_id=NULL WHERE project_id=?", (project_id,)
             )
+            mapping_kinds = conn.execute(
+                "SELECT DISTINCT kind FROM migration_family_mappings WHERE project_id=?",
+                (project_id,),
+            ).fetchall()
+            for row in mapping_kinds:
+                kind = str(row["kind"])
+                previous_context = migration_profile_target_context(previous_profile, kind)
+                next_context = migration_profile_target_context(profile, kind)
+                if previous_context and next_context:
+                    conn.execute(
+                        "UPDATE migration_family_mappings SET target_context=?,updated_at=? "
+                        "WHERE project_id=? AND action='create' AND target_context=?",
+                        (next_context, now(), project_id, previous_context),
+                    )
             conn.execute(
                 "UPDATE migration_projects SET target_profile_id=?,base_workspace_id=NULL,updated_at=? WHERE id=?",
                 (profile_id, now(), project_id),
@@ -4493,12 +4714,30 @@ def migration_project(project_id):
         outputs.append(output)
     source_ids=[int(row["id"]) for row in source_rows]
     combined=selected_migration_model(project_id,source_ids) if source_ids else MigrationModel("merged","")
-    merge_query=request.args.get("merge_query","").strip(); inventory=merge_inventory(combined)
-    configuration_items=[]
+    merge_query=request.args.get("merge_query","").strip()
+    inventory_all=merge_inventory(combined)
+    inventory=inventory_all[:100]
+    topology_items=[]
+    transform_kind=request.args.get("transform_kind", "").strip()
+    available_kind_counts={key:len(value) for key,value in model_collections(combined).items() if value}
+    if transform_kind not in available_kind_counts:
+        transform_kind=next(iter(available_kind_counts), "")
+    transform_query=request.args.get("transform_query", "").strip()
+    transform_candidates=[]
+    transform_candidate_total=0
     for kind,items in model_collections(combined).items():
         for item in items:
             raw=item.__dict__ if hasattr(item,"__dict__") else item
-            configuration_items.append({"kind":kind,"name":str(raw.get("name","")),"source_ref":str(raw.get("source_ref","")),"selector":item_selector(raw)})
+            row={"kind":kind,"name":str(raw.get("name","")),"source_ref":str(raw.get("source_ref","")),"selector":item_selector(raw)}
+            if kind in MIGRATION_TOPOLOGY_KINDS:
+                topology_items.append(row)
+            if kind == transform_kind and (
+                not transform_query
+                or transform_query.casefold() in " ".join((row["name"], row["source_ref"])).casefold()
+            ):
+                transform_candidate_total += 1
+                if len(transform_candidates) < 200:
+                    transform_candidates.append(row)
     with db() as conn:
         merge_rules=[dict(row) for row in conn.execute("SELECT * FROM migration_merge_rules WHERE project_id=? ORDER BY id DESC",(project_id,)).fetchall()]
         transform_rules=[dict(row) for row in conn.execute("SELECT * FROM migration_transform_rules WHERE project_id=? ORDER BY id DESC",(project_id,)).fetchall()]
@@ -4519,13 +4758,26 @@ def migration_project(project_id):
     if selected_filter:
         filter_results=migration_filter_inventory(combined,json.loads(selected_filter["rules_json"] or "[]"),selected_filter["join_mode"])
     target_model=MigrationModel("panos","target")
+    target_context_options=[]
     if project["base_workspace_id"]:
         base_workspace=workspace_row(int(project["base_workspace_id"]))
         if base_workspace:
             target_model=cached_migration_workspace_model(base_workspace["config_path"],base_workspace["sha256"])
+            try:
+                _, _, target_snapshot = cached_workspace_config(
+                    base_workspace["config_path"], base_workspace["sha256"]
+                )
+                target_context_options.extend(available_scopes(target_snapshot))
+            except Exception:
+                pass
     profile_settings_value=profile_settings(profile) if profile else {}
-    target_context=(profile_settings_value.get("folder") or profile_settings_value.get("snippet") or profile_settings_value.get("device") or profile_settings_value.get("device_group") or profile_settings_value.get("vsys") or "target")
-    staged_actions=migration_api_plan(combined,project["target_type"],str(target_context)) if source_ids else []
+    target_context=migration_profile_target_context(profile) if profile else ""
+    if target_context:
+        target_context_options.append(target_context)
+    target_context_options=sorted(set(target_context_options), key=str.casefold)
+    staged_actions_all=migration_api_plan(combined,project["target_type"],str(target_context)) if source_ids else []
+    staged_action_count=len(staged_actions_all)
+    staged_actions=staged_actions_all[:250]
     mappings_by_source=defaultdict(list)
     for mapping in family_mappings: mappings_by_source[int(mapping["source_id"])].append(mapping)
     topology_rules=[rule for rule in transform_rules if str(rule["operation"]).startswith("topology_")]
@@ -4534,10 +4786,21 @@ def migration_project(project_id):
         "interfaces":sorted({str(item.get("name","")) for item in target_model.interfaces if str(item.get("name",""))}),
     }
     target_zones = sorted(set(topology_targets["zones"]) | set(profile_settings_value.get("zones", {})))
+    policy_zone_query=request.args.get("zone_query", "").strip()
     policy_zone_items = []
+    policy_zone_total = 0
     for kind, rules in (("security_rules", combined.security_rules), ("nat_rules", combined.nat_rules)):
         for rule in rules:
             if "any" not in rule.from_zones and "any" not in rule.to_zones:
+                continue
+            haystack=" ".join((
+                rule.name, rule.source_ref, *rule.source, *rule.destination,
+                *rule.from_zones, *rule.to_zones,
+            )).casefold()
+            if policy_zone_query and policy_zone_query.casefold() not in haystack:
+                continue
+            policy_zone_total += 1
+            if len(policy_zone_items) >= 250:
                 continue
             raw = rule.__dict__
             policy_zone_items.append({
@@ -4556,20 +4819,26 @@ def migration_project(project_id):
     return render_template(
         "migration.html", projects=[], profiles=profiles, parsers=PARSERS, project=project,
         sources=sources, workspaces=workspaces, migration_kind_labels=MIGRATION_KIND_LABELS,
-        available_kinds={key:len(value) for key,value in model_collections(combined).items() if value},
+        available_kinds=available_kind_counts,
         merge_inventory=inventory, merge_rules=merge_rules, migration_analysis=migration_analysis(combined),
         migration_review=migration_review_findings(combined) if source_ids else None,
         merge_query=merge_query, search_results=migration_search(combined,merge_query), transform_rules=transform_rules,
-        configuration_items=configuration_items, outputs=outputs, family_mappings=family_mappings,
+        merge_inventory_total=len(inventory_all), topology_items=topology_items,
+        transform_kind=transform_kind, transform_query=transform_query,
+        transform_candidates=transform_candidates, transform_candidate_total=transform_candidate_total,
+        outputs=outputs, family_mappings=family_mappings,
         mappings_by_source=mappings_by_source, mapping_actions=MIGRATION_MAPPING_ACTIONS,
+        default_target_context=target_context, target_context_options=target_context_options,
         topology_rules=topology_rules, topology_targets=topology_targets,
         target_zones=target_zones, policy_zone_items=policy_zone_items,
+        policy_zone_query=policy_zone_query, policy_zone_total=policy_zone_total,
         zone_freeform_allowed=bool(project["target_type"] == "panorama" and not target_zones),
         saved_filters=saved_filters, selected_filter=selected_filter, filter_results=filter_results,
         filter_fields=["name", "kind", "value", "source_ref", "references", "disabled"],
         filter_operators=["contains", "equals", "not_contains", "starts_with", "ends_with", "regex"],
         migration_health=health, best_practices=best_practices, discovery=discovery,
-        staged_actions=staged_actions, catalogs=catalogs, snippets=snippets,
+        staged_actions=staged_actions, staged_action_count=staged_action_count,
+        catalogs=catalogs, snippets=snippets,
         project_roles=role_rows, project_users=users, current_project_role=migration_project_role(project_id),
         project_audits=project_audits,
         latest_analysis=json.loads(latest_analysis["analysis_json"]) if latest_analysis else None,
@@ -4582,27 +4851,46 @@ def migration_family_mapping_save(project_id):
     project = migration_project_row(project_id)
     if not project: return "Not found", 404
     try:
-        source_id = int(request.form.get("source_id", "0"))
-        kind = request.form.get("kind", "").strip()
-        action = request.form.get("action", "map").strip()
-        target_context = request.form.get("target_context", "").strip()[:255]
+        source_values = request.form.getlist("source_id")
+        kind_values = request.form.getlist("kind")
+        action_values = request.form.getlist("action")
+        target_values = request.form.getlist("target_context")
+        if not source_values or not (
+            len(source_values) == len(kind_values) == len(action_values) == len(target_values)
+        ):
+            raise MigrationError("De mappinglijst is onvolledig")
+        updates = []
         with db() as conn:
-            source = conn.execute(
-                "SELECT * FROM migration_sources WHERE id=? AND project_id=?", (source_id, project_id)
-            ).fetchone()
-        if not source or kind not in model_collections(migration_model(source)):
-            raise MigrationError("De bronfamilie bestaat niet")
-        if action not in MIGRATION_MAPPING_ACTIONS:
-            raise MigrationError("Ongeldige mappingactie")
+            for source_value, kind_value, action_value, target_value in zip(
+                source_values, kind_values, action_values, target_values
+            ):
+                source_id = int(source_value)
+                kind = kind_value.strip()
+                action = action_value.strip()
+                target_context = target_value.strip()[:255]
+                source = conn.execute(
+                    "SELECT * FROM migration_sources WHERE id=? AND project_id=?",
+                    (source_id, project_id),
+                ).fetchone()
+                if not source or kind not in model_collections(migration_model(source)):
+                    raise MigrationError("De bronfamilie bestaat niet")
+                if action not in MIGRATION_MAPPING_ACTIONS:
+                    raise MigrationError("Ongeldige mappingactie")
+                if action in {"map", "create"} and not target_context:
+                    raise MigrationError(
+                        f"Doelcontext ontbreekt voor {MIGRATION_KIND_LABELS.get(kind, kind)}"
+                    )
+                updates.append((source_id, kind, action, target_context))
         with db() as conn:
-            conn.execute(
-                "INSERT INTO migration_family_mappings(project_id,source_id,kind,action,target_context,created_at,updated_at) VALUES(?,?,?,?,?,?,?) "
-                "ON CONFLICT(project_id,source_id,kind) DO UPDATE SET action=excluded.action,target_context=excluded.target_context,updated_at=excluded.updated_at",
-                (project_id, source_id, kind, action, target_context, now(), now()),
-            )
+            for source_id, kind, action, target_context in updates:
+                conn.execute(
+                    "INSERT INTO migration_family_mappings(project_id,source_id,kind,action,target_context,created_at,updated_at) VALUES(?,?,?,?,?,?,?) "
+                    "ON CONFLICT(project_id,source_id,kind) DO UPDATE SET action=excluded.action,target_context=excluded.target_context,updated_at=excluded.updated_at",
+                    (project_id, source_id, kind, action, target_context, now(), now()),
+                )
             conn.execute("UPDATE migration_projects SET updated_at=? WHERE id=?", (now(), project_id))
-        audit("migration-family-mapping", f"project={project_id} source={source_id} kind={kind} action={action}")
-        flash("Mapping bijgewerkt.", "success")
+        audit("migration-family-mapping", f"project={project_id} mappings={len(updates)}")
+        flash(f"{len(updates)} mappings bijgewerkt.", "success")
     except Exception as exc:
         flash(f"Mapping niet opgeslagen: {exc}", "error")
     return redirect(url_for("migration_project", project_id=project_id) + "#source-mapping")
@@ -5158,9 +5446,16 @@ def migration_review_open(project_id):
     if not project:
         return "Not found", 404
     try:
-        kind = request.form.get("kind", "").strip()
-        name = request.form.get("name", "").strip()
-        source_ref = request.form.get("source_ref", "").strip()
+        affected = request.form.get("affected", "").strip()
+        if affected:
+            parts = affected.split("||||", 2)
+            if len(parts) != 3:
+                raise MigrationError("Het reviewitem is ongeldig")
+            kind, name, source_ref = (part.strip() for part in parts)
+        else:
+            kind = request.form.get("kind", "").strip()
+            name = request.form.get("name", "").strip()
+            source_ref = request.form.get("source_ref", "").strip()
         if not name or kind not in MIGRATION_KIND_LABELS:
             raise MigrationError("Het reviewitem bestaat niet meer")
         with db() as conn:
