@@ -47,7 +47,7 @@ from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_sin
 from app.migration import (
     MIGRATION_FILTER_FIELDS, MIGRATION_FILTER_OPERATORS, MIGRATION_KIND_LABELS, MIGRATION_MAPPING_ACTIONS,
     MIGRATION_TOPOLOGY_KINDS, Address, AddressGroup, MigrationError, MigrationModel, PARSERS, Policy, Service, ServiceGroup,
-    apply_family_mappings, apply_merge_rules, apply_topology_mappings, apply_transform_rules, merge_inventory,
+    apply_family_mappings, apply_merge_rules, apply_topology_mappings, apply_transform_rules, auto_map_nat_topology, merge_inventory,
     merge_model_into_panos_xml, migration_api_plan, migration_base_xml, migration_best_practices,
     migration_discovery, migration_filter_inventory, migration_health_dashboard, migration_zone_names,
     item_selector, merge_member_names, migration_analysis, migration_item_semantic, migration_review_findings,
@@ -4269,6 +4269,48 @@ def migration_output_push_block(workspace_id: int):
     return output, ""
 
 
+def panos_management_invariants(xml_bytes: bytes) -> dict[str, object]:
+    """Extract access-critical values from a complete PAN-OS configuration."""
+    root = SafeET.fromstring(xml_bytes)
+    device = root.find("./devices/entry")
+    if device is None:
+        raise MigrationError("PAN-OS configuratie bevat geen device-root")
+    system = device.find("./deviceconfig/system")
+    values = {}
+    for path in (
+        "ip-address", "netmask", "default-gateway", "hostname",
+        "dns-setting/servers/primary", "dns-setting/servers/secondary",
+    ):
+        values[path] = (system.findtext(path) or "").strip() if system is not None else ""
+    administrators = {}
+    for entry in device.findall("./mgt-config/users/entry"):
+        name = entry.get("name", "")
+        if name:
+            administrators[name] = (entry.findtext("phash") or entry.findtext("password") or "").strip()
+    values["administrators"] = administrators
+    return values
+
+
+def wait_panos_job(endpoint: str, key: str, ctx, job_id: str, timeout: int = 300) -> dict[str, object]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        root = policy_api.require_success(
+            panos_api_post(endpoint, {
+                "type": "op", "cmd": f"<show><jobs><id>{html.escape(job_id)}</id></jobs></show>", "key": key,
+            }, ctx),
+            f"PAN-OS job {job_id} ophalen",
+        )
+        job = root.find(".//job")
+        if job is not None and (job.findtext("status") or "") == "FIN":
+            details = [value.strip() for value in job.itertext() if value.strip()]
+            return {
+                "status": "FIN", "result": job.findtext("result") or "",
+                "progress": job.findtext("progress") or "", "details": details[-100:],
+            }
+        time.sleep(2)
+    raise TimeoutError(f"PAN-OS job {job_id} duurde langer dan {timeout} seconden")
+
+
 @app.get("/config-workspaces/<int:workspace_id>/push-preview")
 @login_required
 def config_workspace_push_preview(workspace_id):
@@ -4311,7 +4353,20 @@ def config_workspace_push(workspace_id):
         expected = "panorama" if profile["target_type"] == "panorama" else "panos"
         parse_snapshot(path.read_bytes(), expected_kind=expected)
         _, endpoint, key, ctx = panos_profile_context(profile)
-        imported_name = f"ppf-workspace-{workspace_id}-{secrets.token_hex(4)}.xml"
+        if profile["target_type"] in {"panos", "panorama"}:
+            active_root = policy_api.require_success(
+                panos_api_post(endpoint, {"type": "config", "action": "show", "xpath": "/config", "key": key}, ctx),
+                "actieve managementconfiguratie ophalen",
+            )
+            active_config = active_root.find("./result/config")
+            if active_config is None:
+                raise RuntimeError("Firewall gaf geen actieve configuratie terug")
+            active_xml = normalized_config_xml(active_config)
+            if panos_management_invariants(active_xml) != panos_management_invariants(path.read_bytes()):
+                raise RuntimeError(
+                    "managementbescherming: IP, gateway, DNS, hostname of administratorconfig wijkt af"
+                )
+        imported_name = f"ppf-{workspace_id}-{secrets.token_hex(3)}.xml"[:31]
         import_path = path.with_name(imported_name)
         shutil.copyfile(path, import_path)
         import_path.chmod(0o600)
@@ -4327,8 +4382,24 @@ def config_workspace_push(workspace_id):
             )
         finally:
             import_path.unlink(missing_ok=True)
-        audit("config-workspace-loaded", f"workspace={workspace_id} profile={profile['name']} sha256={workspace['sha256']}")
-        flash("Volledige XML-configuratie via API naar de candidate geladen; er is niet gecommit.", "success")
+        validation_root = policy_api.require_success(
+            panos_api_post(endpoint, {"type": "op", "cmd": "<validate><full></full></validate>", "key": key}, ctx),
+            "PAN-OS candidatevalidatie starten",
+        )
+        validation_job = validation_root.findtext(".//job") or ""
+        validation = wait_panos_job(endpoint, key, ctx, validation_job) if validation_job else {
+            "status": "FIN", "result": "OK", "details": [],
+        }
+        audit(
+            "config-workspace-loaded",
+            f"workspace={workspace_id} profile={profile['name']} sha256={workspace['sha256']} validate={validation.get('result','')}",
+        )
+        if validation.get("result") != "OK":
+            details = [value for value in validation.get("details", []) if "invalid" in value.casefold()]
+            message = "; ".join(details[-8:]) or "PAN-OS meldde een ongeldige candidate"
+            flash(f"Candidate geladen maar validatie mislukt; er is niet gecommit: {message}", "error")
+        else:
+            flash("Candidate geladen en succesvol door PAN-OS gevalideerd; er is niet gecommit.", "success")
     except Exception as exc:
         flash(f"Volledige XML niet geladen: {exc}", "error")
     return redirect(url_for("index", policy_profile=workspace["profile_id"]) + "#policy-management")
@@ -5846,9 +5917,11 @@ def migration_merge_preview(project_id):
             scope = settings.get("device_group", "") if panorama else settings.get("vsys", "vsys1")
             base_xml = workspace_config_path(workspace).read_bytes() if workspace else migration_base_xml(model, scope, panorama)
             base_fingerprint = hashlib.sha256(base_xml).hexdigest()
+            nat_topology = auto_map_nat_topology(base_xml, model, scope, panorama)
             _, plan = merge_model_into_panos_xml(
                 base_xml, model, scope, panorama, settings.get("rulebase", "pre")
             )
+            plan["nat_topology"] = nat_topology
         if int(plan.get("create", 0)) == 0:
             raise MigrationError("De selectie veroorzaakt geen wijziging aan de target candidate")
         family_delta = []
@@ -5959,9 +6032,11 @@ def migration_merge_apply(draft_id):
             base_id = int(project["base_workspace_id"] or 0)
             current_base = workspace_row(base_id) if base_id else None
             preflight_xml = workspace_config_path(current_base).read_bytes() if current_base else migration_base_xml(model, scope, panorama)
+            nat_topology = auto_map_nat_topology(preflight_xml, model, scope, panorama)
             _, preflight_plan = merge_model_into_panos_xml(
                 preflight_xml, model, scope, panorama, settings.get("rulebase", "pre"), approved_reuses
             )
+            preflight_plan["nat_topology"] = nat_topology
             if int(preflight_plan.get("create", 0)) == 0:
                 raise MigrationError("De selectie veroorzaakt geen wijziging aan de target candidate")
             workspace_id, plan = create_merged_workspace(profile, project, model, approved_reuses)

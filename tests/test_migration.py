@@ -13,7 +13,7 @@ os.environ.setdefault("PPF_DATA_DIR", tempfile.mkdtemp(prefix="forge-migration-t
 os.environ.setdefault("PPF_SYSLOG_PORT", "55149")
 os.environ.setdefault("PPF_BOOTSTRAP_PASSWORD", "unit-test-bootstrap-password")
 
-from app.migration import Address, MigrationModel, PARSERS, MigrationError, apply_family_mappings, apply_merge_rules, apply_transform_rules, merge_inventory, merge_model_into_panos_xml, migration_analysis, migration_api_plan, migration_base_xml, migration_best_practices, migration_collision_report, migration_discovery, migration_filter_inventory, migration_health_dashboard, migration_review_findings, migration_zone_names, panos_candidate_analysis, parse_vendor, panos_fragment, reconcile_model, scm_items, set_panos_ha_mode
+from app.migration import Address, MigrationModel, PARSERS, MigrationError, apply_family_mappings, apply_merge_rules, apply_transform_rules, auto_map_nat_topology, merge_inventory, merge_model_into_panos_xml, migration_analysis, migration_api_plan, migration_base_xml, migration_best_practices, migration_collision_report, migration_discovery, migration_filter_inventory, migration_health_dashboard, migration_review_findings, migration_zone_names, panos_candidate_analysis, parse_vendor, panos_fragment, reconcile_model, scm_items, set_panos_ha_mode
 from app import main
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -628,6 +628,49 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         self.assertIn("missing-translation", nat.description)
         self.assertEqual(model.address_groups[0].members, ["server"])
         self.assertEqual(migration_analysis(model)["unresolved_references"], [])
+
+    def test_checkpoint_url_like_fqdns_and_group_any_become_review_items(self):
+        data = {"objects": [
+            {"type": "dns-domain", "uid": "bad", "name": "bad-url", "domain": "example.com/path"},
+            {"type": "dns-domain", "uid": "good", "name": "good-host", "domain": "host.example.com"},
+            {"type": "group", "uid": "group", "name": "mixed", "members": ["bad", "good", "any"]},
+        ]}
+        model = parse_vendor("checkpoint", json.dumps(data).encode(), "checkpoint.json")
+        self.assertEqual([item.name for item in model.addresses], ["good-host"])
+        self.assertEqual(model.address_groups[0].members, ["good-host"])
+        self.assertEqual(len(model.extras["migration_review_items"]), 1)
+        findings = {item["code"]: item for item in migration_review_findings(model)["findings"]}
+        self.assertEqual(findings["invalid-fqdn-review"]["count"], 1)
+
+    def test_checkpoint_predefined_applications_are_not_false_unresolved(self):
+        candidate = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase><security><rules><entry name="allow-update"><from><member>any</member></from><to><member>any</member></to><source><member>any</member></source><destination><member>any</member></destination><application><member>ms-update</member></application><service><member>application-default</member></service><action>allow</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'''
+        analysis = panos_candidate_analysis(candidate)
+        self.assertNotIn("ms-update", analysis["unresolved_application_references"])
+
+    def test_nat_topology_is_inferred_only_from_unambiguous_target(self):
+        target = b'''<config><devices><entry name="localhost.localdomain"><network><interface><ethernet><entry name="ethernet1/1"><layer3><ip><entry name="10.0.0.1/24"/></ip></layer3></entry><entry name="ethernet1/2"><layer3><ip><entry name="198.51.100.1/24"/></ip></layer3></entry></ethernet></interface><virtual-router><entry name="default"><routing-table><ip><static-route><entry name="default"><destination>0.0.0.0/0</destination><interface>ethernet1/2</interface></entry></static-route></ip></routing-table></entry></virtual-router></network><vsys><entry name="vsys1"><zone><entry name="Trust"><network><layer3><member>ethernet1/1</member></layer3></network></entry><entry name="Untrust"><network><layer3><member>ethernet1/2</member></layer3></network></entry></zone><rulebase/></entry></vsys></entry></devices></config>'''
+        model = MigrationModel(
+            "checkpoint", "source",
+            addresses=[Address("inside", "10.0.0.10/32")],
+            nat_rules=[main.Policy("outbound", policy_type="nat", source=["inside"], destination=["any"], service=["any"])],
+        )
+        result = auto_map_nat_topology(target, model)
+        self.assertEqual(result["mapped"], 1)
+        self.assertEqual(model.nat_rules[0].from_zones, ["Trust"])
+        self.assertEqual(model.nat_rules[0].to_zones, ["Untrust"])
+        self.assertEqual(model.nat_rules[0].to_interface, "ethernet1/2")
+
+    def test_unresolved_nat_topology_is_review_only_and_not_rendered(self):
+        target = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase/></entry></vsys></entry></devices></config>'''
+        model = MigrationModel(
+            "checkpoint", "source",
+            nat_rules=[main.Policy("needs-map", policy_type="nat", service=["any"])],
+        )
+        result = auto_map_nat_topology(target, model)
+        self.assertEqual(result["review"], 1)
+        self.assertEqual(model.nat_rules[0].mapping_action, "review")
+        fragment = panos_fragment(model)
+        self.assertNotIn(b'entry name="needs-map"', fragment)
 
     def test_migration_analysis_ignores_any_in_object_groups(self):
         model = MigrationModel(

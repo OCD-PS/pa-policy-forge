@@ -41,6 +41,27 @@ def cidr(value: str, mask: str | None = None) -> str:
         return value
 
 
+def valid_panos_fqdn(value: str) -> bool:
+    """Return whether a value is an exact hostname accepted by PAN-OS.
+
+    Check Point dns-domain objects can contain URL paths.  Those must remain
+    review items instead of becoming syntactically invalid PAN-OS FQDNs.
+    """
+    candidate = str(value or "").strip().rstrip(".")
+    if not candidate or len(candidate) > 253 or any(char in candidate for char in "/:@?#"):
+        return False
+    try:
+        ascii_name = candidate.encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    labels = ascii_name.split(".")
+    return len(labels) >= 2 and all(
+        1 <= len(label) <= 63
+        and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label)
+        for label in labels
+    )
+
+
 @dataclass
 class Address:
     name: str
@@ -742,6 +763,26 @@ class CheckPointParser(BaseParser):
                 remaining_unsupported.append(message)
         model.unsupported = remaining_unsupported
 
+        valid_addresses: list[Address] = []
+        invalid_fqdns: list[dict] = []
+        for item in model.addresses:
+            if item.value_type == "fqdn" and not valid_panos_fqdn(item.value):
+                invalid_fqdns.append({
+                    "name": item.name,
+                    "value": item.value,
+                    "source_ref": item.source_ref,
+                    "reason": "URL of ongeldige hostnaam kan niet als PAN-OS FQDN worden aangemaakt",
+                    "mapping_action": "review",
+                })
+                model.warnings.append(
+                    f"{item.source_ref}: FQDN {item.name} bevat geen geldige exacte hostnaam en is voor review uitgesloten"
+                )
+                continue
+            valid_addresses.append(item)
+        if invalid_fqdns:
+            model.extras.setdefault("migration_review_items", []).extend(invalid_fqdns)
+        model.addresses = valid_addresses
+
         address_names = {item.name for item in model.addresses}
         service_names = {item.name for item in model.services}
 
@@ -752,8 +793,14 @@ class CheckPointParser(BaseParser):
             changed = False
             kept_groups = []
             for group in model.address_groups:
-                removed = [value for value in group.members if not self._is_address_reference(value, known)]
-                members = [value for value in group.members if self._is_address_reference(value, known)]
+                removed = [
+                    value for value in group.members
+                    if value == "any" or not self._is_address_reference(value, known)
+                ]
+                members = [
+                    value for value in group.members
+                    if value != "any" and self._is_address_reference(value, known)
+                ]
                 if removed:
                     changed = True
                     model.warnings.append(
@@ -2136,7 +2183,10 @@ def migration_discovery(model: MigrationModel) -> dict:
     }
 
 
-def panos_candidate_analysis(content: bytes | str) -> dict:
+def panos_candidate_analysis(
+    content: bytes | str,
+    predefined_applications: Iterable[str] | None = None,
+) -> dict:
     """Validate references in the complete merged PAN-OS/Panorama candidate.
 
     Project analysis only covers selected migration sources. A target base can
@@ -2151,7 +2201,10 @@ def panos_candidate_analysis(content: bytes | str) -> dict:
     except Exception as exc:
         raise MigrationError(f"Ongeldige PAN-OS candidate XML: {exc}") from exc
 
-    application_definitions = {"any"}
+    application_definitions = {
+        "any", *CheckPointParser.PANOS_APPLICATION_ALIASES.values(),
+        *(str(value) for value in (predefined_applications or []) if str(value)),
+    }
     for path in (
         "./predefined/application/entry",
         "./predefined/application-container/entry",
@@ -2181,6 +2234,119 @@ def panos_candidate_analysis(content: bytes | str) -> dict:
         set(analysis["unresolved_references"]) | set(unresolved_applications)
     )
     return analysis
+
+
+def auto_map_nat_topology(
+    content: bytes | str,
+    model: MigrationModel,
+    scope: str = "vsys1",
+    panorama: bool = False,
+) -> dict[str, object]:
+    """Infer NAT zones/interfaces from target interface networks.
+
+    Only an unambiguous longest-prefix match is applied.  Rules without enough
+    evidence remain review-only and are excluded from generated PAN-OS output.
+    """
+    raw = content.encode() if isinstance(content, str) else content
+    root = SafeET.fromstring(raw)
+    result = {"mapped": 0, "review": 0, "details": []}
+    if panorama:
+        # Panorama topology belongs to a referenced template.  Reuse the
+        # existing parser's resolved zone/interface inventory when available;
+        # otherwise force explicit review instead of guessing a template.
+        zone_owners = root.findall(".//template/entry/config/devices/entry/vsys/entry")
+        network_owners = root.findall(".//template/entry/config/devices/entry")
+    else:
+        zone_owners = root.findall(f"./devices/entry/vsys/entry[@name='{scope}']")
+        network_owners = root.findall("./devices/entry")
+
+    interface_zones: dict[str, str] = {}
+    for owner in zone_owners:
+        for zone in owner.findall("./zone/entry"):
+            zone_name = zone.get("name", "")
+            for member in zone.findall("./network/*/member"):
+                if zone_name and (member.text or "").strip():
+                    interface_zones[(member.text or "").strip()] = zone_name
+
+    topology: list[tuple[ipaddress._BaseNetwork, str, str]] = []
+    default_targets: list[tuple[str, str]] = []
+    for owner in network_owners:
+        for entry in owner.findall("./network/interface/*/entry"):
+            base_name = entry.get("name", "")
+            candidates = [(base_name, entry)]
+            candidates.extend((unit.get("name", ""), unit) for unit in entry.findall(".//units/entry"))
+            for interface_name, node in candidates:
+                zone = interface_zones.get(interface_name, "")
+                if not zone:
+                    continue
+                for ip_entry in node.findall("./layer3/ip/entry") + node.findall("./ip/entry"):
+                    value = ip_entry.get("name", "")
+                    try:
+                        topology.append((ipaddress.ip_interface(value).network, zone, interface_name))
+                    except ValueError:
+                        continue
+        for route in owner.findall("./network/virtual-router/entry/routing-table/ip/static-route/entry"):
+            if (route.findtext("destination") or "") not in {"0.0.0.0/0", "::/0"}:
+                continue
+            interface_name = route.findtext("interface") or ""
+            zone = interface_zones.get(interface_name, "")
+            if zone and interface_name:
+                default_targets.append((zone, interface_name))
+
+    address_values = {item.name: item.value for item in model.addresses if item.value_type == "ip_netmask"}
+    groups = {item.name: item.members for item in model.address_groups}
+
+    def referenced_networks(values: list[str], seen: set[str] | None = None) -> list[ipaddress._BaseNetwork]:
+        seen = seen or set()
+        networks: list[ipaddress._BaseNetwork] = []
+        for value in values:
+            if value in {"any", "original"} or value in seen:
+                continue
+            if value in groups:
+                networks.extend(referenced_networks(groups[value], seen | {value}))
+                continue
+            candidate = address_values.get(value, value)
+            try:
+                networks.append(ipaddress.ip_network(candidate, strict=False))
+            except ValueError:
+                continue
+        return networks
+
+    def infer(values: list[str], allow_default: bool = False) -> tuple[str, str] | None:
+        matches: list[tuple[int, str, str]] = []
+        networks = referenced_networks(values)
+        for network in networks:
+            for target_network, zone, interface_name in topology:
+                if network.version == target_network.version and network.subnet_of(target_network):
+                    matches.append((target_network.prefixlen, zone, interface_name))
+        if matches:
+            longest = max(value[0] for value in matches)
+            choices = {(zone, interface_name) for prefix, zone, interface_name in matches if prefix == longest}
+            if len(choices) == 1:
+                return next(iter(choices))
+        defaults = set(default_targets) if allow_default else set()
+        return next(iter(defaults)) if len(defaults) == 1 else None
+
+    for rule in model.nat_rules:
+        source_target = infer(rule.source)
+        destination_target = infer(rule.destination, allow_default=True)
+        if source_target and rule.from_zones == ["any"]:
+            rule.from_zones = [source_target[0]]
+        if destination_target and rule.to_zones == ["any"]:
+            rule.to_zones = [destination_target[0]]
+            rule.to_interface = destination_target[1]
+        if "any" in rule.to_zones:
+            rule.mapping_action = "review"
+            rule.description = CheckPointParser._review_description(
+                rule.description,
+                ["NAT destinationzone/interface kon niet eenduidig uit de targettopologie worden afgeleid"],
+            )
+            result["review"] += 1
+            result["details"].append({"name": rule.name, "reason": "destination topology unresolved"})
+        else:
+            rule.mapping_action = "create"
+            result["mapped"] += 1
+    return result
 
 
 def migration_review_findings(model: MigrationModel) -> dict:
@@ -2239,6 +2405,19 @@ def migration_review_findings(model: MigrationModel) -> dict:
             affected,
         )
 
+    invalid_fqdns = model.extras.get("migration_review_items", [])
+    if invalid_fqdns:
+        add(
+            "critical", "invalid-fqdn-review", "URL-achtige FQDN-objecten nakijken",
+            "Deze bronwaarden bevatten een URL-pad of ongeldige hostnaam en zijn niet naar PAN-OS geschreven.",
+            len(invalid_fqdns),
+            [{
+                "kind": "addresses", "name": str(item.get("name", "")),
+                "source_ref": str(item.get("source_ref", "")),
+                "selector": str(item.get("name", "")),
+            } for item in invalid_fqdns],
+        )
+
     if model.unsupported:
         add(
             "critical", "unsupported-items", "Niet automatisch geconverteerd",
@@ -2259,6 +2438,18 @@ def migration_review_findings(model: MigrationModel) -> dict:
             "critical", "unsupported-actions", "Policy-acties niet gemapt",
             "Deze regels zijn veiligheidshalve disabled; kies voor elke regel bewust de correcte actie.",
             unsupported_actions, affected,
+        )
+
+    unresolved_nat_topology = [
+        rule for rule in model.nat_rules if rule.mapping_action == "review" or "any" in rule.to_zones
+    ]
+    if unresolved_nat_topology:
+        add(
+            "critical", "nat-topology-unresolved", "NAT-topologie niet eenduidig",
+            "Deze NAT-regels zijn niet naar de candidate geschreven totdat destinationzone en interface gemapt zijn.",
+            len(unresolved_nat_topology),
+            [review_item("nat_rules", rule) for rule in unresolved_nat_topology],
+            "topology-mapping",
         )
 
     policies = [*model.security_rules, *model.nat_rules]
@@ -2483,22 +2674,26 @@ def panos_fragment(model: MigrationModel, scope: str = "vsys1", panorama: bool =
         for value in values: ET.SubElement(parent,"member").text=value
     addresses=ET.SubElement(target,"address")
     for item in model.addresses:
+        if item.mapping_action in {"review", "ignore"}: continue
         e=ET.SubElement(addresses,"entry",{"name":item.name}); ET.SubElement(e,item.value_type.replace("_","-")).text=item.value
         if item.description: ET.SubElement(e,"description").text=item.description
         if item.tags: members(ET.SubElement(e,"tag"),item.tags)
     groups=ET.SubElement(target,"address-group")
     for item in model.address_groups:
+        if item.mapping_action in {"review", "ignore"}: continue
         e=ET.SubElement(groups,"entry",{"name":item.name}); members(ET.SubElement(e,"static"),item.members)
         if item.description: ET.SubElement(e,"description").text=item.description
         if item.tags: members(ET.SubElement(e,"tag"),item.tags)
     services=ET.SubElement(target,"service")
     for item in model.services:
+        if item.mapping_action in {"review", "ignore"}: continue
         e=ET.SubElement(services,"entry",{"name":item.name}); p=ET.SubElement(ET.SubElement(e,"protocol"),item.protocol); ET.SubElement(p,"port").text=item.port
         if item.source_port: ET.SubElement(p,"source-port").text=item.source_port
         if item.description: ET.SubElement(e,"description").text=item.description
         if item.tags: members(ET.SubElement(e,"tag"),item.tags)
     service_groups=ET.SubElement(target,"service-group")
     for item in model.service_groups:
+        if item.mapping_action in {"review", "ignore"}: continue
         e=ET.SubElement(service_groups,"entry",{"name":item.name}); members(ET.SubElement(e,"members"),item.members)
         if item.description: ET.SubElement(e,"description").text=item.description
         if item.tags: members(ET.SubElement(e,"tag"),item.tags)
@@ -2519,6 +2714,7 @@ def panos_fragment(model: MigrationModel, scope: str = "vsys1", panorama: bool =
     for kind,rules in (("security",model.security_rules),("nat",model.nat_rules)):
         root=ET.SubElement(ET.SubElement(rb,kind),"rules")
         for rule in rules:
+            if rule.mapping_action in {"review", "ignore"}: continue
             raw_xml=str(rule.original.get("xml", "")) if isinstance(rule.original,dict) else ""
             try: e=SafeET.fromstring(raw_xml) if raw_xml else ET.Element("entry")
             except Exception: e=ET.Element("entry")
@@ -2565,12 +2761,17 @@ def scm_items(model: MigrationModel) -> list[dict]:
             "target_context": str(getattr(item, "target_context", "")),
             "mapping_action": str(getattr(item, "mapping_action", "create") or "create"),
         }
-    for item in model.addresses: items.append({"kind":"addresses","name":item.name,"payload":{"name":item.name,item.value_type:item.value,**({"description":item.description} if item.description else {})},**route(item)})
-    for item in model.address_groups: items.append({"kind":"address-groups","name":item.name,"payload":{"name":item.name,"static":item.members},**route(item)})
-    for item in model.services: items.append({"kind":"services","name":item.name,"payload":{"name":item.name,"protocol":{item.protocol:{"port":item.port}}},**route(item)})
-    for item in model.service_groups: items.append({"kind":"service-groups","name":item.name,"payload":{"name":item.name,"members":item.members},**route(item)})
+    for item in model.addresses:
+        if item.mapping_action not in {"review", "ignore"}: items.append({"kind":"addresses","name":item.name,"payload":{"name":item.name,item.value_type:item.value,**({"description":item.description} if item.description else {})},**route(item)})
+    for item in model.address_groups:
+        if item.mapping_action not in {"review", "ignore"}: items.append({"kind":"address-groups","name":item.name,"payload":{"name":item.name,"static":item.members},**route(item)})
+    for item in model.services:
+        if item.mapping_action not in {"review", "ignore"}: items.append({"kind":"services","name":item.name,"payload":{"name":item.name,"protocol":{item.protocol:{"port":item.port}}},**route(item)})
+    for item in model.service_groups:
+        if item.mapping_action not in {"review", "ignore"}: items.append({"kind":"service-groups","name":item.name,"payload":{"name":item.name,"members":item.members},**route(item)})
     for kind,rules in (("security",model.security_rules),("nat",model.nat_rules)):
         for rule in rules:
+            if rule.mapping_action in {"review", "ignore"}: continue
             payload={"name":rule.name,"from":rule.from_zones,"to":rule.to_zones,"source":rule.source,"destination":rule.destination,"service":rule.service if kind=="security" else (rule.service or ["any"])[0],"disabled":rule.disabled}
             if kind=="security": payload.update({"application":rule.application,"action":rule.action})
             else: payload.update({"nat_type":rule.nat_type,"to_interface":rule.to_interface})
