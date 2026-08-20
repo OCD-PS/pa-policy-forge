@@ -7,7 +7,7 @@ sys.path.insert(0, str(ROOT))
 
 from app.offline_config import (
     OfflineConfigError, apply_configuration_changes, apply_object_changes, available_scopes, available_templates,
-    configuration_inventory, configuration_records, parse_snapshot,
+    configuration_inventory, configuration_records, create_basic_network_entry, parse_snapshot,
     delete_policies_from_snapshot, insert_policy_in_snapshot, move_policies_in_snapshot,
     object_create_record, object_fingerprint, policy_create_record, policy_fingerprint, render_set_commands, replace_policy_in_snapshot,
     referenced_template, scoped_objects, scoped_policies,
@@ -23,6 +23,19 @@ INHERITED = b'''<config version="12.1"><shared><address><entry name="shared-a"><
 
 
 class OfflineConfigTests(unittest.TestCase):
+    def test_empty_network_containers_are_not_fake_records_and_can_be_bootstrapped(self):
+        source = b'<config><devices><entry name="localhost.localdomain"><network><interface /></network><vsys><entry name="vsys1"><zone /></entry></vsys></entry></devices></config>'
+        _, interfaces = configuration_records(source, "vsys1", "", "network", "interfaces")
+        _, zones = configuration_records(source, "vsys1", "", "network", "zones")
+        self.assertEqual(interfaces, [])
+        self.assertEqual(zones, [])
+        created = create_basic_network_entry(source, "vsys1", "", "interfaces", "ethernet1/1")
+        created = create_basic_network_entry(created, "vsys1", "", "zones", "Trust")
+        _, interfaces = configuration_records(created, "vsys1", "", "network", "interfaces")
+        _, zones = configuration_records(created, "vsys1", "", "network", "zones")
+        self.assertEqual([item["name"] for item in interfaces], ["ethernet1/1"])
+        self.assertEqual([item["name"] for item in zones], ["Trust"])
+
     def test_log_forwarding_profiles_and_destinations_are_structured(self):
         xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><tag><entry name="investigate"/></tag><server-profile><syslog><entry name="siem"/></syslog></server-profile><log-settings><profiles><entry name="forward-all"><description>SIEM</description><enhanced-application-logging>yes</enhanced-application-logging><match-list><entry name="traffic"><log-type>traffic</log-type><filter>(addr.src in 10.0.0.0/8)</filter><send-syslog><member>siem</member></send-syslog><actions><entry name="tag-source"><type><tagging><action>add-tag</action><target>source-address</target><registration>localhost</registration><timeout>60</timeout><tags><member>investigate</member></tags></tagging></type></entry></actions></entry></match-list></entry></profiles></log-settings></entry></vsys></entry></devices></config>'''
         _, profiles = scoped_objects(xml, "vsys1", "log-forwarding")

@@ -1172,7 +1172,7 @@ def configuration_records(
         for section_node in sections:
             entries = _top_level_entries(section_node)
             targets = list(entries)
-            if not entries or _has_nonentry_leaf(section_node):
+            if _has_nonentry_leaf(section_node):
                 targets.insert(0, (section_node, []))
             for entry, labels in targets:
                 locator = _element_locator(root, entry, parents)
@@ -1269,6 +1269,82 @@ def apply_configuration_changes(xml_bytes: bytes, changes: list[dict]) -> bytes:
             parent.remove(current); parent.insert(index, replacement)
         else:
             root = replacement
+    return normalized_config_xml(root)
+
+
+def create_basic_network_entry(
+    xml_bytes: bytes, scope: str, template: str, section: str, name: str,
+    interface_type: str = "ethernet", zone_type: str = "layer3",
+) -> bytes:
+    """Create the first interface/zone when an imported config has no seed row.
+
+    Existing entries continue to use the generic PAN-OS field editor.  This
+    narrow bootstrap path exists because duplicating an existing XML entry is
+    impossible when a third-party migration starts with an empty network tree.
+    """
+    clean_name = str(name or "").strip()
+    if not clean_name or len(clean_name) > 127:
+        raise OfflineConfigError("Name is verplicht en mag maximaal 127 tekens bevatten")
+    root, snapshot = parse_snapshot(xml_bytes)
+
+    def ensure(parent: ET.Element, *tags: str) -> ET.Element:
+        current = parent
+        for tag in tags:
+            child = current.find(tag)
+            if child is None:
+                child = ET.SubElement(current, tag)
+            current = child
+        return current
+
+    device = root.find("./devices/entry")
+    if device is None:
+        devices = ensure(root, "devices")
+        device = ET.SubElement(devices, "entry", {"name": "localhost.localdomain"})
+    template_device = device
+    if snapshot.kind == "panorama":
+        template_entry = next(
+            (item for item in device.findall("./template/entry") if item.get("name") == template),
+            None,
+        )
+        if template_entry is None:
+            raise OfflineConfigError("Kies of maak eerst een Panorama-template")
+        config = ensure(template_entry, "config", "devices")
+        template_device = config.find("entry")
+        if template_device is None:
+            template_device = ET.SubElement(config, "entry", {"name": "localhost.localdomain"})
+
+    if section == "interfaces":
+        if interface_type not in {"ethernet", "aggregate-ethernet", "loopback", "tunnel", "vlan"}:
+            raise OfflineConfigError("Ongeldig interfacetype")
+        parent = ensure(template_device, "network", "interface", interface_type)
+        if any(item.get("name") == clean_name for item in parent.findall("entry")):
+            raise OfflineConfigError(f"Interface {clean_name} bestaat al")
+        entry = ET.SubElement(parent, "entry", {"name": clean_name})
+        if interface_type in {"ethernet", "aggregate-ethernet"}:
+            ET.SubElement(entry, "layer3")
+        ET.SubElement(entry, "comment")
+    elif section == "zones":
+        if zone_type not in {"layer3", "layer2", "virtual-wire", "tap", "tunnel"}:
+            raise OfflineConfigError("Ongeldig zonetype")
+        if snapshot.kind == "panorama":
+            vsys_parent = ensure(template_device, "vsys")
+            scope_entry = next((item for item in vsys_parent.findall("entry") if item.get("name") == scope), None)
+            if scope_entry is None:
+                scope_entry = ET.SubElement(vsys_parent, "entry", {"name": scope or "vsys1"})
+        else:
+            scope_entry = _scope_root(root, snapshot, scope)
+            if scope_entry is None:
+                raise OfflineConfigError("De gekozen VSYS bestaat niet")
+        parent = ensure(scope_entry, "zone")
+        if any(item.get("name") == clean_name for item in parent.findall("entry")):
+            raise OfflineConfigError(f"Zone {clean_name} bestaat al")
+        entry = ET.SubElement(parent, "entry", {"name": clean_name})
+        network = ET.SubElement(entry, "network")
+        ET.SubElement(network, zone_type)
+        enabled = ET.SubElement(entry, "enable-user-identification")
+        enabled.text = "no"
+    else:
+        raise OfflineConfigError("Bootstrap-aanmaak wordt alleen voor interfaces en zones ondersteund")
     return normalized_config_xml(root)
 
 

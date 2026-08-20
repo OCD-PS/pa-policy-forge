@@ -57,6 +57,7 @@ from app.migration import (
 from app.offline_config import (
     OBJECT_NODES, POLICY_NODES, OfflineConfigError, available_scopes, available_templates,
     apply_configuration_changes, apply_object_changes, configuration_inventory,
+    create_basic_network_entry,
     configuration_records as scoped_configuration_records,
     normalized_config_xml, parse_snapshot,
     object_create_record, policy_create_record,
@@ -4032,6 +4033,46 @@ def _store_workspace_configuration_version(workspace, context: dict, changes: li
     return new_id
 
 
+@app.post("/config-workspaces/<int:workspace_id>/configuration/create-basic")
+@login_required
+def config_workspace_configuration_create_basic(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    context = {
+        "workspace_id": workspace_id, "scope": request.form.get("scope", ""),
+        "template": request.form.get("template", ""),
+        "view": request.form.get("workspace_view", "network"),
+        "section": request.form.get("config_section", ""),
+        "operation": "create",
+    }
+    try:
+        if context["view"] != "network" or context["section"] not in {"interfaces", "zones"}:
+            raise OfflineConfigError("Alleen interfaces en zones kunnen via deze actie worden aangemaakt")
+        new_xml = create_basic_network_entry(
+            workspace_config_path(workspace).read_bytes(), context["scope"], context["template"],
+            context["section"], request.form.get("name", ""),
+            request.form.get("interface_type", "ethernet"), request.form.get("zone_type", "layer3"),
+        )
+        with db() as conn:
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+        if not profile:
+            raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
+        new_id = store_config_workspace(
+            profile, f"{workspace['name']} · network add {now()}", workspace["original_name"],
+            new_xml, workspace_version_source(workspace),
+        )
+        if not advance_migration_staging_workspace(workspace["id"], new_id):
+            advance_migration_output_workspace(workspace["id"], new_id, new_xml)
+            set_active_config_workspace(workspace["profile_id"], new_id)
+        audit("config-workspace-configuration-created", f"source={workspace_id} workspace={new_id} section={context['section']}")
+        flash(f"{context['section'].replace('-', ' ').title()} toegevoegd.", "success")
+        return _workspace_config_redirect(new_id, context)
+    except Exception as exc:
+        flash(f"Configuratie-item niet toegevoegd: {exc}", "error")
+        return _workspace_config_redirect(workspace_id, context)
+
+
 @app.post("/config-workspaces/<int:workspace_id>/configuration/preview")
 @login_required
 def config_workspace_configuration_preview(workspace_id):
@@ -4863,7 +4904,10 @@ def migration_project(project_id):
     with db() as conn:
         source_rows = conn.execute("SELECT * FROM migration_sources WHERE project_id=? ORDER BY id", (project_id,)).fetchall()
         profiles = conn.execute("SELECT id,name,target_type FROM profiles WHERE system=0 ORDER BY name").fetchall()
-        workspaces = conn.execute("SELECT id,name,source,created_at FROM config_workspaces WHERE profile_id=? ORDER BY id DESC", (project["target_profile_id"],)).fetchall()
+        workspace_rows = conn.execute(
+            "SELECT id,name,source,original_name,created_at FROM config_workspaces "
+            "WHERE profile_id=? ORDER BY id DESC", (project["target_profile_id"],)
+        ).fetchall()
         output_rows = conn.execute("SELECT * FROM migration_outputs WHERE project_id=? ORDER BY id DESC", (project_id,)).fetchall()
         output_resolution_rows = conn.execute(
             "SELECT migration_output_resolutions.* FROM migration_output_resolutions "
@@ -4872,6 +4916,15 @@ def migration_project(project_id):
             (project_id,),
         ).fetchall()
         profile = conn.execute("SELECT * FROM profiles WHERE id=?", (project["target_profile_id"],)).fetchone()
+    workspaces = []
+    seen_workspace_families = set()
+    selected_base_id = int(project["base_workspace_id"] or 0)
+    for row in workspace_rows:
+        family = str(row["original_name"] or row["name"]).casefold()
+        if int(row["id"]) != selected_base_id and family in seen_workspace_families:
+            continue
+        workspaces.append(row)
+        seen_workspace_families.add(family)
     family_mappings = ensure_migration_family_mappings(project_id, source_rows)
     sources = []
     for row in source_rows:
