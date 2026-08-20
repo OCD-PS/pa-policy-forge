@@ -1180,6 +1180,13 @@ def configuration_records(
                 name = entry.get("name") or section.replace("-", " ").title()
                 kind = " / ".join(labels) if labels else section_node.tag.replace("-", " ").title()
                 fields = _config_edit_fields(entry, skip_nested_entries=entry is section_node and bool(entries))
+                if entry is section_node and not any(
+                    field.get("kind") == "protected"
+                    or (field.get("kind") == "members" and field.get("values"))
+                    or str(field.get("value", "")).strip()
+                    for field in fields
+                ):
+                    continue
                 summary_values = []
                 for field in fields:
                     if field["kind"] == "members":

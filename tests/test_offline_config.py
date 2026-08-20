@@ -24,7 +24,7 @@ INHERITED = b'''<config version="12.1"><shared><address><entry name="shared-a"><
 
 class OfflineConfigTests(unittest.TestCase):
     def test_empty_network_containers_are_not_fake_records_and_can_be_bootstrapped(self):
-        source = b'<config><devices><entry name="localhost.localdomain"><network><interface /></network><vsys><entry name="vsys1"><zone /></entry></vsys></entry></devices></config>'
+        source = b'<config><devices><entry name="localhost.localdomain"><network><interface><ethernet /></interface></network><vsys><entry name="vsys1"><zone /></entry></vsys></entry></devices></config>'
         _, interfaces = configuration_records(source, "vsys1", "", "network", "interfaces")
         _, zones = configuration_records(source, "vsys1", "", "network", "zones")
         self.assertEqual(interfaces, [])
