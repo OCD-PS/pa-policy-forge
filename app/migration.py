@@ -540,38 +540,59 @@ class CheckPointParser(BaseParser):
         })
 
     def parse_bytes(self, content: bytes, source_name: str) -> MigrationModel:
-        """Parse a Check Point show-package archive with one global UID dictionary."""
-        try:
-            archive = tarfile.open(fileobj=io.BytesIO(content), mode="r:*")
-        except tarfile.TarError as exc:
-            raise MigrationError(f"Ongeldig Check Point show-package archief: {exc}") from exc
+        """Parse a Check Point show-package, including a safely nested project archive."""
         documents: list[tuple[str, object]] = []
         total_size = 0
-        with archive:
-            members = archive.getmembers()
-            if len(members) > 500:
-                raise MigrationError("Check Point archief bevat te veel bestanden")
-            for member in members:
-                path = PurePosixPath(member.name)
-                if path.is_absolute() or ".." in path.parts:
-                    raise MigrationError(f"Onveilig pad in Check Point archief: {member.name}")
-                if member.issym() or member.islnk() or member.isdev():
-                    raise MigrationError(f"Onveilig bestandstype in Check Point archief: {member.name}")
-                if not member.isfile() or path.suffix.casefold() != ".json":
-                    continue
-                if member.size > 25 * 1024 * 1024:
-                    raise MigrationError(f"Check Point JSON is te groot: {member.name}")
-                total_size += member.size
-                if total_size > 100 * 1024 * 1024:
-                    raise MigrationError("Uitgepakte Check Point JSON is groter dan 100 MiB")
-                stream = archive.extractfile(member)
-                if stream is None:
-                    continue
-                try:
-                    document = json.loads(stream.read().decode("utf-8-sig"))
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise MigrationError(f"Ongeldige JSON in {member.name}: {exc}") from exc
-                documents.append((member.name, document))
+        member_count = 0
+
+        def read_archive(payload: bytes, archive_name: str, depth: int = 0) -> None:
+            nonlocal total_size, member_count
+            if depth > 3:
+                raise MigrationError("Check Point archief is te diep genest")
+            try:
+                archive = tarfile.open(fileobj=io.BytesIO(payload), mode="r:*")
+            except tarfile.TarError as exc:
+                raise MigrationError(f"Ongeldig Check Point archief {archive_name}: {exc}") from exc
+            with archive:
+                members = archive.getmembers()
+                member_count += len(members)
+                if member_count > 1000:
+                    raise MigrationError("Check Point archief bevat te veel bestanden")
+                for member in members:
+                    path = PurePosixPath(member.name)
+                    qualified_name = f"{archive_name}!/{member.name}"
+                    if path.is_absolute() or ".." in path.parts:
+                        raise MigrationError(f"Onveilig pad in Check Point archief: {qualified_name}")
+                    if member.issym() or member.islnk() or member.isdev():
+                        raise MigrationError(f"Onveilig bestandstype in Check Point archief: {qualified_name}")
+                    if not member.isfile():
+                        continue
+                    suffix = path.suffix.casefold()
+                    if suffix not in {".json", ".tar"}:
+                        continue
+                    per_file_limit = 25 * 1024 * 1024 if suffix == ".json" else 100 * 1024 * 1024
+                    if member.size > per_file_limit:
+                        label = "JSON" if suffix == ".json" else "genest archief"
+                        raise MigrationError(f"Check Point {label} is te groot: {qualified_name}")
+                    total_size += member.size
+                    if total_size > 100 * 1024 * 1024:
+                        raise MigrationError("Uitgepakte Check Point data is groter dan 100 MiB")
+                    stream = archive.extractfile(member)
+                    if stream is None:
+                        continue
+                    raw = stream.read(per_file_limit + 1)
+                    if len(raw) > per_file_limit:
+                        raise MigrationError(f"Check Point bestand is te groot: {qualified_name}")
+                    if suffix == ".tar":
+                        read_archive(raw, qualified_name, depth + 1)
+                        continue
+                    try:
+                        document = json.loads(raw.decode("utf-8-sig"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise MigrationError(f"Ongeldige JSON in {qualified_name}: {exc}") from exc
+                    documents.append((qualified_name, document))
+
+        read_archive(content, source_name)
         if not documents:
             raise MigrationError("Check Point archief bevat geen JSON-export")
 

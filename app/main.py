@@ -4597,7 +4597,12 @@ def migration_home():
             (session.get("username", ""), session.get("username", "")),
         ).fetchall()
         profiles = conn.execute("SELECT id,name,target_type FROM profiles WHERE system=0 ORDER BY name").fetchall()
-    return render_template("migration.html", projects=projects, profiles=profiles, parsers=PARSERS, project=None)
+    selected_target_id = request.args.get("target_profile_id", "")
+    draft_project_name = request.args.get("draft_name", "")[:120]
+    return render_template(
+        "migration.html", projects=projects, profiles=profiles, parsers=PARSERS, project=None,
+        selected_target_id=selected_target_id, draft_project_name=draft_project_name,
+    )
 
 
 @app.get("/migration/projects/<int:project_id>/export-project")
@@ -4835,6 +4840,84 @@ def migration_project_create():
     except Exception as exc:
         flash(f"Migratieproject niet aangemaakt: {exc}", "error")
         return redirect(url_for("migration_home"))
+
+
+@app.post("/migration/targets")
+@login_required
+def migration_target_create():
+    """Create a real push target without leaving the migration project screen."""
+    draft_name = request.form.get("draft_project_name", "").strip()[:120]
+    try:
+        name = request.form.get("name", "").strip()
+        target_type = request.form.get("target_type", "")
+        if not name:
+            raise MigrationError("Targetnaam is verplicht")
+        if target_type not in TARGET_TYPES:
+            raise MigrationError("Onbekend targettype")
+        rulebase = request.form.get("rulebase", "pre")
+        if rulebase not in {"pre", "post"}:
+            raise MigrationError("Rulebase moet pre of post zijn")
+
+        settings = {
+            "zones": {}, "min_sessions": 3, "disabled": False, "tags": ["AI builder"],
+            "global_ping": False, "global_dns": False, "endpoint": "", "vsys": "vsys1",
+            "device_group": "", "rulebase": rulebase, "folder": "", "snippet": "",
+            "device": "", "object_folder": "", "log_profile": "", "passive_serial": "",
+            "passive_source_ip": "",
+        }
+        credentials = {}
+        if target_type == "scm":
+            scope_type = request.form.get("scm_scope_type", "folder")
+            if scope_type not in {"folder", "snippet", "device"}:
+                raise MigrationError("Onbekende SCM-scope")
+            scope_value = request.form.get(scope_type, "").strip()
+            if not scope_value:
+                raise MigrationError(f"SCM {scope_type} is verplicht")
+            settings[scope_type] = scope_value
+            credentials = {
+                key: request.form.get(key, "").strip()
+                for key in ("client_id", "client_secret", "tsg_id")
+            }
+            if not all(credentials.values()):
+                raise MigrationError("SCM client ID, client secret en TSG ID zijn verplicht")
+        else:
+            settings["endpoint"] = validate_panos_endpoint(request.form.get("endpoint", ""))
+            credentials = {
+                key: request.form.get(key, "").strip() for key in ("username", "password")
+            }
+            if not all(credentials.values()):
+                raise MigrationError("Username en password zijn verplicht")
+            if target_type == "panorama":
+                settings["device_group"] = request.form.get("device_group", "").strip()
+                if not settings["device_group"]:
+                    raise MigrationError("Device group is verplicht voor Panorama")
+            else:
+                settings["vsys"] = request.form.get("vsys", "vsys1").strip() or "vsys1"
+
+        timestamp = now()
+        with db() as conn:
+            duplicate = conn.execute(
+                "SELECT id FROM profiles WHERE system=0 AND lower(name)=lower(?)", (name,)
+            ).fetchone()
+            if duplicate:
+                raise MigrationError("Er bestaat al een target met deze naam")
+            profile_id = int(conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    name, 1, "", "", target_type, json.dumps(settings),
+                    fernet.encrypt(json.dumps(credentials).encode()), timestamp, timestamp,
+                ),
+            ).lastrowid)
+        invalidate_profile_caches(profile_id)
+        audit("migration-target-created", f"profile={profile_id} name={name} type={target_type}")
+        flash("Push target aangemaakt en geselecteerd.", "success")
+        return redirect(url_for(
+            "migration_home", target_profile_id=profile_id, draft_name=draft_name
+        ))
+    except Exception as exc:
+        flash(f"Push target niet aangemaakt: {exc}", "error")
+        return redirect(url_for("migration_home", draft_name=draft_name))
 
 
 @app.post("/migration/projects/<int:project_id>/target")

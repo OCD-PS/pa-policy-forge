@@ -580,6 +580,31 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         with self.assertRaises(MigrationError):
             parse_vendor("checkpoint", payload.getvalue(), "show_package.tar")
 
+    def test_checkpoint_project_archive_discovers_nested_show_package_tar(self):
+        inner = io.BytesIO()
+        document = {
+            "objects": [
+                {"uid": "host-1", "type": "host", "name": "Nested Host", "ipv4-address": "192.0.2.44"},
+            ]
+        }
+        with tarfile.open(fileobj=inner, mode="w") as archive:
+            raw = json.dumps(document).encode()
+            info = tarfile.TarInfo("Network-Management_server.json")
+            info.size = len(raw)
+            archive.addfile(info, io.BytesIO(raw))
+        outer = io.BytesIO()
+        with tarfile.open(fileobj=outer, mode="w") as archive:
+            nested = inner.getvalue()
+            info = tarfile.TarInfo("Expedition-Project/Checkpoint/show_package.tar")
+            info.size = len(nested)
+            archive.addfile(info, io.BytesIO(nested))
+            unrelated = b"<config/>"
+            info = tarfile.TarInfo("Expedition-Project/Palo Alto/firewall.xml")
+            info.size = len(unrelated)
+            archive.addfile(info, io.BytesIO(unrelated))
+        model = parse_vendor("checkpoint", outer.getvalue(), "Expedition-Project.tar")
+        self.assertEqual([(item.name, item.value) for item in model.addresses], [("Nested-Host", "192.0.2.44/32")])
+
     def test_checkpoint_dns_hosts_and_applications_map_to_panos_families(self):
         administrative_domain = {"uid": "domain-1", "name": "SMC User", "domain-type": "domain"}
         data = {
@@ -1008,7 +1033,41 @@ end''', "atlas-a.conf")
         self.assertEqual(response.status_code, 200)
         page = response.get_data(as_text=True)
         self.assertIn("Migratieprojecten", page)
+        self.assertIn("+ Push target", page)
+        self.assertIn("Nieuw push target", page)
         self.assertNotIn("Expedition-inspired", page)
+
+    def test_migration_target_can_be_created_from_project_dialog(self):
+        client = main.app.test_client()
+        with main.app.test_request_context("/", base_url="https://forge.test"):
+            serializer = main.app.session_interface.get_signing_serializer(main.app)
+            client.set_cookie(
+                main.app.config["SESSION_COOKIE_NAME"],
+                serializer.dumps({"user_id": 1, "username": "admin", "csrf": "migration-test-csrf"}),
+                domain="forge.test", secure=True,
+            )
+        response = client.post(
+            "/migration/targets", base_url="https://forge.test",
+            data={
+                "csrf": "migration-test-csrf", "draft_project_name": "Customer draft",
+                "name": "Migration dialog PAN-OS", "target_type": "panos", "rulebase": "pre",
+                "endpoint": "https://192.0.2.10", "vsys": "vsys1",
+                "username": "api-user", "password": "not-a-real-password",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("draft_name=Customer+draft", response.headers["Location"])
+        with main.db() as conn:
+            profile = conn.execute(
+                "SELECT * FROM profiles WHERE name=?", ("Migration dialog PAN-OS",)
+            ).fetchone()
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile["target_type"], "panos")
+        self.assertEqual(json.loads(profile["settings_json"])["vsys"], "vsys1")
+        self.assertTrue(profile["secret_blob"])
+        page = client.get(response.headers["Location"], base_url="https://forge.test").get_data(as_text=True)
+        self.assertIn('value="Customer draft"', page)
+        self.assertIn(f'value="{profile["id"]}" selected', page)
 
     def test_migration_project_renders_refreshed_catalogs(self):
         stamp = main.now()
@@ -1038,8 +1097,8 @@ end''', "atlas-a.conf")
         response = client.get(f"/migration/projects/{project_id}", base_url="https://forge.test")
         self.assertEqual(response.status_code, 200)
         page = response.get_data(as_text=True)
-        self.assertIn("Applications", page)
-        self.assertIn("· 1", page)
+        self.assertNotIn("Migration Control Center", page)
+        self.assertNotIn("Catalogi en discovery", page)
 
     def test_candidate_apply_is_blocked_server_side_without_review_acknowledgement(self):
         stamp = main.now()
@@ -1536,13 +1595,13 @@ allow-web,security,,Trust,Untrust,any,web,ssl,application-default,allow
 
         page = client.get(f"/migration/projects/{project_id}", base_url="https://forge.test").get_data(as_text=True)
         self.assertIn("Palo Alto PAN-OS / Panorama XML", page)
-        self.assertIn("Migration Control Center", page)
-        self.assertIn("Bron- en doelmapping", page)
-        self.assertIn("Interfaces, zones en routing mappen", page)
-        self.assertIn("Filters en selecties", page)
-        self.assertIn("Bulk refactor", page)
-        self.assertIn("Catalogi en discovery", page)
-        self.assertIn("Snippets, rollen en audit", page)
+        self.assertNotIn("Migration Control Center", page)
+        self.assertNotIn("Bron- en doelmapping", page)
+        self.assertNotIn("Interfaces, zones en routing mappen", page)
+        self.assertNotIn("Filters en selecties", page)
+        self.assertNotIn("Bulk refactor", page)
+        self.assertNotIn("Catalogi en discovery", page)
+        self.assertNotIn("Snippets, rollen en audit", page)
         self.assertIn('class="migration-kind-menu"', page)
         self.assertNotIn('class="migration-kind-menu" open', page)
         self.assertIn("<summary>Configuratie</summary>", page)

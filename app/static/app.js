@@ -1109,6 +1109,23 @@
     });
   }
 
+  function setupMigrationTargetDialog() {
+    var dialog = document.querySelector("[data-migration-target-dialog]");
+    var open = document.querySelector("[data-migration-target-open]");
+    if (!dialog || !open) return;
+    var projectName = document.querySelector("[data-migration-project-name]");
+    var draft = dialog.querySelector("[data-migration-target-draft]");
+    open.addEventListener("click", function () {
+      if (draft) draft.value = projectName ? projectName.value : "";
+      dialog.showModal();
+    });
+    var close = dialog.querySelector("[data-migration-target-close]");
+    if (close) close.addEventListener("click", function () { dialog.close(); });
+    dialog.addEventListener("click", function (event) {
+      if (event.target === dialog) dialog.close();
+    });
+  }
+
   document.addEventListener("DOMContentLoaded", function () {
     function runSetup(name, callback) {
       try { callback(); }
@@ -1127,6 +1144,7 @@
     runSetup("migration-filter-types", setupMigrationFilterTypes);
     runSetup("migration-zone-mapping", setupMigrationZoneMapping);
     runSetup("targets", setupConditionalTargets);
+    runSetup("migration-target-dialog", setupMigrationTargetDialog);
     runSetup("push-options", setupPushOptions);
     runSetup("policy-management", setupPolicyManagement);
     runSetup("object-management", setupObjectManagement);
