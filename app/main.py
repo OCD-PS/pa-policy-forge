@@ -50,7 +50,7 @@ from app.migration import (
     apply_family_mappings, apply_merge_rules, apply_topology_mappings, apply_transform_rules, auto_map_nat_topology, merge_inventory,
     merge_model_into_panos_xml, migration_api_plan, migration_base_xml, migration_best_practices,
     migration_discovery, migration_filter_inventory, migration_health_dashboard, migration_zone_names,
-    item_selector, merge_member_names, migration_analysis, migration_item_semantic, migration_review_findings,
+    clean_name, item_selector, merge_member_names, migration_analysis, migration_item_semantic, migration_review_findings,
     migration_search, model_collections, panos_candidate_analysis, panos_fragment, parse_vendor, raw_item_payload,
     reconcile_model, scm_items,
 )
@@ -5083,8 +5083,16 @@ def migration_project(project_id):
     for kind,items in model_collections(combined).items():
         for item in items:
             raw=item.__dict__ if hasattr(item,"__dict__") else item
-            row={"kind":kind,"name":str(raw.get("name","")),"source_ref":str(raw.get("source_ref","")),"selector":item_selector(raw)}
-            if kind in MIGRATION_TOPOLOGY_KINDS:
+            row={
+                "kind":kind,"name":str(raw.get("name","")),
+                "source_ref":str(raw.get("source_ref","")),"selector":item_selector(raw),
+                "source_vendor":str(raw.get("source_vendor","")),
+                "networks":list(raw.get("source_networks",[])),
+                "addresses":list(raw.get("source_addresses",[])),
+                "topology_role":str(raw.get("topology_role","")),
+                "suggested_zone":str(raw.get("suggested_zone","")),
+            }
+            if kind in MIGRATION_TOPOLOGY_KINDS and not raw.get("auto_generated"):
                 topology_items.append(row)
             if kind == transform_kind and (
                 not transform_query
@@ -5136,6 +5144,11 @@ def migration_project(project_id):
     mappings_by_source=defaultdict(list)
     for mapping in family_mappings: mappings_by_source[int(mapping["source_id"])].append(mapping)
     topology_rules=[rule for rule in transform_rules if str(rule["operation"]).startswith("topology_")]
+    interface_zone_rules={
+        str(rule["selector"]): json.loads(rule["value"] or "{}")
+        for rule in transform_rules
+        if rule["operation"] == "set_interface_zone"
+    }
     topology_targets={
         "zones":sorted({str(item.get("name","")) for item in target_model.zones if str(item.get("name",""))}),
         "interfaces":sorted({str(item.get("name","")) for item in target_model.interfaces if str(item.get("name",""))}),
@@ -5194,6 +5207,7 @@ def migration_project(project_id):
         mappings_by_source=mappings_by_source, mapping_actions=MIGRATION_MAPPING_ACTIONS,
         default_target_context=target_context, target_context_options=target_context_options,
         topology_rules=topology_rules, topology_targets=topology_targets,
+        interface_zone_rules=interface_zone_rules,
         target_zones=target_zones, policy_zone_items=policy_zone_items,
         policy_zone_query=policy_zone_query, policy_zone_total=policy_zone_total,
         zone_freeform_allowed=bool(project["target_type"] == "panorama" and not target_zones),
@@ -5273,6 +5287,7 @@ def migration_topology_mapping_save(project_id):
         selector = request.form.get("selector", "").strip()
         action = request.form.get("action", "review").strip()
         target = request.form.get("target", "").strip()
+        requested_zone = request.form.get("zone", "").strip()
         operation = f"topology_{action}"
         if kind not in MIGRATION_TOPOLOGY_KINDS or action not in {"map", "create", "ignore", "review"}:
             raise MigrationError("Ongeldige topologiemapping")
@@ -5280,12 +5295,31 @@ def migration_topology_mapping_save(project_id):
             raise MigrationError("Kies een bestaande targetwaarde")
         with db() as conn:
             source_rows = conn.execute("SELECT * FROM migration_sources WHERE project_id=?", (project_id,)).fetchall()
-        available = set()
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (project["target_profile_id"],)).fetchone()
+        available = {}
         for source in source_rows:
             for item in model_collections(migration_model(source)).get(kind, []):
-                available.add(item_selector(item if isinstance(item, dict) else item.__dict__))
+                raw = item if isinstance(item, dict) else item.__dict__
+                available[item_selector(raw)] = raw
         if selector not in available:
             raise MigrationError("De bronwaarde bestaat niet meer")
+        selected = available[selector]
+        if kind == "interfaces" and selected.get("source_vendor") == "checkpoint" and action == "create":
+            raise MigrationError("Map de Check Point-interface naar een PAN-OS interface; maak ze niet blind over")
+        zone = clean_name(requested_zone, "") if requested_zone else ""
+        existing_zones = set()
+        if profile:
+            existing_zones.update(profile_settings(profile).get("zones", {}))
+        if project["base_workspace_id"]:
+            workspace = workspace_row(int(project["base_workspace_id"]))
+            if workspace:
+                existing_zones.update(
+                    str(item.get("name", ""))
+                    for item in cached_migration_workspace_model(
+                        workspace["config_path"], workspace["sha256"]
+                    ).zones
+                    if str(item.get("name", ""))
+                )
         with db() as conn:
             conn.execute(
                 "DELETE FROM migration_transform_rules WHERE project_id=? AND kind=? AND selector=? AND operation LIKE 'topology_%'",
@@ -5295,9 +5329,22 @@ def migration_topology_mapping_save(project_id):
                 "INSERT INTO migration_transform_rules(project_id,operation,kind,selector,value,created_at) VALUES(?,?,?,?,?,?)",
                 (project_id, operation, kind, selector, target, now()),
             )
+            if kind == "interfaces":
+                conn.execute(
+                    "DELETE FROM migration_transform_rules WHERE project_id=? AND kind='interfaces' AND selector=? AND operation='set_interface_zone'",
+                    (project_id, selector),
+                )
+                if zone:
+                    conn.execute(
+                        "INSERT INTO migration_transform_rules(project_id,operation,kind,selector,value,created_at) VALUES(?,?,?,?,?,?)",
+                        (
+                            project_id, "set_interface_zone", "interfaces", selector,
+                            json.dumps({"zone": zone, "create": zone not in existing_zones}, sort_keys=True), now(),
+                        ),
+                    )
             conn.execute("UPDATE migration_projects SET updated_at=? WHERE id=?", (now(), project_id))
         audit("migration-topology-mapping", f"project={project_id} kind={kind} action={action}")
-        flash("Topologiemapping bijgewerkt.", "success")
+        flash("Interface- en zonemapping bijgewerkt." if kind == "interfaces" else "Topologiemapping bijgewerkt.", "success")
     except Exception as exc:
         flash(f"Topologiemapping niet opgeslagen: {exc}", "error")
     return redirect(url_for("migration_project", project_id=project_id) + "#topology-mapping")

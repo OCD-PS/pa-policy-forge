@@ -278,6 +278,61 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(mapped.security_rules[0].from_zones, ["Trust", "DMZ"])
         self.assertEqual(mapped.security_rules[0].to_zones, ["any"])
 
+    def test_checkpoint_interface_zone_route_maps_policy_from_connected_subnet(self):
+        stamp = main.now()
+        with main.db() as conn:
+            profile_id = conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("PANOS interface mapping", "panos", json.dumps({"vsys": "vsys1"}), stamp, stamp),
+            ).lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        base = b'''<config><devices><entry name="localhost.localdomain"><network><interface><ethernet><entry name="ethernet1/1"><layer3/></entry></ethernet></interface></network><vsys><entry name="vsys1"><rulebase/></entry></vsys></entry></devices></config>'''
+        workspace_id = main.store_config_workspace(profile, "Interface base", "base.xml", base, "test")
+        with main.db() as conn:
+            project_id = conn.execute(
+                "INSERT INTO migration_projects(name,target_profile_id,base_workspace_id,owner,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                ("interface-zone-map", profile_id, workspace_id, "admin", stamp, stamp),
+            ).lastrowid
+        source_id = main.store_migration_source(
+            project_id, "checkpoint", "source.tar",
+            MigrationModel(
+                "checkpoint", "source.tar",
+                addresses=[Address("Clients", "10.10.0.0/24")],
+                security_rules=[main.Policy("Clients out", source=["Clients"], source_ref="rule-1")],
+                interfaces=[{
+                    "name": "bond1.10", "interface_type": "ethernet",
+                    "xml": '<entry name="bond1.10"><layer3/></entry>',
+                    "source_ref": "cluster", "source_vendor": "checkpoint",
+                    "source_networks": ["10.10.0.0/24"], "source_addresses": ["10.10.0.1/24"],
+                    "mapping_action": "review",
+                }],
+            ),
+        )
+        client = main.app.test_client()
+        with main.app.test_request_context("/", base_url="https://forge.test"):
+            serializer = main.app.session_interface.get_signing_serializer(main.app)
+            client.set_cookie(
+                main.app.config["SESSION_COOKIE_NAME"],
+                serializer.dumps({"user_id": 1, "username": "admin", "csrf": "migration-test-csrf"}),
+                domain="forge.test", secure=True,
+            )
+        response = client.post(
+            f"/migration/projects/{project_id}/topology",
+            base_url="https://forge.test",
+            data={
+                "csrf": "migration-test-csrf", "kind": "interfaces",
+                "selector": "bond1.10|||cluster", "action": "map",
+                "target": "ethernet1/1", "zone": "Trust",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        mapped = main.selected_migration_model(project_id, [source_id])
+        self.assertEqual(mapped.interfaces, [])
+        self.assertEqual(mapped.security_rules[0].from_zones, ["Trust"])
+        self.assertEqual(mapped.security_rules[0].to_zones, ["any"])
+        self.assertEqual([item["name"] for item in mapped.zones], ["Trust"])
+        self.assertIn("ethernet1/1", mapped.zones[0]["xml"])
+
     def test_health_best_practices_discovery_and_api_plan_are_review_only(self):
         model=MigrationModel(
             "generic","source",
@@ -570,7 +625,7 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         self.assertIn("Track: Log", model.security_rules[0].description)
         self.assertTrue(any("globale UID-dictionary" in message for message in model.warnings))
 
-    def test_checkpoint_gateway_topology_creates_zones_and_maps_unambiguous_policy_sides(self):
+    def test_checkpoint_gateway_topology_requires_interface_zone_assignments_before_mapping(self):
         documents = {
             "Standard_objects.json": [
                 {"type": "network", "uid": "inside", "name": "Inside", "subnet4": "10.10.0.0", "mask-length4": 24},
@@ -613,13 +668,31 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
                 info.size = len(raw)
                 archive.addfile(info, io.BytesIO(raw))
         model = parse_vendor("checkpoint", payload.getvalue(), "show_package.tar")
-        self.assertEqual(
-            {item["name"] for item in model.zones},
-            {"CP-bond1.10", "DMZZone", "Untrust"},
-        )
-        self.assertEqual(model.security_rules[0].from_zones, ["CP-bond1.10"])
-        self.assertEqual(model.security_rules[0].to_zones, ["DMZZone"])
-        self.assertTrue(any("longest-prefix" in message for message in model.warnings))
+        self.assertEqual({item["name"] for item in model.interfaces}, {"bond1.10", "eth2.1725", "eth3"})
+        self.assertEqual(model.zones, [])
+        self.assertEqual(model.security_rules[0].from_zones, ["any"])
+        self.assertEqual(model.security_rules[0].to_zones, ["any"])
+        self.assertTrue(all(item["source_vendor"] == "checkpoint" for item in model.interfaces))
+
+        rules = []
+        for source, target, zone in (
+            ("bond1.10", "ethernet1/1", "Trust"),
+            ("eth2.1725", "ethernet1/2", "DMZ"),
+            ("eth3", "ethernet1/3", "Untrust"),
+        ):
+            selector = f"{source}|||cluster"
+            rules.extend([
+                {"operation": "topology_map", "kind": "interfaces", "selector": selector, "value": target},
+                {"operation": "set_interface_zone", "kind": "interfaces", "selector": selector, "value": json.dumps({"zone": zone, "create": True})},
+            ])
+        mapped = apply_transform_rules(model, rules)
+        self.assertEqual(mapped.interfaces, [])
+        self.assertEqual({item["name"] for item in mapped.zones}, {"Trust", "DMZ", "Untrust"})
+        trust = next(item for item in mapped.zones if item["name"] == "Trust")
+        self.assertIn("ethernet1/1", trust["xml"])
+        self.assertEqual(mapped.security_rules[0].from_zones, ["Trust"])
+        self.assertEqual(mapped.security_rules[0].to_zones, ["DMZ"])
+        self.assertTrue(any("longest-prefix" in message for message in mapped.warnings))
 
     def test_checkpoint_show_package_rejects_parent_traversal(self):
         payload = io.BytesIO()
@@ -1651,7 +1724,7 @@ allow-web,security,,Trust,Untrust,any,web,ssl,application-default,allow
         self.assertIn("Palo Alto PAN-OS / Panorama XML", page)
         self.assertNotIn("Migration Control Center", page)
         self.assertNotIn("Bron- en doelmapping", page)
-        self.assertIn("Interfaces, zones en routing mappen", page)
+        self.assertIn("Interfaces en zones mappen", page)
         self.assertNotIn("Filters en selecties", page)
         self.assertNotIn("Bulk refactor", page)
         self.assertNotIn("Catalogi en discovery", page)
