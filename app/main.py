@@ -376,6 +376,16 @@ def init_db() -> None:
           id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, username TEXT NOT NULL,
           action TEXT NOT NULL, detail TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS post_deploy_monitors (
+          run_id INTEGER PRIMARY KEY, profile_id INTEGER NOT NULL,
+          deployed_at TEXT NOT NULL, baseline_json TEXT NOT NULL,
+          target_type TEXT NOT NULL DEFAULT 'scm', activation_status TEXT NOT NULL DEFAULT 'active',
+          candidate_at TEXT NOT NULL DEFAULT '',
+          one_hour_json TEXT NOT NULL DEFAULT '', one_day_json TEXT NOT NULL DEFAULT '',
+          last_checked_at TEXT, last_error TEXT NOT NULL DEFAULT '',
+          FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE,
+          FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+        );
         CREATE TABLE IF NOT EXISTS config_workspaces (
           id INTEGER PRIMARY KEY, profile_id INTEGER NOT NULL, name TEXT NOT NULL,
           source TEXT NOT NULL, original_name TEXT NOT NULL, config_path TEXT NOT NULL,
@@ -474,6 +484,13 @@ def init_db() -> None:
         source_columns = {row[1] for row in conn.execute("PRAGMA table_info(migration_sources)")}
         if "staging_workspace_id" not in source_columns:
             conn.execute("ALTER TABLE migration_sources ADD COLUMN staging_workspace_id INTEGER")
+        monitor_columns = {row[1] for row in conn.execute("PRAGMA table_info(post_deploy_monitors)")}
+        if "target_type" not in monitor_columns:
+            conn.execute("ALTER TABLE post_deploy_monitors ADD COLUMN target_type TEXT NOT NULL DEFAULT 'scm'")
+        if "activation_status" not in monitor_columns:
+            conn.execute("ALTER TABLE post_deploy_monitors ADD COLUMN activation_status TEXT NOT NULL DEFAULT 'active'")
+        if "candidate_at" not in monitor_columns:
+            conn.execute("ALTER TABLE post_deploy_monitors ADD COLUMN candidate_at TEXT NOT NULL DEFAULT ''")
         if not conn.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
             bootstrap_password = os.getenv("PPF_BOOTSTRAP_PASSWORD", "admin") or "admin"
             if bootstrap_password != "admin" and (len(bootstrap_password) < 12 or password_is_blocked(bootstrap_password)):
@@ -4493,15 +4510,24 @@ def index():
         runs = []
         if selected_run_profile:
             with db() as run_conn:
-                runs = run_conn.execute(
-                    "SELECT runs.*,profiles.name profile_name FROM runs "
+                run_rows = run_conn.execute(
+                    "SELECT runs.*,profiles.name profile_name,profiles.target_type,m.activation_status,m.one_hour_json,m.one_day_json,m.last_error "
+                    "FROM runs "
                     "JOIN profiles ON profiles.id=runs.profile_id "
+                    "LEFT JOIN post_deploy_monitors m ON m.run_id=runs.id "
                     "WHERE runs.profile_id=? AND runs.mode!='prepared' "
                     "AND (runs.status!='complete' OR runs.id IN ("
                     "SELECT id FROM runs WHERE profile_id=? AND mode!='prepared' AND status='complete' ORDER BY id DESC LIMIT 5"
                     ")) ORDER BY runs.id DESC",
                     (selected_run_profile["id"], selected_run_profile["id"]),
                 ).fetchall()
+                for row in run_rows:
+                    item = dict(row)
+                    latest = item.get("one_day_json") or item.get("one_hour_json")
+                    report = json.loads(latest) if latest else None
+                    item["post_status"] = "error" if item.get("last_error") else report.get("status") if report else "pending" if item["mode"] == "push" else ""
+                    item["post_label"] = "fout" if item.get("last_error") else f"{report['checkpoint']} · {report['status']}" if report else "wacht op deployment" if item.get("activation_status") == "pending" else "gepland" if item["post_status"] == "pending" else "—"
+                    runs.append(item)
         editing_id = request.args.get("edit_profile", type=int)
         editing_profile = next((profile for profile in profiles if profile["id"] == editing_id), None)
         selected_id = request.args.get("flow_profile", type=int)
@@ -4859,7 +4885,7 @@ def migration_target_create():
             raise MigrationError("Rulebase moet pre of post zijn")
 
         settings = {
-            "zones": {}, "min_sessions": 3, "disabled": False, "tags": ["AI builder"],
+            "zones": {}, "min_sessions": 10, "disabled": False, "tags": ["AI builder"],
             "global_ping": False, "global_dns": False, "endpoint": "", "vsys": "vsys1",
             "device_group": "", "rulebase": rulebase, "folder": "", "snippet": "",
             "device": "", "object_folder": "", "log_profile": "", "passive_serial": "",
@@ -6283,7 +6309,7 @@ def profile_save():
             raise ValueError("Passieve serial moet verschillen van de actieve serial")
         settings = {
             "zones": parse_zones(request.form.get("zones", "")),
-            "min_sessions": max(1, int(request.form.get("min_sessions", "3"))),
+            "min_sessions": max(1, int(request.form.get("min_sessions", "10"))),
             "disabled": request.form.get("disabled") == "on",
             "tags": [x.strip() for x in request.form.get("tags", "AI builder").split(",") if x.strip()],
             "global_ping": request.form.get("global_ping") == "on",
@@ -6386,7 +6412,7 @@ def write_config(profile, run_dir: Path, push: bool, disabled_override: bool | N
         f"disabled = {'true' if generated_disabled else 'false'}", "tags = [" + ",".join(toml_string(x) for x in s.get("tags", [])) + "]",
         f"global_ping_traceroute = {'true' if s.get('global_ping', True) else 'false'}", 'global_ping_traceroute_apps = ["ping","traceroute"]',
         f"global_dns = {'true' if s.get('global_dns', True) else 'false'}", 'global_dns_apps = ["dns-base"]', 'global_dns_internal_resolvers = []', 'global_dns_external_resolvers = ["1.1.1.1","9.9.9.9"]',
-        f"min_sessions = {s.get('min_sessions', 3)}", "limit = 0", "group_threshold = 10", "source_any_threshold = 5", f"workers = {max(1, (os.cpu_count() or 1) - 2)}", 'include_actions = ["allow"]', f"log_setting = {toml_string(s.get('log_profile',''))}", "",
+        f"min_sessions = {s.get('min_sessions', 10)}", "limit = 0", "group_threshold = 10", "source_any_threshold = 5", f"workers = {max(1, (os.cpu_count() or 1) - 2)}", 'include_actions = ["allow"]', f"log_setting = {toml_string(s.get('log_profile',''))}", "",
         "[panorama]", f"panorama_template = {toml_string(s.get('device_group',''))}", f"panorama_rulebase = {toml_string(s.get('rulebase','pre'))}", f"panorama_log_setting = {toml_string(s.get('log_profile',''))}", "",
         "[panos]", f"panos_vsys = {toml_string(s.get('vsys','vsys1'))}", f"panos_log_setting = {toml_string(s.get('log_profile',''))}", f"panos_endpoint = {toml_string(s.get('endpoint',''))}", 'panos_username = ""', 'panos_password = ""', f"panos_auto_push = {'true' if push else 'false'}", "",
         "[scm]", 'scm_client_id = ""', 'scm_client_secret = ""', 'scm_tsg_id = ""', 'scm_token_url = "https://auth.apps.paloaltonetworks.com/oauth2/access_token"', 'scm_api_base = "https://api.strata.paloaltonetworks.com/config/security/v1"', f"scm_folder = {toml_string(s.get('folder',''))}", f"scm_snippet = {toml_string(s.get('snippet',''))}", f"scm_device = {toml_string(s.get('device',''))}", f"scm_object_folder = {toml_string(s.get('object_folder') or s.get('folder',''))}", f"scm_rulebase = {toml_string(s.get('rulebase','pre'))}", f"scm_log_forwarding_profile = {toml_string(s.get('log_profile',''))}", "",
@@ -6841,6 +6867,213 @@ def prune_successful_run_history(profile_id: int, keep: int = 5) -> int:
     return removed
 
 
+def policy_rule_counters(serials: list[str], names: set[str]) -> dict[str, dict[str, int]]:
+    selected_serials = list(dict.fromkeys(value for value in serials if value))
+    selected_names = sorted(value for value in names if value)
+    counters = {name: {"sessions": 0, "bytes": 0} for name in selected_names}
+    if not selected_serials or not selected_names:
+        return counters
+    serial_marks = ",".join("?" for _ in selected_serials)
+    name_marks = ",".join("?" for _ in selected_names)
+    with flow_store.lock, flow_store._connect() as conn:
+        rows = conn.execute(
+            f"SELECT rule,COALESCE(SUM(repeat),0) sessions,COALESCE(SUM(bytes),0) bytes "
+            f"FROM flows WHERE serial IN ({serial_marks}) AND rule IN ({name_marks}) GROUP BY rule",
+            [*selected_serials, *selected_names],
+        ).fetchall()
+    for row in rows:
+        counters[row["rule"]] = {"sessions": int(row["sessions"]), "bytes": int(row["bytes"])}
+    return counters
+
+
+def post_deploy_review(run_dir: str) -> tuple[dict[str, dict], set[str]]:
+    path = Path(run_dir) / "review.csv"
+    rules: dict[str, dict] = {}
+    anchors: set[str] = set()
+    if not path.exists():
+        return rules, anchors
+    with path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            name = str(row.get("name", "")).strip()
+            if not name or row.get("preflight_status") == "duplicate-match-skip":
+                continue
+            disabled = str(row.get("disabled", "no")).lower() in {"yes", "true", "1"}
+            try:
+                learned_sessions = int(row.get("sessions") or 0)
+            except (TypeError, ValueError):
+                learned_sessions = 0
+            rules[name] = {
+                "disabled": disabled,
+                "learned_sessions": learned_sessions,
+                "application": row.get("application", ""),
+                "service": row.get("service", ""),
+                "anchor_rule": row.get("anchor_rule", ""),
+            }
+            if row.get("anchor_rule"):
+                anchors.add(row["anchor_rule"])
+    return rules, anchors
+
+
+def start_post_deploy_monitor(run_id: int, profile) -> None:
+    with db() as conn:
+        run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+    if not run or run["mode"] != "push":
+        return
+    rules, anchors = post_deploy_review(run["run_dir"])
+    names = set(rules) | anchors
+    active = profile["target_type"] == "scm"
+    baseline = {
+        "rules": rules,
+        "anchors": sorted(anchors),
+        "counts": policy_rule_counters(profile_serials(profile), names) if active else {name: {"sessions": 0, "bytes": 0} for name in names},
+        "serials": profile_serials(profile),
+    }
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO post_deploy_monitors(run_id,profile_id,deployed_at,baseline_json,target_type,activation_status,candidate_at) VALUES(?,?,?,?,?,?,?)",
+            (run_id, profile["id"], run["finished_at"] or now(), json.dumps(baseline, sort_keys=True), profile["target_type"], "active" if active else "pending", run["finished_at"] or now()),
+        )
+    audit("post-deploy-monitor-started", f"profile={profile['name']} run={run_id} target={profile['target_type']} activation={'active' if active else 'pending'} rules={len(rules)}")
+
+
+def running_panos_rule_names(profile) -> set[str]:
+    _, endpoint, key, ctx = panos_profile_context(profile)
+    serials = profile_serials(profile) if profile["target_type"] == "panorama" else [""]
+    if profile["target_type"] == "panorama" and not serials:
+        raise RuntimeError("Panorama activation check requires at least one managed-device serial")
+    xpaths = [
+        "/config/devices/entry/vsys/entry/rulebase/security/rules",
+        "/config/devices/entry/vsys/entry/pre-rulebase/security/rules",
+        "/config/devices/entry/vsys/entry/post-rulebase/security/rules",
+    ]
+    common_names: set[str] | None = None
+    for serial in serials:
+        device_names: set[str] = set()
+        for xpath in xpaths:
+            params = {"type": "config", "action": "show", "xpath": xpath, "key": key}
+            if serial:
+                params["target"] = serial
+            root = policy_api.require_success(policy_api.api_get(endpoint, params, ctx), "fetch running security rules")
+            device_names.update(entry.attrib["name"] for entry in root.findall(".//entry") if entry.attrib.get("name"))
+        common_names = device_names if common_names is None else common_names & device_names
+    return common_names or set()
+
+
+def activate_post_deploy_monitor(row, profile) -> bool:
+    baseline = json.loads(row["baseline_json"])
+    expected = set(baseline.get("rules", {}))
+    if not expected or not expected.issubset(running_panos_rule_names(profile)):
+        return False
+    names = expected | set(baseline.get("anchors", []))
+    baseline["counts"] = policy_rule_counters(list(baseline.get("serials", [])), names)
+    activated_at = now()
+    with db() as conn:
+        conn.execute(
+            "UPDATE post_deploy_monitors SET activation_status='active',deployed_at=?,baseline_json=?,last_checked_at=?,last_error='' WHERE run_id=?",
+            (activated_at, json.dumps(baseline, sort_keys=True), activated_at, row["run_id"]),
+        )
+    audit("post-deploy-monitor-activated", f"run={row['run_id']} target={row['target_type']} rules={len(expected)}")
+    return True
+
+
+def post_deploy_report(baseline: dict, current: dict[str, dict[str, int]], checkpoint: str) -> dict:
+    before = baseline.get("counts", {})
+    rules = baseline.get("rules", {})
+    deltas = {
+        name: {
+            "sessions": max(0, current.get(name, {}).get("sessions", 0) - before.get(name, {}).get("sessions", 0)),
+            "bytes": max(0, current.get(name, {}).get("bytes", 0) - before.get(name, {}).get("bytes", 0)),
+        }
+        for name in set(before) | set(current)
+    }
+    enabled = [name for name, details in rules.items() if not details.get("disabled")]
+    zero_hits = sorted(name for name in enabled if deltas.get(name, {}).get("sessions", 0) == 0)
+    threshold = 10000 if checkpoint == "1h" else 100000
+    high_volume = sorted(
+        ({"name": name, **deltas[name]} for name in enabled if deltas.get(name, {}).get("sessions", 0) >= threshold),
+        key=lambda item: item["sessions"], reverse=True,
+    )
+    generated_sessions = sum(deltas.get(name, {}).get("sessions", 0) for name in enabled)
+    fallback = sorted(
+        ({"name": name, **deltas.get(name, {"sessions": 0, "bytes": 0})} for name in baseline.get("anchors", [])),
+        key=lambda item: item["sessions"], reverse=True,
+    )
+    fallback_sessions = sum(item["sessions"] for item in fallback)
+    ratio = round(fallback_sessions / max(1, generated_sessions + fallback_sessions), 4)
+    significant_fallback = fallback_sessions >= 100 and ratio >= 0.10
+    status = "warning" if high_volume or significant_fallback or (checkpoint == "24h" and zero_hits) else "healthy"
+    return {
+        "checkpoint": checkpoint,
+        "status": status,
+        "checked_at": now(),
+        "generated_sessions": generated_sessions,
+        "zero_hits": zero_hits,
+        "high_volume": high_volume,
+        "fallback": fallback,
+        "fallback_sessions": fallback_sessions,
+        "fallback_ratio": ratio,
+        "significant_fallback": significant_fallback,
+        "rule_deltas": {name: deltas.get(name, {"sessions": 0, "bytes": 0}) for name in enabled},
+    }
+
+
+def evaluate_post_deploy_monitor(row, checkpoint: str) -> dict:
+    baseline = json.loads(row["baseline_json"])
+    names = set(baseline.get("counts", {}))
+    report = post_deploy_report(
+        baseline,
+        policy_rule_counters(list(baseline.get("serials", [])), names),
+        checkpoint,
+    )
+    column = "one_hour_json" if checkpoint == "1h" else "one_day_json"
+    with db() as conn:
+        conn.execute(
+            f"UPDATE post_deploy_monitors SET {column}=?,last_checked_at=?,last_error='' WHERE run_id=?",
+            (json.dumps(report, sort_keys=True), report["checked_at"], row["run_id"]),
+        )
+    audit("post-deploy-monitor-checked", f"run={row['run_id']} checkpoint={checkpoint} status={report['status']}")
+    return report
+
+
+def post_deploy_monitor_loop() -> None:
+    time.sleep(30)
+    while True:
+        try:
+            current = datetime.now(timezone.utc)
+            with db() as conn:
+                monitors = conn.execute("SELECT * FROM post_deploy_monitors ORDER BY run_id").fetchall()
+            for monitor in monitors:
+                if monitor["activation_status"] == "pending":
+                    try:
+                        with db() as conn:
+                            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (monitor["profile_id"],)).fetchone()
+                        if not profile or not activate_post_deploy_monitor(monitor, profile):
+                            continue
+                        with db() as conn:
+                            monitor = conn.execute("SELECT * FROM post_deploy_monitors WHERE run_id=?", (monitor["run_id"],)).fetchone()
+                    except Exception as exc:
+                        with db() as conn:
+                            conn.execute("UPDATE post_deploy_monitors SET last_error=?,last_checked_at=? WHERE run_id=?", (str(exc)[:1000], now(), monitor["run_id"]))
+                        app.logger.exception("post-deploy activation check failed for run %s", monitor["run_id"])
+                        continue
+                deployed = datetime.strptime(monitor["deployed_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                checkpoints = []
+                if not monitor["one_hour_json"] and current >= deployed + timedelta(hours=1):
+                    checkpoints.append("1h")
+                if not monitor["one_day_json"] and current >= deployed + timedelta(hours=24):
+                    checkpoints.append("24h")
+                for checkpoint in checkpoints:
+                    try:
+                        evaluate_post_deploy_monitor(monitor, checkpoint)
+                    except Exception as exc:
+                        with db() as conn:
+                            conn.execute("UPDATE post_deploy_monitors SET last_error=?,last_checked_at=? WHERE run_id=?", (str(exc)[:1000], now(), monitor["run_id"]))
+                        app.logger.exception("post-deploy monitor failed for run %s", monitor["run_id"])
+        except Exception:
+            app.logger.exception("post-deploy monitor scheduler failed")
+        time.sleep(300)
+
+
 def execute_run(profile, mode: str, disabled_override: bool | None = None, prepared=None) -> int:
     push = mode == "push"
     run_dir = RUNS / (datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{profile['id']}-{secrets.token_hex(3)}")
@@ -6881,6 +7114,8 @@ def execute_run(profile, mode: str, disabled_override: bool | None = None, prepa
             "prepared_at": int(time.time()),
         }))
         with db() as conn: conn.execute("UPDATE runs SET status='complete',finished_at=?,rule_count=?,output=? WHERE id=?", (now(), rules, output, run_id))
+        if push:
+            start_post_deploy_monitor(run_id, profile)
         if mode != "prepared":
             try:
                 removed = prune_successful_run_history(profile["id"])
@@ -7004,12 +7239,19 @@ def application_catalog_loop():
 @app.get("/runs/<int:run_id>")
 @login_required
 def run_detail(run_id):
-    with db() as conn: run = conn.execute("SELECT runs.*,profiles.name profile_name FROM runs JOIN profiles ON profiles.id=runs.profile_id WHERE runs.id=?", (run_id,)).fetchone()
+    with db() as conn:
+        run = conn.execute("SELECT runs.*,profiles.name profile_name FROM runs JOIN profiles ON profiles.id=runs.profile_id WHERE runs.id=?", (run_id,)).fetchone()
+        monitor_row = conn.execute("SELECT * FROM post_deploy_monitors WHERE run_id=?", (run_id,)).fetchone()
     if not run: return "Not found", 404
     review=[]; path=Path(run["run_dir"])/"review.csv"
     if path.exists():
         with path.open(newline="") as fh: review=list(csv.DictReader(fh))
-    return render_template("run.html", run=run, review=review)
+    monitor = None
+    if monitor_row:
+        monitor = dict(monitor_row)
+        monitor["one_hour"] = json.loads(monitor["one_hour_json"]) if monitor["one_hour_json"] else None
+        monitor["one_day"] = json.loads(monitor["one_day_json"]) if monitor["one_day_json"] else None
+    return render_template("run.html", run=run, review=review, monitor=monitor)
 
 
 @app.post("/runs/<int:run_id>/delete")
@@ -7087,6 +7329,7 @@ threading.Thread(target=udp_loop,daemon=True,name="syslog-udp").start()
 threading.Thread(target=quota_loop,daemon=True,name="storage-quota").start()
 threading.Thread(target=prepare_loop,daemon=True,name="policy-prepare").start()
 threading.Thread(target=application_catalog_loop,daemon=True,name="application-catalog-scheduler").start()
+threading.Thread(target=post_deploy_monitor_loop,daemon=True,name="post-deploy-monitor").start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0",port=8080)

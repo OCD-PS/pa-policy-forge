@@ -146,7 +146,7 @@
 </div>
 <div class="field">
 <label>Minimale sessies</label>
-<input type="number" name="min_sessions" min="1" value="{{ep.min_sessions if ep else 3}}">
+<input type="number" name="min_sessions" min="1" value="{{ep.min_sessions if ep else 10}}">
 </div>
 <div class="field">
 <label>Tags</label>
@@ -372,6 +372,7 @@
 <th>ID</th>
 <th>Mode</th>
 <th>Status</th>
+<th>Post-check</th>
 <th>Regels</th>
 <th>Gestart</th>
 <th>
@@ -384,6 +385,7 @@
 <td>
 <span class="badge badge-{{'success' if r.status=='complete' else 'danger' if r.status=='failed' else 'warning'}}">{{r.status}}</span>
 </td>
+<td>{% if r.post_status %}<span class="badge badge-{{'success' if r.post_status=='healthy' else 'warning' if r.post_status=='pending' else 'danger'}}">{{r.post_label}}</span>{% else %}—{% endif %}</td>
 <td>{{r.rule_count}}</td>
 <td>{{r.started_at}}</td>
 <td>
@@ -396,7 +398,7 @@
 </div>
 </td>
 </tr>{% else %}<tr>
-<td colspan="6">Nog geen runs voor dit profiel.</td>
+<td colspan="7">Nog geen runs voor dit profiel.</td>
 </tr>{% endfor %}</tbody>
 </table>
 </div>

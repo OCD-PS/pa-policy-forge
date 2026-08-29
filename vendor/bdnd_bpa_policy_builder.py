@@ -172,6 +172,7 @@ class FlowAggregate:
     key: FlowKey
     sources: Counter[str] = field(default_factory=Counter)
     destinations: Counter[str] = field(default_factory=Counter)
+    source_destination_pairs: Counter[tuple[str, str]] = field(default_factory=Counter)
     rules: Counter[str] = field(default_factory=Counter)
     serials: Counter[str] = field(default_factory=Counter)
     sessions: int = 0
@@ -347,6 +348,12 @@ def aggregate_flows(rows: Iterable[dict[str, str]], include_actions: set[str]) -
                 ipish_cache[dst] = is_ipish(dst)
             if ipish_cache[dst]:
                 aggregate.destinations[dst] += repeat
+        for src in sources:
+            if not ipish_cache.get(src, False):
+                continue
+            for dst in destinations:
+                if ipish_cache.get(dst, False):
+                    aggregate.source_destination_pairs[(src, dst)] += repeat
         if rule:
             aggregate.rules[rule] += repeat
         if serial:
@@ -359,6 +366,7 @@ def merge_flow_aggregate(target: FlowAggregate, source: FlowAggregate) -> None:
     target.bytes_total += source.bytes_total
     target.sources.update(source.sources)
     target.destinations.update(source.destinations)
+    target.source_destination_pairs.update(source.source_destination_pairs)
     target.rules.update(source.rules)
     target.serials.update(source.serials)
 
@@ -443,19 +451,21 @@ def make_policy_payload(
     client_to_internet = is_client_to_internet(key, zone_roles)
     top_sources = [item for item, _ in aggregate.sources.most_common(max_members)]
     top_destinations = [item for item, _ in aggregate.destinations.most_common(max_members)]
-    if zone_roles and zone_roles.is_client(key.src_zone):
-        source = ["any"]
-    else:
-        source = ["any"] if len(aggregate.sources) > source_any_threshold else top_sources or ["any"]
+    source = top_sources
     if client_to_internet:
         destination = ["any"]
     else:
-        destination = (
-            ["any"] if len(aggregate.destinations) > destination_any_threshold else top_destinations or ["any"]
-        )
-    app = "any" if client_to_internet else (
+        destination = top_destinations
+    web_service = client_to_internet and key.proto.lower() == "tcp" and key.dport in {"80", "443"}
+    app = "any" if web_service else (
         key.app if key.app not in {"any", "not-applicable", "incomplete", "unknown"} else "any"
     )
+    if not source:
+        raise RuntimeError(f"Refusing overly broad generated policy for {key.src_zone} to {key.dst_zone}: no source")
+    if not destination:
+        raise RuntimeError(f"Refusing generated policy for {key.src_zone} to {key.dst_zone}: no destination")
+    if app == "any" and not web_service:
+        raise RuntimeError(f"Refusing overly broad generated policy for {key.src_zone} to {key.dst_zone}: unknown application")
     name = safe_name(
         f"AUTO-BDND-BPA-{key.src_zone}-{key.dst_zone}-{app}-{key.proto}-{key.dport}-{index:03d}"
     )
@@ -476,8 +486,8 @@ def make_policy_payload(
         "source_user": ["any"],
         "category": ["any"],
         "application": [app],
-        "service": ["service-http", "service-https"]
-        if client_to_internet
+        "service": [{"80": "service-http", "443": "service-https"}[key.dport]]
+        if web_service
         else service_value(key.proto, key.dport, service_mode),
         "action": "allow",
         "tag": tags if tags is not None else DEFAULT_TAGS,
@@ -504,29 +514,6 @@ def build_plan(
     eligible.sort(key=lambda agg: (agg.sessions, agg.bytes_total), reverse=True)
     if limit:
         eligible = eligible[:limit]
-    if zone_roles is not None:
-        merged_client_internet: dict[tuple[str, str, str], FlowAggregate] = {}
-        retained: list[FlowAggregate] = []
-        for agg in eligible:
-            if is_client_to_internet(agg.key, zone_roles):
-                merged_key = (agg.key.src_zone, agg.key.dst_zone, agg.key.action)
-                merged = merged_client_internet.get(merged_key)
-                if merged is None:
-                    merged = FlowAggregate(
-                        FlowKey(agg.key.src_zone, agg.key.dst_zone, "any", "tcp", "80-443", agg.key.action, agg.key.rule)
-                    )
-                    merged_client_internet[merged_key] = merged
-                merged.sessions += agg.sessions
-                merged.bytes_total += agg.bytes_total
-                merged.sources.update(agg.sources)
-                merged.destinations.update(agg.destinations)
-                merged.rules.update(agg.rules)
-                merged.serials.update(agg.serials)
-            else:
-                retained.append(agg)
-        eligible = retained + list(merged_client_internet.values())
-        eligible.sort(key=lambda agg: (agg.sessions, agg.bytes_total), reverse=True)
-
     return [
         make_policy_payload(
             agg,
@@ -730,7 +717,7 @@ def load_builder_config(config_path: Path) -> BPAConfig:
         input_pattern=input_pattern,
         output=output,
         review_csv=review_csv,
-        min_sessions=int(policy_raw.get("min_sessions", 3)),
+        min_sessions=int(policy_raw.get("min_sessions", 10)),
         limit=int(policy_raw.get("limit", 100)),
         max_members=int(policy_raw.get("max_members", 20)),
         source_any_threshold=int(policy_raw.get("source_any_threshold", 200)),

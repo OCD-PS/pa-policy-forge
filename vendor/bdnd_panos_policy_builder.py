@@ -14,6 +14,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -24,7 +25,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -122,6 +123,10 @@ def unique_rule_name(base_name: str, used: set[str], max_len: int = 32) -> str:
 
 
 def object_name_for_ip(value: str, ptr_cache: dict[str, str]) -> tuple[str, str, str]:
+    if "/" in value:
+        network = ipaddress.ip_network(value, strict=False)
+        normalized = str(network)
+        return compact_name("net", normalized.replace(".", "-").replace(":", "-")), "ip-netmask", normalized
     ptr = ptr_cache.setdefault(value, resolve_ptr(value))
     host_prefix = "128" if ipaddress.ip_address(value).version == 6 else "32"
     if ptr:
@@ -230,6 +235,7 @@ class RuleCandidate:
     anchor_rule: str
     sources: Counter[str]
     destinations: Counter[str]
+    applications: Counter[str] = field(default_factory=Counter)
     sessions: int = 0
     bytes_total: int = 0
     transports: Counter[str] | None = None
@@ -238,6 +244,7 @@ class RuleCandidate:
 @dataclass(frozen=True)
 class ZoneRoleConfig:
     zone_roles: dict[str, str]
+    zone_networks: dict[str, tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]] = field(default_factory=dict)
 
     def role_for(self, zone: str) -> str:
         return self.zone_roles.get(zone, "other")
@@ -247,6 +254,20 @@ class ZoneRoleConfig:
 
     def is_internet(self, zone: str) -> bool:
         return self.role_for(zone) == "internet"
+
+    def generalized_source(self, zone: str, value: str) -> str:
+        if not self.is_client(zone):
+            return value
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            return value
+        matches = [network for network in self.zone_networks.get(zone, ()) if address in network]
+        if not matches:
+            return value
+        longest = max(network.prefixlen for network in matches)
+        best = {network for network in matches if network.prefixlen == longest}
+        return str(next(iter(best))) if len(best) == 1 else value
 
 
 @dataclass(frozen=True)
@@ -388,6 +409,14 @@ def is_client_to_internet(src_zone: str, dst_zone: str, zone_roles: ZoneRoleConf
     return zone_roles.is_client(src_zone) and zone_roles.is_internet(dst_zone)
 
 
+def is_server_to_internet(src_zone: str, dst_zone: str, zone_roles: ZoneRoleConfig) -> bool:
+    return zone_roles.role_for(src_zone) == "server" and zone_roles.is_internet(dst_zone)
+
+
+def is_client_to_server(src_zone: str, dst_zone: str, zone_roles: ZoneRoleConfig) -> bool:
+    return zone_roles.is_client(src_zone) and zone_roles.role_for(dst_zone) == "server"
+
+
 def client_internet_web_service(proto: str, dport: str) -> str | None:
     if proto.lower() != "tcp":
         return None
@@ -414,7 +443,8 @@ def merge_candidates(
     if limit:
         eligible = eligible[:limit]
 
-    merged: dict[tuple[str, str, str, str, str, str], RuleCandidate] = {}
+    merged: dict[tuple[str, str, str, str, str, str, str], RuleCandidate] = {}
+    destination_observations: dict[tuple[str, str, str, str, str, str, str], RuleCandidate] = {}
     for agg in eligible:
         key = agg.key
         if is_global_ping_traceroute_app(key.app, suppressed_apps):
@@ -428,31 +458,137 @@ def merge_candidates(
             app = normalize_app(key.app)
             service_members = (service_member_for_flow(app, key.proto, key.dport),)
             bucket_service_key = service_members[0]
+        if app == "any" and not (
+            is_client_to_internet(key.src_zone, key.dst_zone, zone_roles) and web_service
+        ):
+            # Unidentified App-ID is observation noise, not evidence for a broad allow rule.
+            continue
         anchor_rule = key.rule.strip()
-        bucket_key = (key.src_zone, key.dst_zone, app, bucket_service_key, key.action, anchor_rule)
-        candidate = merged.get(bucket_key)
+        if zone_roles.is_client(key.src_zone) and not zone_roles.is_internet(key.dst_zone):
+            for (source, destination), sessions in agg.source_destination_pairs.items():
+                source_scope = zone_roles.generalized_source(key.src_zone, source)
+                observation_key = (
+                    key.src_zone,
+                    key.dst_zone,
+                    destination,
+                    bucket_service_key,
+                    key.action,
+                    anchor_rule,
+                    source_scope,
+                )
+                candidate = destination_observations.get(observation_key)
+                if candidate is None:
+                    candidate = RuleCandidate(
+                        src_zone=key.src_zone,
+                        dst_zone=key.dst_zone,
+                        app=app,
+                        service_members=service_members,
+                        action=key.action,
+                        anchor_rule=anchor_rule,
+                        sources=Counter(),
+                        destinations=Counter(),
+                        transports=Counter(),
+                    )
+                    destination_observations[observation_key] = candidate
+                candidate.applications[app] += sessions
+                candidate.sources[source_scope] += sessions
+                candidate.destinations[destination] += sessions
+                candidate.sessions += sessions
+                if agg.sessions:
+                    candidate.bytes_total += round(agg.bytes_total * sessions / agg.sessions)
+                if candidate.transports is not None:
+                    candidate.transports[f"{key.proto}/{key.dport}"] += sessions
+            continue
+        generalized_sources = Counter()
+        for source, sessions in agg.sources.items():
+            generalized_sources[zone_roles.generalized_source(key.src_zone, source)] += sessions
+        source_scoped = (
+            is_server_to_internet(key.src_zone, key.dst_zone, zone_roles)
+            or is_client_to_server(key.src_zone, key.dst_zone, zone_roles)
+        )
+        source_slices = [
+            (
+                source,
+                Counter({source: sessions}),
+                Counter({
+                    destination: count
+                    for (pair_source, destination), count in agg.source_destination_pairs.items()
+                    if pair_source == source
+                }),
+                sessions,
+            )
+            for source, sessions in agg.sources.items()
+        ] if source_scoped else [("", generalized_sources, agg.destinations, agg.sessions)]
+        for source_key, sources, destinations, sessions in source_slices:
+            bucket_key = (
+                key.src_zone,
+                key.dst_zone,
+                app,
+                bucket_service_key,
+                key.action,
+                anchor_rule,
+                source_key,
+            )
+            candidate = merged.get(bucket_key)
+            if candidate is None:
+                candidate = RuleCandidate(
+                    src_zone=key.src_zone,
+                    dst_zone=key.dst_zone,
+                    app=app,
+                    service_members=service_members,
+                    action=key.action,
+                    anchor_rule=anchor_rule,
+                    sources=Counter(),
+                    destinations=Counter(),
+                    transports=Counter(),
+                )
+                merged[bucket_key] = candidate
+            candidate.applications[app] += sessions
+            candidate.sessions += sessions
+            if agg.sessions:
+                candidate.bytes_total += round(agg.bytes_total * sessions / agg.sessions)
+            candidate.sources.update(sources)
+            candidate.destinations.update(destinations)
+            if candidate.transports is not None:
+                candidate.transports[f"{key.proto}/{key.dport}"] += sessions
+
+    destination_grouped: dict[tuple[str, str, str, str, str, str, tuple[str, ...]], RuleCandidate] = {}
+    for observation in destination_observations.values():
+        destination = next(iter(observation.destinations))
+        app_members = tuple(sorted(observation.applications))
+        group_key = (
+            observation.src_zone,
+            observation.dst_zone,
+            destination,
+            ",".join(observation.service_members),
+            observation.action,
+            observation.anchor_rule,
+            app_members,
+        )
+        candidate = destination_grouped.get(group_key)
         if candidate is None:
             candidate = RuleCandidate(
-                src_zone=key.src_zone,
-                dst_zone=key.dst_zone,
-                app=app,
-                service_members=service_members,
-                action=key.action,
-                anchor_rule=anchor_rule,
+                src_zone=observation.src_zone,
+                dst_zone=observation.dst_zone,
+                app=app_members[0] if len(app_members) == 1 else "apps",
+                service_members=observation.service_members,
+                action=observation.action,
+                anchor_rule=observation.anchor_rule,
                 sources=Counter(),
                 destinations=Counter(),
                 transports=Counter(),
             )
-            merged[bucket_key] = candidate
-        candidate.sessions += agg.sessions
-        candidate.bytes_total += agg.bytes_total
-        candidate.sources.update(agg.sources)
-        candidate.destinations.update(agg.destinations)
-        if candidate.transports is not None:
-            candidate.transports[f"{key.proto}/{key.dport}"] += agg.sessions
+            destination_grouped[group_key] = candidate
+        candidate.applications.update(observation.applications)
+        candidate.sources.update(observation.sources)
+        candidate.destinations.update(observation.destinations)
+        candidate.sessions += observation.sessions
+        candidate.bytes_total += observation.bytes_total
+        if candidate.transports is not None and observation.transports is not None:
+            candidate.transports.update(observation.transports)
 
     return sorted(
-        merged.values(),
+        [*merged.values(), *destination_grouped.values()],
         key=lambda cand: (
             candidate_order(cand, zone_roles)[0],
             candidate_order(cand, zone_roles)[1],
@@ -476,15 +612,12 @@ def members_for_side(
     group_names: set[str],
     group_threshold: int,
     source_any_threshold: int,
+    preserve_observed: bool = False,
 ) -> list[str]:
     if side == "destination" and any(not is_internal(value) for value in observed):
         return ["any"]
-    if side == "source" and zone_roles.is_client(zone):
-        return ["any"]
-    if side == "source" and zone_roles.is_internet(zone):
-        return ["any"]
-    if side == "source" and len(observed) > source_any_threshold:
-        return ["any"]
+    # A learned allow rule must never widen its source to `any` merely because
+    # many addresses were observed. Use concrete members or a generated group.
 
     object_names: list[str] = []
     for value, _ in observed.most_common():
@@ -786,7 +919,9 @@ def build_xml(
     candidates = merge_candidates(aggregates, min_sessions, limit, zone_roles, suppressed_apps)
 
     for index, candidate in enumerate(candidates, start=1):
-        name_parts = [candidate.src_zone, candidate.dst_zone, candidate.app]
+        application_members = sorted(candidate.applications) or [candidate.app]
+        app_name = application_members[0] if len(application_members) == 1 else "apps"
+        name_parts = [candidate.src_zone, candidate.dst_zone, app_name]
         if candidate.service_members != ("application-default",):
             name_parts.extend(candidate.service_members)
         rule_name = unique_rule_name(
@@ -810,6 +945,7 @@ def build_xml(
             group_names,
             group_threshold,
             source_any_threshold,
+            preserve_observed=not zone_roles.is_internet(candidate.dst_zone),
         )
         destination_members = members_for_side(
             candidate.destinations,
@@ -824,6 +960,13 @@ def build_xml(
             group_threshold,
             source_any_threshold,
         )
+        if "any" in source_members:
+            raise RuntimeError(f"Refusing overly broad generated rule {rule_name}: source resolved to any")
+        if "any" in application_members and not (
+            is_client_to_internet(candidate.src_zone, candidate.dst_zone, zone_roles)
+            and set(candidate.service_members).issubset({"service-http", "service-https"})
+        ):
+            raise RuntimeError(f"Refusing overly broad generated rule {rule_name}: application resolved to any")
         if candidate.service_members != ("application-default",) and candidate.transports:
             proto, port = parse_transport(next(iter(candidate.transports)))
             if candidate.service_members == ("service-http", "service-https"):
@@ -839,7 +982,7 @@ def build_xml(
             "destination": destination_members,
             "source-user": ["any"],
             "category": ["any"],
-            "application": [candidate.app],
+            "application": application_members,
             "service": list(candidate.service_members),
         }.items():
             add_member_list(ET.SubElement(entry, element_name), values)
@@ -869,7 +1012,7 @@ def build_xml(
                 "to": candidate.dst_zone,
                 "source": ",".join(source_members),
                 "destination": ",".join(destination_members),
-                "application": candidate.app,
+                "application": ",".join(application_members),
                 "service": ",".join(candidate.service_members),
                 "sessions": str(candidate.sessions),
                 "destination_mode": "internet-any" if destination_members == ["any"] else "internal-objects",
@@ -1273,6 +1416,61 @@ def scm_fetch_all(endpoint: str, token: str, container: dict[str, str]) -> list[
     return collected
 
 
+def fetch_scm_zone_networks(
+    scm: SCMConfig,
+) -> dict[str, tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]]:
+    token = get_scm_token(scm)
+    root = scm_api_root(scm.scm_api_base)
+    container = scm_container(folder=scm.scm_folder, snippet=scm.scm_snippet, device=scm.scm_device)
+    variables = scm_fetch_all(f"{root}/config/setup/v1/variables", token, container)
+    variable_values = {
+        str(item.get("name", "")).strip(): str(item.get("value", "")).strip()
+        for item in variables
+        if str(item.get("type", "")).strip() == "ip-netmask"
+    }
+    network_root = f"{root}/config/network/v1"
+    interfaces: dict[str, set[ipaddress.IPv4Network | ipaddress.IPv6Network]] = {}
+    for endpoint in (
+        "ethernet-interfaces",
+        "aggregate-ethernet-interfaces",
+        "layer3-subinterfaces",
+        "vlan-interfaces",
+    ):
+        try:
+            items = scm_fetch_all(f"{network_root}/{endpoint}", token, container)
+        except RuntimeError:
+            continue
+        for item in items:
+            name = str(item.get("name", "")).strip()
+            layer3 = item.get("layer3") if isinstance(item.get("layer3"), dict) else item
+            addresses = layer3.get("ip", []) if isinstance(layer3, dict) else []
+            for address_item in addresses if isinstance(addresses, list) else []:
+                raw = str(address_item.get("name", "") if isinstance(address_item, dict) else address_item).strip()
+                value = variable_values.get(raw, raw)
+                try:
+                    interface = ipaddress.ip_interface(value)
+                except ValueError:
+                    continue
+                network = interface.network
+                if network.prefixlen == 0 or network.num_addresses <= 2:
+                    continue
+                interfaces.setdefault(name, set()).add(network)
+
+    zone_networks: dict[str, tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]] = {}
+    for zone in scm_fetch_all(f"{network_root}/zones", token, container):
+        name = str(zone.get("name", "")).strip()
+        network = zone.get("network") if isinstance(zone.get("network"), dict) else {}
+        members = network.get("layer3", []) if isinstance(network, dict) else []
+        resolved = {
+            connected
+            for interface_name in members if isinstance(members, list)
+            for connected in interfaces.get(str(interface_name), set())
+        }
+        if name and resolved:
+            zone_networks[name] = tuple(sorted(resolved, key=lambda item: (item.version, item.prefixlen, str(item))))
+    return zone_networks
+
+
 def fetch_scm_inventory(scm: SCMConfig) -> ExistingConfigInventory:
     token = get_scm_token(scm)
     root = scm_api_root(scm.scm_api_base) + "/config/objects/v1"
@@ -1623,6 +1821,110 @@ def payload_rule_key(payload: dict[str, Any]) -> tuple[tuple[str, ...], ...]:
     )
 
 
+SHADOW_MATCH_FIELDS = (
+    ("from",),
+    ("to",),
+    ("source",),
+    ("destination",),
+    ("source_user", "source-user"),
+    ("category",),
+    ("application",),
+)
+
+
+def rule_name(payload: dict[str, Any]) -> str:
+    return normalized_scm_rule_name(str(payload.get("name", "")))
+
+
+def rule_enabled(payload: dict[str, Any]) -> bool:
+    value = payload.get("disabled", False)
+    return not (value is True or str(value).strip().lower() in {"yes", "true", "1"})
+
+
+def members_cover(earlier: tuple[str, ...], later: tuple[str, ...]) -> bool:
+    earlier_set = set(earlier or ("any",))
+    later_set = set(later or ("any",))
+    return "any" in earlier_set or later_set.issubset(earlier_set)
+
+
+def described_transports(payload: dict[str, Any]) -> set[str]:
+    description = str(payload.get("description", ""))
+    match = re.search(r"(?:^|;\s*)transports=([^;]+)", description)
+    return {value.strip().lower() for value in match.group(1).split(",") if value.strip()} if match else set()
+
+
+def explicit_service_transports(payload: dict[str, Any]) -> set[str]:
+    result: set[str] = set()
+    for service in payload_members(payload, "service"):
+        normalized = service.lower()
+        if normalized == "service-http":
+            result.add("tcp/80")
+        elif normalized == "service-https":
+            result.add("tcp/443")
+        else:
+            match = re.fullmatch(r"(\d+)_(tcp|udp|sctp)", normalized)
+            if match:
+                result.add(f"{match.group(2)}/{match.group(1)}")
+    return result
+
+
+def services_cover(earlier: dict[str, Any], later: dict[str, Any]) -> bool:
+    earlier_services = payload_members(earlier, "service") or ("application-default",)
+    later_services = payload_members(later, "service") or ("application-default",)
+    if members_cover(earlier_services, later_services):
+        return True
+    earlier_transports = explicit_service_transports(earlier) or described_transports(earlier)
+    later_transports = explicit_service_transports(later) or described_transports(later)
+    return bool(earlier_transports and later_transports and later_transports.issubset(earlier_transports))
+
+
+def security_rule_covers(earlier: dict[str, Any], later: dict[str, Any]) -> bool:
+    # SCM can return folder/snippet/default envelope rows without policy match
+    # fields. They are navigation metadata, not effective security rules.
+    if not any(key in earlier for key in ("from", "to", "source", "destination", "application", "service")):
+        return False
+    if not rule_enabled(earlier):
+        return False
+    return all(
+        members_cover(payload_members(earlier, *keys), payload_members(later, *keys))
+        for keys in SHADOW_MATCH_FIELDS
+    ) and services_cover(earlier, later)
+
+
+def planned_rule_order(
+    existing_rules: list[dict[str, Any]],
+    generated_rules: list[dict[str, Any]],
+    anchors: dict[str, str],
+) -> list[dict[str, Any]]:
+    generated_names = {rule_name(rule) for rule in generated_rules}
+    normalized_anchors = {normalized_scm_rule_name(name): anchor for name, anchor in anchors.items()}
+    planned = [rule for rule in existing_rules if rule_name(rule) not in generated_names]
+    for generated in generated_rules:
+        anchor_name = normalized_scm_rule_name(normalized_anchors.get(rule_name(generated), ""))
+        anchor_index = next((index for index, rule in enumerate(planned) if rule_name(rule) == anchor_name), len(planned))
+        planned.insert(anchor_index, generated)
+    return planned
+
+
+def enforce_shadowing_gate(
+    existing_rules: list[dict[str, Any]],
+    generated_rules: list[dict[str, Any]],
+    anchors: dict[str, str],
+) -> None:
+    planned = planned_rule_order(existing_rules, generated_rules, anchors)
+    generated_names = {rule_name(rule) for rule in generated_rules}
+    findings: list[str] = []
+    for index, candidate in enumerate(planned):
+        candidate_name = rule_name(candidate)
+        if candidate_name not in generated_names or not rule_enabled(candidate):
+            continue
+        shadow = next((rule for rule in planned[:index] if security_rule_covers(rule, candidate)), None)
+        if shadow is not None:
+            findings.append(f"{candidate_name} shadowed by {rule_name(shadow)}")
+    if findings:
+        raise RuntimeError("Security-policy shadowing gate blocked candidate: " + "; ".join(findings[:20]))
+
+
 def xml_rule_key(entry: ET.Element) -> tuple[tuple[str, ...], ...]:
     return (
         normalized_members(rule_member_values(entry, "./from/member")),
@@ -1635,6 +1937,23 @@ def xml_rule_key(entry: ET.Element) -> tuple[tuple[str, ...], ...]:
         normalized_members(rule_member_values(entry, "./service/member") or ["application-default"]),
         normalized_members(entry.findtext("./action", "allow")),
     )
+
+
+def xml_rule_payload(entry: ET.Element) -> dict[str, Any]:
+    return {
+        "name": entry.attrib.get("name", ""),
+        "from": rule_member_values(entry, "./from/member") or ["any"],
+        "to": rule_member_values(entry, "./to/member") or ["any"],
+        "source": rule_member_values(entry, "./source/member") or ["any"],
+        "destination": rule_member_values(entry, "./destination/member") or ["any"],
+        "source_user": rule_member_values(entry, "./source-user/member") or ["any"],
+        "category": rule_member_values(entry, "./category/member") or ["any"],
+        "application": rule_member_values(entry, "./application/member") or ["any"],
+        "service": rule_member_values(entry, "./service/member") or ["application-default"],
+        "action": entry.findtext("./action", "allow"),
+        "disabled": entry.findtext("./disabled", "no"),
+        "description": entry.findtext("./description", ""),
+    }
 
 
 def set_preflight_statuses(
@@ -1698,11 +2017,16 @@ def preflight_scm_rules(
         if rule.get("name")
     }
     existing_rule_keys = {payload_rule_key(rule) for rule in existing_rules}
-    generated_rules = [
-        (str(rule["name"]), payload_rule_key(rule))
-        for rule in build_scm_payloads(tree, deployment, scm, zone_roles, profile_groups)["rules"]
-    ]
-    return set_preflight_statuses(rows, generated_rules, existing_name_keys, existing_rule_keys)
+    generated_payloads = build_scm_payloads(tree, deployment, scm, zone_roles, profile_groups)["rules"]
+    generated_rules = [(str(rule["name"]), payload_rule_key(rule)) for rule in generated_payloads]
+    statuses = set_preflight_statuses(rows, generated_rules, existing_name_keys, existing_rule_keys)
+    skipped = {normalized_scm_rule_name(row["name"]) for row in rows if row.get("preflight_status") == "duplicate-match-skip"}
+    enforce_shadowing_gate(
+        existing_rules,
+        [rule for rule in generated_payloads if rule_name(rule) not in skipped],
+        movable_anchor_map(rows),
+    )
+    return statuses
 
 
 def rules_xpath(deployment: DeploymentConfig) -> str:
@@ -1744,11 +2068,19 @@ def preflight_panos_rules(
     }
     existing_rule_keys = {xml_rule_key(entry) for entry in existing_entries}
     *_, rules_root = extract_xml_sections(tree, deployment)
+    generated_entries = list(rules_root.findall("./entry")) if rules_root is not None else []
     generated_rules = [
         (entry.attrib["name"], xml_rule_key(entry))
-        for entry in rules_root.findall("./entry")
-    ] if rules_root is not None else []
-    return set_preflight_statuses(rows, generated_rules, existing_name_keys, existing_rule_keys)
+        for entry in generated_entries
+    ]
+    statuses = set_preflight_statuses(rows, generated_rules, existing_name_keys, existing_rule_keys)
+    skipped = {row["name"] for row in rows if row.get("preflight_status") == "duplicate-match-skip"}
+    enforce_shadowing_gate(
+        [xml_rule_payload(entry) for entry in existing_entries],
+        [xml_rule_payload(entry) for entry in generated_entries if entry.attrib.get("name") not in skipped],
+        movable_anchor_map(rows),
+    )
+    return statuses
 
 
 def movable_anchor_map(rows: list[dict[str, str]]) -> dict[str, str]:
@@ -1898,8 +2230,6 @@ def build_scm_payloads(
             src_zone = from_members[0] if from_members else "any"
             dst_zone = to_members[0] if to_members else "any"
             source_members = rule_member_values(entry, "./source/member")
-            if zone_roles.is_client(src_zone):
-                source_members = ["any"]
             profile_group = rule_member_values(entry, "./profile-setting/group/member")
             if not profile_group:
                 profile_group = [profile_group_for_rule(dst_zone, zone_roles, profile_groups)]
@@ -1936,6 +2266,10 @@ def build_scm_payloads(
             0 if payload["name"] == GLOBAL_PING_TRACEROUTE_RULE_NAME else 1,
             zone_order(payload["from"][0] if payload["from"] else "any", zone_roles),
             zone_order(payload["to"][0] if payload["to"] else "any", zone_roles),
+            1 if "any" in payload["application"] else 0,
+            1 if "any" in payload["service"] else 0,
+            1 if "any" in payload["source"] else 0,
+            1 if "any" in payload["destination"] else 0,
             payload["name"],
         )
     )
@@ -1974,6 +2308,12 @@ def push_to_scm(
         device=scm.scm_device,
     )
     rule_params = {"position": scm.scm_rulebase}
+    existing_rules = scm_fetch_rules(f"{security_base}/security-rules", token, rule_container, scm.scm_rulebase)
+    anchors = {
+        normalized_scm_rule_name(name): anchor
+        for name, anchor in movable_anchor_map(review_rows).items()
+    }
+    enforce_shadowing_gate(existing_rules, payloads["rules"], anchors)
 
     for payload in payloads["tags"]:
         scm_upsert(f"{objects_base}/tags", token, payload, object_container)
@@ -1994,7 +2334,11 @@ def push_to_scm(
         for rule in current_rules
         if rule.get("name") and rule.get("id")
     }
-    for generated_name, anchor_name in movable_anchor_map(review_rows).items():
+    for ordered_rule in payloads["rules"]:
+        generated_name = rule_name(ordered_rule)
+        anchor_name = anchors.get(generated_name, "")
+        if not anchor_name:
+            continue
         generated = rules_by_name.get(normalized_scm_rule_name(generated_name))
         anchor = rules_by_name.get(normalized_scm_rule_name(anchor_name))
         if not generated:
@@ -2018,7 +2362,16 @@ def push_to_device(xml_path: Path, deployment: DeploymentConfig, review_rows: li
 
     ctx = ssl._create_unverified_context()
     key = panos_api_key(deployment, ctx)
-    existing_rule_names = {entry.attrib["name"] for entry in fetch_panos_rule_entries(deployment) if entry.attrib.get("name")}
+    existing_entries = fetch_panos_rule_entries(deployment)
+    existing_rule_names = {entry.attrib["name"] for entry in existing_entries if entry.attrib.get("name")}
+    tree = ET.parse(xml_path)
+    *_, generated_root = extract_xml_sections(tree, deployment)
+    generated_entries = list(generated_root.findall("./entry")) if generated_root is not None else []
+    enforce_shadowing_gate(
+        [xml_rule_payload(entry) for entry in existing_entries],
+        [xml_rule_payload(entry) for entry in generated_entries],
+        movable_anchor_map(review_rows),
+    )
 
     import_name = import_name_for_path(xml_path)
     upload_path = xml_path if xml_path.name == import_name else xml_path.with_name(import_name)
@@ -2053,7 +2406,12 @@ def push_to_device(xml_path: Path, deployment: DeploymentConfig, review_rows: li
                 api_get(deployment.panos_endpoint, {"type": "op", "key": key, "cmd": cmd}, ctx),
                 "load partial config",
             )
-        for generated_name, anchor_name in movable_anchor_map(review_rows).items():
+        anchors = movable_anchor_map(review_rows)
+        for entry in generated_entries:
+            generated_name = entry.attrib.get("name", "")
+            anchor_name = anchors.get(generated_name, "")
+            if not generated_name or not anchor_name:
+                continue
             xpath = f"{rules_xpath(deployment)}/entry[@name={xpath_literal(generated_name)}]"
             destination, destination_rule = rule_move_destination(anchor_name, existing_rule_names)
             position = {"where": "before", "dst": destination_rule} if destination == "before" else {"where": "bottom"}
@@ -2178,7 +2536,7 @@ def load_builder_config(path: Path) -> tuple[BuilderConfig, ZoneRoleConfig, Depl
             (),
             path,
         ),
-        min_sessions=config_int(builder_raw, "min_sessions", 3, path),
+        min_sessions=config_int(builder_raw, "min_sessions", 10, path),
         limit=config_int(builder_raw, "limit", 100, path),
         group_threshold=config_int(builder_raw, "group_threshold", 10, path),
         source_any_threshold=config_int(builder_raw, "source_any_threshold", 5, path),
@@ -2358,6 +2716,21 @@ def main() -> int:
         raise SystemExit(f"Missing log path(s): {', '.join(missing)}")
     aggregates = aggregate_log_paths(logs, builder.include_actions, workers=builder.workers)
     ptr_cache = load_ptr_cache(builder.ptr_cache_file)
+    if deployment.scm:
+        try:
+            zone_networks = fetch_scm_zone_networks(scm)
+        except RuntimeError as exc:
+            zone_networks = {}
+            print(f"SCM connected-subnet discovery unavailable; preserving observed source hosts: {type(exc).__name__}")
+        zone_roles = ZoneRoleConfig(zone_roles.zone_roles, zone_networks)
+        if zone_networks:
+            print(
+                "SCM connected subnets: "
+                + ", ".join(
+                    f"{zone}={','.join(str(network) for network in networks)}"
+                    for zone, networks in sorted(zone_networks.items())
+                )
+            )
     selected_log_setting = builder.log_setting
     if selected_log_setting is None:
         if deployment.scm:

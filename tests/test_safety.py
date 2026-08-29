@@ -1,4 +1,5 @@
 import pathlib
+import ipaddress
 import sys
 import tempfile
 import gc
@@ -16,12 +17,16 @@ from vendor.bdnd_bpa_policy_builder import aggregate_flows
 from vendor.bdnd_panos_policy_builder import (
     DeploymentConfig,
     ExistingConfigInventory,
+    SCMConfig,
     ZoneRoleConfig,
     apply_existing_inventory,
     deploy_scm_candidate,
+    enforce_shadowing_gate,
+    fetch_scm_zone_networks,
     merge_candidates,
     movable_anchor_map,
     rule_move_destination,
+    security_rule_covers,
 )
 
 class SafetyTests(unittest.TestCase):
@@ -246,6 +251,180 @@ class SafetyTests(unittest.TestCase):
             ("any", ("service-https",)),
             ("ntp-base", ("application-default",)),
             ("ssl", ("9440_TCP",)),
+        })
+
+    def test_server_to_internet_uses_effective_app_per_source(self):
+        base = {
+            "dst": "198.51.100.1", "src_zone": "servers", "dst_zone": "internet",
+            "proto": "tcp", "dport": "443", "action": "allow", "repeat": "3",
+            "bytes": "100", "rule": "Discovery",
+        }
+        aggregates = aggregate_flows([
+            {**base, "src": "10.0.0.10", "app": "ssl"},
+            {**base, "src": "10.0.0.11", "app": "ssl"},
+            {**base, "src": "10.0.0.10", "app": "apt-get", "dport": "80"},
+            {**base, "src": "10.0.0.12", "app": "incomplete"},
+        ], {"allow"})
+        candidates = merge_candidates(
+            aggregates, 1, 0, ZoneRoleConfig({"servers": "server", "internet": "internet"})
+        )
+        observed = {(tuple(candidate.sources), candidate.app) for candidate in candidates}
+        self.assertEqual(observed, {
+            (("10.0.0.10",), "ssl"),
+            (("10.0.0.11",), "ssl"),
+            (("10.0.0.10",), "apt-get"),
+        })
+        self.assertNotIn("any", {candidate.app for candidate in candidates})
+
+    def test_client_to_server_preserves_observed_paths_and_effective_apps(self):
+        base = {
+            "src_zone": "clients", "dst_zone": "servers", "proto": "tcp",
+            "action": "allow", "repeat": "3", "bytes": "100", "rule": "Discovery",
+        }
+        aggregates = aggregate_flows([
+            {**base, "src": "10.0.1.10", "dst": "10.0.2.20", "app": "ssl", "dport": "443"},
+            {**base, "src": "10.0.1.11", "dst": "10.0.2.21", "app": "ssl", "dport": "443"},
+            {**base, "src": "10.0.1.10", "dst": "10.0.2.22", "app": "ms-rdp", "dport": "3389"},
+            {**base, "src": "10.0.1.12", "dst": "10.0.2.23", "app": "incomplete", "dport": "443"},
+        ], {"allow"})
+        candidates = merge_candidates(
+            aggregates, 1, 0, ZoneRoleConfig({"clients": "client", "servers": "server"})
+        )
+        observed = {
+            (tuple(candidate.sources), tuple(candidate.destinations), candidate.app)
+            for candidate in candidates
+        }
+        self.assertEqual(observed, {
+            (("10.0.1.10",), ("10.0.2.20",), "ssl"),
+            (("10.0.1.11",), ("10.0.2.21",), "ssl"),
+            (("10.0.1.10",), ("10.0.2.22",), "ms-rdp"),
+        })
+        self.assertNotIn("any", {candidate.app for candidate in candidates})
+
+    def test_unidentified_apps_only_generalize_for_client_web_egress(self):
+        internal = {
+            "src": "10.0.1.10", "dst": "10.0.2.20", "src_zone": "other",
+            "dst_zone": "servers", "app": "incomplete", "proto": "tcp", "dport": "443",
+            "action": "allow", "repeat": "10", "bytes": "100", "rule": "Discovery",
+        }
+        internet = {
+            **internal, "src_zone": "clients", "dst_zone": "internet",
+            "dst": "198.51.100.10",
+        }
+        roles = ZoneRoleConfig({"clients": "client", "servers": "server", "internet": "internet"})
+        internal_candidates = merge_candidates(aggregate_flows([internal], {"allow"}), 1, 0, roles)
+        internet_candidates = merge_candidates(aggregate_flows([internet], {"allow"}), 1, 0, roles)
+        self.assertEqual(internal_candidates, [])
+        self.assertEqual(
+            [(candidate.app, candidate.service_members) for candidate in internet_candidates],
+            [("any", ("service-https",))],
+        )
+
+    def test_internal_sources_are_preserved_in_generated_rules(self):
+        text = (ROOT / "vendor/bdnd_panos_policy_builder.py").read_text()
+        self.assertIn(
+            "preserve_observed=not zone_roles.is_internet(candidate.dst_zone)",
+            text,
+        )
+        self.assertNotIn('if zone_roles.is_client(src_zone):\n                source_members = ["any"]', text)
+
+    def test_broad_scm_rules_sort_after_specific_rules(self):
+        text = (ROOT / "vendor/bdnd_panos_policy_builder.py").read_text()
+        app_specificity = '1 if "any" in payload["application"] else 0'
+        source_specificity = '1 if "any" in payload["source"] else 0'
+        self.assertIn(app_specificity, text)
+        self.assertIn(source_specificity, text)
+        self.assertLess(text.index(app_specificity), text.index(source_specificity))
+
+    def test_learned_panos_rules_fail_closed_instead_of_widening_to_any(self):
+        text = (ROOT / "vendor/bdnd_panos_policy_builder.py").read_text()
+        self.assertIn("Refusing overly broad generated rule", text)
+        self.assertNotIn('len(observed) > source_any_threshold and not preserve_observed', text)
+        self.assertIn("zone_roles.generalized_source(key.src_zone, source)", text)
+
+    def test_legacy_bpa_path_does_not_merge_all_client_internet_apps(self):
+        text = (ROOT / "vendor/bdnd_bpa_policy_builder.py").read_text()
+        self.assertNotIn("merged_client_internet", text)
+        self.assertIn("if app == \"any\" and not web_service", text)
+        self.assertIn("source = top_sources", text)
+
+    def test_shadowing_gate_detects_web_service_covering_app_default(self):
+        broad = {
+            "name": "broad", "from": ["servers"], "to": ["internet"],
+            "source": ["any"], "destination": ["any"], "source_user": ["any"],
+            "category": ["any"], "application": ["any"], "service": ["service-https"],
+        }
+        specific = {
+            "name": "specific", "from": ["servers"], "to": ["internet"],
+            "source": ["server-a"], "destination": ["any"], "source_user": ["any"],
+            "category": ["any"], "application": ["ssl"], "service": ["application-default"],
+            "description": "Generated from traffic logs; transports=tcp/443",
+        }
+        self.assertTrue(security_rule_covers(broad, specific))
+        with self.assertRaisesRegex(RuntimeError, "specific shadowed by broad"):
+            enforce_shadowing_gate([], [broad, specific], {})
+
+    def test_shadowing_gate_accepts_specific_before_broad_catch_rule(self):
+        catch = {
+            "name": "Discovery", "from": ["any"], "to": ["any"], "source": ["any"],
+            "destination": ["any"], "source_user": ["any"], "category": ["any"],
+            "application": ["any"], "service": ["any"],
+        }
+        specific = {
+            "name": "specific", "from": ["clients"], "to": ["servers"],
+            "source": ["client-net"], "destination": ["server-a"], "source_user": ["any"],
+            "category": ["any"], "application": ["ssl"], "service": ["application-default"],
+        }
+        enforce_shadowing_gate([catch], [specific], {"specific": "Discovery"})
+
+    def test_scm_moves_follow_safely_sorted_payload_order(self):
+        text = (ROOT / "vendor/bdnd_panos_policy_builder.py").read_text()
+        self.assertIn('for ordered_rule in payloads["rules"]:', text)
+        self.assertNotIn('for generated_name, anchor_name in movable_anchor_map(review_rows).items():', text)
+
+    def test_client_rules_are_destination_centric_and_group_equal_app_sets(self):
+        base = {
+            "dst": "10.0.2.20", "src_zone": "clients", "dst_zone": "servers",
+            "proto": "tcp", "action": "allow", "repeat": "10", "bytes": "100",
+            "rule": "Discovery",
+        }
+        aggregates = aggregate_flows([
+            {**base, "src": "10.0.1.10", "app": "ssl", "dport": "443"},
+            {**base, "src": "10.0.1.11", "app": "web-browsing", "dport": "80"},
+            {**base, "src": "10.0.3.12", "app": "ssl", "dport": "443"},
+        ], {"allow"})
+        roles = ZoneRoleConfig(
+            {"clients": "client", "servers": "server"},
+            {"clients": (ipaddress.ip_network("10.0.1.0/24"), ipaddress.ip_network("10.0.3.0/24"))},
+        )
+        candidates = merge_candidates(aggregates, 1, 0, roles)
+        observed = {
+            (tuple(candidate.sources), tuple(candidate.destinations), tuple(sorted(candidate.applications)))
+            for candidate in candidates
+        }
+        self.assertEqual(observed, {
+            (("10.0.1.0/24",), ("10.0.2.20",), ("ssl", "web-browsing")),
+            (("10.0.3.0/24",), ("10.0.2.20",), ("ssl",)),
+        })
+
+    @patch("vendor.bdnd_panos_policy_builder.get_scm_token", return_value="token")
+    @patch("vendor.bdnd_panos_policy_builder.scm_fetch_all")
+    def test_scm_zone_networks_resolve_interface_variables_fail_closed(self, fetch, _token):
+        def response(endpoint, _token_value, _container):
+            if endpoint.endswith("/variables"):
+                return [{"name": "$CLIENT_IP", "type": "ip-netmask", "value": "10.0.1.1/24"}]
+            if endpoint.endswith("/ethernet-interfaces"):
+                return [{"name": "$CLIENT_IF", "layer3": {"ip": [{"name": "$CLIENT_IP"}]}}]
+            if endpoint.endswith("/zones"):
+                return [
+                    {"name": "clients", "network": {"layer3": ["$CLIENT_IF"]}},
+                    {"name": "vpn", "network": {"layer3": ["$TUNNEL_IF"]}},
+                ]
+            return []
+        fetch.side_effect = response
+        scm = SCMConfig("id", "secret", "tsg", "token-url", "https://api.example/config/security/v1", "folder", "objects", "", "", "pre", "log")
+        self.assertEqual(fetch_scm_zone_networks(scm), {
+            "clients": (ipaddress.ip_network("10.0.1.0/24"),),
         })
 
     def test_source_rule_is_kept_for_positioning(self):

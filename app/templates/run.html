@@ -29,6 +29,28 @@
 {% endif %}
 </div>
 </div>
+{% if monitor %}
+<div class="card" style="margin-top:22px">
+<div class="card-header"><div><h2>Post-deployment controle</h2><p class="muted">{% if monitor.activation_status=='pending' %}Candidate geschreven {{monitor.candidate_at}} · wacht tot de regels in de running config staan{% else %}Baseline {{monitor.deployed_at}} · automatische controle na 1 uur en 24 uur{% endif %}</p></div></div>
+{% if monitor.last_error %}<div class="callout"><strong>Controle mislukt</strong><br>{{monitor.last_error}}</div>{% endif %}
+<div class="grid grid-2">
+{% for label,report in [('Na 1 uur',monitor.one_hour),('Na 24 uur',monitor.one_day)] %}
+<div class="card">
+<div class="card-header"><h3>{{label}}</h3>{% if report %}<span class="badge badge-{{'success' if report.status=='healthy' else 'danger'}}">{{report.status}}</span>{% else %}<span class="badge badge-warning">{{'wacht op deployment' if monitor.activation_status=='pending' else 'gepland'}}</span>{% endif %}</div>
+{% if report %}
+<p><strong>{{report.generated_sessions}}</strong> sessies op nieuwe regels · <strong>{{report.fallback_sessions}}</strong> op brede fallback ({{(report.fallback_ratio * 100)|round(1)}}%)</p>
+{% if report.zero_hits %}<p><strong>Zonder hits:</strong> {{report.zero_hits|join(', ')}}</p>{% endif %}
+{% if report.high_volume %}<p><strong>Onverwacht hoog volume:</strong> {% for item in report.high_volume %}{{item.name}} ({{item.sessions}}){% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+{% if report.significant_fallback %}<p><strong>Actie nodig:</strong> de brede fallback ontvangt nog betekenisvol verkeer.</p>{% endif %}
+<p class="muted">Gecontroleerd {{report.checked_at}}</p>
+{% else %}<p class="muted">{{'De timer start zodra de running config is bevestigd.' if monitor.activation_status=='pending' else 'Nog niet vervallen.'}}</p>{% endif %}
+</div>
+{% endfor %}
+</div>
+</div>
+{% elif run.mode=='push' %}
+<div class="card" style="margin-top:22px"><h2>Post-deployment controle</h2><p class="muted">Beschikbaar voor toekomstige SCM-deployments nadat deze functie werd geactiveerd.</p></div>
+{% endif %}
 {% if review %}
 <div class="review-toolbar" style="margin-top:22px"><input class="search" data-table-filter="#review" placeholder="Filter review..."></div>
 <div class="table-wrap">

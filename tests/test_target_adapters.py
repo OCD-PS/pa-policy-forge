@@ -1409,6 +1409,56 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertIn("Translated Packet", template)
         self.assertIn('name="nat_translation_editor" value="yes"', template)
 
+    def test_post_deploy_report_flags_zero_high_volume_and_fallback(self):
+        baseline = {
+            "rules": {"specific-zero": {"disabled": False}, "specific-busy": {"disabled": False}},
+            "anchors": ["broad-discovery"],
+            "counts": {
+                "specific-zero": {"sessions": 10, "bytes": 100},
+                "specific-busy": {"sessions": 20, "bytes": 200},
+                "broad-discovery": {"sessions": 30, "bytes": 300},
+            },
+        }
+        current = {
+            "specific-zero": {"sessions": 10, "bytes": 100},
+            "specific-busy": {"sessions": 100020, "bytes": 1000200},
+            "broad-discovery": {"sessions": 20030, "bytes": 2000300},
+        }
+        report = main.post_deploy_report(baseline, current, "24h")
+        self.assertEqual(report["status"], "warning")
+        self.assertEqual(report["zero_hits"], ["specific-zero"])
+        self.assertEqual(report["high_volume"][0]["name"], "specific-busy")
+        self.assertTrue(report["significant_fallback"])
+
+    def test_post_deploy_report_does_not_warn_for_one_hour_zero_hits(self):
+        baseline = {
+            "rules": {"new-rule": {"disabled": False}},
+            "anchors": ["broad-discovery"],
+            "counts": {"new-rule": {"sessions": 4, "bytes": 40}, "broad-discovery": {"sessions": 5, "bytes": 50}},
+        }
+        report = main.post_deploy_report(baseline, baseline["counts"], "1h")
+        self.assertEqual(report["status"], "healthy")
+        self.assertEqual(report["zero_hits"], ["new-rule"])
+        self.assertFalse(report["significant_fallback"])
+
+    def test_panorama_activation_requires_rules_on_every_managed_device(self):
+        profile = {
+            "id": 77,
+            "target_type": "panorama",
+            "serial": "FW-A",
+            "settings_json": json.dumps({"passive_serial": "FW-B"}),
+        }
+
+        def running_config(_endpoint, params, _ctx):
+            names = ["generated-common", "only-a"] if params.get("target") == "FW-A" else ["generated-common", "only-b"]
+            entries = "".join(f'<entry name="{name}" />' for name in names)
+            return f'<response status="success"><result><rules>{entries}</rules></result></response>'
+
+        with patch.object(main, "panos_profile_context", return_value=({}, "https://panorama.test", "key", object())), \
+             patch.object(main.policy_api, "api_get", side_effect=running_config):
+            names = main.running_panos_rule_names(profile)
+        self.assertEqual(names, {"generated-common"})
+
 
 if __name__ == "__main__":
     unittest.main()
