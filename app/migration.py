@@ -748,6 +748,148 @@ class CheckPointParser(BaseParser):
         review = "MIGRATION-REVIEW: " + "; ".join(notes)
         return "; ".join(filter(None, [description, review]))[:1023]
 
+    @classmethod
+    def _apply_gateway_zone_inference(cls, model: MigrationModel, items: list[dict]) -> None:
+        """Infer conservative PAN-OS zones from Check Point gateway topology.
+
+        A Check Point show-package contains this information in
+        ``Standard_gateway_objects.json``. Prefer the cluster object over its
+        members, retain explicit Check Point security-zone names, and otherwise
+        create deterministic per-interface zone names. Only unambiguous
+        longest-prefix matches are applied to policies.
+        """
+        gateways = [
+            item for item in items
+            if isinstance(item, dict) and isinstance(item.get("interfaces"), list)
+        ]
+        if not gateways:
+            return
+        clusters = [
+            item for item in gateways
+            if "gatewaycluster" in str(item.get("type", "")).casefold()
+        ]
+        gateway = max(clusters or gateways, key=lambda item: len(item.get("interfaces", [])))
+        topology: list[tuple[ipaddress._BaseNetwork, str]] = []
+        zone_sources: dict[str, list[str]] = {}
+        for interface in gateway.get("interfaces", []):
+            if not isinstance(interface, dict):
+                continue
+            address = str(interface.get("ipv4-address") or "").strip()
+            prefix = interface.get("ipv4-mask-length")
+            interface_name = str(interface.get("interface-name") or "").strip()
+            if not address or prefix is None or not interface_name:
+                continue
+            try:
+                network = ipaddress.ip_interface(f"{address}/{prefix}").network
+            except ValueError:
+                continue
+            if network.is_link_local:
+                continue
+            metadata = (
+                interface.get("topology")
+                if isinstance(interface.get("topology"), dict)
+                else {}
+            )
+            explicit = metadata.get("security-zone")
+            explicit_name = (
+                str(explicit.get("name") or "") if isinstance(explicit, dict) else ""
+            )
+            if explicit_name:
+                zone = clean_name(explicit_name)
+            elif metadata.get("leads-to-internet"):
+                zone = "Untrust"
+            else:
+                zone = clean_name(f"CP-{interface_name}")
+            topology.append((network, zone))
+            zone_sources.setdefault(zone, []).append(interface_name)
+        if not topology:
+            return
+
+        existing_zones = {str(item.get("name", "")) for item in model.zones}
+        gateway_name = str(gateway.get("name") or gateway.get("uid") or "Check Point gateway")
+        for zone, interfaces in sorted(zone_sources.items(), key=lambda item: item[0].casefold()):
+            if zone in existing_zones:
+                continue
+            entry = ET.Element("entry", {"name": zone})
+            network = ET.SubElement(entry, "network")
+            ET.SubElement(network, "layer3")
+            model.zones.append({
+                "name": zone,
+                "xml": ET.tostring(entry, encoding="unicode"),
+                "source_ref": f"{gateway_name}: {', '.join(unique(interfaces))}",
+            })
+            existing_zones.add(zone)
+
+        address_networks: dict[str, list[ipaddress._BaseNetwork]] = {}
+        for item in model.addresses:
+            if item.value_type != "ip_netmask":
+                continue
+            try:
+                address_networks.setdefault(item.name, []).append(
+                    ipaddress.ip_network(item.value, strict=False)
+                )
+            except ValueError:
+                continue
+        groups = {item.name: item.members for item in model.address_groups}
+
+        def expand(
+            values: list[str], seen: set[str] | None = None
+        ) -> list[ipaddress._BaseNetwork] | None:
+            seen = seen or set()
+            result: list[ipaddress._BaseNetwork] = []
+            for value in values:
+                if value in {"any", "original"} or value in seen:
+                    return None
+                if value in groups:
+                    nested = expand(groups[value], seen | {value})
+                    if nested is None:
+                        return None
+                    result.extend(nested)
+                    continue
+                if value in address_networks:
+                    result.extend(address_networks[value])
+                    continue
+                try:
+                    result.append(ipaddress.ip_network(value, strict=False))
+                except ValueError:
+                    return None
+            return result or None
+
+        def infer(values: list[str]) -> list[str] | None:
+            networks = expand(values)
+            if not networks:
+                return None
+            result: list[str] = []
+            for network in networks:
+                matches = [
+                    (target.prefixlen, zone)
+                    for target, zone in topology
+                    if network.version == target.version and network.subnet_of(target)
+                ]
+                if not matches:
+                    return None
+                longest = max(prefix for prefix, _ in matches)
+                choices = {zone for prefix, zone in matches if prefix == longest}
+                if len(choices) != 1:
+                    return None
+                result.append(next(iter(choices)))
+            return unique(result)
+
+        mapped_sides = 0
+        for rule in [*model.security_rules, *model.nat_rules]:
+            source_zones = infer(rule.source)
+            destination_zones = infer(rule.destination)
+            if source_zones and rule.from_zones == ["any"]:
+                rule.from_zones = source_zones
+                mapped_sides += 1
+            if destination_zones and rule.to_zones == ["any"]:
+                rule.to_zones = destination_zones
+                mapped_sides += 1
+        model.warnings.append(
+            f"Check Point gatewaytopologie: {len(model.zones)} zones gevonden; "
+            f"{mapped_sides} policyzijden via eenduidige longest-prefix mapping ingevuld"
+        )
+
     @staticmethod
     def _is_address_reference(value: str, known: set[str]) -> bool:
         if value in {"any", "original"} or value in known:
@@ -1095,6 +1237,7 @@ class CheckPointParser(BaseParser):
             access, nat = data, []
         self._walk_rules(access, model, lookup, type_lookup)
         self._walk_nat_rules(nat, model, lookup, services_by_name)
+        self._apply_gateway_zone_inference(model, items)
         return self._conservative_panos_staging(deduplicate(model))
 
     @staticmethod

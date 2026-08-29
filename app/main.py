@@ -5140,7 +5140,16 @@ def migration_project(project_id):
         "zones":sorted({str(item.get("name","")) for item in target_model.zones if str(item.get("name",""))}),
         "interfaces":sorted({str(item.get("name","")) for item in target_model.interfaces if str(item.get("name",""))}),
     }
-    target_zones = sorted(set(topology_targets["zones"]) | set(profile_settings_value.get("zones", {})))
+    offline_source_zones = {
+        str(item.get("name", ""))
+        for item in combined.zones
+        if int(project["profile_system"] or 0) and str(item.get("name", ""))
+    }
+    target_zones = sorted(
+        set(topology_targets["zones"])
+        | set(profile_settings_value.get("zones", {}))
+        | offline_source_zones
+    )
     policy_zone_query=request.args.get("zone_query", "").strip()
     policy_zone_items = []
     policy_zone_total = 0
@@ -5197,6 +5206,9 @@ def migration_project(project_id):
         project_roles=role_rows, project_users=users, current_project_role=migration_project_role(project_id),
         project_audits=project_audits,
         latest_analysis=json.loads(latest_analysis["analysis_json"]) if latest_analysis else None,
+        show_topology_mapping=bool(
+            source_ids and (topology_items or policy_zone_items or policy_zone_query)
+        ),
     )
 
 
@@ -5321,6 +5333,7 @@ def migration_policy_zone_mapping_save(project_id):
             ]
         if not profile or not source_ids:
             raise MigrationError("Targetprofiel of migratiebron ontbreekt")
+        model = selected_migration_model(project_id, source_ids)
         target_model = MigrationModel("panos", "target")
         if project["base_workspace_id"]:
             base_workspace = workspace_row(int(project["base_workspace_id"]))
@@ -5329,8 +5342,21 @@ def migration_policy_zone_mapping_save(project_id):
                     base_workspace["config_path"], base_workspace["sha256"]
                 )
         settings = profile_settings(profile)
-        target_zones = set(migration_zone_names(target_model)) | set(settings.get("zones", {}))
-        freeform_allowed = profile["target_type"] == "panorama" and not target_zones
+        source_zones = {
+            str(item.get("name", ""))
+            for item in model.zones
+            if int(profile["system"] or 0) and str(item.get("name", ""))
+        }
+        target_zones = (
+            set(migration_zone_names(target_model))
+            | set(settings.get("zones", {}))
+            | source_zones
+        )
+        freeform_allowed = bool(
+            int(profile["system"] or 0)
+            and settings.get("system_offline")
+            and not target_zones
+        )
         for zone in [*from_zones, *to_zones]:
             if not freeform_allowed and zone not in target_zones:
                 raise MigrationError(
@@ -5338,7 +5364,6 @@ def migration_policy_zone_mapping_save(project_id):
                 )
             if freeform_allowed and not re.fullmatch(r"[A-Za-z0-9._ -]{1,63}", zone):
                 raise MigrationError("Ongeldige zonenaam")
-        model = selected_migration_model(project_id, source_ids)
         available = {
             f"{kind}|||{item_selector(rule.__dict__)}": (kind, item_selector(rule.__dict__))
             for kind, rules in (("security_rules", model.security_rules), ("nat_rules", model.nat_rules))

@@ -570,6 +570,57 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         self.assertIn("Track: Log", model.security_rules[0].description)
         self.assertTrue(any("globale UID-dictionary" in message for message in model.warnings))
 
+    def test_checkpoint_gateway_topology_creates_zones_and_maps_unambiguous_policy_sides(self):
+        documents = {
+            "Standard_objects.json": [
+                {"type": "network", "uid": "inside", "name": "Inside", "subnet4": "10.10.0.0", "mask-length4": 24},
+                {"type": "network", "uid": "dmz", "name": "DMZ-Web", "subnet4": "172.16.5.0", "mask-length4": 24},
+            ],
+            "Standard_gateway_objects.json": [{
+                "type": "CpmiGatewayCluster",
+                "uid": "cluster",
+                "name": "cluster",
+                "interfaces": [
+                    {
+                        "interface-name": "bond1.10", "ipv4-address": "10.10.0.1", "ipv4-mask-length": 24,
+                        "topology": {"leads-to-internet": False},
+                    },
+                    {
+                        "interface-name": "eth2.1725", "ipv4-address": "172.16.5.1", "ipv4-mask-length": 24,
+                        "topology": {"security-zone": {"name": "DMZZone"}},
+                    },
+                    {
+                        "interface-name": "eth3", "ipv4-address": "198.51.100.1", "ipv4-mask-length": 24,
+                        "topology": {"leads-to-internet": True},
+                    },
+                ],
+            }],
+            "Access-Management_server.json": {
+                "objects-dictionary": [
+                    {"type": "rulebaseaction", "uid": "accept", "name": "Accept"},
+                ],
+                "rulebase": [{
+                    "type": "access-rule", "uid": "rule", "name": "Inside to DMZ",
+                    "source": ["inside"], "destination": ["dmz"], "service": ["any"], "action": "accept",
+                }],
+            },
+        }
+        payload = io.BytesIO()
+        with tarfile.open(fileobj=payload, mode="w") as archive:
+            for name, document in documents.items():
+                raw = json.dumps(document).encode()
+                info = tarfile.TarInfo(name)
+                info.size = len(raw)
+                archive.addfile(info, io.BytesIO(raw))
+        model = parse_vendor("checkpoint", payload.getvalue(), "show_package.tar")
+        self.assertEqual(
+            {item["name"] for item in model.zones},
+            {"CP-bond1.10", "DMZZone", "Untrust"},
+        )
+        self.assertEqual(model.security_rules[0].from_zones, ["CP-bond1.10"])
+        self.assertEqual(model.security_rules[0].to_zones, ["DMZZone"])
+        self.assertTrue(any("longest-prefix" in message for message in model.warnings))
+
     def test_checkpoint_show_package_rejects_parent_traversal(self):
         payload = io.BytesIO()
         with tarfile.open(fileobj=payload, mode="w") as archive:
@@ -1600,7 +1651,7 @@ allow-web,security,,Trust,Untrust,any,web,ssl,application-default,allow
         self.assertIn("Palo Alto PAN-OS / Panorama XML", page)
         self.assertNotIn("Migration Control Center", page)
         self.assertNotIn("Bron- en doelmapping", page)
-        self.assertNotIn("Interfaces, zones en routing mappen", page)
+        self.assertIn("Interfaces, zones en routing mappen", page)
         self.assertNotIn("Filters en selecties", page)
         self.assertNotIn("Bulk refactor", page)
         self.assertNotIn("Catalogi en discovery", page)
