@@ -1487,7 +1487,10 @@ allow-web,security,,Trust,Untrust,any,web,ssl,application-default,allow
             },
         )
         self.assertEqual(preview.status_code, 200)
-        match = re.search(r'action="/migration/drafts/([^/]+)/apply"', preview.get_data(as_text=True))
+        preview_html = preview.get_data(as_text=True)
+        self.assertNotIn('#best-practices', preview_html)
+        self.assertNotIn('#topology-mapping', preview_html)
+        match = re.search(r'action="/migration/drafts/([^/]+)/apply"', preview_html)
         self.assertIsNotNone(match)
         applied = client.post(
             f"/migration/drafts/{match.group(1)}/apply", base_url="https://forge.test",

@@ -609,6 +609,7 @@
       detailDialog.querySelector("[data-object-detail-close]").addEventListener("click", function () { detailDialog.close(); });
     }
     if (!dialog || !form) { updateCount(); return; }
+    var currentObjectType = (form.querySelector('[name="object_type"]') || {}).value || "";
     var groupType = form.querySelector("[data-object-group-type]");
     function updateGroupType() { if (!groupType) return; var dynamic = groupType.value === "dynamic"; var staticNode = form.querySelector("[data-static-members]"); var dynamicNode = form.querySelector("[data-dynamic-filter]"); if (staticNode) staticNode.hidden = dynamic; if (dynamicNode) dynamicNode.hidden = !dynamic; }
     if (groupType) groupType.addEventListener("change", updateGroupType);

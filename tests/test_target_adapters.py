@@ -318,6 +318,7 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertIn("function parseTagTokens", javascript)
         self.assertIn("tagQuoteOpen", javascript)
         self.assertIn("objectValueAlreadyAssigned", javascript)
+        self.assertIn("var currentObjectType =", javascript)
         self.assertIn("activeField._offlineValues.has", javascript)
         self.assertIn("pickerTarget._hasPickerValue", javascript)
         self.assertIn("data-single-tag-values", live_template)
