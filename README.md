@@ -1,6 +1,6 @@
 # PA Policy Forge
 
-Self-hosted Palo Alto traffic-flow policy builder with an HTTPS web interface, UDP syslog collection, encrypted target credentials, policy review, and target-aware pushes to SCM, Panorama, or standalone PAN-OS.
+Self-hosted Palo Alto traffic-flow policy builder with an HTTPS web interface, UDP and TCP syslog collection, encrypted target credentials, policy review, and target-aware pushes to SCM, Panorama, or standalone PAN-OS.
 
 ## Safety guarantees
 
@@ -46,6 +46,7 @@ Ports:
 - `80/tcp`: HTTP to HTTPS redirect only
 - `443/tcp`: HTTPS GUI
 - `514/udp`: PAN-OS syslog
+- `514/tcp`: PAN-OS syslog using RFC 6587 octet-counting or newline framing
 
 The default login is `admin` / `admin`. For the current lab workflow PA Policy
 Forge does not force a password change. Direct Docker Compose deployments may
@@ -83,7 +84,7 @@ For offline customers, transfer the repository plus a saved container image bund
 ## First workflow
 
 1. Log in with the configured bootstrap account.
-2. Configure one or more PAN-OS firewalls to forward TRAFFIC logs to UDP 514.
+2. Configure one or more PAN-OS firewalls to forward TRAFFIC logs to UDP or TCP 514.
 3. Confirm each serial appears under discovered firewalls.
 4. Create a profile, map zones to roles, and enter the target credentials.
    For HA pairs, configure both the active and passive firewall serial.

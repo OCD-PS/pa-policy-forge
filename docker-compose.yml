@@ -7,9 +7,13 @@ services:
     ports:
       - "${PPF_BIND_ADDRESS:-0.0.0.0}:443:8443/tcp"
       - "${PPF_BIND_ADDRESS:-0.0.0.0}:514:5514/udp"
+      - "${PPF_BIND_ADDRESS:-0.0.0.0}:514:5514/tcp"
     environment:
       PPF_DATA_DIR: /data
       PPF_SYSLOG_PORT: "5514"
+      PPF_SYSLOG_MAX_MESSAGE_BYTES: "1048576"
+      PPF_SYSLOG_TCP_TIMEOUT: "30"
+      PPF_SYSLOG_TCP_MAX_CONNECTIONS: "64"
       PPF_MAX_GIB: "50"
       PPF_BOOTSTRAP_PASSWORD: ${PPF_BOOTSTRAP_PASSWORD:-admin}
       PPF_TRUSTED_HOSTS: ${PPF_TRUSTED_HOSTS:-}
@@ -20,7 +24,7 @@ services:
       - /var/lib/pa-policy-forge:/data
       - /opt/pa-policy-forge/certs:/certs
     healthcheck:
-      test: ["CMD", "python3", "-c", "import ssl,urllib.request; urllib.request.urlopen('https://127.0.0.1:8443/healthz',context=ssl._create_unverified_context(),timeout=5)"]
+      test: ["CMD", "python3", "-c", "import socket,ssl,urllib.request; urllib.request.urlopen('https://127.0.0.1:8443/healthz',context=ssl._create_unverified_context(),timeout=5); socket.create_connection(('127.0.0.1',5514),2).close()"]
       interval: 30s
       timeout: 8s
       retries: 3

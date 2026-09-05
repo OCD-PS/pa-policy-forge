@@ -42,7 +42,8 @@ from app.certificates import (
     install_certificate,
     read_upload,
 )
-from vendor.paloalto_light_syslog import FlowStore, parse_panos_syslog
+from vendor.paloalto_light_syslog import FlowStore, env_int, parse_panos_syslog
+from vendor.syslog_stream import tcp_server
 from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_single_replacements
 from app.migration import (
     MIGRATION_FILTER_FIELDS, MIGRATION_FILTER_OPERATORS, MIGRATION_KIND_LABELS, MIGRATION_MAPPING_ACTIONS,
@@ -7383,21 +7384,42 @@ def run_download(run_id, kind):
     return send_file(path, as_attachment=True, download_name=f"pa-policy-forge-run-{run_id}-{name}")
 
 
+def ingest_syslog(payload: bytes, source: str) -> None:
+    flow = parse_panos_syslog(payload.decode("utf-8", errors="replace"))
+    if not flow or not syslog_source_allowed(flow.serial, source):
+        return
+    flow_store.add_flow(flow)
+    timestamp = now()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO sources(serial,source_ip,first_seen,last_seen,messages) "
+            "VALUES(?,?,?,?,1) ON CONFLICT(serial,source_ip) DO UPDATE SET "
+            "last_seen=excluded.last_seen,messages=messages+1",
+            (flow.serial, source, timestamp, timestamp),
+        )
+
+
 def udp_loop():
     class Handler(socketserver.BaseRequestHandler):
         def handle(self):
-            flow=parse_panos_syslog(self.request[0].decode("utf-8",errors="replace"))
-            if not flow: return
-            source=self.client_address[0]
-            if not syslog_source_allowed(flow.serial, source): return
-            flow_store.add_flow(flow); timestamp=now()
-            with db() as conn:
-                conn.execute("INSERT INTO sources(serial,source_ip,first_seen,last_seen,messages) VALUES(?,?,?,?,1) ON CONFLICT(serial,source_ip) DO UPDATE SET last_seen=excluded.last_seen,messages=messages+1", (flow.serial,source,timestamp,timestamp))
+            ingest_syslog(self.request[0], self.client_address[0])
     server=socketserver.ThreadingUDPServer(("0.0.0.0", int(os.getenv("PPF_SYSLOG_PORT","514"))),Handler); server.daemon_threads=True; server.serve_forever()
+
+
+def tcp_loop():
+    server = tcp_server(
+        ("0.0.0.0", int(os.getenv("PPF_SYSLOG_PORT", "514"))),
+        ingest_syslog,
+        max_message_bytes=env_int("PPF_SYSLOG_MAX_MESSAGE_BYTES", 1048576),
+        connection_timeout=env_int("PPF_SYSLOG_TCP_TIMEOUT", 30),
+        max_connections=env_int("PPF_SYSLOG_TCP_MAX_CONNECTIONS", 64),
+    )
+    server.serve_forever()
 
 
 refresh_syslog_source_policy()
 threading.Thread(target=udp_loop,daemon=True,name="syslog-udp").start()
+threading.Thread(target=tcp_loop,daemon=True,name="syslog-tcp").start()
 threading.Thread(target=quota_loop,daemon=True,name="storage-quota").start()
 threading.Thread(target=prepare_loop,daemon=True,name="policy-prepare").start()
 threading.Thread(target=application_catalog_loop,daemon=True,name="application-catalog-scheduler").start()
