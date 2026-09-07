@@ -57,6 +57,23 @@
     all("[data-menu-toggle]").forEach(function (button) {
       button.addEventListener("click", function () { document.body.classList.toggle("nav-open"); });
     });
+
+    // A review action must reveal its editor, even when that editor is folded.
+    function revealAnchor(hash) {
+      if (!hash || hash === "#") return;
+      var target;
+      try { target = document.getElementById(decodeURIComponent(hash.slice(1))); }
+      catch (_) { return; }
+      for (var node = target; node; node = node.parentElement) {
+        if (node.tagName === "DETAILS") node.open = true;
+      }
+    }
+    document.addEventListener("click", function (event) {
+      var link = event.target.closest('a[href^="#"]');
+      if (link && !event.defaultPrevented) revealAnchor(link.getAttribute("href"));
+    });
+    window.addEventListener("hashchange", function () { revealAnchor(window.location.hash); });
+    revealAnchor(window.location.hash);
   }
 
   function setupSidebarCollapse() {
@@ -141,6 +158,10 @@
     });
   }
 
+  function updateTableRowVisibility(row) {
+    row.hidden = row.dataset.tableTextMatch === "false" || row.dataset.tableFamilyMatch === "false";
+  }
+
   function setupFilters() {
     all("[data-table-filter]").forEach(function (input) {
       var table = document.querySelector(input.getAttribute("data-table-filter"));
@@ -148,7 +169,8 @@
       input.addEventListener("input", function () {
         var query = input.value.toLocaleLowerCase().trim();
         all("tbody tr", table).forEach(function (row) {
-          row.hidden = query && !row.textContent.toLocaleLowerCase().includes(query);
+          row.dataset.tableTextMatch = String(!query || row.textContent.toLocaleLowerCase().includes(query));
+          updateTableRowVisibility(row);
         });
       });
     });
@@ -265,7 +287,7 @@
       var form = select.closest("form");
       function updateScope() {
         all("[data-scm-scope]", form).forEach(function (group) {
-          var visible = group.getAttribute("data-scm-scope") === select.value;
+          var visible = !select.disabled && group.getAttribute("data-scm-scope") === select.value;
           group.hidden = !visible;
           all("input", group).forEach(function (field) { field.disabled = !visible; });
         });
@@ -411,7 +433,7 @@
       checkbox.addEventListener("click", function (event) {
         if ((event.ctrlKey || event.shiftKey) && lastSelectedIndex !== null) {
           var start = Math.min(lastSelectedIndex, rowIndex); var end = Math.max(lastSelectedIndex, rowIndex);
-          for (var i = start; i <= end; i += 1) { var rangeCheckbox = rows[i].querySelector("[data-policy-select]"); if (rangeCheckbox) rangeCheckbox.checked = true; }
+          for (var i = start; i <= end; i += 1) { var rangeCheckbox = rows[i].querySelector("[data-policy-select]"); if (!rows[i].hidden && rangeCheckbox) rangeCheckbox.checked = true; }
           checkbox.checked = true;
         }
       });
@@ -420,7 +442,7 @@
         if (event.target.closest("input,button,a,select")) return;
         if ((event.ctrlKey || event.shiftKey) && lastSelectedIndex !== null) {
           var start = Math.min(lastSelectedIndex, rowIndex); var end = Math.max(lastSelectedIndex, rowIndex);
-          for (var i = start; i <= end; i += 1) { var rangeCheckbox = rows[i].querySelector("[data-policy-select]"); if (rangeCheckbox) rangeCheckbox.checked = true; }
+          for (var i = start; i <= end; i += 1) { var rangeCheckbox = rows[i].querySelector("[data-policy-select]"); if (!rows[i].hidden && rangeCheckbox) rangeCheckbox.checked = true; }
         } else checkbox.checked = !checkbox.checked;
         lastSelectedIndex = rowIndex; updateActionCount();
       });
@@ -481,7 +503,7 @@
       var createKinds = {from:"zones",to:"zones",source:"addresses",destination:"addresses",application:"application-groups",service:"services",tag:"tags",log_setting:"log-forwarding",source_translation_address:"addresses",destination_translation_address:"addresses"};
       function addPickedValue(name) { if (!pickerTarget) return; if (typeof pickerTarget._addTagValue === "function") { pickerTarget._addTagValue(name); } else if (typeof pickerTarget._addTokenValue === "function") { pickerTarget._addTokenValue(name); } else if (typeof pickerTarget._addScalarValue === "function") { pickerTarget._addScalarValue(name); } else if (pickerTarget.hasAttribute("data-bulk-entry")) { pickerTarget.value = name; pickerTarget.closest("[data-bulk-field]").querySelector("[data-bulk-add-button]").click(); } else { pickerTarget.value = name; } }
       function updatePickerCount() { var count = valuePicker.querySelector("[data-policy-picker-selected-count]"); if (count) count.textContent = pickerSelections.size; }
-      function renderPolicyPicker(query) { var field = pickerTarget ? pickerTarget.dataset.pickerField : ""; var kinds = pickerKinds[field] || []; var candidates = policyCatalog.filter(function (item) { return kinds.includes(item.kind); }); if (kinds.includes("$current")) { var datasetKeys = {source_user:"sourceUser",destination_user:"destinationUser",source_hip:"sourceHip",destination_hip:"destinationHip",profile_group:"profileGroup",log_setting:"logSetting"}; var key = datasetKeys[field] || field; var seen = new Set(); rows.forEach(function (policyRow) { (policyRow.dataset[key] || "").split("|||").filter(Boolean).forEach(function (name) { if (!seen.has(name)) { seen.add(name); candidates.push({name:name,kind:"huidige rulebase"}); } }); }); } var results = valuePicker.querySelector("[data-policy-picker-results]"); results.innerHTML = ""; candidates.filter(function (item) { return (!pickerTarget || typeof pickerTarget._hasPickerValue !== "function" || !pickerTarget._hasPickerValue(item.name)) && (!query || item.name.toLocaleLowerCase().includes(query)); }).forEach(function (item) { var row = document.createElement("div"); row.className = "member-result" + (pickerSelections.has(item.name) ? " is-selected" : ""); var copy = document.createElement("div"); var strong = document.createElement("strong"); strong.textContent = item.name; var small = document.createElement("small"); small.textContent = item.kind; copy.appendChild(strong); copy.appendChild(small); var button = document.createElement("button"); button.className = "btn btn-small"; button.type = "button"; button.textContent = pickerSelections.has(item.name) ? "Geselecteerd" : "Selecteer"; button.addEventListener("click", function () { if (pickerSelections.has(item.name)) pickerSelections.delete(item.name); else { if (pickerTarget && pickerTarget.dataset.pickerCardinality === "one") pickerSelections.clear(); pickerSelections.add(item.name); } updatePickerCount(); renderPolicyPicker(query); }); row.appendChild(copy); row.appendChild(button); results.appendChild(row); }); if (!results.children.length) { var empty = document.createElement("div"); empty.className = "muted member-result"; empty.textContent = "Geen bestaand compatibel object gevonden."; results.appendChild(empty); } updatePickerCount(); }
+      function renderPolicyPicker(query) { var field = pickerTarget ? pickerTarget.dataset.pickerField : ""; var kinds = pickerKinds[field] || []; var candidates = policyCatalog.filter(function (item) { return kinds.includes(item.kind); }); if (kinds.includes("$current")) { var datasetKeys = {source_user:"sourceUser",destination_user:"destinationUser",source_hip:"sourceHip",destination_hip:"destinationHip",profile_group:"profileGroup",log_setting:"logSetting"}; var key = datasetKeys[field] || field; var seen = new Set(); rows.forEach(function (policyRow) { (policyRow.dataset[key] || "").split("|||").filter(Boolean).forEach(function (name) { if (!seen.has(name)) { seen.add(name); candidates.push({name:name,kind:"huidige rulebase"}); } }); }); } var results = valuePicker.querySelector("[data-policy-picker-results]"); results.innerHTML = ""; candidates.filter(function (item) { return (!pickerTarget || typeof pickerTarget._hasPickerValue !== "function" || !pickerTarget._hasPickerValue(item.name)) && (!query || item.name.toLocaleLowerCase().includes(query)); }).forEach(function (item) { var row = document.createElement("div"); row.className = "member-result" + (pickerSelections.has(item.name) ? " is-selected" : ""); var copy = document.createElement("div"); var strong = document.createElement("strong"); strong.textContent = item.name; var small = document.createElement("small"); small.textContent = item.kind; copy.appendChild(strong); copy.appendChild(small); var button = document.createElement("button"); button.className = "btn btn-small"; button.type = "button"; button.textContent = pickerSelections.has(item.name) ? "Geselecteerd" : "Selecteer"; function toggleSelection() { if (pickerSelections.has(item.name)) pickerSelections.delete(item.name); else { if (pickerTarget && pickerTarget.dataset.pickerCardinality === "one") pickerSelections.clear(); pickerSelections.add(item.name); } updatePickerCount(); renderPolicyPicker(query); } button.addEventListener("click", function (event) { event.stopPropagation(); toggleSelection(); }); row.addEventListener("click", toggleSelection); row.appendChild(copy); row.appendChild(button); results.appendChild(row); }); if (!results.children.length) { var empty = document.createElement("div"); empty.className = "muted member-result"; empty.textContent = "Geen bestaand compatibel object gevonden."; results.appendChild(empty); } updatePickerCount(); }
       function showApplicationError(message) { if (!message || !pickerTarget || pickerTarget.dataset.pickerField !== "application") return; var results = valuePicker.querySelector("[data-policy-picker-results]"); var warning = document.createElement("div"); warning.className = "callout member-result"; warning.textContent = "Applicatiecatalogus niet bijgewerkt: " + message; results.prepend(warning); }
       function showApplicationStatus(data) { var status = valuePicker.querySelector("[data-policy-picker-status]"); if (!status) return; status.textContent = data.error ? "Applicatiecatalogus kon niet worden bijgewerkt." : data.ready ? data.items.length + " applicaties beschikbaar." : data.refreshing ? "Application database wordt geladen…" : "Geen application database beschikbaar."; }
       function loadApplications() { var catalogUrl = catalogProfileMatch ? "/profiles/" + catalogProfileMatch[1] + "/catalog/applications" : workspaceApplicationState ? workspaceApplicationState.dataset.workspaceApplicationCatalog : ""; if (!catalogUrl) return; var initialStatus = valuePicker.querySelector("[data-policy-picker-status]"); if (initialStatus) initialStatus.textContent = "Application database wordt geladen…"; fetch(catalogUrl, {headers:{"Accept":"application/json"}}).then(function (response) { if (!response.ok) throw new Error("HTTP " + response.status); return response.json(); }).then(function (data) { var existing = new Set(policyCatalog.filter(function (item) { return item.kind === "applications"; }).map(function (item) { return item.name; })); (data.items || []).forEach(function (item) { if (!existing.has(item.name)) policyCatalog.push(item); }); showApplicationStatus(data); if (pickerTarget && pickerTarget.dataset.pickerField === "application") { renderPolicyPicker((valuePicker.querySelector("[data-policy-picker-filter]").value || "").toLocaleLowerCase()); showApplicationError(data.error); } if (!data.ready && data.refreshing && applicationPolls < 40) { applicationPolls += 1; setTimeout(loadApplications, 3000); } }).catch(function (error) { showApplicationError(error.message); }); }
@@ -869,7 +891,7 @@
         var kinds = entry ? (entry.dataset.offlinePolicyKinds || "").split(/\s+/).filter(Boolean) : [];
         var candidates = catalog.filter(function (item) { return kinds.includes(item.kind); });
         if (kinds.includes("current") && activeField) { var seen = new Set(candidates.map(function (item) { return item.name; })); activeField._offlineValues.forEach(function (name) { if (!seen.has(name)) { seen.add(name); candidates.push({name:name,kind:"huidige configuratie"}); } }); }
-        candidates.filter(function (item) { return (!activeField || !activeField._offlineValues.has(item.name)) && (!query || item.name.toLocaleLowerCase().includes(query)); }).forEach(function (item) { var row = document.createElement("div"); row.className = "member-result" + (selected.has(item.name) ? " is-selected" : ""); var copy = document.createElement("div"); var strong = document.createElement("strong"); strong.textContent = item.name; var small = document.createElement("small"); small.textContent = item.kind; copy.appendChild(strong); copy.appendChild(small); var button = document.createElement("button"); button.type = "button"; button.className = "btn btn-small"; button.textContent = selected.has(item.name) ? "Geselecteerd" : "Selecteer"; button.addEventListener("click", function () { if (selected.has(item.name)) selected.delete(item.name); else { if (activeField && activeField.dataset.offlineCardinality === "one") selected.clear(); selected.add(item.name); } updateSelectedCount(); renderPicker(query); }); row.appendChild(copy); row.appendChild(button); results.appendChild(row); });
+        candidates.filter(function (item) { return (!activeField || !activeField._offlineValues.has(item.name)) && (!query || item.name.toLocaleLowerCase().includes(query)); }).forEach(function (item) { var row = document.createElement("div"); row.className = "member-result" + (selected.has(item.name) ? " is-selected" : ""); var copy = document.createElement("div"); var strong = document.createElement("strong"); strong.textContent = item.name; var small = document.createElement("small"); small.textContent = item.kind; copy.appendChild(strong); copy.appendChild(small); var button = document.createElement("button"); button.type = "button"; button.className = "btn btn-small"; button.textContent = selected.has(item.name) ? "Geselecteerd" : "Selecteer"; function toggleSelection() { if (selected.has(item.name)) selected.delete(item.name); else { if (activeField && activeField.dataset.offlineCardinality === "one") selected.clear(); selected.add(item.name); } updateSelectedCount(); renderPicker(query); } button.addEventListener("click", function (event) { event.stopPropagation(); toggleSelection(); }); row.addEventListener("click", toggleSelection); row.appendChild(copy); row.appendChild(button); results.appendChild(row); });
         if (!results.children.length) { var empty = document.createElement("div"); empty.className = "muted member-result"; empty.textContent = "Geen bestaande compatibele waarde gevonden."; results.appendChild(empty); }
         updateSelectedCount();
       }
@@ -938,11 +960,11 @@
         var button = document.createElement("button"); button.type = "button"; button.className = "btn btn-small" + (initiallyActive ? " is-active" : ""); button.textContent = family;
         button.addEventListener("click", function () {
           all("button", root).forEach(function (item) { item.classList.toggle("is-active", item === button); });
-          rows.forEach(function (row) { row.hidden = family !== "All" && row.dataset.configFamily !== family; });
+          rows.forEach(function (row) { row.dataset.tableFamilyMatch = String(family === "All" || row.dataset.configFamily === family); updateTableRowVisibility(row); });
         });
         root.appendChild(button);
       });
-      rows.forEach(function (row) { row.hidden = row.dataset.configFamily !== families[0]; });
+      rows.forEach(function (row) { row.dataset.tableFamilyMatch = String(row.dataset.configFamily === families[0]); updateTableRowVisibility(row); });
     }
 
     function tokenEditor(field, wrapper) {
