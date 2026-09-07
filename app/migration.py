@@ -2035,6 +2035,65 @@ def apply_merge_rules(model: MigrationModel, rules: list[dict]) -> MigrationMode
     return result
 
 
+def _address_network_resolver(model: MigrationModel):
+    """Expand every member, failing closed on unknown, cyclic or conflicting names."""
+    addresses: dict[str, list[Address]] = {}
+    groups: dict[str, list[AddressGroup]] = {}
+    for item in model.addresses:
+        addresses.setdefault(item.name, []).append(item)
+    for item in model.address_groups:
+        groups.setdefault(item.name, []).append(item)
+
+    def expand(values: list[str], seen: frozenset[str] = frozenset()):
+        networks = []
+        for value in values:
+            if value in {"any", "original"} or value in seen:
+                return None
+            if value in groups:
+                definitions = {tuple(item.members) for item in groups[value]}
+                if value in addresses or len(definitions) != 1:
+                    return None
+                nested = expand(list(next(iter(definitions))), seen | {value})
+                if not nested:
+                    return None
+                networks.extend(nested)
+                continue
+            if value in addresses:
+                definitions = {(item.value_type, item.value) for item in addresses[value]}
+                if len(definitions) != 1:
+                    return None
+                kind, candidate = next(iter(definitions))
+                if kind != "ip_netmask":
+                    return None
+            else:
+                candidate = value
+            try:
+                networks.append(ipaddress.ip_network(candidate, strict=False))
+            except ValueError:
+                return None
+        return networks or None
+
+    return expand
+
+
+def _network_path(network, topology):
+    """Resolve the entire address range, including more-specific exceptions.
+
+    Empty paths represent known but unmapped interfaces/routes.  Keeping these
+    in the table prevents an assigned aggregate/default from hiding them.
+    """
+    covering = [(target.prefixlen, path) for target, path in topology
+                if target.version == network.version and network.subnet_of(target)]
+    if not covering:
+        return None
+    longest = max(prefix for prefix, _ in covering)
+    paths = {path for prefix, path in covering if prefix == longest}
+    paths.update(path for target, path in topology
+                 if target.version == network.version and target.subnet_of(network)
+                 and target.prefixlen > longest)
+    return next(iter(paths)) if len(paths) == 1 and None not in paths else None
+
+
 def _apply_interface_zone_assignments(model: MigrationModel, rules: list[dict]) -> MigrationModel:
     """Create assigned PAN-OS zones and infer rule zones from source subnets.
 
@@ -2067,19 +2126,21 @@ def _apply_interface_zone_assignments(model: MigrationModel, rules: list[dict]) 
     if not assignments:
         return result
 
-    interface_zones: list[tuple[ipaddress._BaseNetwork, str]] = []
+    interface_zones = []
     new_zone_members: dict[str, list[str]] = {}
-    for selector, (zone, create_zone) in assignments.items():
-        interface = selector_item(result.interfaces, selector)
-        if not isinstance(interface, dict):
-            continue
+    for interface in result.interfaces:
+        selector = item_selector(interface)
+        zone, create_zone = assignments.get(selector, ("", False))
         decision, target = topology.get(selector, ("topology_review", ""))
-        if decision == "topology_ignore":
-            continue
-        effective_interface = target if decision == "topology_map" and target else str(interface.get("name", ""))
+        # A source topology label is not a valid PAN-OS target interface.  The
+        # explicit mapping must exist before either export or inference uses it.
+        effective_interface = target if decision == "topology_map" else ""
+        if decision == "topology_create" and interface.get("source_vendor") != "checkpoint":
+            effective_interface = str(interface.get("name", ""))
+        assigned_zone = zone if effective_interface and zone else None
         for value in interface.get("source_networks", []):
             try:
-                interface_zones.append((ipaddress.ip_network(str(value), strict=False), zone))
+                interface_zones.append((ipaddress.ip_network(str(value), strict=False), assigned_zone))
             except ValueError:
                 continue
         if create_zone and effective_interface:
@@ -2102,37 +2163,7 @@ def _apply_interface_zone_assignments(model: MigrationModel, rules: list[dict]) 
         })
         existing_zones.add(zone)
 
-    address_networks: dict[str, list[ipaddress._BaseNetwork]] = {}
-    for item in result.addresses:
-        if item.value_type != "ip_netmask":
-            continue
-        try:
-            address_networks.setdefault(item.name, []).append(
-                ipaddress.ip_network(item.value, strict=False)
-            )
-        except ValueError:
-            continue
-    groups = {item.name: item.members for item in result.address_groups}
-
-    def expand(values: list[str], seen: set[str] | None = None) -> list[ipaddress._BaseNetwork] | None:
-        seen = seen or set()
-        expanded: list[ipaddress._BaseNetwork] = []
-        for value in values:
-            if value in {"any", "original"} or value in seen:
-                return None
-            if value in groups:
-                nested = expand(groups[value], seen | {value})
-                if nested is None:
-                    return None
-                expanded.extend(nested)
-            elif value in address_networks:
-                expanded.extend(address_networks[value])
-            else:
-                try:
-                    expanded.append(ipaddress.ip_network(value, strict=False))
-                except ValueError:
-                    return None
-        return expanded or None
+    expand = _address_network_resolver(result)
 
     def infer(values: list[str]) -> list[str] | None:
         networks = expand(values)
@@ -2140,24 +2171,22 @@ def _apply_interface_zone_assignments(model: MigrationModel, rules: list[dict]) 
             return None
         zones: list[str] = []
         for network in networks:
-            matches = [
-                (target.prefixlen, zone)
-                for target, zone in interface_zones
-                if target.version == network.version and network.subnet_of(target)
-            ]
-            if not matches:
+            zone = _network_path(network, interface_zones)
+            if not zone:
                 return None
-            longest = max(prefix for prefix, _ in matches)
-            choices = {zone for prefix, zone in matches if prefix == longest}
-            if len(choices) != 1:
-                return None
-            zones.append(next(iter(choices)))
+            zones.append(zone)
         return unique(zones)
 
     mapped_sides = 0
     for policy in [*result.security_rules, *result.nat_rules]:
-        source_zones = infer(policy.source)
-        destination_zones = infer(policy.destination)
+        source_zones = None if policy.original.get("source-negate") else infer(policy.source)
+        destination_zones = None if policy.original.get("destination-negate") else infer(policy.destination)
+        if policy.policy_type == "security" and any(
+            rule.destination_translation and not rule.disabled for rule in result.nat_rules
+        ):
+            # Security uses post-NAT zones with pre-NAT addresses.  Source
+            # connected networks alone cannot establish which DNAT rule wins.
+            destination_zones = None
         if source_zones and policy.from_zones == ["any"]:
             policy.from_zones = source_zones
             mapped_sides += 1
@@ -2487,105 +2516,133 @@ def panos_candidate_analysis(
     return analysis
 
 
+def _migration_topology_owners(content, scope, panorama):
+    """Return only the target's unambiguous Network and VSYS owners."""
+    from app.offline_config import parse_snapshot, referenced_template, _config_roots
+    raw = content.encode() if isinstance(content, str) else content
+    root, snapshot = parse_snapshot(raw)
+    if panorama:
+        # A same-named interface in a different template is a different device.
+        # Resolve only this DG's inherited reference, never all templates.
+        template = referenced_template(snapshot, scope)
+        owners = _config_roots(root, snapshot, scope, template) if template else []
+        # Template-stack overrides require an effective-config merge.  Until
+        # that is available, do not guess from one member or blend its peers.
+        network_owners = owners[0][1].findall("./config/devices/entry") if len(owners) == 1 else []
+        zone_owners = [vsys for owner in network_owners for vsys in owner.findall("./vsys/entry")]
+        if len(zone_owners) != 1:
+            zone_owners, network_owners = [], []
+    else:
+        network_owners = [owner for owner in root.findall("./devices/entry")
+                          if any(vsys.get("name") == scope for vsys in owner.findall("./vsys/entry"))]
+        zone_owners = [vsys for owner in network_owners for vsys in owner.findall("./vsys/entry")
+                       if vsys.get("name") == scope]
+    return network_owners, zone_owners
+
+
+def migration_topology_targets(content: bytes | str, scope: str = "vsys1", panorama: bool = False) -> dict[str, list[str]]:
+    """Existing topology names in exactly the selected target context."""
+    network_owners, zone_owners = _migration_topology_owners(content, scope, panorama)
+    targets = {"interfaces": [], "zones": [], "vlans": [], "virtual_routers": [], "logical_routers": []}
+    for owner in network_owners:
+        for entry in owner.findall("./network/interface/*/entry"):
+            targets["interfaces"].append(entry.get("name", ""))
+            targets["interfaces"].extend(unit.get("name", "") for unit in entry.findall(".//units/entry"))
+        targets["interfaces"].extend(entry.get("name", "") for entry in owner.findall("./network/interface/*/units/entry"))
+        for kind, path in (("vlans", "vlan"), ("virtual_routers", "virtual-router"), ("logical_routers", "logical-router")):
+            targets[kind].extend(entry.get("name", "") for entry in owner.findall(f"./network/{path}/entry"))
+    targets["zones"] = [entry.get("name", "") for owner in zone_owners for entry in owner.findall("./zone/entry")]
+    return {kind: sorted(unique(names), key=str.casefold) for kind, names in targets.items()}
+
+
 def auto_map_nat_topology(
     content: bytes | str,
     model: MigrationModel,
     scope: str = "vsys1",
     panorama: bool = False,
 ) -> dict[str, object]:
-    """Infer NAT zones/interfaces from target interface networks.
+    """Infer NAT topology only if every address follows one target path.
 
-    Only an unambiguous longest-prefix match is applied.  Rules without enough
-    evidence remain review-only and are excluded from generated PAN-OS output.
+    Unknown addresses, competing paths and unresolved scopes remain review-only.
+    Explicitly selected zones and interfaces are preserved.
     """
-    raw = content.encode() if isinstance(content, str) else content
-    root = SafeET.fromstring(raw)
+    network_owners, zone_owners = _migration_topology_owners(content, scope, panorama)
     result = {"mapped": 0, "review": 0, "details": []}
-    if panorama:
-        # Panorama topology belongs to a referenced template.  Reuse the
-        # existing parser's resolved zone/interface inventory when available;
-        # otherwise force explicit review instead of guessing a template.
-        zone_owners = root.findall(".//template/entry/config/devices/entry/vsys/entry")
-        network_owners = root.findall(".//template/entry/config/devices/entry")
-    else:
-        zone_owners = root.findall(f"./devices/entry/vsys/entry[@name='{scope}']")
-        network_owners = root.findall("./devices/entry")
 
-    interface_zones: dict[str, str] = {}
+    interface_zones: dict[str, set[str]] = {}
     for owner in zone_owners:
         for zone in owner.findall("./zone/entry"):
             zone_name = zone.get("name", "")
             for member in zone.findall("./network/*/member"):
                 if zone_name and (member.text or "").strip():
-                    interface_zones[(member.text or "").strip()] = zone_name
+                    interface_zones.setdefault((member.text or "").strip(), set()).add(zone_name)
 
-    topology: list[tuple[ipaddress._BaseNetwork, str, str]] = []
-    default_targets: list[tuple[str, str]] = []
+    connected = []
+    routes = []
+    scoped_interfaces = set(interface_zones)
+
+    def path_for(interface_name):
+        zones = interface_zones.get(interface_name, set())
+        return (next(iter(zones)), interface_name) if len(zones) == 1 else None
+
     for owner in network_owners:
-        for entry in owner.findall("./network/interface/*/entry"):
+        for entry in owner.findall("./network/interface/*/entry") + owner.findall("./network/interface/*/units/entry"):
             base_name = entry.get("name", "")
             candidates = [(base_name, entry)]
             candidates.extend((unit.get("name", ""), unit) for unit in entry.findall(".//units/entry"))
             for interface_name, node in candidates:
-                zone = interface_zones.get(interface_name, "")
-                if not zone:
-                    continue
                 for ip_entry in node.findall("./layer3/ip/entry") + node.findall("./ip/entry"):
                     value = ip_entry.get("name", "")
                     try:
-                        topology.append((ipaddress.ip_interface(value).network, zone, interface_name))
+                        connected.append((ipaddress.ip_interface(value).network, path_for(interface_name)))
                     except ValueError:
                         continue
-        for route in owner.findall("./network/virtual-router/entry/routing-table/ip/static-route/entry"):
-            if (route.findtext("destination") or "") not in {"0.0.0.0/0", "::/0"}:
-                continue
-            interface_name = route.findtext("interface") or ""
-            zone = interface_zones.get(interface_name, "")
-            if zone and interface_name:
-                default_targets.append((zone, interface_name))
+        routers = owner.findall("./network/virtual-router/entry")
+        eligible = [router for router in routers
+                    if scoped_interfaces.intersection(member.text for member in router.findall("./interface/member"))]
+        # Some imported minimal bases omit VR membership; one router is safe
+        # to inspect, but several unidentified routing domains are not.
+        if not eligible and len(routers) == 1:
+            eligible = routers
+        for router in eligible:
+            route_entries = router.findall("./routing-table/ip/static-route/entry")
+            route_entries += router.findall("./routing-table/ipv6/static-route/entry")
+            for route in route_entries:
+                candidate = route.findtext("destination") or ""
+                try:
+                    network = ipaddress.ip_network(candidate, strict=False)
+                except ValueError:
+                    continue
+                routes.append((network, path_for(route.findtext("interface") or "")))
 
-    address_values = {item.name: item.value for item in model.addresses if item.value_type == "ip_netmask"}
-    groups = {item.name: item.members for item in model.address_groups}
+    expand = _address_network_resolver(model)
 
-    def referenced_networks(values: list[str], seen: set[str] | None = None) -> list[ipaddress._BaseNetwork]:
-        seen = seen or set()
-        networks: list[ipaddress._BaseNetwork] = []
-        for value in values:
-            if value in {"any", "original"} or value in seen:
-                continue
-            if value in groups:
-                networks.extend(referenced_networks(groups[value], seen | {value}))
-                continue
-            candidate = address_values.get(value, value)
-            try:
-                networks.append(ipaddress.ip_network(candidate, strict=False))
-            except ValueError:
-                continue
-        return networks
-
-    def infer(values: list[str], allow_default: bool = False) -> tuple[str, str] | None:
-        matches: list[tuple[int, str, str]] = []
-        networks = referenced_networks(values)
+    def infer(values: list[str], destination: bool = False):
+        networks = expand(values)
+        if not networks:
+            return None
+        topology = connected + routes if destination else connected
+        paths = set()
         for network in networks:
-            for target_network, zone, interface_name in topology:
-                if network.version == target_network.version and network.subnet_of(target_network):
-                    matches.append((target_network.prefixlen, zone, interface_name))
-        if matches:
-            longest = max(value[0] for value in matches)
-            choices = {(zone, interface_name) for prefix, zone, interface_name in matches if prefix == longest}
-            if len(choices) == 1:
-                return next(iter(choices))
-        defaults = set(default_targets) if allow_default else set()
-        return next(iter(defaults)) if len(defaults) == 1 else None
+            path = _network_path(network, topology)
+            if path is None:
+                return None
+            paths.add(path)
+        return next(iter(paths)) if len(paths) == 1 else None
 
     for rule in model.nat_rules:
-        source_target = infer(rule.source)
-        destination_target = infer(rule.destination, allow_default=True)
+        # Do not turn a deliberately ignored/mapped rule back into a create.
+        if rule.mapping_action in {"ignore", "map"}:
+            continue
+        source_target = None if rule.original.get("source-negate") else infer(rule.source)
+        destination_target = None if rule.original.get("destination-negate") else infer(rule.destination, True)
         if source_target and rule.from_zones == ["any"]:
             rule.from_zones = [source_target[0]]
-        if destination_target and rule.to_zones == ["any"]:
+        if (destination_target and rule.to_zones == ["any"]
+                and rule.to_interface in {"any", destination_target[1]}):
             rule.to_zones = [destination_target[0]]
-            rule.to_interface = destination_target[1]
+            if rule.to_interface == "any":
+                rule.to_interface = destination_target[1]
         if "any" in rule.to_zones:
             rule.mapping_action = "review"
             rule.description = CheckPointParser._review_description(

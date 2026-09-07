@@ -827,7 +827,7 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         model = MigrationModel(
             "checkpoint", "source",
             addresses=[Address("inside", "10.0.0.10/32")],
-            nat_rules=[main.Policy("outbound", policy_type="nat", source=["inside"], destination=["any"], service=["any"])],
+            nat_rules=[main.Policy("outbound", policy_type="nat", source=["inside"], destination=["203.0.113.8"], service=["any"])],
         )
         result = auto_map_nat_topology(target, model)
         self.assertEqual(result["mapped"], 1)
