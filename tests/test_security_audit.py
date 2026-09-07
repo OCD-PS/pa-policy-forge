@@ -145,6 +145,18 @@ class ProjectWorkspaceAuthorizationTests(unittest.TestCase):
         self.authenticate("stranger")
         self.assertEqual(self.export_status(self.workspace_id), 404)
 
+    def test_reused_project_id_does_not_grant_old_xml_to_new_owner(self):
+        main.init_db()
+        with main.db() as conn:
+            conn.execute("DELETE FROM migration_project_roles WHERE project_id=?", (self.project_id,))
+            conn.execute("DELETE FROM migration_projects WHERE id=?", (self.project_id,))
+            replacement_id = conn.execute("""INSERT INTO migration_projects
+                (name,target_profile_id,owner,created_at,updated_at)
+                VALUES('replacement',?,'stranger','now','now')""", (self.profile_id,)).lastrowid
+        self.assertEqual(replacement_id, self.project_id)
+        self.authenticate("stranger")
+        self.assertEqual(self.export_status(self.workspace_id), 404)
+
 
 class CredentialTransportTests(unittest.TestCase):
     def test_redirects_cannot_forward_keys_or_bearer_tokens(self):

@@ -25,8 +25,8 @@ system: authenticated users still share global device profiles and settings.
 ## Verification
 
 - Original build: 5 failures out of 8 initial authorization regression cases.
-- Fixed build: 15 new bounded security tests passed.
-- Complete isolated suite: 253 tests passed; no firewall API calls were needed.
+- Fixed build: 16 new bounded security tests passed.
+- Complete isolated suite: 254 tests passed; no firewall API calls were needed.
 - `pip-audit -r requirements.txt`: no known vulnerabilities in the resolved pinned
   dependency set at the time of the audit. This is not a future guarantee.
 - Bandit reviewed 15,837 Python source lines. Its initial 28 medium / 21 low
@@ -43,6 +43,12 @@ system: authenticated users still share global device profiles and settings.
 Use `PPF_BACKGROUND_WORKERS=0` when importing the app in isolated tests. It
 suppresses startup syslog listeners and scheduled workers; production defaults
 remain unchanged.
+
+The independent second pass also reproduced numeric project-ID reuse after
+deletion: a newly created project could otherwise inherit a tombstoned ACL.
+Workspace grants now bind to a durable random project identity as well as its
+integer ID. The delete/recreate regression failed before that follow-up fix and
+passes afterward.
 
 ## Remaining limits / accepted risks
 
