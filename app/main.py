@@ -577,6 +577,11 @@ app.jinja_env.globals["csrf_token"] = csrf
 
 @app.before_request
 def protect_csrf():
+    # Flask's integer URL converter accepts values larger than SQLite row ids.
+    # Reject only out-of-domain resource ids, before a route binds them to SQL.
+    for name, value in (request.view_args or {}).items():
+        if name.endswith("_id") and isinstance(value, int) and not 1 <= value <= 2**63 - 1:
+            return "Not found", 404
     if request.method == "POST" and not hmac.compare_digest(request.form.get("csrf", ""), session.get("csrf", "-")):
         return "Invalid CSRF token", 400
 
@@ -5194,7 +5199,7 @@ def migration_project(project_id):
         users=[row["username"] for row in conn.execute("SELECT username FROM users ORDER BY username").fetchall()]
         audit_candidates=[dict(row) for row in conn.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 1000").fetchall()]
         latest_analysis=conn.execute("SELECT * FROM migration_analysis_runs WHERE project_id=? ORDER BY id DESC LIMIT 1",(project_id,)).fetchone()
-    selected_filter_id=int(request.args.get("saved_filter","0") or 0)
+    selected_filter_id=request.args.get("saved_filter", default=0, type=int) or 0
     project_audits=[
         row for row in audit_candidates
         if re.search(rf"(?:^|\s)project={project_id}(?:\s|$)",str(row.get("detail","")))
