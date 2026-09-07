@@ -159,6 +159,10 @@ class TopologyAuditTests(unittest.TestCase):
         self.assertNotIn("10.10.0.1/24", names["interfaces"])
         self.assertEqual(set(names), m.MIGRATION_TOPOLOGY_KINDS)
 
+    def test_zone_memberships_are_scoped_to_reference_template(self):
+        self.assertEqual(m.migration_interface_zone_memberships(self.panorama(), "selected", True)["ethernet1/1"], ["Trust"])
+        self.assertEqual(m.migration_interface_zone_memberships(self.panorama(""), "selected", True), {})
+
 
 if __name__ == "__main__":
     unittest.main()

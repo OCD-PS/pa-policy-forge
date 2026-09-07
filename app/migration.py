@@ -2570,6 +2570,19 @@ def migration_topology_targets(content: bytes | str, scope: str = "vsys1", panor
     return {kind: sorted(unique(names), key=str.casefold) for kind, names in targets.items()}
 
 
+def migration_interface_zone_memberships(content: bytes | str, scope: str = "vsys1", panorama: bool = False) -> dict[str, list[str]]:
+    """Actual zone attachments, for validating interface-zone assignments."""
+    _, zone_owners = _migration_topology_owners(content, scope, panorama)
+    memberships: dict[str, list[str]] = {}
+    for owner in zone_owners:
+        for zone in owner.findall("./zone/entry"):
+            for member in zone.findall("./network/*/member"):
+                name = (member.text or "").strip()
+                if name and zone.get("name"):
+                    memberships.setdefault(name, []).append(zone.get("name"))
+    return {name: unique(zones) for name, zones in memberships.items()}
+
+
 def auto_map_nat_topology(
     content: bytes | str,
     model: MigrationModel,
