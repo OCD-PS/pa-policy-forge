@@ -58,7 +58,7 @@ from app.migration import (
     migration_interface_zone_memberships,
     clean_name, item_selector, merge_member_names, migration_analysis, migration_item_semantic, migration_review_findings,
     migration_search, model_collections, panos_candidate_analysis, panos_fragment, parse_vendor, raw_item_payload,
-    reconcile_model, scm_items,
+    reconcile_model, scm_items, restore_migration_source_topology,
 )
 from app.offline_config import (
     OBJECT_NODES, POLICY_NODES, OfflineConfigError, available_scopes, available_templates,
@@ -6073,6 +6073,7 @@ def migration_source_sync_workspace(project_id, source_id):
         edited = parse_vendor("panos", workspace_config_path(workspace).read_bytes(), source["source_name"])
         edited.vendor = original.vendor
         edited.source_name = original.source_name
+        edited = restore_migration_source_topology(original, edited)
         unsupported_action_warnings = [
             message for message in original.warnings
             if "niet-ondersteunde Check Point actie" in message
