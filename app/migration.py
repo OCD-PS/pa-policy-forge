@@ -2413,17 +2413,20 @@ def migration_best_practices(model: MigrationModel) -> dict:
     policies = [*model.security_rules, *model.nat_rules]
     checks = []
 
-    def add(code: str, title: str, passed: bool, detail: str, count: int = 0, remediable: bool = False):
+    def add(code: str, title: str, passed: bool, detail: str, count: int = 0, remediable: bool = False, informational: bool = False):
         checks.append({
             "code": code, "title": title, "passed": bool(passed),
             "detail": detail, "count": int(count), "remediable": bool(remediable),
+            "informational": bool(informational),
         })
 
     enabled = sum(not rule.disabled for rule in policies)
     add(
-        "imported-disabled", "Imported policies disabled",
-        enabled == 0, "Nieuwe migratieregels blijven disabled tot een engineer ze bewust activeert.",
-        enabled, True,
+        "policy-state-review", "Enabled/disabled-status",
+        enabled == 0,
+        f"{enabled} enabled en {len(policies) - enabled} disabled. De bronstatus behouden is toegestaan; "
+        "controleer enabled regels vóór push. Alle security policies disabled maken is een optionele importoverride.",
+        informational=True,
     )
     any_service = sum("any" in rule.service for rule in model.security_rules)
     add(
@@ -2455,9 +2458,9 @@ def migration_best_practices(model: MigrationModel) -> dict:
     )
     return {
         "checks": checks,
-        "passed": sum(item["passed"] for item in checks),
-        "failed": sum(not item["passed"] for item in checks),
-        "remediable": sum(item["remediable"] and not item["passed"] for item in checks),
+        "passed": sum(item["passed"] and not item["informational"] for item in checks),
+        "failed": sum(not item["passed"] and not item["informational"] for item in checks),
+        "remediable": sum(item["remediable"] and not item["passed"] and not item["informational"] for item in checks),
     }
 
 

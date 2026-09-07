@@ -54,6 +54,8 @@ class FrontendTemplateTests(unittest.TestCase):
         self.assertEqual(set(links.anchors) - set(links.ids), set())
         self.assertEqual(len(links.ids), len(set(links.ids)), "No duplicate ids across collapsed tools")
         self.assertIn("/migration_analysis_run", html)
+        self.assertIn("Security en NAT disabled zetten", html)
+        self.assertIn('data-confirm="Alle geïmporteerde Security- en NAT-regels disabled zetten?"', html)
 
     def test_interface_picker_uses_scoped_targets_instead_of_global_union(self):
         context = self.migration_context()
