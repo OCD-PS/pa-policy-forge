@@ -146,6 +146,32 @@ class ConfigurationCreationRouteTests(unittest.TestCase):
         root = ET.fromstring(main.workspace_config_path(main.workspace_row(new_id)).read_bytes())
         self.assertIsNotNone(root.find("./devices/entry/vsys/entry/authentication-profile/entry[@name='local-auth']/method/local-database"))
 
+    def test_empty_vlan_add_then_edit_can_fill_optional_interface(self):
+        added_id, _ = self.created_id(self.post())
+        page = self.page(added_id)
+        records = [json.loads(html.unescape(raw)) for raw in re.findall(r"data-config-record='([^']*)'", page)]
+        record = next(item for item in records if item["name"] == "created-vlan")
+        self.assertIn("Interfaces", record["ui_tabs"])
+        field = next(field for field in record["edit_fields"] if field.get("technical_label") == "Interface")
+        self.assertTrue(field["optional"])
+        response = self.client.post(f"/config-workspaces/{added_id}/configuration/preview", data={
+            "csrf": "route-csrf", "scope": "vsys1", "template": "vsys1", "workspace_view": "network",
+            "config_section": "vlans", "operation": "update", "locator": record["locator"],
+            "name": record["name"], "direct_save": "yes",
+            "generic_updates": json.dumps([self.update(record, "Interface", ["ethernet1/1"])]),
+        })
+        self.addCleanup(response.close)
+        edited_id, query = self.created_id(response, added_id)
+        self.assertEqual(query["config_section"], ["vlans"])
+        self.assertEqual(self.count_workspaces(), 3)
+        self.assertIn("Opgeslagen", self.page(edited_id))
+        new_xml = main.workspace_config_path(main.workspace_row(edited_id)).read_bytes()
+        self.assertEqual(ET.fromstring(new_xml).findtext(".//vlan/entry/interface/member"), "ethernet1/1")
+        self.assertIn(b"fixture-retained-hash", new_xml)
+        self.assertIsNone(ET.fromstring(new_xml).find(".//vlan/entry/virtual-interface"))
+        added_xml = main.workspace_config_path(main.workspace_row(added_id)).read_bytes()
+        self.assertIsNone(ET.fromstring(added_xml).find(".//vlan/entry/interface"))
+
     def test_panorama_add_preserves_template_and_uses_its_existing_vsys(self):
         root = ET.Element("config")
         device = ET.SubElement(ET.SubElement(root, "devices"), "entry", {"name": "localhost.localdomain"})

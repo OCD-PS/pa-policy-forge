@@ -1202,6 +1202,149 @@ def _has_nonentry_leaf(node: ET.Element) -> bool:
     return False
 
 
+def _configuration_edit_seed(root: ET.Element, current: ET.Element, parents=None):
+    """Match a server schema to its actual XML owner, retaining union choices."""
+    if parents is None:
+        parents = _element_parents(root)
+    chain = []
+    node = current
+    while id(node) in parents:
+        node = parents[id(node)][0]
+        chain.append(node.tag)
+    ancestry = list(reversed(chain))
+    for variant, spec in CONFIG_CREATE_SCHEMAS.items():
+        _, section, _, parent_path, _, xml, _ = spec
+        suffix = parent_path.split("/")
+        if variant == "ethernet-subinterface":
+            suffix = ["network", "interface", "ethernet", "entry", "layer3", "units"]
+        if ancestry[-len(suffix):] != suffix:
+            continue
+        seed = SafeET.fromstring(xml)
+        if current.tag != seed.tag:
+            continue
+        if variant in {"ethernet-layer3", "aggregate-layer3"}:
+            if any(current.find(tag) is not None for tag in ("layer2", "virtual-wire", "tap", "ha", "aggregate-group")):
+                continue
+        if section == "zones":
+            zone_kind = variant.removeprefix("zone-")
+            network = current.find("network")
+            if network is None or network.find(zone_kind) is None:
+                continue
+        if section == "authentication-profile":
+            method = "local-database" if variant == "authentication-local" else "ldap"
+            if current.find(f"./method/{method}") is None:
+                continue
+        if section == "interfaces":
+            # A DHCP client and static IPv4 address are alternative choices.
+            # Do not offer a synthetic static address beneath an active client.
+            for path in (".", "./layer3"):
+                configured, offered = current.find(path), seed.find(path)
+                if configured is not None and offered is not None:
+                    dhcp = configured.find("dhcp-client")
+                    ip = offered.find("ip")
+                    if dhcp is not None and dhcp.findtext("enable", "yes") != "no" and ip is not None:
+                        offered.remove(ip)
+        return seed, section
+    return None, ""
+
+
+def _augmented_configuration_edit(root: ET.Element, current: ET.Element, skip_nested_entries: bool = False, parents=None):
+    """Build a virtual edit tree without putting optional placeholders on disk.
+
+    Existing child order remains stable. Missing schema fields are appended in
+    deterministic order on read and apply, so numeric field paths are identical.
+    Fingerprints always remain tied to the unmodified source entry.
+    """
+    replacement = copy.deepcopy(current)
+    if parents is None:
+        parents = _element_parents(root)
+    seed, section = _configuration_edit_seed(root, current, parents)
+    synthetic = set()
+    hints = {}
+    schemas = [(replacement, seed, section)] if seed is not None else []
+    if not skip_nested_entries:
+        # Physical interfaces contain subinterfaces in the same editor. Apply
+        # the latter's own schema too, while retaining the original index paths.
+        for nested in current.iter("entry"):
+            if nested is current:
+                continue
+            nested_seed, nested_section = _configuration_edit_seed(root, nested, parents)
+            if nested_seed is not None:
+                path = _element_locator(current, nested, parents)
+                schemas.append((_indexed_element(replacement, path), nested_seed, nested_section))
+    for target_entry, seed, section in schemas:
+        schema_fields = _configuration_creation_fields(seed, section)["edit_fields"]
+        seed_hints = {id(_indexed_element(seed, field["path"])): field for field in schema_fields}
+
+        def attach(target, source, created=False):
+            if created:
+                synthetic.add(id(target))
+                target.text = None
+                if target.tag == "entry":
+                    target.set("name", "")
+            if id(source) in seed_hints:
+                hints[id(target)] = seed_hints[id(source)]
+            for child in list(source):
+                if _protected_config_tag(child.tag):
+                    continue
+                matches = target.findall(child.tag)
+                if not matches:
+                    added = ET.Element(child.tag, child.attrib)
+                    target.append(added)
+                    attach(added, child, True)
+                else:
+                    # An entry seed describes fields for existing members, not
+                    # permission to invent another server/VRF with its example name.
+                    for match in matches:
+                        attach(match, child)
+        attach(target_entry, seed)
+    fields = []
+    for field in _config_edit_fields(replacement, skip_nested_entries):
+        node = _indexed_element(replacement, field["path"])
+        if schemas and field["kind"] == "text" and node.tag in {"entry", "local-database"}:
+            continue
+        hint = hints.get(id(node), {})
+        if hint.get("options"):
+            field["options"] = list(hint["options"])
+            existing = str(field.get("value", ""))
+            if id(node) not in synthetic and existing and existing not in field["options"]:
+                # A newer PAN-OS enum may be unknown to this schema. Preserve
+                # that existing choice without allowing arbitrary new values.
+                field["options"].append(existing)
+        if field["kind"] == "members":
+            field["values"] = [value for value in field.get("values", []) if value]
+        if id(node) in synthetic:
+            field["optional"] = True
+            if field["kind"] == "members":
+                field["values"] = []
+            else:
+                field["value"] = ""
+                if hint.get("kind") == "boolean":
+                    field["kind"] = "boolean"
+            if field.get("options"):
+                field["options"] = ["", *field["options"]]
+        fields.append(field)
+    return replacement, fields, synthetic
+
+
+def _prune_virtual_configuration_fields(node: ET.Element, synthetic: set[int]) -> None:
+    """Materialize only filled virtual fields; leave original unknown XML alone."""
+    for child in list(node):
+        _prune_virtual_configuration_fields(child, synthetic)
+        if id(child) not in synthetic:
+            continue
+        populated = bool(list(child)) or bool((child.text or "").strip())
+        if child.tag == "entry":
+            if child.get("name"):
+                continue
+            if populated:
+                raise OfflineConfigError("Geef een naam op voor het nieuwe geneste configuratie-item")
+        elif child.attrib:
+            continue
+        if not populated:
+            node.remove(child)
+
+
 def configuration_records(
     xml_bytes: bytes, scope: str, template: str, view: str, section: str, parsed=None,
 ) -> tuple[ConfigSnapshot, list[dict]]:
@@ -1234,15 +1377,18 @@ def configuration_records(
         for section_node in sections:
             entries = _top_level_entries(section_node)
             targets = list(entries)
-            if _has_nonentry_leaf(section_node):
+            singleton_seed, _ = _configuration_edit_seed(root, section_node, parents)
+            if _has_nonentry_leaf(section_node) or singleton_seed is not None:
                 targets.insert(0, (section_node, []))
             for entry, labels in targets:
                 locator = _element_locator(root, entry, parents)
                 xml = ET.tostring(entry, encoding="unicode")
                 name = entry.get("name") or section.replace("-", " ").title()
                 kind = " / ".join(labels) if labels else section_node.tag.replace("-", " ").title()
-                fields = _config_edit_fields(entry, skip_nested_entries=entry is section_node and bool(entries))
-                if entry is section_node and not any(
+                _, fields, _ = _augmented_configuration_edit(
+                    root, entry, skip_nested_entries=entry is section_node and bool(entries), parents=parents
+                )
+                if entry is section_node and singleton_seed is None and not any(
                     field.get("kind") == "protected"
                     or (field.get("kind") == "members" and field.get("values"))
                     or str(field.get("value", "")).strip()
@@ -1259,6 +1405,10 @@ def configuration_records(
                         summary_values.append(field["label"].rsplit(" / ", 1)[-1])
                     if len(summary_values) >= 3:
                         break
+                if section == "zones" and not summary_values:
+                    network = entry.find("network")
+                    if network is not None:
+                        summary_values.extend(child.tag.replace("-", " ").title() for child in network)
                 record = {
                     "id": locator, "locator": locator, "name": name, "owner": owner,
                     "kind": kind, "is_entry": entry.tag == "entry", "editable": True,
@@ -1291,7 +1441,7 @@ def apply_configuration_changes(xml_bytes: bytes, changes: list[dict]) -> bytes:
             parent_locator = "/".join(locator.split("/")[:-1])
             _indexed_element(root, parent_locator).remove(current)
             continue
-        replacement = copy.deepcopy(current)
+        replacement, editable_fields, synthetic = _augmented_configuration_edit(root, current)
         new_name = str(change.get("name", "")).strip()
         if replacement.tag == "entry":
             if not new_name:
@@ -1301,7 +1451,7 @@ def apply_configuration_changes(xml_bytes: bytes, changes: list[dict]) -> bytes:
             if any(sibling is not current and sibling.tag == "entry" and sibling.get("name") == new_name for sibling in list(parent)):
                 raise OfflineConfigError(f"Configuratie-item {new_name} bestaat al")
             replacement.set("name", new_name)
-        allowed = {(field["path"], field["kind"]) for field in _config_edit_fields(current) if field["kind"] != "protected"}
+        allowed = {(field["path"], field["kind"]): field for field in editable_fields if field["kind"] != "protected"}
         updates = change.get("updates", [])
         if not isinstance(updates, list) or len(updates) > 10000:
             raise OfflineConfigError("Ongeldige configuratievelden")
@@ -1323,7 +1473,14 @@ def apply_configuration_changes(xml_bytes: bytes, changes: list[dict]) -> bytes:
             elif key[1] == "attribute":
                 target.set("name", str(update.get("value", ""))[:65535])
             else:
-                target.text = str(update.get("value", ""))[:65535]
+                value = str(update.get("value", ""))[:65535]
+                field = allowed[key]
+                if key[1] == "boolean" and value not in ({"", "yes", "no"} if field.get("optional") else {"yes", "no"}):
+                    raise OfflineConfigError("Ongeldige booleanwaarde")
+                if field.get("options") and value not in field["options"]:
+                    raise OfflineConfigError("Kies een waarde uit de beschikbare opties")
+                target.text = value
+        _prune_virtual_configuration_fields(replacement, synthetic)
         if change.get("operation") == "create":
             if current.tag != "entry" or not locator:
                 raise OfflineConfigError("Alleen een benoemd configuratie-item kan als basis worden gebruikt")
