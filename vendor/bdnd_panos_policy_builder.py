@@ -34,6 +34,7 @@ from defusedxml import ElementTree as SafeET
 from bdnd_bpa_policy_builder import (
     GENERATED_FILE_PATTERNS,
     aggregate_log_paths,
+    credential_urlopen,
     safe_name,
 )
 
@@ -1069,10 +1070,10 @@ def import_name_for_path(path: Path, max_len: int = 32) -> str:
 def api_get(endpoint: str, params: dict[str, str], ctx: ssl.SSLContext) -> str:
     request_params = dict(params)
     api_key = request_params.pop("key", "")
-    url = endpoint.rstrip("/") + "/api?" + urllib.parse.urlencode(request_params)
+    url = endpoint.rstrip("/") + "/api/?" + urllib.parse.urlencode(request_params)
     headers = {"X-PAN-KEY": api_key} if api_key else {}
     request = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(request, context=ctx, timeout=120) as response:
+    with credential_urlopen(request, context=ctx, timeout=120) as response:
         return response.read().decode("utf-8", errors="replace")
 
 
@@ -1087,7 +1088,7 @@ def api_post_form(endpoint: str, params: dict[str, str], ctx: ssl.SSLContext) ->
         headers=headers,
         method="POST",
     )
-    with urllib.request.urlopen(request, context=ctx, timeout=120) as response:
+    with credential_urlopen(request, context=ctx, timeout=120) as response:
         return response.read().decode("utf-8", errors="replace")
 
 
@@ -1115,7 +1116,7 @@ def api_post_multipart(endpoint: str, params: dict[str, str], file_path: Path, c
         headers=headers,
         method="POST",
     )
-    with urllib.request.urlopen(request, context=ctx, timeout=300) as response:
+    with credential_urlopen(request, context=ctx, timeout=300) as response:
         return response.read().decode("utf-8", errors="replace")
 
 
@@ -1259,7 +1260,7 @@ def scm_http_request(
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(full_url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with credential_urlopen(request, timeout=120) as response:
             body = response.read().decode("utf-8", errors="replace")
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as exc:
@@ -1726,11 +1727,11 @@ def get_scm_token(scm: SCMConfig) -> str:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with credential_urlopen(request, timeout=60) as response:
             token_data = json.loads(response.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"SCM token request failed: HTTP {exc.code}: {body}") from exc
+        # Token endpoints can reflect the submitted client secret in an error.
+        raise RuntimeError(f"SCM token request failed: HTTP {exc.code}") from exc
     token = token_data.get("access_token")
     if not token:
         raise RuntimeError("SCM token response did not contain access_token")

@@ -554,17 +554,24 @@ class CheckPointParser(BaseParser):
             except tarfile.TarError as exc:
                 raise MigrationError(f"Ongeldig Check Point archief {archive_name}: {exc}") from exc
             with archive:
-                members = archive.getmembers()
-                member_count += len(members)
-                if member_count > 1000:
-                    raise MigrationError("Check Point archief bevat te veel bestanden")
-                for member in members:
+                # Do not materialize/decompress the entire archive before
+                # enforcing the limits. Count skipped payloads too: an ignored
+                # file must not bypass the decompressed-byte budget.
+                for member in archive:
+                    member_count += 1
+                    if member_count > 1000:
+                        raise MigrationError("Check Point archief bevat te veel bestanden")
                     path = PurePosixPath(member.name)
                     qualified_name = f"{archive_name}!/{member.name}"
                     if path.is_absolute() or ".." in path.parts:
                         raise MigrationError(f"Onveilig pad in Check Point archief: {qualified_name}")
                     if member.issym() or member.islnk() or member.isdev():
                         raise MigrationError(f"Onveilig bestandstype in Check Point archief: {qualified_name}")
+                    if member.size < 0:
+                        raise MigrationError(f"Ongeldige bestandsgrootte in Check Point archief: {qualified_name}")
+                    total_size += member.size
+                    if total_size > 100 * 1024 * 1024:
+                        raise MigrationError("Uitgepakte Check Point data is groter dan 100 MiB")
                     if not member.isfile():
                         continue
                     suffix = path.suffix.casefold()
@@ -574,9 +581,6 @@ class CheckPointParser(BaseParser):
                     if member.size > per_file_limit:
                         label = "JSON" if suffix == ".json" else "genest archief"
                         raise MigrationError(f"Check Point {label} is te groot: {qualified_name}")
-                    total_size += member.size
-                    if total_size > 100 * 1024 * 1024:
-                        raise MigrationError("Uitgepakte Check Point data is groter dan 100 MiB")
                     stream = archive.extractfile(member)
                     if stream is None:
                         continue

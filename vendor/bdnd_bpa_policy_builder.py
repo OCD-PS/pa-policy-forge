@@ -550,10 +550,29 @@ def write_review_csv(path: Path, policies: list[dict[str, Any]]) -> None:
             )
 
 
+class NoCredentialRedirect(urllib.request.HTTPRedirectHandler):
+    """API credentials may only be sent to the configured HTTPS endpoint."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # urllib otherwise retains Authorization/X-PAN-KEY across origins and
+        # permits HTTPS-to-HTTP redirects. APIs must return a direct response.
+        return None
+
+
+def credential_urlopen(request: urllib.request.Request, *, context=None, timeout=120):
+    parsed = urllib.parse.urlsplit(request.full_url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("Credential-bearing API requests require an HTTPS URL without embedded credentials")
+    opener = urllib.request.build_opener(
+        NoCredentialRedirect(), urllib.request.HTTPSHandler(context=context),
+    )
+    return opener.open(request, timeout=timeout)
+
+
 def http_request(method: str, url: str, headers: dict[str, str], data: bytes | None = None) -> Any:
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with credential_urlopen(request, timeout=60) as response:
             body = response.read().decode("utf-8")
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as exc:

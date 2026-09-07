@@ -45,6 +45,10 @@ from app.certificates import (
 from vendor.paloalto_light_syslog import FlowStore, env_int, parse_panos_syslog
 from vendor.syslog_stream import tcp_server
 from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_single_replacements
+from app.workspace_access import (
+    initialize_workspace_access, inherit_workspace_access, link_workspace_project,
+    workspace_allowed,
+)
 from app.migration import (
     MIGRATION_FILTER_FIELDS, MIGRATION_FILTER_OPERATORS, MIGRATION_KIND_LABELS, MIGRATION_MAPPING_ACTIONS,
     MIGRATION_TOPOLOGY_KINDS, Address, AddressGroup, MigrationError, MigrationModel, PARSERS, Policy, Service, ServiceGroup,
@@ -486,6 +490,7 @@ def init_db() -> None:
         source_columns = {row[1] for row in conn.execute("PRAGMA table_info(migration_sources)")}
         if "staging_workspace_id" not in source_columns:
             conn.execute("ALTER TABLE migration_sources ADD COLUMN staging_workspace_id INTEGER")
+        initialize_workspace_access(conn)
         monitor_columns = {row[1] for row in conn.execute("PRAGMA table_info(post_deploy_monitors)")}
         if "target_type" not in monitor_columns:
             conn.execute("ALTER TABLE post_deploy_monitors ADD COLUMN target_type TEXT NOT NULL DEFAULT 'scm'")
@@ -1074,7 +1079,7 @@ def panos_api_post(endpoint: str, params: dict, ctx: ssl.SSLContext) -> str:
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     if api_key: headers["X-PAN-KEY"] = api_key
     api_request = urllib.request.Request(endpoint.rstrip("/") + "/api/", data=request_body, headers=headers, method="POST")
-    with urllib.request.urlopen(api_request, context=ctx, timeout=120) as response:
+    with policy_api.credential_urlopen(api_request, context=ctx, timeout=120) as response:
         return response.read().decode("utf-8", errors="replace")
 
 
@@ -2473,7 +2478,18 @@ def write_target_policy(profile, policy_kind: str, policy: dict, original_name: 
         policy_api.require_success(panos_api_post(endpoint, {"type": "config", "action": "rename", "xpath": xpath, "newname": policy["name"], "key": key}, ctx), f"rename {policy_kind} rule {current_name}")
 
 
+def workspace_access_allowed(workspace_id: int, write: bool | None = None) -> bool:
+    if not has_request_context():
+        return True
+    if write is None:
+        write = request.method not in {"GET", "HEAD", "OPTIONS"}
+    with db() as conn:
+        return workspace_allowed(conn, workspace_id, str(session.get("username", "")), write)
+
+
 def workspace_row(workspace_id: int):
+    if not workspace_access_allowed(workspace_id):
+        return None
     with db() as conn:
         return conn.execute(
             "SELECT config_workspaces.*,profiles.name profile_name,profiles.target_type,profiles.settings_json,profiles.secret_blob,profiles.system profile_system,profiles.updated_at profile_updated_at "
@@ -2482,7 +2498,15 @@ def workspace_row(workspace_id: int):
         ).fetchone()
 
 
-def store_config_workspace(profile, name: str, original_name: str, xml_bytes: bytes, source: str) -> int:
+def accessible_workspace_rows(rows):
+    if not has_request_context():
+        return rows
+    username = str(session.get("username", ""))
+    with db() as conn:
+        return [row for row in rows if workspace_allowed(conn, int(row["id"]), username)]
+
+
+def store_config_workspace(profile, name: str, original_name: str, xml_bytes: bytes, source: str, project_id: int | None = None) -> int:
     expected = "panorama" if profile["target_type"] == "panorama" else "panos"
     root, snapshot = parse_snapshot(xml_bytes, expected_kind=expected)
     normalized = normalized_config_xml(root)
@@ -2498,6 +2522,10 @@ def store_config_workspace(profile, name: str, original_name: str, xml_bytes: by
                 (profile["id"], name[:120], source, original_name[:255], str(path), snapshot_sha256(normalized), json.dumps(snapshot.as_dict()), timestamp, timestamp),
             )
             workspace_id = int(cursor.lastrowid)
+            if project_id is None and has_request_context():
+                project_id = (request.view_args or {}).get("project_id")
+            if project_id and source.startswith("migration-"):
+                link_workspace_project(conn, workspace_id, int(project_id))
     except Exception:
         path.unlink(missing_ok=True)
         raise
@@ -2508,6 +2536,7 @@ def store_config_workspace(profile, name: str, original_name: str, xml_bytes: by
 def advance_migration_staging_workspace(previous_workspace_id: int, new_workspace_id: int) -> bool:
     """Keep an imported source attached to the newest immutable workspace version."""
     with db() as conn:
+        inherit_workspace_access(conn, previous_workspace_id, new_workspace_id)
         linked_sources = conn.execute(
             "SELECT id,project_id FROM migration_sources WHERE staging_workspace_id=?",
             (previous_workspace_id,),
@@ -2613,6 +2642,7 @@ def store_migration_output(
             raise MigrationError("Migratieproject of output-workspace ontbreekt")
         if int(workspace["profile_id"]) != int(project["target_profile_id"]):
             raise MigrationError("Output-workspace hoort niet bij het targetprofiel")
+        link_workspace_project(conn, workspace_id, project_id)
         cursor = conn.execute(
             "INSERT INTO migration_outputs(project_id,workspace_id,label,topology,node_role,collision_json,sanity_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
             (
@@ -3106,6 +3136,7 @@ def create_merged_workspace(
             f"{project['name']}-new-config.xml",
             base_xml,
             "migration-generated-base",
+            project_id=int(project["id"]),
         )
         with db() as conn:
             conn.execute(
@@ -3120,7 +3151,7 @@ def create_merged_workspace(
         settings.get("rulebase", "pre"), approved_reuses,
     )
     workspace_id = store_config_workspace(
-        profile, f"{project['name']} · merged {now()}", workspace["original_name"], merged_xml, "migration-merge"
+        profile, f"{project['name']} · merged {now()}", workspace["original_name"], merged_xml, "migration-merge", project_id=int(project["id"])
     )
     set_active_config_workspace(profile["id"], workspace_id)
     return workspace_id, plan
@@ -4588,6 +4619,7 @@ def index():
                         "SELECT * FROM config_workspaces WHERE profile_id=? ORDER BY id DESC",
                         (policy_profile["id"],),
                     ).fetchall()
+                policy_workspaces = accessible_workspace_rows(policy_workspaces)
                 active_id = active_config_workspace_id(policy_profile)
                 active_workspace = next((item for item in policy_workspaces if item["id"] == active_id), None)
                 if policy_source != "choose" and active_workspace:
@@ -5053,7 +5085,7 @@ def migration_project(project_id):
     workspaces = []
     seen_workspace_families = set()
     selected_base_id = int(project["base_workspace_id"] or 0)
-    for row in workspace_rows:
+    for row in accessible_workspace_rows(workspace_rows):
         family = str(row["original_name"] or row["name"]).casefold()
         if int(row["id"]) != selected_base_id and family in seen_workspace_families:
             continue
@@ -6057,9 +6089,13 @@ def migration_base_select(project_id):
     if not project: return "Not found", 404
     try:
         workspace_id = int(request.form.get("base_workspace_id", "0") or 0)
+        if workspace_id and not workspace_access_allowed(workspace_id, write=True):
+            raise MigrationError("Deze base-workspace is niet beschikbaar voor dit project")
         with db() as conn:
             if workspace_id and not conn.execute("SELECT 1 FROM config_workspaces WHERE id=? AND profile_id=?", (workspace_id, project["target_profile_id"])).fetchone(): raise MigrationError("Base-workspace hoort niet bij het target")
             conn.execute("UPDATE migration_projects SET base_workspace_id=?,updated_at=? WHERE id=?", (workspace_id or None, now(), project_id))
+            if workspace_id:
+                link_workspace_project(conn, workspace_id, project_id)
         audit("migration-base-selected", f"project={project_id} workspace={workspace_id}")
         flash("Base configuration bijgewerkt.", "success")
     except Exception as exc: flash(f"Base configuration niet gekozen: {exc}", "error")
@@ -7485,12 +7521,13 @@ def tcp_loop():
 
 
 refresh_syslog_source_policy()
-threading.Thread(target=udp_loop,daemon=True,name="syslog-udp").start()
-threading.Thread(target=tcp_loop,daemon=True,name="syslog-tcp").start()
-threading.Thread(target=quota_loop,daemon=True,name="storage-quota").start()
-threading.Thread(target=prepare_loop,daemon=True,name="policy-prepare").start()
-threading.Thread(target=application_catalog_loop,daemon=True,name="application-catalog-scheduler").start()
-threading.Thread(target=post_deploy_monitor_loop,daemon=True,name="post-deploy-monitor").start()
+if os.getenv("PPF_BACKGROUND_WORKERS", "1") != "0":
+    threading.Thread(target=udp_loop,daemon=True,name="syslog-udp").start()
+    threading.Thread(target=tcp_loop,daemon=True,name="syslog-tcp").start()
+    threading.Thread(target=quota_loop,daemon=True,name="storage-quota").start()
+    threading.Thread(target=prepare_loop,daemon=True,name="policy-prepare").start()
+    threading.Thread(target=application_catalog_loop,daemon=True,name="application-catalog-scheduler").start()
+    threading.Thread(target=post_deploy_monitor_loop,daemon=True,name="post-deploy-monitor").start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0",port=8080)
