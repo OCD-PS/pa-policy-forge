@@ -63,7 +63,7 @@ from app.migration import (
 from app.offline_config import (
     OBJECT_NODES, POLICY_NODES, OfflineConfigError, available_scopes, available_templates,
     apply_configuration_changes, apply_object_changes, configuration_inventory,
-    create_basic_network_entry,
+    create_basic_network_entry, configuration_create_templates, create_configuration_entry,
     configuration_records as scoped_configuration_records,
     normalized_config_xml, parse_snapshot,
     object_create_record, policy_create_record,
@@ -3481,6 +3481,7 @@ def config_workspace_editor(workspace_id):
         alternate_policy_count = 0
         inventory = {"network": [], "device": []}
         config_records = []
+        config_create_templates = []
         if workspace_view == "policies":
             _, all_policies = scoped_policies(xml_bytes, scope, policy_kind, rulebase, parsed=(parsed_root, snapshot))
             policy_inventory_total = len(all_policies)
@@ -3569,6 +3570,9 @@ def config_workspace_editor(workspace_id):
                     xml_bytes, scope, template, workspace_view, config_section,
                     parsed=(parsed_root, snapshot),
                 )
+                config_create_templates = configuration_create_templates(
+                    xml_bytes, scope, template, workspace_view, config_section,
+                )
         new_policy = bool(workspace_view == "policies" and request.args.get("add_policy") == "1")
         if new_policy:
             edit_policy = policy_create_record(policy_kind, scope, rulebase)
@@ -3602,6 +3606,7 @@ def config_workspace_editor(workspace_id):
             workspace_structured_object_types=WORKSPACE_STRUCTURED_OBJECT_TYPES,
             config_section=config_section,
             inventory=inventory, config_records=config_records,
+            config_create_templates=config_create_templates,
             offline_policy_fields=OFFLINE_POLICY_FIELDS,
             workspace_policy_nav=WORKSPACE_POLICY_NAV, workspace_object_nav=WORKSPACE_OBJECT_NAV,
             workspace_network_nav=WORKSPACE_NETWORK_NAV, workspace_device_nav=WORKSPACE_DEVICE_NAV,
@@ -4125,26 +4130,40 @@ def config_workspace_configuration_create_basic(workspace_id):
         "operation": "create",
     }
     try:
-        if context["view"] != "network" or context["section"] not in {"interfaces", "zones"}:
-            raise OfflineConfigError("Alleen interfaces en zones kunnen via deze actie worden aangemaakt")
-        new_xml = create_basic_network_entry(
-            workspace_config_path(workspace).read_bytes(), context["scope"], context["template"],
-            context["section"], request.form.get("name", ""),
-            request.form.get("interface_type", "ethernet"), request.form.get("zone_type", "layer3"),
-        )
+        xml_bytes = workspace_config_path(workspace).read_bytes()
+        variant = request.form.get("variant", "").strip()
+        if variant:
+            raw_updates = request.form.get("generic_updates", "[]")
+            if len(raw_updates) > 262144:
+                raise OfflineConfigError("Te veel velden voor één configuratie-item")
+            updates = json.loads(raw_updates)
+            if not isinstance(updates, list) or len(updates) > 512 or any(not isinstance(item, dict) for item in updates):
+                raise OfflineConfigError("Ongeldige configuratievelden")
+            new_xml = create_configuration_entry(
+                xml_bytes, context["scope"], context["template"], context["view"],
+                context["section"], variant, request.form.get("name", ""), updates,
+            )
+        else:
+            if context["view"] != "network" or context["section"] not in {"interfaces", "zones"}:
+                raise OfflineConfigError("Kies het type configuratie-item")
+            new_xml = create_basic_network_entry(
+                xml_bytes, context["scope"], context["template"],
+                context["section"], request.form.get("name", ""),
+                request.form.get("interface_type", "ethernet"), request.form.get("zone_type", "layer3"),
+            )
         with db() as conn:
             profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
         if not profile:
             raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
         new_id = store_config_workspace(
-            profile, f"{workspace['name']} · network add {now()}", workspace["original_name"],
+            profile, f"{workspace['name']} · {context['view']} add {now()}", workspace["original_name"],
             new_xml, workspace_version_source(workspace),
         )
         if not advance_migration_staging_workspace(workspace["id"], new_id):
             advance_migration_output_workspace(workspace["id"], new_id, new_xml)
             set_active_config_workspace(workspace["profile_id"], new_id)
         audit("config-workspace-configuration-created", f"source={workspace_id} workspace={new_id} section={context['section']}")
-        flash(f"{context['section'].replace('-', ' ').title()} toegevoegd.", "success")
+        flash("Opgeslagen", "success")
         return _workspace_config_redirect(new_id, context)
     except Exception as exc:
         flash(f"Configuratie-item niet toegevoegd: {exc}", "error")
