@@ -160,3 +160,23 @@ test('generic Add preserves zero, honors field limits and never submits protecte
   assert.deepEqual(JSON.parse(form.querySelector('[data-config-updates]').value), []);
   assert.deepEqual(errors, []); dom.window.close();
 });
+
+test('optional absent boolean fields stay unset until deliberately selected', async () => {
+  const schema = {create_variant:'zone', kind:'Zone', owner:'vsys1', is_entry:true, edit_fields:[
+    {path:'enable-user-identification',label:'User Identification',kind:'boolean',value:'',optional:true},
+    {path:'logging',label:'Logging',kind:'bool',value:'',optional:true},
+    {path:'mode',label:'Mode',kind:'text',value:'',optional:true,options:['','layer3','layer2']},
+  ]};
+  const {dom, document, window, errors} = await page(configMarkup() + `<script type="application/json" data-config-create-templates>${JSON.stringify([schema])}</script>`);
+  document.querySelector('[data-config-add]').click();
+  const form = document.querySelector('[data-config-form]');
+  const selects = [...document.querySelectorAll('[data-config-fields] select')];
+  assert.deepEqual(selects.map(select => select.value), ['', '', '']);
+  assert.ok(selects.every(select => select.selectedOptions[0].textContent === 'Niet ingesteld'));
+  form.dispatchEvent(new window.Event('submit', {cancelable:true}));
+  assert.deepEqual(JSON.parse(form.querySelector('[data-config-updates]').value), []);
+  selects[0].value = 'no';
+  form.dispatchEvent(new window.Event('submit', {cancelable:true}));
+  assert.deepEqual(JSON.parse(form.querySelector('[data-config-updates]').value), [{path:'enable-user-identification',kind:'boolean',value:'no'}]);
+  assert.deepEqual(errors, []); dom.window.close();
+});

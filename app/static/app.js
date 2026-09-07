@@ -1028,14 +1028,15 @@
           } else if (field.kind === "members") tokenEditor(field, wrapper);
           else if (field.kind === "boolean" || field.kind === "bool") {
             var booleanValues = field.kind === "bool" ? ["true", "false"] : ["yes", "no"];
-            var select = document.createElement("select"); booleanValues.forEach(function (value) { var option = document.createElement("option"); option.value = value; option.textContent = value; option.selected = String(field.value).trim().toLowerCase() === value; select.appendChild(option); }); field._input = select; wrapper.appendChild(select);
+            if (field.optional) booleanValues.unshift("");
+            var select = document.createElement("select"); booleanValues.forEach(function (value) { var option = document.createElement("option"); option.value = value; option.textContent = value === "" ? "Niet ingesteld" : value; option.selected = String(field.value == null ? "" : field.value).trim().toLowerCase() === value; select.appendChild(option); }); field._input = select; wrapper.appendChild(select);
           } else {
             var input;
             if (field.options && field.options.length) {
               input = document.createElement("select");
               var current = String(field.value == null ? "" : field.value);
               var options = field.options.slice(); if (current && !options.includes(current)) options.unshift(current);
-              options.forEach(function (value) { var option = document.createElement("option"); option.value = value; option.textContent = value; option.selected = value === current; input.appendChild(option); });
+              options.forEach(function (value) { var option = document.createElement("option"); option.value = value; option.textContent = value === "" && field.optional ? "Niet ingesteld" : value; option.selected = value === current; input.appendChild(option); });
             } else {
               input = field.kind === "json" || String(field.value || "").length > 180 ? document.createElement("textarea") : document.createElement("input"); input.value = field.value == null ? "" : field.value; if (input.tagName === "TEXTAREA") input.rows = field.kind === "json" ? 8 : 4;
               input.maxLength = Number.isInteger(field.max_length) && field.max_length > 0 ? Math.min(field.max_length, 65535) : 65535;
