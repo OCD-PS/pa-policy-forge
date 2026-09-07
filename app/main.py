@@ -51,6 +51,7 @@ from app.migration import (
     apply_family_mappings, apply_merge_rules, apply_topology_mappings, apply_transform_rules, auto_map_nat_topology, merge_inventory,
     merge_model_into_panos_xml, migration_api_plan, migration_base_xml, migration_best_practices,
     migration_discovery, migration_filter_inventory, migration_health_dashboard, migration_zone_names, migration_topology_targets,
+    migration_interface_zone_memberships,
     clean_name, item_selector, merge_member_names, migration_analysis, migration_item_semantic, migration_review_findings,
     migration_search, model_collections, panos_candidate_analysis, panos_fragment, parse_vendor, raw_item_payload,
     reconcile_model, scm_items,
@@ -2779,6 +2780,10 @@ def migration_project_topology_targets(project, profile, context=None):
                 content, context or migration_profile_target_context(profile),
                 panorama=project["target_type"] == "panorama",
             ))
+            targets["interface_zone_memberships"] = migration_interface_zone_memberships(
+                content, context or migration_profile_target_context(profile),
+                panorama=project["target_type"] == "panorama",
+            )
     elif project["target_type"] == "scm" and profile:
         targets["zones"] = sorted(profile_settings(profile).get("zones", {}))
     return targets
@@ -5368,6 +5373,21 @@ def migration_topology_mapping_save(project_id):
         if zone and (not re.fullmatch(r"[A-Za-z0-9 ._-]{1,31}", zone) or zone.casefold() == "any"):
             raise MigrationError("Ongeldige zonenaam: maximaal 31 letters, cijfers, spaties, punten, streepjes of underscores; geen any")
         existing_zones = set(scoped_targets.get("zones", []))
+        if zone:
+            interface = target if action == "map" else str(selected.get("name", ""))
+            attached = scoped_targets.get("interface_zone_memberships", {}).get(interface, [])
+            if (zone in existing_zones and zone not in attached) or any(value != zone for value in attached):
+                raise MigrationError("De interface hoort niet bij deze targetzone. Pas de zone-interfacekoppeling eerst aan in de base")
+            with db() as conn:
+                assignments = conn.execute(
+                    "SELECT z.selector,z.value AS zone_value,t.value AS target FROM migration_transform_rules z "
+                    "JOIN migration_transform_rules t ON t.project_id=z.project_id AND t.kind=z.kind AND t.selector=z.selector "
+                    "WHERE z.project_id=? AND z.kind='interfaces' AND z.operation='set_interface_zone' "
+                    "AND t.operation='topology_map' AND z.selector<>?",
+                    (project_id, selector),
+                ).fetchall()
+            if any(row["target"] == interface and json.loads(row["zone_value"] or "{}").get("zone") not in {None, "", zone} for row in assignments):
+                raise MigrationError("Deze targetinterface is al aan een andere zone toegewezen")
         with db() as conn:
             conn.execute(
                 "DELETE FROM migration_transform_rules WHERE project_id=? AND kind=? AND selector=? AND operation LIKE 'topology_%'",

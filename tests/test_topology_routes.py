@@ -89,6 +89,28 @@ class TopologyRouteAuditTests(unittest.TestCase):
                 self.assertEqual(rows[0]["selector"], "bond1.10|||cluster")
                 self.assertIn("ethernet1/1.10", rows[0]["targets"])
 
+    def test_existing_zone_requires_actual_interface_membership(self):
+        with patch.object(main, "migration_project_topology_targets", return_value={
+            "interfaces": ["ethernet1/1.10"], "zones": ["Audit Zone"],
+            "interface_zone_memberships": {},
+        }):
+            self.save()
+        self.assertEqual(self.transforms(), [])
+        with patch.object(main, "migration_project_topology_targets", return_value={
+            "interfaces": ["ethernet1/1.10"], "zones": ["Audit Zone"],
+            "interface_zone_memberships": {"ethernet1/1.10": ["Audit Zone"]},
+        }):
+            self.save()
+        self.assertEqual(len(self.transforms()), 2)
+
+    def test_interface_already_in_another_zone_rejects_new_assignment(self):
+        with patch.object(main, "migration_project_topology_targets", return_value={
+            "interfaces": ["ethernet1/1.10"], "zones": ["Other Zone"],
+            "interface_zone_memberships": {"ethernet1/1.10": ["Other Zone"]},
+        }):
+            self.save()
+        self.assertEqual(self.transforms(), [])
+
     def test_scm_workspace_policy_save_messages_are_concise(self):
         source = main.Path(main.__file__).read_text()
         self.assertNotIn('bewaard in een nieuwe workspaceversie.', source)
