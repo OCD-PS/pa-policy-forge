@@ -50,7 +50,7 @@ from app.migration import (
     MIGRATION_TOPOLOGY_KINDS, Address, AddressGroup, MigrationError, MigrationModel, PARSERS, Policy, Service, ServiceGroup,
     apply_family_mappings, apply_merge_rules, apply_topology_mappings, apply_transform_rules, auto_map_nat_topology, merge_inventory,
     merge_model_into_panos_xml, migration_api_plan, migration_base_xml, migration_best_practices,
-    migration_discovery, migration_filter_inventory, migration_health_dashboard, migration_zone_names,
+    migration_discovery, migration_filter_inventory, migration_health_dashboard, migration_zone_names, migration_topology_targets,
     clean_name, item_selector, merge_member_names, migration_analysis, migration_item_semantic, migration_review_findings,
     migration_search, model_collections, panos_candidate_analysis, panos_fragment, parse_vendor, raw_item_payload,
     reconcile_model, scm_items,
@@ -2765,6 +2765,25 @@ def apply_migration_import_policy_status(model: MigrationModel, force_disabled: 
     }
 
 
+def migration_project_topology_targets(project, profile, context=None):
+    """Only offer topology from the concrete target scope, never other templates."""
+    targets = {kind: [] for kind in MIGRATION_TOPOLOGY_KINDS}
+    if project["base_workspace_id"]:
+        workspace = workspace_row(int(project["base_workspace_id"]))
+        if workspace:
+            path = safe_workspace_path(CONFIG_WORKSPACES, workspace["config_path"])
+            content = path.read_bytes()
+            if not hmac.compare_digest(hashlib.sha256(content).hexdigest(), workspace["sha256"]):
+                raise MigrationError("De base-workspace is gewijzigd of beschadigd")
+            targets.update(migration_topology_targets(
+                content, context or migration_profile_target_context(profile),
+                panorama=project["target_type"] == "panorama",
+            ))
+    elif project["target_type"] == "scm" and profile:
+        targets["zones"] = sorted(profile_settings(profile).get("zones", {}))
+    return targets
+
+
 def migration_profile_target_context(profile, kind: str = "") -> str:
     """Return the concrete default context used by the selected target adapter."""
     settings = profile_settings(profile)
@@ -3627,7 +3646,7 @@ def config_workspace_policy_preview(workspace_id):
                 )
             new_id = store_workspace_edit_version(workspace, new_xml, "policy add" if operation == "create" else "policy edit")
             audit("config-workspace-policy-created" if operation == "create" else "config-workspace-policy-edited", f"source={workspace['id']} workspace={new_id} scope={scope} policy={updated_name}")
-            flash("Policy bewaard in een nieuwe workspaceversie.", "success")
+            flash("Opgeslagen", "success")
             return redirect(url_for(
                 "config_workspace_editor", workspace_id=new_id, scope=scope,
                 workspace_view="policies", policy_kind=kind, rulebase=rulebase,
@@ -3706,7 +3725,7 @@ def config_workspace_policy_bulk_preview(workspace_id):
                 )
             new_id = store_workspace_edit_version(workspace, new_xml, "bulk edit")
             audit("config-workspace-policy-bulk-edited", f"source={workspace['id']} workspace={new_id} scope={scope} rules={len(changes)}")
-            flash(f"{len(changes)} policies bewaard in een nieuwe workspaceversie.", "success")
+            flash("Opgeslagen", "success")
             return redirect(url_for(
                 "config_workspace_editor", workspace_id=new_id, scope=scope,
                 workspace_view="policies", policy_kind=kind, rulebase=rulebase,
@@ -3933,7 +3952,7 @@ def config_workspace_object_preview(workspace_id):
             )
             new_id = store_workspace_edit_version(workspace, new_xml, "object edit")
             audit("config-workspace-object-edited", f"source={workspace['id']} workspace={new_id} scope={scope} type={object_type} operation={operation}")
-            flash("Objectwijziging bewaard in een nieuwe workspaceversie.", "success")
+            flash("Opgeslagen", "success")
             return redirect(url_for(
                 "config_workspace_editor", workspace_id=new_id, scope=scope,
                 workspace_view="objects", object_type=object_type,
@@ -4018,7 +4037,7 @@ def config_workspace_object_apply(draft_id):
             set_active_config_workspace(workspace["profile_id"], new_id)
         draft_path.unlink(missing_ok=True)
         audit("config-workspace-object-edited", f"source={workspace['id']} workspace={new_id} scope={draft['scope']} type={draft['object_type']} operation={draft['operation']}")
-        flash("Objectwijziging bewaard in een nieuwe workspaceversie; de bron bleef onaangeroerd.", "success")
+        flash("Opgeslagen", "success")
         return redirect(url_for("config_workspace_editor", workspace_id=new_id, scope=draft["scope"], workspace_view="objects", object_type=draft["object_type"]))
     except Exception as exc:
         flash(f"Objectwijziging niet bewaard: {exc}", "error")
@@ -4153,7 +4172,7 @@ def config_workspace_configuration_preview(workspace_id):
         if request.form.get("direct_save") == "yes":
             direct_context = {**context, "operation": operation}
             new_id = _store_workspace_configuration_version(workspace, direct_context, [change])
-            flash("Configuratie rechtstreeks bewaard in een nieuwe workspaceversie.", "success")
+            flash("Opgeslagen", "success")
             return _workspace_config_redirect(new_id, direct_context)
         draft_id = secrets.token_urlsafe(24)
         draft = {**context, "operation": operation, "before": public_ui_record(before), "changes": [change], "created_at": now()}
@@ -4215,7 +4234,7 @@ def config_workspace_configuration_apply(draft_id):
             raise OfflineConfigError("De bronworkspace bestaat niet meer")
         new_id = _store_workspace_configuration_version(workspace, draft, draft["changes"])
         draft_path.unlink(missing_ok=True)
-        flash("Configuratiewijziging bewaard in een nieuwe workspaceversie; de bron bleef onaangeroerd.", "success")
+        flash("Opgeslagen", "success")
         return _workspace_config_redirect(new_id, draft)
     except Exception as exc:
         flash(f"Configuratiewijziging niet bewaard: {exc}", "error")
@@ -5093,8 +5112,6 @@ def migration_project(project_id):
                 "topology_role":str(raw.get("topology_role","")),
                 "suggested_zone":str(raw.get("suggested_zone","")),
             }
-            if kind in MIGRATION_TOPOLOGY_KINDS and not raw.get("auto_generated"):
-                topology_items.append(row)
             if kind == transform_kind and (
                 not transform_query
                 or transform_query.casefold() in " ".join((row["name"], row["source_ref"])).casefold()
@@ -5102,6 +5119,34 @@ def migration_project(project_id):
                 transform_candidate_total += 1
                 if len(transform_candidates) < 200:
                     transform_candidates.append(row)
+    # A mapped/ignored source is absent from the transformed model.  Keep its
+    # original selector visible so the engineer can revise that decision.
+    topology_contexts = {
+        (int(mapping["source_id"]), mapping["kind"]): mapping["target_context"]
+        for mapping in family_mappings
+    }
+    topology_by_context = {}
+    for source in source_rows:
+        for kind, items in model_collections(migration_model(source)).items():
+            if kind not in MIGRATION_TOPOLOGY_KINDS:
+                continue
+            context = topology_contexts.get((int(source["id"]), kind)) or migration_profile_target_context(profile)
+            if context not in topology_by_context:
+                topology_by_context[context] = migration_project_topology_targets(project, profile, context)
+            for item in items:
+                raw = item.__dict__ if hasattr(item, "__dict__") else item
+                if raw.get("auto_generated"):
+                    continue
+                topology_items.append({
+                    "kind": kind, "name": str(raw.get("name", "")),
+                    "source_ref": str(raw.get("source_ref", "")), "selector": item_selector(raw),
+                    "source_vendor": str(raw.get("source_vendor", "")),
+                    "networks": list(raw.get("source_networks", [])),
+                    "addresses": list(raw.get("source_addresses", [])),
+                    "topology_role": str(raw.get("topology_role", "")),
+                    "suggested_zone": str(raw.get("suggested_zone", "")),
+                    "targets": topology_by_context[context].get(kind, []),
+                })
     with db() as conn:
         merge_rules=[dict(row) for row in conn.execute("SELECT * FROM migration_merge_rules WHERE project_id=? ORDER BY id DESC",(project_id,)).fetchall()]
         transform_rules=[dict(row) for row in conn.execute("SELECT * FROM migration_transform_rules WHERE project_id=? ORDER BY id DESC",(project_id,)).fetchall()]
@@ -5150,10 +5195,7 @@ def migration_project(project_id):
         for rule in transform_rules
         if rule["operation"] == "set_interface_zone"
     }
-    topology_targets={
-        "zones":sorted({str(item.get("name","")) for item in target_model.zones if str(item.get("name",""))}),
-        "interfaces":sorted({str(item.get("name","")) for item in target_model.interfaces if str(item.get("name",""))}),
-    }
+    topology_targets = migration_project_topology_targets(project, profile)
     offline_source_zones = {
         str(item.get("name", ""))
         for item in combined.zones
@@ -5298,29 +5340,34 @@ def migration_topology_mapping_save(project_id):
             source_rows = conn.execute("SELECT * FROM migration_sources WHERE project_id=?", (project_id,)).fetchall()
             profile = conn.execute("SELECT * FROM profiles WHERE id=?", (project["target_profile_id"],)).fetchone()
         available = {}
+        source_owners = {}
         for source in source_rows:
             for item in model_collections(migration_model(source)).get(kind, []):
                 raw = item if isinstance(item, dict) else item.__dict__
-                available[item_selector(raw)] = raw
+                key = item_selector(raw)
+                if key in available and key == selector:
+                    raise MigrationError("De bronwaarde komt in meerdere imports voor; maak de bronselectie eerst uniek")
+                available[key] = raw
+                source_owners[key] = int(source["id"])
         if selector not in available:
             raise MigrationError("De bronwaarde bestaat niet meer")
         selected = available[selector]
         if kind == "interfaces" and selected.get("source_vendor") == "checkpoint" and action == "create":
             raise MigrationError("Map de Check Point-interface naar een PAN-OS interface; maak ze niet blind over")
-        zone = clean_name(requested_zone, "") if requested_zone else ""
-        existing_zones = set()
-        if profile:
-            existing_zones.update(profile_settings(profile).get("zones", {}))
-        if project["base_workspace_id"]:
-            workspace = workspace_row(int(project["base_workspace_id"]))
-            if workspace:
-                existing_zones.update(
-                    str(item.get("name", ""))
-                    for item in cached_migration_workspace_model(
-                        workspace["config_path"], workspace["sha256"]
-                    ).zones
-                    if str(item.get("name", ""))
-                )
+        with db() as conn:
+            mapping = conn.execute(
+                "SELECT target_context FROM migration_family_mappings WHERE project_id=? AND source_id=? AND kind=?",
+                (project_id, source_owners[selector], kind),
+            ).fetchone()
+        context = mapping["target_context"] if mapping else migration_profile_target_context(profile)
+        scoped_targets = migration_project_topology_targets(project, profile, context)
+        if action == "map" and target not in scoped_targets.get(kind, []):
+            raise MigrationError("De gekozen target bestaat niet in de geselecteerde doelcontext; vernieuw de base en kies opnieuw")
+        # A review or ignored interface must not create a usable target zone.
+        zone = requested_zone if kind == "interfaces" and action in {"map", "create"} else ""
+        if zone and (not re.fullmatch(r"[A-Za-z0-9 ._-]{1,31}", zone) or zone.casefold() == "any"):
+            raise MigrationError("Ongeldige zonenaam: maximaal 31 letters, cijfers, spaties, punten, streepjes of underscores; geen any")
+        existing_zones = set(scoped_targets.get("zones", []))
         with db() as conn:
             conn.execute(
                 "DELETE FROM migration_transform_rules WHERE project_id=? AND kind=? AND selector=? AND operation LIKE 'topology_%'",
