@@ -29,6 +29,7 @@ class ConfigurationCreationRouteTests(unittest.TestCase):
         for name, value in {
             "APP_DB": root / "app.sqlite3", "CONFIG_WORKSPACES": root / "workspaces",
             "POLICY_DRAFTS": root / "policy-drafts", "OBJECT_DRAFTS": root / "object-drafts",
+            "MIGRATION_SOURCES": root / "migration-sources",
         }.items():
             if name != "APP_DB":
                 value.mkdir()
@@ -220,6 +221,77 @@ class ConfigurationCreationRouteTests(unittest.TestCase):
         self.assertIn("created-vlan", self.page(new_id))
         self.assertEqual(self.post(workspace_id=new_id, name="unauthorized-vlan").status_code, 404)
         self.assertEqual(self.count_workspaces(), 2)
+
+    def test_authenticated_checkpoint_source_sync_retains_topology_and_transform_selectors(self):
+        from app import migration
+        interface = {"name": "eth0", "interface_type": "ethernet", "source_vendor": "checkpoint",
+            "source_ref": "CP-Gateway", "source_networks": ["10.0.0.0/24"],
+            "source_addresses": ["10.0.0.1/24"], "topology_role": "internal", "mapping_action": "review",
+            "xml": '<entry name="eth0"><layer3><ip><entry name="10.0.0.1/24" /></ip></layer3></entry>'}
+        original = migration.MigrationModel("checkpoint", "full-export.tar", interfaces=[interface],
+            warnings=["Fixture topology requires review", "Fixture niet-ondersteunde Check Point actie: custom"],
+            unsupported=["Fixture unsupported feature"])
+        source_id = main.store_migration_source(self.project_id, "checkpoint", original.source_name, original)
+        source_before = main.migration_source_row(source_id)
+        original_bytes = Path(source_before["model_path"]).read_bytes()
+
+        root = ET.fromstring(BASE)
+        ethernet = root.find(".//network/interface/ethernet")
+        ethernet.clear()
+        ethernet.append(ET.fromstring(interface["xml"].replace("10.0.0.1/24", "192.0.2.12/28")))
+        vsys = root.find(".//vsys/entry")
+        fragment = ET.fromstring(migration.panos_fragment(migration.MigrationModel("panos", "edited",
+            security_rules=[migration.Policy("edited-rule", source=["192.0.2.8"], disabled=False,
+                description="REVIEW: actie custom")]), "vsys1"))
+        vsys.append(fragment.find(".//vsys/entry/rulebase"))
+        with main.db() as conn:
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (self.profile_id,)).fetchone()
+        edited_workspace_id = main.store_config_workspace(profile, "source editor", "source.xml", ET.tostring(root),
+                                                          "migration-staging", project_id=self.project_id)
+        selector = migration.item_selector(interface)
+        transforms = [
+            {"operation": "topology_map", "kind": "interfaces", "selector": selector, "value": "ethernet1/1"},
+            {"operation": "set_interface_zone", "kind": "interfaces", "selector": selector,
+             "value": json.dumps({"zone": "Trust", "create": True})},
+        ]
+        with main.db() as conn:
+            conn.execute("UPDATE migration_sources SET staging_workspace_id=? WHERE id=?", (edited_workspace_id, source_id))
+            for transform in transforms:
+                conn.execute("INSERT INTO migration_transform_rules(project_id,operation,kind,selector,value,created_at) VALUES(?,?,?,?,?,'now')",
+                             (self.project_id, transform["operation"], transform["kind"], transform["selector"], transform["value"]))
+            output_id = conn.execute("INSERT INTO migration_outputs(project_id,workspace_id,label,sanity_json,created_at) VALUES(?,?,?,'{}','now')",
+                                     (self.project_id, self.workspace_id, "previous-output")).lastrowid
+        response = self.client.post(f"/migration/projects/{self.project_id}/sources/{source_id}/sync-workspace",
+                                    data={"csrf": "route-csrf"})
+        self.addCleanup(response.close)
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.location.endswith(f"/migration/projects/{self.project_id}"))
+        with self.client.session_transaction() as session:
+            self.assertTrue(any("Wijzigingen uit de importeditor zijn opgenomen" in message for _, message in session.get("_flashes", [])))
+        source_after = main.migration_source_row(source_id)
+        synced = main.migration_model(source_after)
+        self.assertEqual(synced.vendor, "checkpoint")
+        self.assertEqual(synced.source_name, "full-export.tar")
+        self.assertEqual(synced.interfaces[0]["source_vendor"], "checkpoint")
+        self.assertEqual(migration.item_selector(synced.interfaces[0]), selector)
+        self.assertEqual(synced.interfaces[0]["source_networks"], ["192.0.2.0/28"])
+        self.assertEqual(synced.interfaces[0]["source_addresses"], ["192.0.2.12/28"])
+        self.assertEqual(synced.warnings, original.warnings)
+        self.assertEqual(synced.unsupported, original.unsupported)
+        self.assertNotEqual(source_after["model_path"], source_before["model_path"])
+        self.assertEqual(Path(source_before["model_path"]).read_bytes(), original_bytes)
+        with main.db() as conn:
+            saved_transforms = [dict(row) for row in conn.execute("SELECT operation,kind,selector,value FROM migration_transform_rules WHERE project_id=? ORDER BY id", (self.project_id,))]
+            sanity = json.loads(conn.execute("SELECT sanity_json FROM migration_outputs WHERE id=?", (output_id,)).fetchone()[0])
+        self.assertEqual(saved_transforms, transforms)
+        mapped = migration.apply_transform_rules(synced, saved_transforms)
+        self.assertEqual(mapped.security_rules[0].from_zones, ["Trust"])
+        self.assertFalse(mapped.security_rules[0].disabled)
+        self.assertTrue(sanity["regenerate_required"])
+        self.assertTrue(sanity["source_changed"])
+        preserved_xml = main.workspace_config_path(main.workspace_row(edited_workspace_id)).read_bytes()
+        self.assertIn(b"fixture-retained-hash", preserved_xml)
+        self.assertIn(b"192.0.2.44", preserved_xml)
 
 
 if __name__ == "__main__":
