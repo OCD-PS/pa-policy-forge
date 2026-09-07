@@ -931,6 +931,12 @@
     var fieldsRoot = dialog.querySelector("[data-config-fields]");
     var tabsRoot = dialog.querySelector("[data-config-field-tabs]");
     var currentFields = [];
+    var editAction = form.getAttribute("action");
+    var createAction = dialog.dataset.configCreateUrl || "";
+    var createTemplatesNode = document.querySelector("[data-config-create-templates]");
+    var createTemplates = createTemplatesNode ? JSON.parse(createTemplatesNode.textContent || "[]") : [];
+    var variantInput = form.querySelector('input[name="variant"]');
+    if (!variantInput) { variantInput = document.createElement("input"); variantInput.type = "hidden"; variantInput.name = "variant"; form.appendChild(variantInput); }
     if (!form.querySelector('input[name="direct_save"]')) { var directSave = document.createElement("input"); directSave.type = "hidden"; directSave.name = "direct_save"; directSave.value = "yes"; form.appendChild(directSave); }
 
     // Turn the shared generic dialog markup into the compact PAN-OS editor.
@@ -996,8 +1002,10 @@
     }
 
     function renderRecord(item, createMode) {
+      form.setAttribute("action", createMode && item.create_variant && createAction ? createAction : editAction);
+      variantInput.value = createMode ? item.create_variant || "" : "";
       currentFields = item.edit_fields || [];
-      form.querySelector("[data-config-locator]").value = item.locator;
+      form.querySelector("[data-config-locator]").value = item.locator || "";
       dialog.querySelector("[data-config-dialog-title]").textContent = (createMode ? "Add " + item.kind : "Edit " + item.name);
       dialog.querySelector("[data-config-dialog-kind]").textContent = item.kind;
       dialog.querySelector("[data-config-dialog-owner]").textContent = item.owner;
@@ -1075,10 +1083,21 @@
     setupFamilyTabs();
     var actionbar = remove && remove.closest(".object-actionbar");
     var creatableRows = all("[data-config-record-row]").filter(function (row) { return row.dataset.configCreatable === "true"; });
-    if (actionbar && !creatableRows.length) actionbar.hidden = true;
-    if (actionbar && creatableRows.length) {
+    if (actionbar && !creatableRows.length && !createTemplates.length) actionbar.hidden = true;
+    if (actionbar && (creatableRows.length || createTemplates.length)) {
+      var createType = null;
+      if (createTemplates.length > 1) {
+        createType = document.createElement("select"); createType.className = "config-create-type"; createType.dataset.configCreateVariant = ""; createType.setAttribute("aria-label", "Nieuw configuratietype");
+        createTemplates.forEach(function (item, index) { var option = document.createElement("option"); option.value = String(index); option.textContent = item.label || item.kind || item.ui_family; createType.appendChild(option); });
+        actionbar.insertBefore(createType, remove);
+      }
       var add = document.createElement("button"); add.type = "button"; add.className = "btn btn-primary"; add.textContent = "+ Add"; add.dataset.configAdd = "";
       add.addEventListener("click", function () {
+        if (createTemplates.length) {
+          var template = createTemplates[createType ? Number(createType.value) : 0];
+          renderRecord(JSON.parse(JSON.stringify(template)), true);
+          return;
+        }
         var rows = all("[data-config-record-row]");
         var checked = rows.find(function (row) { var check = row.querySelector("[data-config-record-select]"); return row.dataset.configCreatable === "true" && check && check.checked; });
         var base = checked || rows.find(function (row) { return row.dataset.configCreatable === "true" && !row.hidden && row.style.display !== "none"; }) || rows.find(function (row) { return row.dataset.configCreatable === "true"; });

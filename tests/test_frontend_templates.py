@@ -39,6 +39,12 @@ class FrontendTemplateTests(unittest.TestCase):
             policy_zone_items=[], migration_kind_labels={}, topology_rules=[], interface_zone_rules={},
         )
 
+    def test_all_templates_parse(self):
+        environment = self.environment()
+        for name in environment.list_templates():
+            with self.subTest(template=name):
+                environment.parse(environment.loader.get_source(environment, name)[0])
+
     def test_migration_review_and_step_links_have_real_targets(self):
         html = self.environment().get_template("migration.html").render(**self.migration_context())
         links = Links(); links.feed(html)

@@ -413,3 +413,4 @@ body.sidebar-collapsed .object-actionbar { left: 100px; }
 
 /* Layout display rules must never expose inactive tabs, fields or pickers. */
 [hidden] { display: none !important; }
+.object-actionbar .config-create-type { width: auto; max-width: min(280px, 100%); min-width: 160px; }

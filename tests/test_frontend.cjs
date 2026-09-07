@@ -58,8 +58,8 @@ test('filtered policy range selection never includes hidden policies', async () 
 function configMarkup() {
   const record = (name, family) => JSON.stringify({name, ui_family:family, is_entry:true, kind:family, owner:'vsys1', locator:name, edit_fields:[]});
   return `<div class="config-record-list"><div class="policy-filterbar"><input data-table-filter="#config"></div>
-    <form><table id="config"><tbody>${[['port-red','Ethernet'],['port-blue','VLAN']].map(([name,family]) => `<tr data-config-record-row data-config-record='${record(name,family)}'><td><input type="checkbox" data-config-record-select></td><td><button data-config-record-edit>${name}</button></td></tr>`).join('')}</tbody></table><div class="object-actionbar"><span data-config-selected-count></span><button data-config-delete disabled>Delete</button></div></form></div>
-    <dialog data-config-dialog><form data-config-form><input data-config-locator><input data-config-updates><div class="card-header"><div><h2 data-config-dialog-title></h2><span data-config-dialog-kind></span><span data-config-dialog-owner></span></div></div><div data-config-field-tabs></div><div data-config-fields></div><div class="bulk-dialog-actions"><button class="btn-primary" name="operation">Save</button></div></form></dialog>`;
+    <form><table id="config"><tbody>${[['port-red','Ethernet'],['port-blue','VLAN']].map(([name,family]) => `<tr data-config-record-row data-config-record='${record(name,family)}'><td><input type="checkbox" data-config-record-select></td><td><button type="button" data-config-record-edit>${name}</button></td></tr>`).join('')}</tbody></table><div class="object-actionbar"><span data-config-selected-count></span><button data-config-delete disabled>Delete</button></div></form></div>
+    <dialog data-config-dialog data-config-create-url="/config-workspaces/1/configuration/create-basic"><form data-config-form action="/config-workspaces/1/configuration/preview"><input data-config-locator><input data-config-updates><div class="card-header"><div><h2 data-config-dialog-title></h2><span data-config-dialog-kind></span><span data-config-dialog-owner></span></div></div><div data-config-field-tabs></div><div data-config-fields></div><div class="bulk-dialog-actions"><button class="btn-primary" name="operation">Save</button></div></form></dialog>`;
 }
 
 test('configuration family and text filters compose instead of resetting each other', async () => {
@@ -99,5 +99,44 @@ test('offline policy picker rows support multiple selections like object groups'
   assert.equal(document.querySelector('[data-policy-picker-selected-count]').textContent, '2');
   document.querySelector('[data-policy-picker-add-selected]').click();
   assert.equal(document.querySelector('[data-offline-policy-input]').value, 'one,two');
+  assert.deepEqual(errors, []); dom.window.close();
+});
+
+function createSchemas() {
+  return `<script type="application/json" data-config-create-templates>${JSON.stringify([
+    {create_variant:'vlan', kind:'VLAN', label:'VLAN', owner:'vsys1', is_entry:true, edit_fields:[{path:'virtual-interface',label:'Virtual interface',kind:'text',value:''}]},
+    {create_variant:'router', kind:'Virtual Router', label:'Virtual Router', owner:'vsys1', is_entry:true, edit_fields:[]},
+  ])}</script>`;
+}
+
+test('empty configuration pages create through a real schema in the shared modal', async () => {
+  const markup = configMarkup().replace(/<tbody>[\s\S]*?<\/tbody>/, '<tbody></tbody>') + createSchemas();
+  const {dom, document, window, errors} = await page(markup);
+  const add = document.querySelector('[data-config-add]');
+  assert.ok(add, 'Empty page must expose Add without requiring a seed row');
+  assert.equal(document.querySelector('.object-actionbar').hidden, false);
+  add.click();
+  const form = document.querySelector('[data-config-form]');
+  assert.equal(document.querySelector('[data-config-dialog]').open, true);
+  assert.equal(form.getAttribute('action'), '/config-workspaces/1/configuration/create-basic');
+  assert.equal(form.querySelector('[name=variant]').value, 'vlan');
+  form.querySelector('[name=name]').value = 'VLAN-10';
+  document.querySelector('[data-config-fields] input:not([name])').value = 'vlan.10';
+  form.dispatchEvent(new window.Event('submit', {cancelable:true}));
+  assert.deepEqual(JSON.parse(form.querySelector('[data-config-updates]').value), [{path:'virtual-interface',kind:'text',value:'vlan.10'}]);
+  document.querySelector('[data-config-create-variant]').value = '1';
+  add.click();
+  assert.equal(form.querySelector('[name=variant]').value, 'router');
+  assert.equal(form.querySelector('[name=name]').value, '');
+  assert.deepEqual(errors, []); dom.window.close();
+});
+
+test('editing after Add restores the update endpoint and clears create variant', async () => {
+  const {dom, document, errors} = await page(configMarkup() + createSchemas());
+  document.querySelector('[data-config-add]').click();
+  document.querySelector('[data-config-record-edit]').click();
+  const form = document.querySelector('[data-config-form]');
+  assert.equal(form.getAttribute('action'), '/config-workspaces/1/configuration/preview');
+  assert.equal(form.querySelector('[name=variant]').value, '');
   assert.deepEqual(errors, []); dom.window.close();
 });
