@@ -140,3 +140,23 @@ test('editing after Add restores the update endpoint and clears create variant',
   assert.equal(form.querySelector('[name=variant]').value, '');
   assert.deepEqual(errors, []); dom.window.close();
 });
+
+test('generic Add preserves zero, honors field limits and never submits protected fields', async () => {
+  const schema = {create_variant:'router', kind:'Virtual Router', owner:'vsys1', is_entry:true, edit_fields:[
+    {path:'metric',label:'Metric',kind:'text',value:0,required:true,max_length:7},
+    {path:'secret',label:'Existing protected value',kind:'protected',value:'must-not-be-rendered'},
+  ]};
+  const {dom, document, window, errors} = await page(configMarkup() + `<script type="application/json" data-config-create-templates>${JSON.stringify([schema])}</script>`);
+  document.querySelector('[data-config-add]').click();
+  const form = document.querySelector('[data-config-form]');
+  const metric = document.querySelector('[data-config-fields] input:not([name])');
+  assert.equal(metric.value, '0');
+  assert.equal(metric.required, true);
+  assert.equal(metric.maxLength, 7);
+  assert.equal(form.querySelector('[name=name]').required, true);
+  assert.equal(form.querySelector('[name=name]').maxLength, 127);
+  assert.equal(document.querySelector('[data-config-fields]').textContent.includes('must-not-be-rendered'), false);
+  form.dispatchEvent(new window.Event('submit', {cancelable:true}));
+  assert.deepEqual(JSON.parse(form.querySelector('[data-config-updates]').value), []);
+  assert.deepEqual(errors, []); dom.window.close();
+});

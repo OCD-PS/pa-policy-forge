@@ -1037,8 +1037,10 @@
               var options = field.options.slice(); if (current && !options.includes(current)) options.unshift(current);
               options.forEach(function (value) { var option = document.createElement("option"); option.value = value; option.textContent = value; option.selected = value === current; input.appendChild(option); });
             } else {
-              input = field.kind === "json" || String(field.value || "").length > 180 ? document.createElement("textarea") : document.createElement("input"); input.value = field.value || ""; if (input.tagName === "TEXTAREA") input.rows = field.kind === "json" ? 8 : 4;
+              input = field.kind === "json" || String(field.value || "").length > 180 ? document.createElement("textarea") : document.createElement("input"); input.value = field.value == null ? "" : field.value; if (input.tagName === "TEXTAREA") input.rows = field.kind === "json" ? 8 : 4;
+              input.maxLength = Number.isInteger(field.max_length) && field.max_length > 0 ? Math.min(field.max_length, 65535) : 65535;
             }
+            input.required = Boolean(field.required);
             field._input = input; wrapper.appendChild(input);
           }
           if (field.technical_label && field.technical_label !== field.label) { var path = document.createElement("small"); path.className = "config-field-path"; path.textContent = field.technical_label; wrapper.appendChild(path); }
@@ -1047,7 +1049,7 @@
         if (item.is_entry && index === 0) {
           var nameField = document.createElement("div"); nameField.className = "field full config-generic-field config-name-field";
           var nameLabel = document.createElement("label"); nameLabel.textContent = "Name";
-          var nameInput = document.createElement("input"); nameInput.name = "name"; nameInput.required = true; nameInput.value = createMode ? "" : item.name; nameInput.placeholder = createMode ? "Nieuwe unieke naam" : "";
+          var nameInput = document.createElement("input"); nameInput.name = "name"; nameInput.required = true; nameInput.maxLength = Number.isInteger(item.name_max_length) && item.name_max_length > 0 ? Math.min(item.name_max_length, 127) : 127; nameInput.value = createMode ? "" : item.name; nameInput.placeholder = createMode ? "Nieuwe unieke naam" : "";
           nameField.appendChild(nameLabel); nameField.appendChild(nameInput); grid.insertBefore(nameField, grid.firstChild);
         } else if (!item.is_entry && index === 0) {
           var hiddenName = document.createElement("input"); hiddenName.type = "hidden"; hiddenName.name = "name"; hiddenName.value = item.name; grid.appendChild(hiddenName);

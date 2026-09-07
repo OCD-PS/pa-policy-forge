@@ -8,3 +8,4 @@ runs/
 *.key
 *.crt
 *.pfx
+node_modules/

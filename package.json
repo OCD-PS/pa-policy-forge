@@ -1,0 +1,15 @@
+{
+  "name": "pa-policy-forge-ui-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Development-only DOM regression checks; not copied into the appliance image",
+  "scripts": {
+    "test": "node --test tests/test_frontend.cjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "jsdom": "26.1.0"
+  }
+}
