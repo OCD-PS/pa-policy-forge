@@ -1934,7 +1934,7 @@ def apply_family_mappings(model: MigrationModel, mappings: list[dict]) -> Migrat
 def apply_topology_mappings(model: MigrationModel, mappings: list[dict]) -> MigrationModel:
     """Map source topology names to existing targets without copying source definitions."""
     result = MigrationModel.from_dict(model.as_dict())
-    replacements: dict[str, str] = {}
+    replacements: dict[str, dict[str, str]] = {}
     for mapping in mappings:
         kind = str(mapping.get("kind", ""))
         source = str(mapping.get("source", "")).strip()
@@ -1948,7 +1948,7 @@ def apply_topology_mappings(model: MigrationModel, mappings: list[dict]) -> Migr
             if (item.get("name", "") if isinstance(item, dict) else item.name) == source
         ]
         if action == "map" and target:
-            replacements[source] = target
+            replacements.setdefault(kind, {})[source] = target
             for item in matching:
                 collection.remove(item)
         elif action == "ignore":
@@ -1957,23 +1957,7 @@ def apply_topology_mappings(model: MigrationModel, mappings: list[dict]) -> Migr
         elif action == "review":
             result.warnings.append(f"Topologiemapping vereist review: {kind} {source}")
 
-    if replacements:
-        for rule in [*result.security_rules, *result.nat_rules]:
-            rule.from_zones = unique(replacements.get(value, value) for value in rule.from_zones)
-            rule.to_zones = unique(replacements.get(value, value) for value in rule.to_zones)
-            if rule.to_interface in replacements:
-                rule.to_interface = replacements[rule.to_interface]
-        for items in result.extras.values():
-            for item in items:
-                try:
-                    entry = SafeET.fromstring(str(item.get("xml", "")))
-                    for node in entry.iter():
-                        if node.text in replacements:
-                            node.text = replacements[node.text]
-                    item["xml"] = ET.tostring(entry, encoding="unicode")
-                except Exception:
-                    continue
-    return result
+    return _rewrite_typed_references(result, replacements) if replacements else result
 
 
 def merge_member_names(model: MigrationModel, kind: str, master: str, mode: str, selected: list[str] | None = None) -> list[str]:
@@ -1989,6 +1973,74 @@ def merge_member_names(model: MigrationModel, kind: str, master: str, mode: str,
         same_name=str(item.get("name","")).casefold()==master_name; same_value=signature(item)==master_signature
         if (mode=="name" and same_name) or (mode=="value" and same_value) or (mode=="name_value" and same_name and same_value): members.append(item_selector(item))
     return unique(members)
+
+
+def _rewrite_typed_references(model: MigrationModel, replacements: dict[str, dict[str, str]]) -> MigrationModel:
+    """Rewrite references in their own namespace, never unrelated free text."""
+    def names(*kinds):
+        values = dict(replacements.get("*", {}))
+        for kind in kinds:
+            values.update(replacements.get(kind, {}))
+        return values
+
+    addresses = names("addresses", "address_groups")
+    services = names("services", "service_groups")
+    applications = names("applications", "application_groups", "application_filters")
+    tags, zones, interfaces = names("tags"), names("zones"), names("interfaces")
+    for group in model.address_groups:
+        group.members = unique(addresses.get(value, value) for value in group.members)
+    for group in model.service_groups:
+        group.members = unique(services.get(value, value) for value in group.members)
+    for collection in (model.addresses, model.address_groups, model.services, model.service_groups):
+        for item in collection:
+            item.tags = unique(tags.get(value, value) for value in item.tags)
+
+    def translation(value, key=""):
+        if isinstance(value, dict):
+            return {field: translation(child, field.replace("-", "_")) for field, child in value.items()}
+        if isinstance(value, list):
+            return [translation(child, key) for child in value]
+        mapping = addresses if key in {"translated_address", "ip", "floating_ip"} else interfaces if key == "interface" else {}
+        return mapping.get(value, value) if isinstance(value, str) else value
+
+    for rule in [*model.security_rules, *model.nat_rules]:
+        for field, mapping in (("source", addresses), ("destination", addresses), ("service", services),
+                               ("application", applications), ("tags", tags), ("from_zones", zones), ("to_zones", zones)):
+            setattr(rule, field, unique(mapping.get(value, value) for value in getattr(rule, field)))
+        rule.to_interface = interfaces.get(rule.to_interface, rule.to_interface)
+        rule.source_translation = translation(rule.source_translation)
+        rule.destination_translation = translation(rule.destination_translation)
+
+    xml_items = [(kind, item) for kind, items in model.extras.items() for item in items]
+    xml_items.extend(("zones", item) for item in model.zones)
+    xml_items.extend(("interfaces", item) for item in model.interfaces)
+    for kind, item in xml_items:
+        try:
+            entry = SafeET.fromstring(str(item.get("xml", "")))
+        except (ET.ParseError, ValueError):
+            continue
+        paths = [(".//tag/member", tags)]
+        if kind.endswith("_rules"):
+            paths.extend([
+                ("./source/member", addresses), ("./destination/member", addresses),
+                ("./service/member", services), ("./service", services),
+                ("./application/member", applications), ("./from/member", zones), ("./to/member", zones),
+                ("./to-interface", interfaces), (".//translated-address/member", addresses),
+                (".//translated-address", addresses), (".//interface-address/interface", interfaces),
+            ])
+        if kind == "application_groups":
+            paths.append(("./members/member", applications))
+        if kind == "zones":
+            paths.append(("./network/*/member", interfaces))
+        if kind in {"virtual_routers", "logical_routers", "vlans", "virtual_wires"}:
+            paths.extend([(".//interface/member", interfaces), (".//interface", interfaces),
+                          ("./interface1", interfaces), ("./interface2", interfaces)])
+        for path, mapping in paths:
+            for node in entry.findall(path):
+                if node.text in mapping:
+                    node.text = mapping[node.text]
+        item["xml"] = ET.tostring(entry, encoding="unicode")
+    return model
 
 
 def apply_merge_rules(model: MigrationModel, rules: list[dict]) -> MigrationModel:
@@ -2007,7 +2059,7 @@ def apply_merge_rules(model: MigrationModel, rules: list[dict]) -> MigrationMode
         member_ids={id(item) for item in member_items}
         for item in member_items:
             name=item.name if hasattr(item,"name") else str(item.get("name",""))
-            if item is not master_item and name != master: rename[name]=master
+            if item is not master_item and name != master: rename.setdefault(kind, {})[name]=master
         filtered=[]; master_seen=False
         for item in collection:
             if item is master_item:
@@ -2017,22 +2069,7 @@ def apply_merge_rules(model: MigrationModel, rules: list[dict]) -> MigrationMode
             else: filtered.append(item)
         if kind in result.extras: result.extras[kind]=filtered
         else: setattr(result,kind,filtered)
-    if not rename: return result
-    for group in result.address_groups: group.members=unique(rename.get(value,value) for value in group.members)
-    for group in result.service_groups: group.members=unique(rename.get(value,value) for value in group.members)
-    for attr in ("security_rules","nat_rules"):
-        for policy in getattr(result,attr):
-            for field_name in ("source","destination","service","application","tags"):
-                setattr(policy,field_name,unique(rename.get(value,value) for value in getattr(policy,field_name)))
-    for kind, items in result.extras.items():
-        for item in items:
-            try:
-                entry=SafeET.fromstring(item.get("xml", ""))
-                for node in entry.iter():
-                    if node.text in rename: node.text=rename[node.text]
-                item["xml"]=ET.tostring(entry,encoding="unicode")
-            except Exception: continue
-    return result
+    return _rewrite_typed_references(result, rename) if rename else result
 
 
 def _address_network_resolver(model: MigrationModel):
@@ -2217,7 +2254,7 @@ def apply_transform_rules(model: MigrationModel, rules: list[dict]) -> Migration
                         try:
                             entry=SafeET.fromstring(item.get("xml","")); entry.set("name",value); item["xml"]=ET.tostring(entry,encoding="unicode")
                         except Exception: pass
-                    replacements[old]=value
+                    replacements.setdefault(kind, {})[old]=value
                 elif hasattr(item,"disabled"): item.disabled=operation=="disable"
         elif operation == "bulk_rename" and kind in model_collections(result):
             try:
@@ -2247,7 +2284,7 @@ def apply_transform_rules(model: MigrationModel, rules: list[dict]) -> Migration
                         item["xml"] = ET.tostring(entry, encoding="unicode")
                     except Exception:
                         pass
-                replacements[old] = new
+                replacements.setdefault(kind, {})[old] = new
         elif operation == "set_interface_zone":
             continue
         elif operation in {"topology_map", "topology_create", "topology_ignore", "topology_review"}:
@@ -2256,7 +2293,7 @@ def apply_transform_rules(model: MigrationModel, rules: list[dict]) -> Migration
                 continue
             old = item.name if hasattr(item, "name") else str(item.get("name", ""))
             if operation == "topology_map" and value:
-                replacements[old] = value
+                replacements.setdefault(kind, {})[old] = value
                 collection.remove(item)
             elif operation == "topology_ignore":
                 collection.remove(item)
@@ -2273,30 +2310,8 @@ def apply_transform_rules(model: MigrationModel, rules: list[dict]) -> Migration
             if zones:
                 setattr(item, "from_zones" if operation == "set_from_zones" else "to_zones", zones)
         elif operation=="replace_reference" and selector and value:
-            replacements[selector]=value
-    if replacements:
-        for group in result.address_groups: group.members=unique(replacements.get(v,v) for v in group.members)
-        for group in result.service_groups: group.members=unique(replacements.get(v,v) for v in group.members)
-        for attr in ("security_rules","nat_rules"):
-            for policy in getattr(result,attr):
-                for field_name in ("from_zones","to_zones","source","destination","service","application","tags"):
-                    setattr(policy,field_name,unique(replacements.get(v,v) for v in getattr(policy,field_name)))
-        for items in result.extras.values():
-            for item in items:
-                try:
-                    entry=SafeET.fromstring(item.get("xml",""))
-                    for node in entry.iter():
-                        if node.text in replacements: node.text=replacements[node.text]
-                    item["xml"]=ET.tostring(entry,encoding="unicode")
-                except Exception: continue
-        for item in [*result.interfaces, *result.zones]:
-            try:
-                entry=SafeET.fromstring(item.get("xml",""))
-                for node in entry.iter():
-                    if node.text in replacements: node.text=replacements[node.text]
-                item["xml"]=ET.tostring(entry,encoding="unicode")
-            except Exception: continue
-    return result
+            replacements.setdefault(kind or "*", {})[selector]=value
+    return _rewrite_typed_references(result, replacements) if replacements else result
 
 
 def migration_analysis(model: MigrationModel) -> dict:
@@ -3069,14 +3084,17 @@ def scm_items(model: MigrationModel) -> list[dict]:
             "target_context": str(getattr(item, "target_context", "")),
             "mapping_action": str(getattr(item, "mapping_action", "create") or "create"),
         }
+    def metadata(item):
+        return {**({"description": item.description} if item.description else {}),
+                **({"tag": list(item.tags)} if item.tags else {})}
     for item in model.addresses:
-        if item.mapping_action not in {"review", "ignore"}: items.append({"kind":"addresses","name":item.name,"payload":{"name":item.name,item.value_type:item.value,**({"description":item.description} if item.description else {})},**route(item)})
+        if item.mapping_action not in {"review", "ignore"}: items.append({"kind":"addresses","name":item.name,"payload":{"name":item.name,item.value_type:item.value,**metadata(item)},**route(item)})
     for item in model.address_groups:
-        if item.mapping_action not in {"review", "ignore"}: items.append({"kind":"address-groups","name":item.name,"payload":{"name":item.name,"static":item.members},**route(item)})
+        if item.mapping_action not in {"review", "ignore"}: items.append({"kind":"address-groups","name":item.name,"payload":{"name":item.name,"static":item.members,**metadata(item)},**route(item)})
     for item in model.services:
-        if item.mapping_action not in {"review", "ignore"}: items.append({"kind":"services","name":item.name,"payload":{"name":item.name,"protocol":{item.protocol:{"port":item.port}}},**route(item)})
+        if item.mapping_action not in {"review", "ignore"}: items.append({"kind":"services","name":item.name,"payload":{"name":item.name,"protocol":{item.protocol:{"port":item.port,**({"source_port":item.source_port} if item.source_port else {})}},**metadata(item)},**route(item)})
     for item in model.service_groups:
-        if item.mapping_action not in {"review", "ignore"}: items.append({"kind":"service-groups","name":item.name,"payload":{"name":item.name,"members":item.members},**route(item)})
+        if item.mapping_action not in {"review", "ignore"}: items.append({"kind":"service-groups","name":item.name,"payload":{"name":item.name,"members":item.members,**metadata(item)},**route(item)})
     for kind,rules in (("security",model.security_rules),("nat",model.nat_rules)):
         for rule in rules:
             if rule.mapping_action in {"review", "ignore"}: continue
