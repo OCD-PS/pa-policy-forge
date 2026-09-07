@@ -1705,6 +1705,71 @@ def selector_item(collection: list, selector: str):
     return matches[0] if len(matches) == 1 else None
 
 
+def restore_migration_source_topology(original: MigrationModel, edited: MigrationModel) -> MigrationModel:
+    """Keep source topology identity when the import editor round-trips PAN-OS.
+
+    XML is the edited source of truth. Only unambiguous provenance is restored;
+    addresses/networks are re-derived, never copied from an earlier subnet.
+    Check Point staging interfaces remain map-only, including new/renamed ones.
+    """
+    result = MigrationModel.from_dict(edited.as_dict())
+    metadata = ("source_ref", "source_vendor", "topology_role", "suggested_zone", "mapping_action",
+                "gateway", "gateway_name", "gateway_uid", "source_gateway", "source_uid", "uid")
+    def indexes(items):
+        by_selector, by_name = {}, {}
+        for item in items:
+            by_selector.setdefault(item_selector(item), []).append(item)
+            by_name.setdefault(str(item.get("name", "")), []).append(item)
+        return by_selector, by_name
+    original_selectors, original_names = indexes(original.interfaces)
+    edited_selectors, edited_names = indexes(result.interfaces)
+    for interface in result.interfaces:
+        selector = item_selector(interface)
+        exact = original_selectors.get(selector, [])
+        edited_exact = edited_selectors.get(selector, [])
+        name = str(interface.get("name", ""))
+        matching = original_names.get(name, [])
+        edited_matching = edited_names.get(name, [])
+        previous = exact[0] if len(exact) == len(edited_exact) == 1 else (
+            matching[0] if len(matching) == len(edited_matching) == 1 else None)
+        if previous is not None:
+            for key in metadata:
+                if key in previous:
+                    interface[key] = copy.deepcopy(previous[key])
+        checkpoint = original.vendor == "checkpoint" or interface.get("source_vendor") == "checkpoint"
+        if checkpoint:
+            interface["source_vendor"] = "checkpoint"
+            if previous is None:
+                interface["mapping_action"] = "review"
+        if not checkpoint and not (previous and "source_networks" in previous):
+            continue
+        try:
+            entry = SafeET.fromstring(interface.get("xml", ""))
+        except Exception as exc:
+            raise MigrationError("Ongeldige interfaceconfiguratie in de importeditor") from exc
+        addresses, networks = [], []
+        # Do not take child subinterface addresses as networks of their parent.
+        for path in (".", "./layer3"):
+            layer3 = entry.find(path)
+            if layer3 is None:
+                continue
+            dhcp = layer3.find("dhcp-client")
+            address_nodes = list(layer3.findall("./ipv6/address/entry"))
+            if dhcp is None or dhcp.findtext("enable", "yes") == "no":
+                address_nodes.extend(layer3.findall("./ip/entry"))
+            for node in address_nodes:
+                value = str(node.get("name", ""))
+                try:
+                    parsed = ipaddress.ip_interface(value)
+                except ValueError:
+                    continue
+                addresses.append(str(parsed))
+                networks.append(str(parsed.network))
+        interface["source_addresses"] = unique(addresses)
+        interface["source_networks"] = unique(networks)
+    return result
+
+
 def migration_item_semantic(item) -> str:
     """Stable value comparison that deliberately ignores source provenance."""
     raw = asdict(item) if hasattr(item, "__dataclass_fields__") else dict(item)
