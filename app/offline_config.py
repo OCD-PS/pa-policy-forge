@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import copy
 import shlex
+import re
+import ipaddress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -159,7 +161,7 @@ CONFIG_SECTION_PATHS = {
         "certificates": (".//certificate",),
         "certificate-management": (".//ssl-decrypt",),
         "local-user-database": (".//local-user-database",),
-        "server-profiles": (".//server-profile",),
+        "server-profiles": (".//server-profile", ".//log-settings/syslog"),
         "log-settings": (".//log-settings",),
         "high-availability": (".//high-availability",),
         "user-identification": (".//user-id-collector",),
@@ -167,6 +169,57 @@ CONFIG_SECTION_PATHS = {
         # Operational software and license pages are intentionally not mapped
         # to candidate XML writes.  They are not ordinary configuration nodes.
     },
+}
+
+# Immutable bootstrap schemas for empty sections.  These are candidate editor
+# seeds, not claims of full device validation; required references must be filled
+# before save.  Secret/account/certificate operations are deliberately excluded.
+# XML paths follow the PaloAltoNetworks/pan-os-python Network and Device models.
+CONFIG_CREATE_SCHEMAS = {
+    "ethernet-layer3": ("network", "interfaces", "device", "network/interface/ethernet", "Ethernet Interface",
+             '<entry name=""><layer3><ip><entry name="" /></ip><mtu>1500</mtu></layer3><comment /><link-state>auto</link-state></entry>', ()),
+    "aggregate-layer3": ("network", "interfaces", "device", "network/interface/aggregate-ethernet", "Aggregate Interface",
+             '<entry name=""><layer3><ip><entry name="" /></ip><mtu>1500</mtu></layer3><comment /></entry>', ()),
+    "ethernet-subinterface": ("network", "interfaces", "device", "network/interface/ethernet", "Ethernet Subinterface",
+             '<entry name=""><tag /><ip><entry name="" /></ip><comment /></entry>', ()),
+    "loopback-interface": ("network", "interfaces", "device", "network/interface/loopback/units", "Loopback Interface",
+             '<entry name=""><ip><entry name="" /></ip><comment /></entry>', ()),
+    "tunnel-interface": ("network", "interfaces", "device", "network/interface/tunnel/units", "Tunnel Interface",
+             '<entry name=""><ip><entry name="" /></ip><comment /></entry>', ()),
+    "vlan-interface": ("network", "interfaces", "device", "network/interface/vlan/units", "VLAN Interface",
+             '<entry name=""><ip><entry name="" /></ip><comment /></entry>', ()),
+    "zone-layer3": ("network", "zones", "vsys", "zone", "Layer 3 Zone",
+             '<entry name=""><network><layer3><member /></layer3></network><enable-user-identification>no</enable-user-identification></entry>', ()),
+    "zone-layer2": ("network", "zones", "vsys", "zone", "Layer 2 Zone",
+             '<entry name=""><network><layer2><member /></layer2></network><enable-user-identification>no</enable-user-identification></entry>', ()),
+    "zone-virtual-wire": ("network", "zones", "vsys", "zone", "Virtual Wire Zone",
+             '<entry name=""><network><virtual-wire><member /></virtual-wire></network><enable-user-identification>no</enable-user-identification></entry>', ()),
+    "zone-tap": ("network", "zones", "vsys", "zone", "Tap Zone",
+             '<entry name=""><network><tap><member /></tap></network></entry>', ()),
+    "vlan": ("network", "vlans", "device", "network/vlan", "VLAN",
+             '<entry name=""><interface><member /></interface><virtual-interface><interface /></virtual-interface></entry>', ()),
+    "virtual-wire": ("network", "virtual-wires", "device", "network/virtual-wire", "Virtual Wire",
+             '<entry name=""><interface1 /><interface2 /><tag-allowed>0-4094</tag-allowed><multicast-firewalling><enable>no</enable></multicast-firewalling><link-state-pass-through><enable>yes</enable></link-state-pass-through></entry>', ("interface1", "interface2")),
+    "virtual-router": ("network", "virtual-routers", "device", "network/virtual-router", "Virtual Router",
+             '<entry name=""><interface><member /></interface><admin-dists><static>10</static><static-ipv6>10</static-ipv6></admin-dists></entry>', ()),
+    "logical-router": ("network", "logical-routers", "device", "network/logical-router", "Logical Router",
+             '<entry name=""><vrf><entry name="default"><interface><member /></interface></entry></vrf></entry>', ()),
+    "interface-management-profile": ("network", "network-profiles", "device", "network/profiles/interface-management-profile", "Interface Management Profile",
+             '<entry name=""><ping>no</ping><https>no</https><ssh>no</ssh><http>no</http><telnet>no</telnet><snmp>no</snmp><permitted-ip><entry name="" /></permitted-ip></entry>', ()),
+    "tunnel-monitor-profile": ("network", "network-profiles", "device", "network/profiles/monitor-profile", "Tunnel Monitor Profile",
+             '<entry name=""><interval>3</interval><threshold>5</threshold><action>wait-recover</action></entry>', ()),
+    "lldp": ("network", "lldp", "device", "network", "LLDP",
+             '<lldp><enable>no</enable></lldp>', ()),
+    "authentication-local": ("device", "authentication-profile", "vsys", "authentication-profile", "Local Database Authentication",
+             '<entry name=""><method><local-database /></method><allow-list><member /></allow-list><user-domain /><username-modifier>%USERINPUT%</username-modifier></entry>', ("allow-list",)),
+    "authentication-ldap": ("device", "authentication-profile", "vsys", "authentication-profile", "LDAP Authentication",
+             '<entry name=""><method><ldap><server-profile /><login-attribute>sAMAccountName</login-attribute></ldap></method><allow-list><member /></allow-list><user-domain /><username-modifier>%USERINPUT%</username-modifier></entry>', ("method/ldap/server-profile", "allow-list")),
+    "authentication-sequence": ("device", "authentication-sequence", "vsys", "authentication-sequence", "Authentication Sequence",
+             '<entry name=""><authentication-profiles><member /></authentication-profiles><use-domain-find-profile>yes</use-domain-find-profile></entry>', ("authentication-profiles",)),
+    "local-user-group": ("device", "local-user-database", "vsys", "local-user-database/user-group", "Local User Group",
+             '<entry name=""><user><member /></user></entry>', ("user",)),
+    "syslog-server-profile": ("device", "server-profiles", "vsys", "log-settings/syslog", "Syslog Server Profile",
+             '<entry name=""><server><entry name="server-1"><server /><transport>UDP</transport><port>514</port><format>BSD</format><facility>LOG_USER</facility></entry></server></entry>', ("server/entry/server",)),
 }
 
 PROTECTED_CONFIG_TAGS = {
@@ -1167,6 +1220,15 @@ def configuration_records(
         sections: list[ET.Element] = []
         for path in paths:
             for node in search_source.findall(path):
+                ancestor = node
+                imported = False
+                while id(ancestor) in parents:
+                    ancestor = parents[id(ancestor)][0]
+                    if ancestor.tag == "import":
+                        imported = True
+                        break
+                if imported:
+                    continue
                 if id(node) not in seen_sections:
                     seen_sections.add(id(node)); sections.append(node)
         for section_node in sections:
@@ -1279,80 +1341,241 @@ def apply_configuration_changes(xml_bytes: bytes, changes: list[dict]) -> bytes:
     return normalized_config_xml(root)
 
 
+def _configuration_creation_owner(root, snapshot, scope, template, owner_kind):
+    if snapshot.kind == "panorama":
+        selected = next((item for item in root.findall("./devices/entry/template/entry") if item.get("name") == template), None)
+        if selected is None:
+            raise OfflineConfigError("Kies een concrete Panorama-template voor aanmaak")
+        device = selected.find("./config/devices/entry")
+    else:
+        device = root.find("./devices/entry")
+    if device is None:
+        raise OfflineConfigError("De configuratie bevat geen doel-device")
+    if owner_kind == "device":
+        return device
+    vsyses = device.findall("./vsys/entry")
+    owner = next((item for item in vsyses if item.get("name") == scope), None)
+    if owner is None and snapshot.kind == "panorama" and len(vsyses) == 1:
+        owner = vsyses[0]
+    if owner is None:
+        raise OfflineConfigError("Kies een bestaande, eenduidige VSYS in de doelconfiguratie")
+    return owner
+
+
+def _configuration_creation_fields(entry, section):
+    fields = []
+    options = {"transport": ["UDP", "TCP", "SSL"], "format": ["BSD", "IETF"],
+               "facility": ["LOG_USER"] + [f"LOG_LOCAL{number}" for number in range(8)],
+               "action": ["wait-recover", "fail-over"], "link-state": ["auto", "up", "down"]}
+    for field in _config_edit_fields(entry):
+        if field["kind"] == "protected":
+            continue
+        node = _indexed_element(entry, field["path"])
+        # Choice nodes and named entries have no editable inner text.
+        if field["kind"] == "text" and node.tag in {"local-database", "entry"}:
+            continue
+        if field["kind"] == "members":
+            field["values"] = [value for value in field["values"] if value]
+        if node.tag in options:
+            field["options"] = options[node.tag]
+        fields.append(field)
+    return panos_ui_decorate_record({"is_entry": entry.tag == "entry", "edit_fields": fields}, section)
+
+
+def configuration_create_templates(xml_bytes: bytes, scope: str, template: str, view: str, section: str) -> list[dict]:
+    """Offer typed Add forms even when no existing record can act as a seed."""
+    root, snapshot = parse_snapshot(xml_bytes)
+    templates = []
+    for variant, spec in CONFIG_CREATE_SCHEMAS.items():
+        spec_view, spec_section, owner_kind, parent_path, label, xml, _ = spec
+        if (view, section) != (spec_view, spec_section):
+            continue
+        try:
+            owner = _configuration_creation_owner(root, snapshot, scope, template, owner_kind)
+        except OfflineConfigError:
+            continue
+        entry = SafeET.fromstring(xml)
+        parent = owner.find(parent_path)
+        if entry.tag != "entry" and parent is not None and parent.find(entry.tag) is not None:
+            continue
+        record = _configuration_creation_fields(entry, section)
+        record.update({"create_variant": variant, "name": "", "kind": label, "label": label,
+                       "owner": template if snapshot.kind == "panorama" else scope, "ui_family": label})
+        templates.append(record)
+    return templates
+
+
+def create_configuration_entry(xml_bytes: bytes, scope: str, template: str, view: str, section: str,
+                               variant: str, name: str, updates: list[dict] | None = None) -> bytes:
+    """Create a typed candidate item using only a server-owned XML schema."""
+    spec = CONFIG_CREATE_SCHEMAS.get(variant)
+    if spec is None or (view, section) != spec[:2]:
+        raise OfflineConfigError("Ongeldig configuratietype voor deze pagina")
+    _, _, owner_kind, parent_path, _, xml, required = spec
+    root, snapshot = parse_snapshot(xml_bytes)
+    owner = _configuration_creation_owner(root, snapshot, scope, template, owner_kind)
+    entry = SafeET.fromstring(xml)
+    clean_name = str(name or "").strip()
+    if entry.tag == "entry":
+        invalid_name = re.search(r"[\x00-\x1f\\]", clean_name) or ("/" in clean_name and section != "interfaces")
+        if not clean_name or len(clean_name) > 127 or invalid_name:
+            raise OfflineConfigError("Name is verplicht, maximaal 127 tekens en zonder slashes of controltekens")
+        entry.set("name", clean_name)
+    if section == "interfaces":
+        patterns = {"ethernet-layer3": r"ethernet\d+/\d+", "aggregate-layer3": r"ae\d+",
+                    "ethernet-subinterface": r"ethernet\d+/\d+\.\d+", "loopback-interface": r"loopback\.\d+",
+                    "tunnel-interface": r"tunnel\.\d+", "vlan-interface": r"vlan\.\d+"}
+        if not re.fullmatch(patterns.get(variant, r"(?!)"), clean_name):
+            raise OfflineConfigError("Ongeldige PAN-OS interfacenaam voor dit type")
+    offered = _configuration_creation_fields(entry, section)["edit_fields"]
+    allowed = {(field["path"], field["kind"]): field for field in offered if field["kind"] != "protected"}
+    if not isinstance(updates, (list, type(None))) or len(updates or []) > 10000:
+        raise OfflineConfigError("Ongeldige configuratievelden")
+    for update in updates or []:
+        if not isinstance(update, dict):
+            raise OfflineConfigError("Ongeldig configuratieveld")
+        key = (str(update.get("path", "")), str(update.get("kind", "")))
+        field = allowed.get(key)
+        if field is None:
+            raise OfflineConfigError("Het veld behoort niet tot dit configuratietype")
+        node = _indexed_element(entry, key[0])
+        if key[1] == "members":
+            values = update.get("values", [])
+            if not isinstance(values, list) or len(values) > 10000:
+                raise OfflineConfigError("Ongeldige memberlijst")
+            for child in list(node):
+                node.remove(child)
+            for value in dict.fromkeys(str(value).strip() for value in values):
+                if value:
+                    ET.SubElement(node, "member").text = value
+        else:
+            value = str(update.get("value", "")).strip()
+            if len(value) > 65535 or (key[1] == "boolean" and value not in {"yes", "no"}):
+                raise OfflineConfigError("Ongeldige configuratiewaarde")
+            if field.get("options") and value not in field["options"]:
+                raise OfflineConfigError("Kies een waarde uit de beschikbare opties")
+            if key[1] == "attribute":
+                if field.get("value") and not value:
+                    raise OfflineConfigError("De naam van een genest configuratie-item mag niet leeg zijn")
+                if len(value) > 255 or re.search(r"[\x00-\x1f]", value):
+                    raise OfflineConfigError("Ongeldige naam voor het geneste configuratie-item")
+                node.set("name", value)
+            else:
+                node.text = value
+    for path in required:
+        node = entry.find(path)
+        if node is None or not any(str(value or "").strip() for value in node.itertext()):
+            raise OfflineConfigError(f"Verplicht veld ontbreekt: {path.replace('/', ' / ')}")
+    if variant == "ethernet-subinterface":
+        physical_name, suffix = clean_name.rsplit(".", 1)
+        physical = next((item for item in owner.findall("./network/interface/ethernet/entry") if item.get("name") == physical_name), None)
+        if physical is None or physical.find("layer3") is None:
+            raise OfflineConfigError("Maak eerst de bijbehorende Layer 3 Ethernet-interface")
+        if not entry.findtext("tag"):
+            entry.find("tag").text = suffix
+        if not entry.findtext("tag").isdigit() or not 1 <= int(entry.findtext("tag")) <= 4094:
+            raise OfflineConfigError("De subinterface VLAN-tag moet tussen 1 en 4094 liggen")
+    if variant == "virtual-wire" and entry.findtext("interface1") == entry.findtext("interface2"):
+        raise OfflineConfigError("Een Virtual Wire vereist twee verschillende interfaces")
+    for ip_entry in entry.findall(".//ip/entry") + entry.findall("./permitted-ip/entry"):
+        value = ip_entry.get("name", "")
+        if value:
+            try:
+                ipaddress.ip_interface(value)
+            except ValueError as exc:
+                raise OfflineConfigError("Voer een geldig interface-IP/netmask in") from exc
+    device = _configuration_creation_owner(root, snapshot, scope, template, "device")
+    interface_names = {item.get("name") for item in device.findall("./network/interface/*/entry")}
+    interface_names.update(item.get("name") for item in device.findall("./network/interface/*/units/entry"))
+    interface_names.update(item.get("name") for item in device.findall("./network/interface/*/entry/layer3/units/entry"))
+    interface_paths = {
+        "vlan": ("./interface/member", "./virtual-interface/interface"),
+        "virtual-router": ("./interface/member",), "logical-router": ("./vrf/entry/interface/member",),
+        "virtual-wire": ("./interface1", "./interface2"),
+    }.get(variant, ("./network/*/member",) if section == "zones" else ())
+    for path in interface_paths:
+        for node in entry.findall(path):
+            if (node.text or "").strip() and node.text not in interface_names:
+                raise OfflineConfigError(f"Interface {node.text} bestaat niet; maak ze eerst aan")
+    reference_paths = {
+        "authentication-sequence": ("authentication-profiles/member", "authentication-profile"),
+        "authentication-ldap": ("method/ldap/server-profile", "server-profile/ldap"),
+        "local-user-group": ("user/member", "local-user-database/user"),
+    }
+    if variant in reference_paths:
+        field_path, collection_path = reference_paths[variant]
+        existing = {item.get("name") for item in owner.findall(f"./{collection_path}/entry")}
+        existing.update(item.get("name") for item in root.findall(f"./shared/{collection_path}/entry"))
+        for node in entry.findall(field_path):
+            if (node.text or "").strip() and node.text not in existing:
+                raise OfflineConfigError(f"Referentie {node.text} bestaat niet; maak het object eerst aan")
+    for field in offered:
+        node = _indexed_element(entry, field["path"])
+        limits = {"interval": (1, 60), "threshold": (2, 100), "port": (1, 65535),
+                  "static": (1, 255), "static-ipv6": (1, 255), "mtu": (576, 9216)}
+        if node.tag in limits and node.text:
+            low, high = limits[node.tag]
+            if not node.text.isdigit() or not low <= int(node.text) <= high:
+                raise OfflineConfigError(f"{node.tag} moet tussen {low} en {high} liggen")
+
+    # Remove optional blank placeholders; keep union-choice nodes such as
+    # <local-database/> and the named root. Never export <member/> as a value.
+    def prune(node):
+        for child in list(node):
+            had_children = bool(list(child))
+            prune(child)
+            empty = not list(child) and not (child.text or "").strip()
+            if (child.tag == "entry" and not child.get("name")) or (
+                empty and child.tag != "entry" and child.tag not in {"local-database", "layer3", "layer2", "virtual-wire", "network"}
+                and (had_children or child.tag == "member" or not child.attrib)
+            ):
+                node.remove(child)
+    prune(entry)
+    parent = owner
+    for tag in parent_path.split("/"):
+        current = parent.find(tag)
+        if current is None:
+            current = ET.SubElement(parent, tag)
+        parent = current
+    if variant == "ethernet-subinterface":
+        parent = physical.find("layer3")
+        units = parent.find("units")
+        if units is None:
+            units = ET.SubElement(parent, "units")
+        parent = units
+    if entry.tag == "entry":
+        if any(child.get("name") == clean_name for child in parent.findall("entry")):
+            raise OfflineConfigError(f"Configuratie-item {clean_name} bestaat al")
+    elif parent.find(entry.tag) is not None:
+        raise OfflineConfigError("Deze instelling bestaat al; open ze om te bewerken")
+    parent.append(entry)
+    if section == "interfaces":
+        vsys = _configuration_creation_owner(root, snapshot, scope, template, "vsys")
+        imported = vsys
+        for tag in ("import", "network", "interface"):
+            child = imported.find(tag)
+            if child is None:
+                child = ET.SubElement(imported, tag)
+            imported = child
+        if clean_name not in [member.text for member in imported.findall("member")]:
+            ET.SubElement(imported, "member").text = clean_name
+    return normalized_config_xml(root)
+
+
 def create_basic_network_entry(
     xml_bytes: bytes, scope: str, template: str, section: str, name: str,
     interface_type: str = "ethernet", zone_type: str = "layer3",
 ) -> bytes:
-    """Create the first interface/zone when an imported config has no seed row.
-
-    Existing entries continue to use the generic PAN-OS field editor.  This
-    narrow bootstrap path exists because duplicating an existing XML entry is
-    impossible when a third-party migration starts with an empty network tree.
-    """
-    clean_name = str(name or "").strip()
-    if not clean_name or len(clean_name) > 127:
-        raise OfflineConfigError("Name is verplicht en mag maximaal 127 tekens bevatten")
-    root, snapshot = parse_snapshot(xml_bytes)
-
-    def ensure(parent: ET.Element, *tags: str) -> ET.Element:
-        current = parent
-        for tag in tags:
-            child = current.find(tag)
-            if child is None:
-                child = ET.SubElement(current, tag)
-            current = child
-        return current
-
-    device = root.find("./devices/entry")
-    if device is None:
-        devices = ensure(root, "devices")
-        device = ET.SubElement(devices, "entry", {"name": "localhost.localdomain"})
-    template_device = device
-    if snapshot.kind == "panorama":
-        template_entry = next(
-            (item for item in device.findall("./template/entry") if item.get("name") == template),
-            None,
-        )
-        if template_entry is None:
-            raise OfflineConfigError("Kies of maak eerst een Panorama-template")
-        config = ensure(template_entry, "config", "devices")
-        template_device = config.find("entry")
-        if template_device is None:
-            template_device = ET.SubElement(config, "entry", {"name": "localhost.localdomain"})
-
+    """Backward-compatible quick Add, backed by the same validated schemas."""
     if section == "interfaces":
-        if interface_type not in {"ethernet", "aggregate-ethernet", "loopback", "tunnel", "vlan"}:
-            raise OfflineConfigError("Ongeldig interfacetype")
-        parent = ensure(template_device, "network", "interface", interface_type)
-        if any(item.get("name") == clean_name for item in parent.findall("entry")):
-            raise OfflineConfigError(f"Interface {clean_name} bestaat al")
-        entry = ET.SubElement(parent, "entry", {"name": clean_name})
-        if interface_type in {"ethernet", "aggregate-ethernet"}:
-            ET.SubElement(entry, "layer3")
-        ET.SubElement(entry, "comment")
+        variant = {"ethernet": "ethernet-subinterface" if "." in name else "ethernet-layer3",
+                   "aggregate-ethernet": "aggregate-layer3", "loopback": "loopback-interface",
+                   "tunnel": "tunnel-interface", "vlan": "vlan-interface"}.get(interface_type, "")
     elif section == "zones":
-        if zone_type not in {"layer3", "layer2", "virtual-wire", "tap", "tunnel"}:
-            raise OfflineConfigError("Ongeldig zonetype")
-        if snapshot.kind == "panorama":
-            vsys_parent = ensure(template_device, "vsys")
-            scope_entry = next((item for item in vsys_parent.findall("entry") if item.get("name") == scope), None)
-            if scope_entry is None:
-                scope_entry = ET.SubElement(vsys_parent, "entry", {"name": scope or "vsys1"})
-        else:
-            scope_entry = _scope_root(root, snapshot, scope)
-            if scope_entry is None:
-                raise OfflineConfigError("De gekozen VSYS bestaat niet")
-        parent = ensure(scope_entry, "zone")
-        if any(item.get("name") == clean_name for item in parent.findall("entry")):
-            raise OfflineConfigError(f"Zone {clean_name} bestaat al")
-        entry = ET.SubElement(parent, "entry", {"name": clean_name})
-        network = ET.SubElement(entry, "network")
-        ET.SubElement(network, zone_type)
-        enabled = ET.SubElement(entry, "enable-user-identification")
-        enabled.text = "no"
+        variant = f"zone-{zone_type}"
     else:
-        raise OfflineConfigError("Bootstrap-aanmaak wordt alleen voor interfaces en zones ondersteund")
-    return normalized_config_xml(root)
+        raise OfflineConfigError("Gebruik de getypeerde aanmaak voor deze configuratiesectie")
+    return create_configuration_entry(xml_bytes, scope, template, "network", section, variant, name)
 
 
 def configuration_inventory(xml_bytes: bytes, scope: str, template: str = "", parsed=None) -> dict[str, list[dict]]:
