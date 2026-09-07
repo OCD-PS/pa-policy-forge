@@ -323,11 +323,17 @@ class OfflineConfigTests(unittest.TestCase):
 
     def test_network_editor_exposes_add_flow_for_every_configuration_list(self):
         javascript = (ROOT / "app" / "static" / "app.js").read_text()
+        template = (ROOT / "app" / "templates" / "workspace_editor.html").read_text()
         self.assertIn('add.textContent = "+ Add"', javascript)
+        # Existing rows remain a fallback; empty lists use a server-owned schema.
         self.assertIn('renderRecord(JSON.parse(base.getAttribute("data-config-record")), true)', javascript)
+        self.assertIn('renderRecord(JSON.parse(JSON.stringify(template)), true)', javascript)
         self.assertIn('primary.value = createMode ? "create" : "update"', javascript)
         self.assertIn('nameInput.value = createMode ? "" : item.name', javascript)
-        self.assertIn('if (actionbar && !creatableRows.length) actionbar.hidden = true', javascript)
+        self.assertIn('if (actionbar && !creatableRows.length && !createTemplates.length) actionbar.hidden = true', javascript)
+        self.assertIn('if (actionbar && (creatableRows.length || createTemplates.length))', javascript)
+        self.assertIn('if config_records or config_create_templates|default([])', template)
+        self.assertIn('data-config-create-templates', template)
 
 
 if __name__ == "__main__":
