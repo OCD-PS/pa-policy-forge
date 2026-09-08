@@ -86,13 +86,17 @@ For offline customers, transfer the repository plus a saved container image bund
 1. Log in with the configured bootstrap account.
 2. Configure one or more PAN-OS firewalls to forward TRAFFIC logs to UDP or TCP 514.
 3. Confirm each serial appears under discovered firewalls.
-4. Create a profile, map zones to roles, and enter the target credentials.
-   For HA pairs, configure both the active and passive firewall serial.
-5. Generate a preview and inspect/download the review CSV and XML.
-6. Use **Push** only after review. SCM-generated policies are written to the configured
+4. Add a firewall profile with its active and optional passive serial/source IP.
+5. Open the device card, choose whether it is managed by SCM, Panorama, or standalone
+   PAN-OS, and save the connection. Policy Forge then reads the current target zones.
+6. Assign each current zone a client, server, internet, or other role in the device
+   workspace. Preview, policy management, run history, and push stay unavailable until
+   both the management target and zone roles are configured.
+7. Generate a preview from the same device workspace and inspect/download the review CSV and XML.
+8. Use **Push** only after review. SCM-generated policies are written to the configured
    folder and deployed to the profile's HA targets. Panorama and standalone writes remain
    candidate-only and require their normal commit workflow.
-7. After the accepted rules are manually positioned and deployed, use **Flows purgen** on the profile to start a clean observation cycle. Profiles and run history are retained.
+9. After the accepted rules are manually positioned and deployed, use **Flows purgen** on the profile to start a clean observation cycle. Profiles and run history are retained.
 
 Policy runs can be removed individually from the run history. Deletion removes
 the database record plus its review/XML artifacts, after verifying that the
