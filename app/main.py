@@ -6594,8 +6594,8 @@ def profile_save():
             "min_sessions": max(1, int(request.form.get("min_sessions", "10"))),
             "disabled": request.form.get("disabled") == "on",
             "tags": [x.strip() for x in request.form.get("tags", "AI builder").split(",") if x.strip()],
-            "global_ping": request.form.get("global_ping") == "on",
-            "global_dns": request.form.get("global_dns") == "on",
+            "global_ping": request.form.get("global_ping") == "on" if profile_id else True,
+            "global_dns": request.form.get("global_dns") == "on" if profile_id else True,
             "endpoint": validate_panos_endpoint(request.form.get("endpoint", "")) if profile_id and target_type in {"panorama", "panos"} else "",
             "vsys": request.form.get("vsys", "vsys1").strip(),
             "device_group": request.form.get("device_group", "").strip(),
@@ -6626,7 +6626,8 @@ def profile_save():
                 blob = existing["secret_blob"]
             else:
                 blob = fernet.encrypt(json.dumps(merged).encode()) if merged else b""
-            values = (request.form["name"].strip(), request.form.get("enabled") == "on", active_serial, optional_ip_address(request.form.get("source_ip", "")), target_type, json.dumps(settings), blob, now())
+            enabled = request.form.get("enabled") == "on" if profile_id else True
+            values = (request.form["name"].strip(), enabled, active_serial, optional_ip_address(request.form.get("source_ip", "")), target_type, json.dumps(settings), blob, now())
             if profile_id:
                 conn.execute("UPDATE profiles SET name=?,enabled=?,serial=?,source_ip=?,target_type=?,settings_json=?,secret_blob=?,updated_at=? WHERE id=?", (*values, profile_id))
             else:
