@@ -140,6 +140,7 @@ SCM_POLICY_TYPES = {
 SCM_UNAVAILABLE_POLICY_TYPES = {"tunnel-inspection", "dos", "sdwan"}
 SCM_POLICY_ENVELOPE_KEYS = {"id", "name", "folder", "snippet", "device", "position", "policy_type"}
 TARGET_TYPES = {"scm", "panorama", "panos"}
+UNCONFIGURED_TARGET = "unconfigured"
 PANOS_POLICY_NODES = {
     "security": "security", "nat": "nat", "qos": "qos", "pbf": "pbf",
     "decryption": "decryption", "application-override": "application-override",
@@ -815,6 +816,17 @@ def profile_settings(profile) -> dict:
         return json.loads(profile["settings_json"] or "{}")
     except (TypeError, json.JSONDecodeError):
         return {}
+
+
+def profile_has_target(profile) -> bool:
+    settings = profile_settings(profile)
+    if profile["target_type"] not in TARGET_TYPES:
+        return False
+    return bool(settings.get("configured", bool(settings.get("zones"))))
+
+
+def profile_is_configured(profile) -> bool:
+    return profile_has_target(profile) and bool(profile_settings(profile).get("zones"))
 
 
 def profile_serials(profile) -> list[str]:
@@ -4584,6 +4596,8 @@ def index():
             profile["zones_text"] = "\n".join(f"{zone} = {role}" for zone, role in settings.get("zones", {}).items())
             profile["scm_scope_type"] = "snippet" if settings.get("snippet") else "device" if settings.get("device") else "folder"
             profile["flow_count"] = sum(counts.get(serial, 0) for serial in profile_serials(row))
+            profile["target_configured"] = profile_has_target(row)
+            profile["configured"] = profile_is_configured(row)
             profiles.append(profile)
         run_profile_id = request.args.get("run_profile", type=int)
         selected_run_profile = next((profile for profile in profiles if profile["id"] == run_profile_id), None)
@@ -4619,6 +4633,36 @@ def index():
             if serials:
                 placeholders = ",".join("?" for _ in serials)
                 flows = conn.execute(f"SELECT * FROM flows WHERE serial IN ({placeholders}) ORDER BY last_seen DESC LIMIT 100", serials).fetchall()
+    profile_zone_rows = []
+    profile_zone_error = ""
+    if editing_profile:
+        mapped_zones = dict(editing_profile.get("zones", {}))
+        live_zone_names = []
+        if profile_has_target(editing_profile):
+            try:
+                live_zones = cached_live_items(
+                    editing_profile,
+                    "profile-zones",
+                    lambda: fetch_scm_objects(editing_profile, "zones"),
+                    force=request.args.get("refresh_zones") == "1",
+                )
+                live_zone_names = sorted(
+                    {str(item.get("name", "")).strip() for item in live_zones if str(item.get("name", "")).strip()},
+                    key=str.casefold,
+                )
+            except Exception as exc:
+                profile_zone_error = str(exc)
+        profile_zone_rows = [
+            {"name": name, "role": mapped_zones.get(name, "other"), "live": True}
+            for name in live_zone_names
+        ]
+        live_zone_set = set(live_zone_names)
+        profile_zone_rows.extend(
+            {"name": name, "role": role, "live": False}
+            for name, role in mapped_zones.items()
+            if name not in live_zone_set
+        )
+    configured_profiles = [profile for profile in profiles if profile["configured"]]
     policy_profile = None; policies = []; policy_error = ""; policy_objects = []; object_catalog = []; policy_catalog = []; policy_workspaces = []; live_application_state = {}; scm_config_records = []; object_create_template = None
     policy_source = request.args.get("policy_source", "").strip()
     force_live_refresh = request.args.get("refresh") == "1"
@@ -4689,7 +4733,7 @@ def index():
                             fetch_object_catalog(policy_profile, "policy-picker"), policies
                         )
                 except Exception as exc: policy_error = str(exc)
-    return render_template("app.html", profiles=profiles, editing_profile=editing_profile, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, object_create_template=object_create_template, policy_catalog=policy_catalog, live_application_state=live_application_state, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, config_section=config_section, scm_configuration_sections=SCM_CONFIGURATION_SECTIONS, config_records=scm_config_records, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats(), certificate=certificate_summary(CERT_DIR / "tls.crt", APPLIANCE_CONFIG), application_catalog_settings=application_catalog_configuration())
+    return render_template("app.html", profiles=profiles, configured_profiles=configured_profiles, editing_profile=editing_profile, profile_zone_rows=profile_zone_rows, profile_zone_error=profile_zone_error, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, object_create_template=object_create_template, policy_catalog=policy_catalog, live_application_state=live_application_state, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, config_section=config_section, scm_configuration_sections=SCM_CONFIGURATION_SECTIONS, config_records=scm_config_records, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats(), certificate=certificate_summary(CERT_DIR / "tls.crt", APPLIANCE_CONFIG), application_catalog_settings=application_catalog_configuration())
 
 
 @app.get("/migration")
@@ -4703,7 +4747,9 @@ def migration_home():
             "ORDER BY migration_projects.updated_at DESC",
             (session.get("username", ""), session.get("username", "")),
         ).fetchall()
-        profiles = conn.execute("SELECT id,name,target_type FROM profiles WHERE system=0 ORDER BY name").fetchall()
+        profiles = conn.execute(
+            "SELECT id,name,target_type FROM profiles WHERE system=0 AND target_type IN ('scm','panorama','panos') ORDER BY name"
+        ).fetchall()
     selected_target_id = request.args.get("target_profile_id", "")
     draft_project_name = request.args.get("draft_name", "")[:120]
     return render_template(
@@ -5093,7 +5139,9 @@ def migration_project(project_id):
     if not project: return "Not found", 404
     with db() as conn:
         source_rows = conn.execute("SELECT * FROM migration_sources WHERE project_id=? ORDER BY id", (project_id,)).fetchall()
-        profiles = conn.execute("SELECT id,name,target_type FROM profiles WHERE system=0 ORDER BY name").fetchall()
+        profiles = conn.execute(
+            "SELECT id,name,target_type FROM profiles WHERE system=0 AND target_type IN ('scm','panorama','panos') ORDER BY name"
+        ).fetchall()
         workspace_rows = conn.execute(
             "SELECT id,name,source,original_name,created_at FROM config_workspaces "
             "WHERE profile_id=? ORDER BY id DESC", (project["target_profile_id"],)
@@ -6487,35 +6535,68 @@ def parse_zones(text: str) -> dict[str, str]:
     return result
 
 
+def parse_zone_fields(form) -> dict[str, str]:
+    names = form.getlist("zone_name")
+    roles = form.getlist("zone_role")
+    if not names:
+        return parse_zones(form.get("zones", ""))
+    if len(names) != len(roles):
+        raise ValueError("De zonemapping is onvolledig")
+    result = {}
+    for name, role in zip(names, roles):
+        name = str(name).strip()
+        role = str(role).strip()
+        if not name:
+            raise ValueError("Een zonenaam ontbreekt")
+        if role not in {"client", "server", "internet", "other"}:
+            raise ValueError(f"Ongeldige rol voor {name}")
+        result[name] = role
+    if not result:
+        raise ValueError("Haal eerst de zones op en wijs ze een rol toe")
+    return result
+
+
 @app.post("/profiles/save")
 @login_required
 def profile_save():
+    profile_id = 0
+    saved_profile_id = 0
     try:
         profile_id = int(request.form.get("id") or 0)
         preserved_workspace_id = 0
+        existing_profile = None
         if profile_id:
             with db() as conn:
                 existing_profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
-            if existing_profile:
-                if int(existing_profile["system"] or 0):
-                    raise ValueError("Interne offline targets kunnen niet als deviceprofiel worden bewerkt")
-                preserved_workspace_id = active_config_workspace_id(existing_profile)
-        target_type = request.form.get("target_type", "")
-        if target_type not in TARGET_TYPES: raise ValueError("Onbekend targettype")
+            if not existing_profile:
+                return "Not found", 404
+            if int(existing_profile["system"] or 0):
+                raise ValueError("Interne offline targets kunnen niet als deviceprofiel worden bewerkt")
+            preserved_workspace_id = active_config_workspace_id(existing_profile)
+        target_type = request.form.get("target_type", "") if profile_id else UNCONFIGURED_TARGET
+        if profile_id and target_type not in TARGET_TYPES: raise ValueError("Kies waar dit device wordt beheerd")
         rulebase = request.form.get("rulebase", "pre")
         if rulebase not in {"pre", "post"}: raise ValueError("Rulebase moet pre of post zijn")
         active_serial = request.form.get("serial", "").strip()
+        if not active_serial:
+            raise ValueError("Serienummer van de actieve firewall is verplicht")
         passive_serial = request.form.get("passive_serial", "").strip()
         if passive_serial and passive_serial == active_serial:
             raise ValueError("Passieve serial moet verschillen van de actieve serial")
+        zone_rows_submitted = bool(request.form.getlist("zone_name"))
         settings = {
-            "zones": parse_zones(request.form.get("zones", "")),
+            "configured": bool(profile_id),
+            "zones": (
+                parse_zone_fields(request.form)
+                if profile_id and zone_rows_submitted
+                else dict(profile_settings(existing_profile).get("zones", {})) if profile_id else {}
+            ),
             "min_sessions": max(1, int(request.form.get("min_sessions", "10"))),
             "disabled": request.form.get("disabled") == "on",
             "tags": [x.strip() for x in request.form.get("tags", "AI builder").split(",") if x.strip()],
             "global_ping": request.form.get("global_ping") == "on",
             "global_dns": request.form.get("global_dns") == "on",
-            "endpoint": validate_panos_endpoint(request.form.get("endpoint", "")) if request.form.get("target_type") in {"panorama", "panos"} else "",
+            "endpoint": validate_panos_endpoint(request.form.get("endpoint", "")) if profile_id and target_type in {"panorama", "panos"} else "",
             "vsys": request.form.get("vsys", "vsys1").strip(),
             "device_group": request.form.get("device_group", "").strip(),
             "rulebase": rulebase,
@@ -6530,11 +6611,11 @@ def profile_save():
         if preserved_workspace_id:
             settings["config_workspace_id"] = preserved_workspace_id
         supplied = {k: request.form.get(k, "") for k in ("username", "password", "client_id", "client_secret", "tsg_id")}
-        if target_type in {"panorama", "panos"} and not settings["endpoint"]:
+        if profile_id and target_type in {"panorama", "panos"} and not settings["endpoint"]:
             raise ValueError("Endpoint is verplicht voor Panorama en standalone PAN-OS")
-        if target_type == "panorama" and not settings["device_group"]:
+        if profile_id and target_type == "panorama" and not settings["device_group"]:
             raise ValueError("Device group is verplicht voor Panorama")
-        if target_type == "scm" and sum(bool(settings[k]) for k in ("folder", "snippet", "device")) != 1:
+        if profile_id and target_type == "scm" and sum(bool(settings[k]) for k in ("folder", "snippet", "device")) != 1:
             raise ValueError("Selecteer exact één SCM-scope: folder, snippet of device")
         with db() as conn:
             existing = conn.execute("SELECT secret_blob FROM profiles WHERE id=?", (profile_id,)).fetchone() if profile_id else None
@@ -6551,12 +6632,21 @@ def profile_save():
             else:
                 cursor = conn.execute("INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (*values, now()))
                 profile_id = int(cursor.lastrowid)
+            saved_profile_id = profile_id
         invalidate_profile_caches(profile_id)
         refresh_syslog_source_policy()
-        audit("profile-saved", request.form["name"]); flash("Firewallprofiel opgeslagen.", "success")
+        audit("profile-saved", request.form["name"])
+        if target_type == UNCONFIGURED_TARGET:
+            message = "Device opgeslagen. Configureer nu het beheerplatform en de actuele zones."
+        elif not zone_rows_submitted and not settings["zones"]:
+            message = "Beheerplatform opgeslagen. De actuele zones zijn opgehaald; wijs nu per zone de rol toe."
+        else:
+            message = "Device-instellingen en zonemappings opgeslagen."
+        flash(message, "success")
     except Exception as exc:
         flash(f"Profiel niet opgeslagen: {exc}", "error")
-    return redirect(url_for("index") + "#profiles")
+    target_id = saved_profile_id or profile_id
+    return redirect((url_for("index", edit_profile=target_id) if target_id else url_for("index")) + "#profiles")
 
 
 @app.post("/profiles/<int:profile_id>/delete")
@@ -6604,6 +6694,7 @@ def toml_string(value) -> str:
 def write_config(profile, run_dir: Path, push: bool, disabled_override: bool | None = None) -> dict:
     s = json.loads(profile["settings_json"]); secret = json.loads(fernet.decrypt(profile["secret_blob"]).decode()) if profile["secret_blob"] else {}
     target = profile["target_type"]
+    if not profile_is_configured(profile): raise ValueError("Open het device en configureer eerst het beheerplatform en de zones")
     if target not in TARGET_TYPES: raise ValueError("Onbekend targettype")
     if target in {"panorama", "panos"}: s["endpoint"] = validate_panos_endpoint(s.get("endpoint", ""))
     generated_disabled = s.get("disabled") if disabled_override is None else disabled_override
@@ -7377,6 +7468,8 @@ def prepare_loop():
         try:
             with db() as conn: profiles = conn.execute("SELECT * FROM profiles WHERE enabled=1 ORDER BY id").fetchall()
             for profile in profiles:
+                if not profile_is_configured(profile):
+                    continue
                 if not profile_serials(profile):
                     continue
                 if fresh_prepared_run(profile): continue

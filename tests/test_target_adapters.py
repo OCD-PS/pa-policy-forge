@@ -198,6 +198,51 @@ class TargetAdapterTests(unittest.TestCase):
         with self.assertRaises(ValueError): main.optional_ip_address("not-an-ip")
         self.assertEqual(main.TARGET_TYPES, {"scm", "panorama", "panos"})
 
+    def test_structured_zone_roles_are_parsed_without_freeform_text(self):
+        from werkzeug.datastructures import MultiDict
+
+        form = MultiDict([
+            ("zone_name", "L3-Clients"), ("zone_role", "client"),
+            ("zone_name", "L3-Servers"), ("zone_role", "server"),
+            ("zone_name", "Internet"), ("zone_role", "internet"),
+        ])
+        self.assertEqual(main.parse_zone_fields(form), {
+            "L3-Clients": "client", "L3-Servers": "server", "Internet": "internet",
+        })
+
+    def test_unconfigured_profile_is_not_ready_for_build(self):
+        pending = {"target_type": main.UNCONFIGURED_TARGET, "settings_json": '{"zones": {}}'}
+        target_only = {"target_type": "panos", "settings_json": '{"configured": true, "zones": {}}'}
+        ready = {"target_type": "panos", "settings_json": '{"configured": true, "zones": {"Trust": "client"}}'}
+        self.assertFalse(main.profile_has_target(pending))
+        self.assertTrue(main.profile_has_target(target_only))
+        self.assertFalse(main.profile_is_configured(target_only))
+        self.assertTrue(main.profile_is_configured(ready))
+
+    def test_new_firewall_can_be_added_before_choosing_management_target(self):
+        client = main.app.test_client()
+        with main.db() as conn:
+            user = conn.execute("SELECT id,username FROM users ORDER BY id LIMIT 1").fetchone()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = user["id"]
+            login["username"] = user["username"]
+            login["csrf"] = "new-firewall-csrf"
+        response = client.post(
+            "/profiles/save", base_url="https://forge.test",
+            data={
+                "csrf": "new-firewall-csrf", "name": "Unconfigured route test",
+                "serial": "TEST-UNCONFIGURED-01", "source_ip": "192.0.2.20", "enabled": "on",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        with main.db() as conn:
+            row = conn.execute("SELECT * FROM profiles WHERE name=?", ("Unconfigured route test",)).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["target_type"], main.UNCONFIGURED_TARGET)
+            self.assertFalse(main.profile_is_configured(row))
+            self.assertIn(f"edit_profile={row['id']}", response.headers["Location"])
+            conn.execute("DELETE FROM profiles WHERE id=?", (row["id"],))
+
     def test_known_distribution_passwords_are_blocked_on_change(self):
         self.assertTrue(main.password_is_blocked("OCD1234!"))
         self.assertTrue(main.password_is_blocked("admin"))

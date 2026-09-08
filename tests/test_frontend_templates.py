@@ -45,6 +45,16 @@ class FrontendTemplateTests(unittest.TestCase):
             with self.subTest(template=name):
                 environment.parse(environment.loader.get_source(environment, name)[0])
 
+    def test_device_workspace_owns_zone_mapping_and_push_flow(self):
+        source = self.environment().loader.get_source(self.environment(), "app.html")[0]
+        self.assertIn("Firewall toevoegen", source)
+        self.assertIn("Open device", source)
+        self.assertIn("Actuele zones en rollen", source)
+        self.assertIn('name="zone_role"', source)
+        self.assertIn("Zones opnieuw ophalen", source)
+        self.assertIn("Flow voor {{ep.name}}", source)
+        self.assertNotIn("Selecteer een target", source)
+
     def test_migration_review_and_step_links_have_real_targets(self):
         html = self.environment().get_template("migration.html").render(**self.migration_context())
         links = Links(); links.feed(html)
