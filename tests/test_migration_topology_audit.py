@@ -37,6 +37,39 @@ def assignment(name, target, zone):
 
 
 class TopologyAuditTests(unittest.TestCase):
+    def test_checkpoint_interface_can_create_canonical_panos_interface_and_zone(self):
+        model = m.MigrationModel(
+            "checkpoint", "source", interfaces=[source_interface("eth0", "10.0.0.0/24")]
+        )
+        selector = "eth0|||gateway"
+        mapped = m.apply_transform_rules(model, [
+            {"kind": "interfaces", "selector": selector, "operation": "topology_create", "value": "ethernet1/4"},
+            {"kind": "interfaces", "selector": selector, "operation": "set_interface_zone", "value": json.dumps({"zone": "DMZ", "create": True})},
+        ])
+        self.assertEqual(mapped.interfaces[0]["name"], "ethernet1/4")
+        self.assertIn('name="ethernet1/4"', mapped.interfaces[0]["xml"])
+        self.assertIn("ethernet1/4", mapped.zones[0]["xml"])
+
+    def test_created_interface_can_join_existing_zone_without_duplicate_zone(self):
+        model = m.MigrationModel(
+            "checkpoint", "source", interfaces=[source_interface("eth0", "10.0.0.0/24")]
+        )
+        selector = "eth0|||gateway"
+        mapped = m.apply_transform_rules(model, [
+            {"kind": "interfaces", "selector": selector, "operation": "topology_create", "value": "ethernet1/4"},
+            {"kind": "interfaces", "selector": selector, "operation": "set_interface_zone", "value": json.dumps({"zone": "DMZ", "create": True})},
+        ])
+        merged, plan = m.merge_model_into_panos_xml(target_xml(), mapped, "vsys1")
+        root = ET.fromstring(merged)
+        zones = root.findall("./devices/entry/vsys/entry[@name='vsys1']/zone/entry[@name='DMZ']")
+        self.assertEqual(len(zones), 1)
+        self.assertEqual(
+            [member.text for member in zones[0].findall("./network/layer3/member")],
+            ["ethernet1/2", "ethernet1/4"],
+        )
+        self.assertIsNotNone(root.find("./devices/entry/network/interface/ethernet/entry[@name='ethernet1/4']"))
+        self.assertEqual(plan["conflicts"], [])
+
     def test_zone_requires_explicit_target_interface_mapping(self):
         model = m.MigrationModel("checkpoint", "source", interfaces=[source_interface("eth0", "10.0.0.0/24")],
                                  security_rules=[m.Policy("rule", source=["10.0.0.8"])])

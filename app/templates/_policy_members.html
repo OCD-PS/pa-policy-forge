@@ -1,0 +1,4 @@
+{% macro compact_members(values) -%}
+{% set count=values|length %}
+{% if not count %}—{% elif count <= 3 %}{{values|join(', ')}}{% else %}<span class="policy-members"><span>{{values[:2]|join(', ')}}</span><button class="badge policy-members-open" type="button" data-policy-members='{{values|tojson|forceescape}}'>+{{count-2}} meer</button></span>{% endif %}
+{%- endmacro %}

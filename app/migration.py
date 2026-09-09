@@ -2241,8 +2241,8 @@ def _apply_interface_zone_assignments(model: MigrationModel, rules: list[dict]) 
         # A source topology label is not a valid PAN-OS target interface.  The
         # explicit mapping must exist before either export or inference uses it.
         effective_interface = target if decision == "topology_map" else ""
-        if decision == "topology_create" and interface.get("source_vendor") != "checkpoint":
-            effective_interface = str(interface.get("name", ""))
+        if decision == "topology_create":
+            effective_interface = target or str(interface.get("name", ""))
         assigned_zone = zone if effective_interface and zone else None
         for value in interface.get("source_networks", []):
             try:
@@ -2364,6 +2364,16 @@ def apply_transform_rules(model: MigrationModel, rules: list[dict]) -> Migration
             if operation == "topology_map" and value:
                 replacements.setdefault(kind, {})[old] = value
                 collection.remove(item)
+            elif operation == "topology_create" and kind == "interfaces" and value:
+                item["name"] = value
+                item["interface_type"] = "ethernet"
+                try:
+                    entry = SafeET.fromstring(item.get("xml", ""))
+                    entry.set("name", value)
+                    item["xml"] = ET.tostring(entry, encoding="unicode")
+                except (ET.ParseError, ValueError) as exc:
+                    raise MigrationError("Ongeldige broninterfaceconfiguratie") from exc
+                replacements.setdefault(kind, {})[old] = value
             elif operation == "topology_ignore":
                 collection.remove(item)
             elif operation == "topology_review":
@@ -3672,7 +3682,28 @@ def _merge_model_into_panos_xml_scope(
         for item in model.zones:
             entry = SafeET.fromstring(item["xml"]); name = str(item.get("name", entry.get("name", ""))); entry.set("name", name)
             if name in existing:
-                if _entry_signature(existing[name]) != _entry_signature(entry): plan["conflicts"].append(f"zone: {name}")
+                if item.get("auto_generated") and item.get("source_ref") == "Interface zone assignment":
+                    incoming_network = entry.find("./network")
+                    existing_network = existing[name].find("./network")
+                    incoming_types = list(incoming_network) if incoming_network is not None else []
+                    existing_types = list(existing_network) if existing_network is not None else []
+                    if len(incoming_types) != 1 or (
+                        existing_types and any(node.tag != incoming_types[0].tag for node in existing_types)
+                    ):
+                        plan["conflicts"].append(f"zone: {name}")
+                    else:
+                        if existing_network is None:
+                            existing_network = ET.SubElement(existing[name], "network")
+                        target_type = existing_network.find(f"./{incoming_types[0].tag}")
+                        if target_type is None:
+                            target_type = ET.SubElement(existing_network, incoming_types[0].tag)
+                        current_members = {node.text for node in target_type.findall("./member")}
+                        for member in incoming_types[0].findall("./member"):
+                            if member.text and member.text not in current_members:
+                                ET.SubElement(target_type, "member").text = member.text
+                                current_members.add(member.text)
+                        plan["reuse"] += 1
+                elif _entry_signature(existing[name]) != _entry_signature(entry): plan["conflicts"].append(f"zone: {name}")
                 else: plan["reuse"] += 1
             else:
                 if mapping_action("zones", name) == "map":

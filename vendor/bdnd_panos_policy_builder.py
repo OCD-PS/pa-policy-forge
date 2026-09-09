@@ -414,6 +414,18 @@ def is_server_to_internet(src_zone: str, dst_zone: str, zone_roles: ZoneRoleConf
     return zone_roles.role_for(src_zone) == "server" and zone_roles.is_internet(dst_zone)
 
 
+def is_untrust_zone(zone: str) -> bool:
+    return zone == "Untrust"
+
+
+def valid_service_port(value: str) -> bool:
+    parts = value.split("-", 1)
+    if not all(part.isdigit() for part in parts):
+        return False
+    ports = [int(part) for part in parts]
+    return all(1 <= port <= 65535 for port in ports) and (len(ports) == 1 or ports[0] <= ports[1])
+
+
 def is_client_to_server(src_zone: str, dst_zone: str, zone_roles: ZoneRoleConfig) -> bool:
     return zone_roles.is_client(src_zone) and zone_roles.role_for(dst_zone) == "server"
 
@@ -451,16 +463,31 @@ def merge_candidates(
         if is_global_ping_traceroute_app(key.app, suppressed_apps):
             continue
         web_service = client_internet_web_service(key.proto, key.dport)
-        if is_client_to_internet(key.src_zone, key.dst_zone, zone_roles) and web_service:
+        https_to_untrust = is_untrust_zone(key.dst_zone) and key.proto.lower() == "tcp" and key.dport == "443"
+        explicit_internal_transport = False
+        if https_to_untrust or (is_client_to_internet(key.src_zone, key.dst_zone, zone_roles) and web_service):
             app = "any"
-            service_members = (web_service,)
-            bucket_service_key = web_service
+            service_members = ("service-https" if https_to_untrust else web_service,)
+            bucket_service_key = service_members[0]
         else:
             app = normalize_app(key.app)
-            service_members = (service_member_for_flow(app, key.proto, key.dport),)
+            explicit_internal_transport = (
+                app == "any"
+                and key.src_zone in zone_roles.zone_roles
+                and key.dst_zone in zone_roles.zone_roles
+                and not zone_roles.is_internet(key.src_zone)
+                and not zone_roles.is_internet(key.dst_zone)
+                and key.proto.lower() in {"tcp", "udp"}
+                and valid_service_port(key.dport)
+            )
+            service_members = (
+                (service_name(key.proto, key.dport) if explicit_internal_transport else service_member_for_flow(app, key.proto, key.dport)),
+            )
             bucket_service_key = service_members[0]
         if app == "any" and not (
-            is_client_to_internet(key.src_zone, key.dst_zone, zone_roles) and web_service
+            https_to_untrust
+            or (is_client_to_internet(key.src_zone, key.dst_zone, zone_roles) and web_service)
+            or explicit_internal_transport
         ):
             # Unidentified App-ID is observation noise, not evidence for a broad allow rule.
             continue
@@ -503,23 +530,9 @@ def merge_candidates(
         generalized_sources = Counter()
         for source, sessions in agg.sources.items():
             generalized_sources[zone_roles.generalized_source(key.src_zone, source)] += sessions
-        source_scoped = (
-            is_server_to_internet(key.src_zone, key.dst_zone, zone_roles)
-            or is_client_to_server(key.src_zone, key.dst_zone, zone_roles)
-        )
-        source_slices = [
-            (
-                source,
-                Counter({source: sessions}),
-                Counter({
-                    destination: count
-                    for (pair_source, destination), count in agg.source_destination_pairs.items()
-                    if pair_source == source
-                }),
-                sessions,
-            )
-            for source, sessions in agg.sources.items()
-        ] if source_scoped else [("", generalized_sources, agg.destinations, agg.sessions)]
+        # Sources with identical policy semantics belong in one rule. Splitting
+        # server egress per observed IP caused an avoidable rule explosion.
+        source_slices = [("", generalized_sources, agg.destinations, agg.sessions)]
         for source_key, sources, destinations, sessions in source_slices:
             bucket_key = (
                 key.src_zone,
@@ -937,7 +950,7 @@ def build_xml(
             zone_roles,
             profile_groups,
         )
-        source_members = members_for_side(
+        source_members = ["any"] if is_untrust_zone(candidate.src_zone) else members_for_side(
             candidate.sources,
             "source",
             candidate.src_zone,
@@ -964,16 +977,23 @@ def build_xml(
             group_threshold,
             source_any_threshold,
         )
-        if "any" in source_members:
+        if "any" in source_members and not is_untrust_zone(candidate.src_zone):
             raise RuntimeError(f"Refusing overly broad generated rule {rule_name}: source resolved to any")
         if "any" in application_members and not (
-            is_client_to_internet(candidate.src_zone, candidate.dst_zone, zone_roles)
-            and set(candidate.service_members).issubset({"service-http", "service-https"})
+            (
+                (is_client_to_internet(candidate.src_zone, candidate.dst_zone, zone_roles) or is_untrust_zone(candidate.dst_zone))
+                and set(candidate.service_members).issubset({"service-http", "service-https"})
+            )
+            or (
+                not zone_roles.is_internet(candidate.src_zone)
+                and not zone_roles.is_internet(candidate.dst_zone)
+                and candidate.service_members != ("application-default",)
+            )
         ):
             raise RuntimeError(f"Refusing overly broad generated rule {rule_name}: application resolved to any")
         if candidate.service_members != ("application-default",) and candidate.transports:
             proto, port = parse_transport(next(iter(candidate.transports)))
-            if candidate.service_members == ("service-http", "service-https"):
+            if set(candidate.service_members).issubset({"service-http", "service-https"}):
                 pass
             else:
                 ensure_service_object(services, candidate.service_members[0], proto, port, service_names)
@@ -1900,13 +1920,22 @@ def planned_rule_order(
     existing_rules: list[dict[str, Any]],
     generated_rules: list[dict[str, Any]],
     anchors: dict[str, str],
+    normalizer=lambda value: value,
 ) -> list[dict[str, Any]]:
-    generated_names = {rule_name(rule) for rule in generated_rules}
-    normalized_anchors = {normalized_scm_rule_name(name): anchor for name, anchor in anchors.items()}
-    planned = [rule for rule in existing_rules if rule_name(rule) not in generated_names]
+    generated_names = {normalizer(rule_name(rule)) for rule in generated_rules}
+    normalized_anchors = {normalizer(name): anchor for name, anchor in anchors.items()}
+    planned = [rule for rule in existing_rules if normalizer(rule_name(rule)) not in generated_names]
     for generated in generated_rules:
-        anchor_name = normalized_scm_rule_name(normalized_anchors.get(rule_name(generated), ""))
-        anchor_index = next((index for index, rule in enumerate(planned) if rule_name(rule) == anchor_name), len(planned))
+        anchor_name = normalizer(normalized_anchors.get(normalizer(rule_name(generated)), ""))
+        if not anchor_name:
+            raise RuntimeError(f"Cannot position generated policy {rule_name(generated)!r}: source policy is missing")
+        matching_indexes = [index for index, rule in enumerate(planned) if normalizer(rule_name(rule)) == anchor_name]
+        if len(matching_indexes) != 1:
+            raise RuntimeError(
+                f"Cannot position generated policy {rule_name(generated)!r}: "
+                f"source policy {anchor_name!r} matched {len(matching_indexes)} rules"
+            )
+        anchor_index = matching_indexes[0]
         planned.insert(anchor_index, generated)
     return planned
 
@@ -1915,13 +1944,14 @@ def enforce_shadowing_gate(
     existing_rules: list[dict[str, Any]],
     generated_rules: list[dict[str, Any]],
     anchors: dict[str, str],
+    normalizer=lambda value: value,
 ) -> None:
-    planned = planned_rule_order(existing_rules, generated_rules, anchors)
-    generated_names = {rule_name(rule) for rule in generated_rules}
+    planned = planned_rule_order(existing_rules, generated_rules, anchors, normalizer)
+    generated_names = {normalizer(rule_name(rule)) for rule in generated_rules}
     findings: list[str] = []
     for index, candidate in enumerate(planned):
         candidate_name = rule_name(candidate)
-        if candidate_name not in generated_names or not rule_enabled(candidate):
+        if normalizer(candidate_name) not in generated_names or not rule_enabled(candidate):
             continue
         shadow = next((rule for rule in planned[:index] if security_rule_covers(rule, candidate)), None)
         if shadow is not None:
@@ -2097,7 +2127,11 @@ def movable_anchor_map(rows: list[dict[str, str]]) -> dict[str, str]:
 
 
 def rule_move_destination(anchor_name: str, existing_names: set[str], normalizer=lambda value: value) -> tuple[str, str]:
-    return ("before", anchor_name) if normalizer(anchor_name) in existing_names else ("bottom", "")
+    if not anchor_name:
+        raise RuntimeError("Cannot place generated policy: source policy is missing")
+    if normalizer(anchor_name) not in existing_names:
+        raise RuntimeError(f"Cannot place generated policy: source policy {anchor_name!r} was not found")
+    return "before", anchor_name
 
 
 def normalized_scm_rule_name(name: str) -> str:
@@ -2318,7 +2352,7 @@ def push_to_scm(
         normalized_scm_rule_name(name): anchor
         for name, anchor in movable_anchor_map(review_rows).items()
     }
-    enforce_shadowing_gate(existing_rules, payloads["rules"], anchors)
+    enforce_shadowing_gate(existing_rules, payloads["rules"], anchors, normalized_scm_rule_name)
 
     for payload in payloads["tags"]:
         scm_upsert(f"{objects_base}/tags", token, payload, object_container)
@@ -2349,7 +2383,7 @@ def push_to_scm(
         if not generated:
             raise RuntimeError(f"Cannot move generated policy {generated_name!r}: rule was not returned by SCM")
         destination, _ = rule_move_destination(anchor_name, set(rules_by_name), normalized_scm_rule_name)
-        move_payload = {"destination": "before", "rulebase": scm.scm_rulebase, "destination_rule": anchor["id"]} if destination == "before" else {"destination": "bottom", "rulebase": scm.scm_rulebase}
+        move_payload = {"destination": destination, "rulebase": scm.scm_rulebase, "destination_rule": anchor["id"]}
         scm_http_request(
             "POST",
             f"{security_base}/security-rules/{generated['id']}:move",
@@ -2419,14 +2453,14 @@ def push_to_device(xml_path: Path, deployment: DeploymentConfig, review_rows: li
                 continue
             xpath = f"{rules_xpath(deployment)}/entry[@name={xpath_literal(generated_name)}]"
             destination, destination_rule = rule_move_destination(anchor_name, existing_rule_names)
-            position = {"where": "before", "dst": destination_rule} if destination == "before" else {"where": "bottom"}
+            position = {"where": destination, "dst": destination_rule}
             require_success(
                 api_get(
                     deployment.panos_endpoint,
                     {"type": "config", "action": "move", "xpath": xpath, "key": key, **position},
                     ctx,
                 ),
-                f"move {generated_name} before {anchor_name}" if destination == "before" else f"move {generated_name} to bottom",
+                f"move {generated_name} before {anchor_name}",
             )
     finally:
         if copied and upload_path.exists():

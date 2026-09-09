@@ -103,6 +103,18 @@ class TopologyRouteAuditTests(unittest.TestCase):
             self.save()
         self.assertEqual(len(self.transforms()), 2)
 
+    def test_created_interface_can_be_attached_to_an_existing_zone(self):
+        with patch.object(main, "migration_project_topology_targets", return_value={
+            "interfaces": ["ethernet1/1.10"], "zones": ["Audit Zone"],
+            "interface_zone_memberships": {},
+        }):
+            response = self.save(action="create", target="ethernet1/2", zone="Audit Zone")
+        self.assertEqual(response.status_code, 302)
+        rows = self.transforms()
+        self.assertEqual(next(row["value"] for row in rows if row["operation"] == "topology_create"), "ethernet1/2")
+        assignment = json.loads(next(row["value"] for row in rows if row["operation"] == "set_interface_zone"))
+        self.assertEqual(assignment, {"create": True, "zone": "Audit Zone"})
+
     def test_interface_already_in_another_zone_rejects_new_assignment(self):
         with patch.object(main, "migration_project_topology_targets", return_value={
             "interfaces": ["ethernet1/1.10"], "zones": ["Other Zone"],

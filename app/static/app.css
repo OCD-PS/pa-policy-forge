@@ -113,6 +113,21 @@ h3 { margin-bottom: 10px; font-size: 16px; }
 .workspace-policy-dialog .bulk-dialog-body { padding: 22px; }
 .workspace-policy-list tr.policy-disabled-row > td { opacity: .62; }
 .workspace-policy-list tr.policy-disabled-row .badge-warning { opacity: 1; }
+.policy-members { display: grid; gap: 5px; min-width: 130px; max-width: 280px; }
+.policy-members > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.policy-members-open { width: max-content; border: 1px solid #555; cursor: pointer; }
+.policy-members-open:hover, .policy-members-open:focus { border-color: var(--orange); color: var(--orange); }
+.policy-members-dialog { width: min(620px, calc(100vw - 32px)); }
+.policy-members-dialog .card-header { margin: 0 0 14px; }
+.policy-members-dialog .search { width: 100%; }
+.policy-members-dialog-list { display: grid; gap: 4px; max-height: 55vh; margin-top: 12px; overflow: auto; }
+.policy-members-dialog-list span { padding: 7px 9px; border: 1px solid var(--line); border-radius: 4px; background: #111; overflow-wrap: anywhere; }
+.dashboard-actions { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 12px; margin: 0 0 18px; }
+.dashboard-action { display: grid; gap: 5px; padding: 16px; color: var(--text); text-align: left; text-decoration: none; cursor: pointer; }
+.dashboard-action strong { color: var(--orange); font-size: 16px; }
+.dashboard-action span { color: var(--muted); }
+.dashboard-action:hover, .dashboard-action:focus { border-color: var(--orange); outline: none; }
+@media(max-width:780px){.dashboard-actions{grid-template-columns:1fr}}
 .policy-editor-dialog.workspace-config-dialog { width: min(980px,calc(100vw - 32px)); height: min(720px,calc(100vh - 32px)); max-height: calc(100vh - 32px); margin: auto; padding: 0; overflow: hidden; border: 1px solid #4a4a4a; border-radius: 9px; background: var(--surface); color: var(--text); box-shadow: 0 24px 70px rgba(0,0,0,.72); }
 .workspace-config-dialog::backdrop { background: rgba(0,0,0,.76); backdrop-filter: blur(2px); }
 .config-dialog-layout { height: 100%; display: grid; grid-template-rows: auto auto minmax(0,1fr) auto; }

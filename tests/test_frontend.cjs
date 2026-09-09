@@ -82,6 +82,22 @@ test('closed details are opened when an in-page action links to their contents',
   assert.deepEqual(errors, []); dom.window.close();
 });
 
+test('long policy members open in a searchable modal without expanding the table row', async () => {
+  const values = ['portal.example', 'updates.example', 'ntp.example', 'backup.example'];
+  const {dom, document, window, errors} = await page(`<table><tbody><tr><td><button type="button" data-policy-members='${JSON.stringify(values)}'>+2 meer</button></td></tr></tbody></table>`);
+  document.querySelector('[data-policy-members]').click();
+  const dialog = document.querySelector('.policy-members-dialog');
+  assert.equal(dialog.open, true);
+  assert.deepEqual([...dialog.querySelectorAll('[data-policy-members-list] span')].map(node => node.textContent), values);
+  const search = dialog.querySelector('[data-policy-members-search]');
+  search.value = 'ntp'; search.dispatchEvent(new window.Event('input'));
+  assert.deepEqual([...dialog.querySelectorAll('[data-policy-members-list] span')].map(node => node.textContent), ['ntp.example']);
+  dialog.querySelector('.config-dialog-close').click();
+  assert.equal(dialog.open, false);
+  assert.equal(document.querySelector('tbody tr').querySelectorAll('span').length, 0, 'values stay outside the table row');
+  assert.deepEqual(errors, []); dom.window.close();
+});
+
 test('hidden editor fields remain hidden despite layout display rules', async () => {
   const {dom, document, window} = await page(`<style>${styles}</style><div class="field full" data-dynamic-filter hidden>Dynamic filter</div>`);
   assert.equal(window.getComputedStyle(document.querySelector('[data-dynamic-filter]')).display, 'none');

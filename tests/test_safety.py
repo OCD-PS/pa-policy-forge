@@ -17,6 +17,7 @@ from vendor.bdnd_bpa_policy_builder import aggregate_flows
 from vendor.bdnd_panos_policy_builder import (
     DeploymentConfig,
     ExistingConfigInventory,
+    ProfileGroupConfig,
     SCMConfig,
     ZoneRoleConfig,
     apply_existing_inventory,
@@ -28,6 +29,7 @@ from vendor.bdnd_panos_policy_builder import (
     rule_move_destination,
     security_rule_covers,
     add_member_list,
+    build_xml,
 )
 
 class SafetyTests(unittest.TestCase):
@@ -270,9 +272,9 @@ class SafetyTests(unittest.TestCase):
             ("ssl", ("9440_TCP",)),
         })
 
-    def test_server_to_internet_uses_effective_app_per_source(self):
+    def test_server_to_internet_aggregates_sources_with_equal_semantics(self):
         base = {
-            "dst": "198.51.100.1", "src_zone": "servers", "dst_zone": "internet",
+            "dst": "198.51.100.1", "src_zone": "servers", "dst_zone": "Untrust",
             "proto": "tcp", "dport": "443", "action": "allow", "repeat": "3",
             "bytes": "100", "rule": "Discovery",
         }
@@ -283,15 +285,13 @@ class SafetyTests(unittest.TestCase):
             {**base, "src": "10.0.0.12", "app": "incomplete"},
         ], {"allow"})
         candidates = merge_candidates(
-            aggregates, 1, 0, ZoneRoleConfig({"servers": "server", "internet": "internet"})
+            aggregates, 1, 0, ZoneRoleConfig({"servers": "server", "Untrust": "internet"})
         )
-        observed = {(tuple(candidate.sources), candidate.app) for candidate in candidates}
+        observed = {(tuple(sorted(candidate.sources)), candidate.app, candidate.service_members) for candidate in candidates}
         self.assertEqual(observed, {
-            (("10.0.0.10",), "ssl"),
-            (("10.0.0.11",), "ssl"),
-            (("10.0.0.10",), "apt-get"),
+            (("10.0.0.10",), "apt-get", ("application-default",)),
+            (("10.0.0.10", "10.0.0.11", "10.0.0.12"), "any", ("service-https",)),
         })
-        self.assertNotIn("any", {candidate.app for candidate in candidates})
 
     def test_client_to_server_preserves_observed_paths_and_effective_apps(self):
         base = {
@@ -315,10 +315,10 @@ class SafetyTests(unittest.TestCase):
             (("10.0.1.10",), ("10.0.2.20",), "ssl"),
             (("10.0.1.11",), ("10.0.2.21",), "ssl"),
             (("10.0.1.10",), ("10.0.2.22",), "ms-rdp"),
+            (("10.0.1.12",), ("10.0.2.23",), "any"),
         })
-        self.assertNotIn("any", {candidate.app for candidate in candidates})
 
-    def test_unidentified_apps_only_generalize_for_client_web_egress(self):
+    def test_unidentified_internal_app_uses_explicit_service_and_is_not_dropped(self):
         internal = {
             "src": "10.0.1.10", "dst": "10.0.2.20", "src_zone": "other",
             "dst_zone": "servers", "app": "incomplete", "proto": "tcp", "dport": "443",
@@ -328,14 +328,58 @@ class SafetyTests(unittest.TestCase):
             **internal, "src_zone": "clients", "dst_zone": "internet",
             "dst": "198.51.100.10",
         }
-        roles = ZoneRoleConfig({"clients": "client", "servers": "server", "internet": "internet"})
+        roles = ZoneRoleConfig({"clients": "client", "servers": "server", "other": "other", "internet": "internet"})
         internal_candidates = merge_candidates(aggregate_flows([internal], {"allow"}), 1, 0, roles)
         internet_candidates = merge_candidates(aggregate_flows([internet], {"allow"}), 1, 0, roles)
-        self.assertEqual(internal_candidates, [])
+        self.assertEqual(
+            [(candidate.app, candidate.service_members) for candidate in internal_candidates],
+            [("any", ("443_TCP",))],
+        )
         self.assertEqual(
             [(candidate.app, candidate.service_members) for candidate in internet_candidates],
             [("any", ("service-https",))],
         )
+
+    def test_unidentified_app_with_unclassified_zone_is_not_treated_as_east_west(self):
+        flow = {
+            "src": "10.0.1.10", "dst": "10.0.2.20", "src_zone": "misspelled",
+            "dst_zone": "servers", "app": "incomplete", "proto": "tcp", "dport": "443",
+            "action": "allow", "repeat": "10", "bytes": "100", "rule": "Discovery",
+        }
+        roles = ZoneRoleConfig({"servers": "server"})
+        self.assertEqual(merge_candidates(aggregate_flows([flow], {"allow"}), 1, 0, roles), [])
+
+    def test_only_exact_untrust_source_is_generalized_to_any_in_final_xml(self):
+        deployment = DeploymentConfig(False, False, "", "pre", "", "vsys1", "", "", "", "", False)
+        profiles = ProfileGroupConfig("", "", "", "")
+        roles = ZoneRoleConfig({"Untrust": "internet", "untrust": "internet", "servers": "server"})
+
+        def generated_source(zone):
+            flow = {
+                "src": "198.51.100.25", "dst": "10.0.0.25", "src_zone": zone,
+                "dst_zone": "servers", "app": "ssl", "proto": "tcp", "dport": "443",
+                "action": "allow", "repeat": "4", "bytes": "400", "rule": "Discovery",
+            }
+            tree, _ = build_xml(
+                aggregate_flows([flow], {"allow"}), 1, 0, 10, 100, True, (),
+                False, (), False, (), (), (), roles, deployment, "", profiles,
+            )
+            return [node.text for node in tree.getroot().findall(".//rulebase/security/rules/entry/source/member")]
+
+        self.assertEqual(generated_source("Untrust"), ["any"])
+        self.assertNotEqual(generated_source("untrust"), ["any"])
+
+    def test_invalid_or_unsupported_incomplete_transports_do_not_create_east_west_rules(self):
+        roles = ZoneRoleConfig({"clients": "client", "servers": "server"})
+        base = {
+            "src": "10.0.1.10", "dst": "10.0.2.20", "src_zone": "clients",
+            "dst_zone": "servers", "app": "incomplete", "action": "allow",
+            "repeat": "10", "bytes": "100", "rule": "Discovery",
+        }
+        for proto, port in (("sctp", "443"), ("tcp", "0"), ("tcp", "70000"), ("tcp", "9000-8000")):
+            with self.subTest(proto=proto, port=port):
+                flow = {**base, "proto": proto, "dport": port}
+                self.assertEqual(merge_candidates(aggregate_flows([flow], {"allow"}), 1, 0, roles), [])
 
     def test_internal_sources_are_preserved_in_generated_rules(self):
         text = (ROOT / "vendor/bdnd_panos_policy_builder.py").read_text()
@@ -379,7 +423,12 @@ class SafetyTests(unittest.TestCase):
         }
         self.assertTrue(security_rule_covers(broad, specific))
         with self.assertRaisesRegex(RuntimeError, "specific shadowed by broad"):
-            enforce_shadowing_gate([], [broad, specific], {})
+            enforce_shadowing_gate(
+                [{"name": "Discovery", "from": ["any"], "to": ["any"], "source": ["any"],
+                  "destination": ["any"], "application": ["any"], "service": ["any"], "disabled": True}],
+                [broad, specific],
+                {"broad": "Discovery", "specific": "Discovery"},
+            )
 
     def test_shadowing_gate_accepts_specific_before_broad_catch_rule(self):
         catch = {
@@ -448,6 +497,7 @@ class SafetyTests(unittest.TestCase):
         rows = [{"name": "generated", "anchor_rule": "Discovery", "preflight_status": "new"}]
         self.assertEqual(movable_anchor_map(rows), {"generated": "Discovery"})
         self.assertEqual(rule_move_destination("Discovery", {"Discovery"}), ("before", "Discovery"))
-        self.assertEqual(rule_move_destination("Missing", {"Discovery"}), ("bottom", ""))
+        with self.assertRaisesRegex(RuntimeError, "was not found"):
+            rule_move_destination("Missing", {"Discovery"})
 
 if __name__ == "__main__": unittest.main()

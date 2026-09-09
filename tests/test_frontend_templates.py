@@ -45,6 +45,15 @@ class FrontendTemplateTests(unittest.TestCase):
             with self.subTest(template=name):
                 environment.parse(environment.loader.get_source(environment, name)[0])
 
+    def test_policy_member_macro_keeps_long_rules_compact(self):
+        macro = self.environment().get_template("_policy_members.html").module.compact_members
+        short = str(macro(["one", "two", "three"]))
+        long = str(macro(["one", "two", "three", "four", "five"]))
+        self.assertNotIn("<details", short)
+        self.assertIn('class="policy-members"', long)
+        self.assertIn("+3 meer", long)
+        self.assertIn("five", long)
+
     def test_device_workspace_owns_zone_mapping_and_push_flow(self):
         source = self.environment().loader.get_source(self.environment(), "app.html")[0]
         self.assertIn("Firewall toevoegen", source)

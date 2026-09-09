@@ -1171,6 +1171,37 @@
     });
   }
 
+  function setupPolicyMemberDialogs() {
+    var dialog = document.createElement("dialog");
+    dialog.className = "policy-members-dialog push-dialog";
+    dialog.innerHTML = '<div class="push-dialog-brand">POLICYWAARDEN</div>' +
+      '<div class="push-dialog-body"><div class="card-header"><h2>Alle waarden</h2>' +
+      '<button class="config-dialog-close" type="button" aria-label="Sluiten">×</button></div>' +
+      '<input class="search" type="search" placeholder="Zoek in deze waarden" data-policy-members-search>' +
+      '<div class="policy-members-dialog-list" data-policy-members-list></div></div>';
+    document.body.appendChild(dialog);
+    var values = [];
+    var list = dialog.querySelector("[data-policy-members-list]");
+    var search = dialog.querySelector("[data-policy-members-search]");
+    function render() {
+      var query = search.value.toLocaleLowerCase().trim();
+      list.innerHTML = "";
+      values.filter(function (value) { return !query || value.toLocaleLowerCase().includes(query); }).forEach(function (value) {
+        var row = document.createElement("span"); row.textContent = value; list.appendChild(row);
+      });
+    }
+    document.addEventListener("click", function (event) {
+      var button = event.target.closest("[data-policy-members]");
+      if (!button) return;
+      try { values = JSON.parse(button.dataset.policyMembers || "[]").map(String); }
+      catch (_error) { values = []; }
+      search.value = ""; render(); dialog.showModal(); search.focus();
+    });
+    search.addEventListener("input", render);
+    dialog.querySelector(".config-dialog-close").addEventListener("click", function () { dialog.close(); });
+    dialog.addEventListener("click", function (event) { if (event.target === dialog) dialog.close(); });
+  }
+
   document.addEventListener("DOMContentLoaded", function () {
     function runSetup(name, callback) {
       try { callback(); }
@@ -1190,6 +1221,7 @@
     runSetup("migration-zone-mapping", setupMigrationZoneMapping);
     runSetup("targets", setupConditionalTargets);
     runSetup("migration-target-dialog", setupMigrationTargetDialog);
+    runSetup("policy-member-dialogs", setupPolicyMemberDialogs);
     runSetup("push-options", setupPushOptions);
     runSetup("policy-management", setupPolicyManagement);
     runSetup("object-management", setupObjectManagement);

@@ -76,6 +76,7 @@ from app.offline_config import (
 )
 
 BASE = Path(__file__).resolve().parent.parent
+BEST_PRACTICE_BASE = BASE / "app" / "bases" / "ocd-bpa-v11.xml"
 DATA = Path(os.getenv("PPF_DATA_DIR", "/data"))
 CERT_DIR = Path(os.getenv("PPF_CERT_DIR", "/certs"))
 APPLIANCE_CONFIG = Path(os.getenv("PPF_APPLIANCE_CONFIG", str(DATA / "appliance.json")))
@@ -2850,6 +2851,26 @@ def migration_project_topology_targets(project, profile, context=None):
     return targets
 
 
+def migration_saved_interface_zones(project_id: int) -> set[str]:
+    """Return valid zones staged by earlier interface mapping rows."""
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT value FROM migration_transform_rules "
+            "WHERE project_id=? AND kind='interfaces' AND operation='set_interface_zone'",
+            (project_id,),
+        ).fetchall()
+    zones = set()
+    for row in rows:
+        try:
+            value = json.loads(row["value"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        zone = str(value.get("zone", "")).strip() if isinstance(value, dict) else ""
+        if zone and re.fullmatch(r"[A-Za-z0-9 ._-]{1,31}", zone) and zone.casefold() != "any":
+            zones.add(zone)
+    return zones
+
+
 def migration_profile_target_context(profile, kind: str = "") -> str:
     """Return the concrete default context used by the selected target adapter."""
     settings = profile_settings(profile)
@@ -3188,6 +3209,53 @@ def create_merged_workspace(
     return workspace_id, plan
 
 
+def migration_best_practice_base_xml(profile) -> bytes:
+    """Build a sanitized BPA-backed base in the selected target flavor/scope."""
+    if not BEST_PRACTICE_BASE.is_file():
+        raise MigrationError("De ingebouwde best-practice base ontbreekt")
+    raw = BEST_PRACTICE_BASE.read_bytes()
+    settings = profile_settings(profile)
+    if profile["target_type"] == "panos":
+        scope = str(settings.get("vsys") or "vsys1")
+        root = SafeET.fromstring(raw)
+        vsys = root.find("./devices/entry/vsys/entry")
+        if vsys is None:
+            raise MigrationError("De best-practice base bevat geen VSYS")
+        vsys.set("name", scope)
+        return normalized_config_xml(root)
+    if profile["target_type"] != "panorama":
+        raise MigrationError("Een XML-base is alleen beschikbaar voor PAN-OS en Panorama")
+    scope = str(settings.get("device_group") or "Shared")
+    model = parse_vendor("panos", raw, BEST_PRACTICE_BASE.name)
+    for items in model_collections(model).values():
+        for item in items:
+            if hasattr(item, "target_context"):
+                item.target_context = scope
+            elif isinstance(item, dict):
+                item["target_context"] = scope
+    base = migration_base_xml(model, scope, panorama=True, version="11.0.0")
+    merged, plan = merge_model_into_panos_xml(
+        base, model, scope, panorama=True, rulebase=settings.get("rulebase", "pre")
+    )
+    if plan.get("conflicts"):
+        raise MigrationError("De best-practice Panorama-base bevat mergeconflicten")
+    return merged
+
+
+def create_migration_best_practice_workspace(profile, project_id: int, project_name: str) -> int:
+    xml_bytes = migration_best_practice_base_xml(profile)
+    workspace_id = store_config_workspace(
+        profile,
+        f"{project_name} · OCD BPA best practices",
+        "ocd-bpa-v11.xml",
+        xml_bytes,
+        "built-in-best-practice",
+        project_id=project_id,
+    )
+    set_active_config_workspace(int(profile["id"]), workspace_id)
+    return workspace_id
+
+
 def live_profile_migration_source(profile) -> tuple[MigrationModel, bytes | None]:
     """Read a configured target through its native API without changing it."""
     def as_list(value,default):
@@ -3465,7 +3533,8 @@ def config_workspace_editor(workspace_id):
             raise OfflineConfigError("De gekozen scope bestaat niet")
         scope = requested_scope or saved_context.get("scope", "")
         if scope not in scopes:
-            scope = scopes[0]
+            non_shared_scopes = [value for value in scopes if value != "Shared"]
+            scope = non_shared_scopes[0] if snapshot.kind == "panorama" and non_shared_scopes else scopes[0]
         workspace_view = request.args.get("workspace_view", "policies")
         if workspace_view not in {"policies", "objects", "network", "device"}:
             workspace_view = "policies"
@@ -5344,6 +5413,7 @@ def migration_project(project_id):
         set(topology_targets["zones"])
         | set(profile_settings_value.get("zones", {}))
         | offline_source_zones
+        | migration_saved_interface_zones(project_id)
     )
     policy_zone_query=request.args.get("zone_query", "").strip()
     policy_zone_items = []
@@ -5475,6 +5545,8 @@ def migration_topology_mapping_save(project_id):
             raise MigrationError("Ongeldige topologiemapping")
         if action == "map" and not target:
             raise MigrationError("Kies een bestaande targetwaarde")
+        if kind == "interfaces" and action == "create" and not target:
+            raise MigrationError("Geef de nieuwe PAN-OS interfacenaam op")
         with db() as conn:
             source_rows = conn.execute("SELECT * FROM migration_sources WHERE project_id=?", (project_id,)).fetchall()
             profile = conn.execute("SELECT * FROM profiles WHERE id=?", (project["target_profile_id"],)).fetchone()
@@ -5491,8 +5563,6 @@ def migration_topology_mapping_save(project_id):
         if selector not in available:
             raise MigrationError("De bronwaarde bestaat niet meer")
         selected = available[selector]
-        if kind == "interfaces" and selected.get("source_vendor") == "checkpoint" and action == "create":
-            raise MigrationError("Map de Check Point-interface naar een PAN-OS interface; maak ze niet blind over")
         with db() as conn:
             mapping = conn.execute(
                 "SELECT target_context FROM migration_family_mappings WHERE project_id=? AND source_id=? AND kind=?",
@@ -5502,15 +5572,33 @@ def migration_topology_mapping_save(project_id):
         scoped_targets = migration_project_topology_targets(project, profile, context)
         if action == "map" and target not in scoped_targets.get(kind, []):
             raise MigrationError("De gekozen target bestaat niet in de geselecteerde doelcontext; vernieuw de base en kies opnieuw")
+        if kind == "interfaces" and action == "create":
+            if project["target_type"] == "scm":
+                raise MigrationError("Nieuwe interfaces vanuit migratie zijn nog niet veilig beschikbaar voor SCM")
+            if not re.fullmatch(r"ethernet[1-9][0-9]*/[1-9][0-9]*", target):
+                raise MigrationError(
+                    "Gebruik voor een nieuwe fysieke interface de PAN-OS-notatie "
+                    "ethernet<slot>/<poort>, bijvoorbeeld ethernet1/1"
+                )
+            if target in scoped_targets.get("interfaces", []):
+                raise MigrationError("Deze interface bestaat al; kies Map")
+            with db() as conn:
+                duplicate = conn.execute(
+                    "SELECT selector FROM migration_transform_rules WHERE project_id=? "
+                    "AND kind='interfaces' AND operation='topology_create' AND value=? AND selector<>?",
+                    (project_id, target, selector),
+                ).fetchone()
+            if duplicate:
+                raise MigrationError("Deze nieuwe targetinterface is al aan een andere broninterface gekoppeld")
         # A review or ignored interface must not create a usable target zone.
         zone = requested_zone if kind == "interfaces" and action in {"map", "create"} else ""
         if zone and (not re.fullmatch(r"[A-Za-z0-9 ._-]{1,31}", zone) or zone.casefold() == "any"):
             raise MigrationError("Ongeldige zonenaam: maximaal 31 letters, cijfers, spaties, punten, streepjes of underscores; geen any")
         existing_zones = set(scoped_targets.get("zones", []))
         if zone:
-            interface = target if action == "map" else str(selected.get("name", ""))
+            interface = target if action in {"map", "create"} else str(selected.get("name", ""))
             attached = scoped_targets.get("interface_zone_memberships", {}).get(interface, [])
-            if (zone in existing_zones and zone not in attached) or any(value != zone for value in attached):
+            if (action == "map" and zone in existing_zones and zone not in attached) or any(value != zone for value in attached):
                 raise MigrationError("De interface hoort niet bij deze targetzone. Pas de zone-interfacekoppeling eerst aan in de base")
             with db() as conn:
                 assignments = conn.execute(
@@ -5541,7 +5629,7 @@ def migration_topology_mapping_save(project_id):
                         "INSERT INTO migration_transform_rules(project_id,operation,kind,selector,value,created_at) VALUES(?,?,?,?,?,?)",
                         (
                             project_id, "set_interface_zone", "interfaces", selector,
-                            json.dumps({"zone": zone, "create": zone not in existing_zones}, sort_keys=True), now(),
+                            json.dumps({"zone": zone, "create": action == "create" or zone not in existing_zones}, sort_keys=True), now(),
                         ),
                     )
             conn.execute("UPDATE migration_projects SET updated_at=? WHERE id=?", (now(), project_id))
@@ -5600,6 +5688,7 @@ def migration_policy_zone_mapping_save(project_id):
             set(migration_zone_names(target_model))
             | set(settings.get("zones", {}))
             | source_zones
+            | migration_saved_interface_zones(project_id)
         )
         freeform_allowed = bool(
             int(profile["system"] or 0)
@@ -6191,7 +6280,19 @@ def migration_base_select(project_id):
     project = migration_project_row(project_id)
     if not project: return "Not found", 404
     try:
-        workspace_id = int(request.form.get("base_workspace_id", "0") or 0)
+        selected_base = request.form.get("base_workspace_id", "")
+        if selected_base == "best-practice":
+            with db() as conn:
+                profile = conn.execute(
+                    "SELECT * FROM profiles WHERE id=?", (project["target_profile_id"],)
+                ).fetchone()
+            if not profile:
+                raise MigrationError("Targetprofiel bestaat niet meer")
+            workspace_id = create_migration_best_practice_workspace(
+                profile, project_id, str(project["name"])
+            )
+        else:
+            workspace_id = int(selected_base or 0)
         if workspace_id and not workspace_access_allowed(workspace_id, write=True):
             raise MigrationError("Deze base-workspace is niet beschikbaar voor dit project")
         with db() as conn:
@@ -6200,7 +6301,7 @@ def migration_base_select(project_id):
             if workspace_id:
                 link_workspace_project(conn, workspace_id, project_id)
         audit("migration-base-selected", f"project={project_id} workspace={workspace_id}")
-        flash("Base configuration bijgewerkt.", "success")
+        flash("Basisconfiguratie bijgewerkt.", "success")
     except Exception as exc: flash(f"Base configuration niet gekozen: {exc}", "error")
     return redirect(url_for("migration_project", project_id=project_id))
 
