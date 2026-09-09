@@ -31,7 +31,7 @@
 </div>
 </div>
 {% if run.status=='running' %}
-<div class="callout" style="margin-top:22px"><strong>Policy-run bezig</strong><br>Deze pagina vernieuwt automatisch. Je mag ze veilig openlaten; de gatewayverbinding hoeft niet te blijven wachten.</div>
+<div class="callout" style="margin-top:22px"><strong>Policy-run bezig</strong></div>
 {% elif run.status=='complete' and run.mode=='preview' %}
 <div class="callout" style="margin-top:22px"><strong>Preview voltooid</strong><br>{{run.rule_count}} regels gegenereerd. Er is niets naar het target geschreven.</div>
 {% elif run.status=='complete' and run.mode=='push' and run.target_type=='scm' %}
