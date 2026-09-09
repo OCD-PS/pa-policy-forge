@@ -171,7 +171,7 @@ def save_ptr_cache(path: Path | None, ptr_cache: dict[str, str]) -> None:
 
 
 def add_member_list(parent: ET.Element, values: Iterable[str]) -> None:
-    for value in values:
+    for value in dict.fromkeys(values):
         ET.SubElement(parent, "member").text = value
 
 
@@ -759,9 +759,10 @@ def build_xml(
                 add_member_list(ET.SubElement(entry, "tag"), tags)
             if log_setting:
                 ET.SubElement(entry, "log-setting").text = log_setting
-            profile_setting = ET.SubElement(entry, "profile-setting")
-            group = ET.SubElement(profile_setting, "group")
-            ET.SubElement(group, "member").text = profile_groups.other
+            if profile_groups.other:
+                profile_setting = ET.SubElement(entry, "profile-setting")
+                group = ET.SubElement(profile_setting, "group")
+                ET.SubElement(group, "member").text = profile_groups.other
             ET.SubElement(entry, "description").text = (
                 "Generated global internal diagnostic rule. "
                 "Internet-mapped zones are excluded; per-zone ping/traceroute rules are suppressed."
@@ -837,9 +838,10 @@ def build_xml(
                 add_member_list(ET.SubElement(entry, "tag"), tags)
             if log_setting:
                 ET.SubElement(entry, "log-setting").text = log_setting
-            profile_setting = ET.SubElement(entry, "profile-setting")
-            group = ET.SubElement(profile_setting, "group")
-            ET.SubElement(group, "member").text = profile_groups.server
+            if profile_groups.server:
+                profile_setting = ET.SubElement(entry, "profile-setting")
+                group = ET.SubElement(profile_setting, "group")
+                ET.SubElement(group, "member").text = profile_groups.server
             ET.SubElement(entry, "description").text = (
                 "Generated global internal DNS rule. "
                 "Internal clients may query approved internal resolver objects."
@@ -885,9 +887,10 @@ def build_xml(
                 add_member_list(ET.SubElement(entry, "tag"), tags)
             if log_setting:
                 ET.SubElement(entry, "log-setting").text = log_setting
-            profile_setting = ET.SubElement(entry, "profile-setting")
-            group = ET.SubElement(profile_setting, "group")
-            ET.SubElement(group, "member").text = profile_groups.internet
+            if profile_groups.internet:
+                profile_setting = ET.SubElement(entry, "profile-setting")
+                group = ET.SubElement(profile_setting, "group")
+                ET.SubElement(group, "member").text = profile_groups.internet
             ET.SubElement(entry, "description").text = (
                 "Generated global DNS egress rule. "
                 "Approved internal resolvers may query approved external resolver objects."
@@ -994,9 +997,10 @@ def build_xml(
             add_member_list(ET.SubElement(entry, "tag"), tags)
         if log_setting:
             ET.SubElement(entry, "log-setting").text = log_setting
-        profile_setting = ET.SubElement(entry, "profile-setting")
-        group = ET.SubElement(profile_setting, "group")
-        ET.SubElement(group, "member").text = profile_group
+        if profile_group:
+            profile_setting = ET.SubElement(entry, "profile-setting")
+            group = ET.SubElement(profile_setting, "group")
+            ET.SubElement(group, "member").text = profile_group
         transport_note = ""
         if candidate.transports:
             transport_note = f"; transports={','.join(candidate.transports)}"
@@ -2598,7 +2602,7 @@ def load_builder_config(path: Path) -> tuple[BuilderConfig, ZoneRoleConfig, Depl
     profile_raw = data.get("profile_groups", {})
     if profile_raw and not isinstance(profile_raw, dict):
         raise ValueError(f"{path} [profile_groups] section must be a table")
-    default_profile = "best-practice"
+    default_profile = ""
 
     return builder, ZoneRoleConfig(zone_roles), DeploymentConfig(
         panorama=panorama,
@@ -2629,10 +2633,10 @@ def load_builder_config(path: Path) -> tuple[BuilderConfig, ZoneRoleConfig, Depl
         scm_rulebase=scm_rulebase,
         scm_log_forwarding_profile=str(scm_raw.get("scm_log_forwarding_profile", "default-1")).strip(),
     ), ProfileGroupConfig(
-        client=str(profile_raw.get("client", default_profile)).strip() or default_profile,
-        server=str(profile_raw.get("server", default_profile)).strip() or default_profile,
-        internet=str(profile_raw.get("internet", default_profile)).strip() or default_profile,
-        other=str(profile_raw.get("other", default_profile)).strip() or default_profile,
+        client=str(profile_raw.get("client", default_profile)).strip(),
+        server=str(profile_raw.get("server", default_profile)).strip(),
+        internet=str(profile_raw.get("internet", default_profile)).strip(),
+        other=str(profile_raw.get("other", default_profile)).strip(),
     )
 
 

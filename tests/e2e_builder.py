@@ -26,7 +26,7 @@ sample=(pathlib.Path(__file__).with_name("panos-traffic-allow.syslog")).read_tex
 flow=parse_panos_syslog(sample)
 assert flow is not None
 forge.flow_store.add_flow(flow)
-settings={"zones":{"trust":"client","untrust":"internet"},"min_sessions":1,"disabled":True,"tags":["PA Policy Forge QA"],"global_ping":True,"global_dns":True,"endpoint":f"https://127.0.0.1:{fake_server.server_port}","vsys":"vsys1","device_group":"","rulebase":"pre","folder":"","object_folder":"","log_profile":""}
+settings={"zones":{"trust":"client","untrust":"internet"},"min_sessions":1,"disabled":True,"tags":["PA Policy Forge QA"],"global_ping":True,"global_dns":True,"endpoint":f"https://127.0.0.1:{fake_server.server_port}","vsys":"vsys1","device_group":"","rulebase":"pre","folder":"","object_folder":"","log_profile":"","profile_group":""}
 with forge.db() as conn:
     cur=conn.execute("INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",("E2E",1,flow.serial,"","panos",json.dumps(settings),b"",forge.now(),forge.now()))
     profile=conn.execute("SELECT * FROM profiles WHERE id=?",(cur.lastrowid,)).fetchone()
@@ -38,5 +38,6 @@ for name in ("bdnd_panos_policy_builder.py","bdnd_bpa_policy_builder.py"):
 result=subprocess.run(["python3","bdnd_panos_policy_builder.py"],cwd=run,capture_output=True,text=True,timeout=120)
 assert result.returncode==0,result.stdout+result.stderr
 assert (run/"policy.xml").exists() and (run/"review.csv").exists()
+assert "<profile-setting>" not in (run/"policy.xml").read_text()
 fake_server.shutdown()
 print("e2e_builder_ok")

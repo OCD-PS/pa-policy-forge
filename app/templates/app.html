@@ -146,6 +146,14 @@
 <div class="zone-mapping-heading"><label>Actuele zones en rollen</label>{% if ep.target_type!='unconfigured' %}<a class="btn btn-small" href="{{url_for('index',edit_profile=ep.id,refresh_zones=1)}}#profiles">Zones opnieuw ophalen</a>{% endif %}</div>
 {% if profile_zone_error %}<div class="callout"><strong>Zones konden niet worden opgehaald</strong><br>{{profile_zone_error}}<br>De opgeslagen mappings blijven hieronder behouden.</div>{% endif %}
 {% if profile_zone_rows %}<div class="table-wrap zone-mapping-table"><table><thead><tr><th>Zone op device</th><th>Rol in Policy Forge</th><th>Status</th></tr></thead><tbody>{% for zone in profile_zone_rows %}<tr><td><input type="hidden" name="zone_name" value="{{zone.name}}"><strong>{{zone.name}}</strong></td><td><select name="zone_role" aria-label="Rol voor {{zone.name}}"><option value="client" {{'selected' if zone.role=='client'}}>Client</option><option value="server" {{'selected' if zone.role=='server'}}>Server</option><option value="internet" {{'selected' if zone.role=='internet'}}>Internet</option><option value="other" {{'selected' if zone.role=='other'}}>Overig</option></select></td><td><span class="badge badge-{{'success' if zone.live else 'warning'}}">{{'Actueel' if zone.live else 'Niet meer gevonden'}}</span></td></tr>{% endfor %}</tbody></table></div>{% elif ep.target_type=='unconfigured' %}<div class="callout"><strong>Nog geen beheerplatform gekoppeld</strong><br>Kies hierboven SCM, Panorama of standalone en sla op. Policy Forge haalt daarna automatisch de actuele zones op.</div>{% elif not profile_zone_error %}<div class="callout"><strong>Nog geen zones gevonden</strong><br>Sla de verbinding op of haal de zones opnieuw op.</div>{% endif %}
+<div class="zone-mapping-heading"><label>Security Profile Group uit source</label></div>
+<select name="profile_group">
+<option value="">Geen profielgroep</option>
+{% set selected_profile_group = ep.profile_group if ep else '' %}
+{% if selected_profile_group and selected_profile_group not in profile_group_options %}<option value="{{selected_profile_group}}" selected>{{selected_profile_group}} (niet meer gevonden)</option>{% endif %}
+{% for name in profile_group_options %}<option value="{{name}}" {{'selected' if name==selected_profile_group}}>{{name}}</option>{% endfor %}
+</select>
+{% if profile_group_error %}<small class="help">Profielgroepen konden niet worden opgehaald: {{profile_group_error}}</small>{% else %}<small class="help">Deze keuzelijst komt live uit de source-config. Leeg pusht regels zonder Security Profile Group.</small>{% endif %}
 </div>
 <div class="field">
 <label>Minimale sessies</label>

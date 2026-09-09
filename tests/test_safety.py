@@ -27,9 +27,26 @@ from vendor.bdnd_panos_policy_builder import (
     movable_anchor_map,
     rule_move_destination,
     security_rule_covers,
+    add_member_list,
 )
 
 class SafetyTests(unittest.TestCase):
+    def test_generated_member_lists_are_deduplicated(self):
+        parent = ET.Element("static")
+        add_member_list(parent, ["one", "two", "one", "three", "two"])
+        self.assertEqual([node.text for node in parent.findall("member")], ["one", "two", "three"])
+
+    def test_generated_profile_group_is_selected_or_omitted(self):
+        app_text = (ROOT / "app/main.py").read_text()
+        template = (ROOT / "app/templates/app.html").read_text()
+        builder_text = (ROOT / "vendor/bdnd_panos_policy_builder.py").read_text()
+        self.assertIn('"profile_group": request.form.get("profile_group", "").strip()', app_text)
+        self.assertIn("s.get('profile_group','')", app_text)
+        self.assertIn('name="profile_group"', template)
+        self.assertIn("Geen profielgroep", template)
+        self.assertIn('default_profile = ""', builder_text)
+        self.assertIn("if profile_group:", builder_text)
+
     def test_scm_deploy_is_explicitly_device_scoped(self):
         text=(ROOT/"vendor/bdnd_panos_policy_builder.py").read_text()
         self.assertIn('config-versions/candidate:push', text)

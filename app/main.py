@@ -4649,6 +4649,8 @@ def index():
                 flows = conn.execute(f"SELECT * FROM flows WHERE serial IN ({placeholders}) ORDER BY last_seen DESC LIMIT 100", serials).fetchall()
     profile_zone_rows = []
     profile_zone_error = ""
+    profile_group_options = []
+    profile_group_error = ""
     if editing_profile:
         mapped_zones = dict(editing_profile.get("zones", {}))
         live_zone_names = []
@@ -4676,6 +4678,20 @@ def index():
             for name, role in mapped_zones.items()
             if name not in live_zone_set
         )
+        if profile_has_target(editing_profile):
+            try:
+                live_profile_groups = cached_live_items(
+                    editing_profile,
+                    "profile-security-profile-groups",
+                    lambda: fetch_scm_objects(editing_profile, "security-profile-groups"),
+                    force=request.args.get("refresh_zones") == "1",
+                )
+                profile_group_options = sorted(
+                    {str(item.get("name", "")).strip() for item in live_profile_groups if str(item.get("name", "")).strip()},
+                    key=str.casefold,
+                )
+            except Exception as exc:
+                profile_group_error = str(exc)
     configured_profiles = [profile for profile in profiles if profile["configured"]]
     policy_profile = None; policies = []; policy_error = ""; policy_objects = []; object_catalog = []; policy_catalog = []; policy_workspaces = []; live_application_state = {}; scm_config_records = []; object_create_template = None
     policy_source = request.args.get("policy_source", "").strip()
@@ -4747,7 +4763,7 @@ def index():
                             fetch_object_catalog(policy_profile, "policy-picker"), policies
                         )
                 except Exception as exc: policy_error = str(exc)
-    return render_template("app.html", profiles=profiles, configured_profiles=configured_profiles, editing_profile=editing_profile, profile_zone_rows=profile_zone_rows, profile_zone_error=profile_zone_error, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, object_create_template=object_create_template, policy_catalog=policy_catalog, live_application_state=live_application_state, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, config_section=config_section, scm_configuration_sections=SCM_CONFIGURATION_SECTIONS, config_records=scm_config_records, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats(), certificate=certificate_summary(CERT_DIR / "tls.crt", APPLIANCE_CONFIG), application_catalog_settings=application_catalog_configuration())
+    return render_template("app.html", profiles=profiles, configured_profiles=configured_profiles, editing_profile=editing_profile, profile_zone_rows=profile_zone_rows, profile_zone_error=profile_zone_error, profile_group_options=profile_group_options, profile_group_error=profile_group_error, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, object_create_template=object_create_template, policy_catalog=policy_catalog, live_application_state=live_application_state, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, config_section=config_section, scm_configuration_sections=SCM_CONFIGURATION_SECTIONS, config_records=scm_config_records, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats(), certificate=certificate_summary(CERT_DIR / "tls.crt", APPLIANCE_CONFIG), application_catalog_settings=application_catalog_configuration())
 
 
 @app.get("/migration")
@@ -6619,6 +6635,7 @@ def profile_save():
             "device": request.form.get("device", "").strip(),
             "object_folder": request.form.get("object_folder", "").strip(),
             "log_profile": request.form.get("log_profile", "").strip(),
+            "profile_group": request.form.get("profile_group", "").strip(),
             "passive_serial": passive_serial,
             "passive_source_ip": optional_ip_address(request.form.get("passive_source_ip", "")),
         }
@@ -6723,7 +6740,7 @@ def write_config(profile, run_dir: Path, push: bool, disabled_override: bool | N
         "[panorama]", f"panorama_template = {toml_string(s.get('device_group',''))}", f"panorama_rulebase = {toml_string(s.get('rulebase','pre'))}", f"panorama_log_setting = {toml_string(s.get('log_profile',''))}", "",
         "[panos]", f"panos_vsys = {toml_string(s.get('vsys','vsys1'))}", f"panos_log_setting = {toml_string(s.get('log_profile',''))}", f"panos_endpoint = {toml_string(s.get('endpoint',''))}", 'panos_username = ""', 'panos_password = ""', f"panos_auto_push = {'true' if push else 'false'}", "",
         "[scm]", 'scm_client_id = ""', 'scm_client_secret = ""', 'scm_tsg_id = ""', 'scm_token_url = "https://auth.apps.paloaltonetworks.com/oauth2/access_token"', 'scm_api_base = "https://api.strata.paloaltonetworks.com/config/security/v1"', f"scm_folder = {toml_string(s.get('folder',''))}", f"scm_snippet = {toml_string(s.get('snippet',''))}", f"scm_device = {toml_string(s.get('device',''))}", f"scm_object_folder = {toml_string(s.get('object_folder') or s.get('folder',''))}", f"scm_rulebase = {toml_string(s.get('rulebase','pre'))}", f"scm_log_forwarding_profile = {toml_string(s.get('log_profile',''))}", "",
-        "[profile_groups]", 'client = "best-practice"', 'server = "best-practice"', 'internet = "best-practice"', 'other = "best-practice"', "", "[zone_roles]",
+        "[profile_groups]", f"client = {toml_string(s.get('profile_group',''))}", f"server = {toml_string(s.get('profile_group',''))}", f"internet = {toml_string(s.get('profile_group',''))}", f"other = {toml_string(s.get('profile_group',''))}", "", "[zone_roles]",
     ]
     lines += [f"{toml_string(k)} = {toml_string(v)}" for k, v in s["zones"].items()]
     (run_dir / "bdnd_panos_zone_roles.toml").write_text("\n".join(lines) + "\n")
