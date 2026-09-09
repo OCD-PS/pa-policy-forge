@@ -211,7 +211,17 @@ class FlowStore:
         self.init_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
+        class ClosingSQLiteConnection(sqlite3.Connection):
+            def __exit__(self, exc_type, exc_value, traceback):
+                try:
+                    return super().__exit__(exc_type, exc_value, traceback)
+                finally:
+                    self.close()
+
+        conn = sqlite3.connect(
+            self.db_path, timeout=30, isolation_level=None,
+            factory=ClosingSQLiteConnection,
+        )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")

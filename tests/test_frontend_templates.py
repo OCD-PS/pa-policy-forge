@@ -55,6 +55,13 @@ class FrontendTemplateTests(unittest.TestCase):
         self.assertIn("Flow voor {{ep.name}}", source)
         self.assertNotIn("Selecteer een target", source)
 
+    def test_running_policy_page_auto_refreshes_and_explains_background_work(self):
+        source = self.environment().loader.get_source(self.environment(), "run.html")[0]
+        self.assertIn('run.status==\'running\'', source)
+        self.assertIn('http-equiv="refresh"', source)
+        self.assertIn("gatewayverbinding hoeft niet te blijven wachten", source)
+        self.assertIn("SCM-candidate geschreven en de deployment is uitgevoerd", source)
+
     def test_migration_review_and_step_links_have_real_targets(self):
         html = self.environment().get_template("migration.html").render(**self.migration_context())
         links = Links(); links.feed(html)

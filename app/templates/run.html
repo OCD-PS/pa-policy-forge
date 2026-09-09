@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+{% if run.status=='running' %}<meta http-equiv="refresh" content="3">{% endif %}
 <title>Run #{{run.id}} · PA Policy Forge</title>
 <link rel="stylesheet" href="{{url_for('static',filename='app.css',v=asset_version)}}">
 </head>
@@ -29,6 +30,17 @@
 {% endif %}
 </div>
 </div>
+{% if run.status=='running' %}
+<div class="callout" style="margin-top:22px"><strong>Policy-run bezig</strong><br>Deze pagina vernieuwt automatisch. Je mag ze veilig openlaten; de gatewayverbinding hoeft niet te blijven wachten.</div>
+{% elif run.status=='complete' and run.mode=='preview' %}
+<div class="callout" style="margin-top:22px"><strong>Preview voltooid</strong><br>{{run.rule_count}} regels gegenereerd. Er is niets naar het target geschreven.</div>
+{% elif run.status=='complete' and run.mode=='push' and run.target_type=='scm' %}
+<div class="callout" style="margin-top:22px"><strong>Push voltooid</strong><br>{{run.rule_count}} regels zijn naar de SCM-candidate geschreven en de deployment is uitgevoerd.</div>
+{% elif run.status=='complete' and run.mode=='push' %}
+<div class="callout" style="margin-top:22px"><strong>Candidate geschreven</strong><br>{{run.rule_count}} regels zijn naar de candidateconfiguratie geschreven; er is geen commit uitgevoerd.</div>
+{% elif run.status=='failed' %}
+<div class="callout" style="margin-top:22px"><strong>Run mislukt</strong><br>Bekijk de uitvoer hieronder voor de foutmelding.</div>
+{% endif %}
 {% if monitor %}
 <div class="card" style="margin-top:22px">
 <div class="card-header"><div><h2>Post-deployment controle</h2><p class="muted">{% if monitor.activation_status=='pending' %}Candidate geschreven {{monitor.candidate_at}} · wacht tot de regels in de running config staan{% else %}Baseline {{monitor.deployed_at}} · automatische controle na 1 uur en 24 uur{% endif %}</p></div></div>

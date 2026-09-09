@@ -41,6 +41,69 @@ class TargetAdapterTests(unittest.TestCase):
         defaults.update(settings)
         return {"target_type": target, "settings_json": json.dumps(defaults), "secret_blob": b""}
 
+    def test_database_context_closes_connection(self):
+        connection = main.db()
+        with connection as active:
+            self.assertEqual(active.execute("SELECT 1").fetchone()[0], 1)
+        with self.assertRaises(main.sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+
+        flow_connection = main.flow_store._connect()
+        with flow_connection as active:
+            self.assertEqual(active.execute("SELECT 1").fetchone()[0], 1)
+        with self.assertRaises(main.sqlite3.ProgrammingError):
+            flow_connection.execute("SELECT 1")
+
+    def test_manual_build_returns_immediately_and_reserves_one_run(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("async-build-test", 1, "SERIAL-ASYNC", "192.0.2.10", "panos", "{}", b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+        started = []
+
+        class DeferredThread:
+            def __init__(self, *, target, args, daemon, name):
+                self.target, self.args, self.daemon, self.name = target, args, daemon, name
+
+            def start(self):
+                started.append(self)
+
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1; login["username"] = "test"; login["must_change"] = False; login["csrf"] = "build-csrf"
+        run_dir = None
+        try:
+            with patch.object(main.threading, "Thread", DeferredThread):
+                response = client.post(
+                    f"/profiles/{profile_id}/build",
+                    data={"csrf": "build-csrf", "mode": "preview"},
+                    base_url="https://forge.test",
+                )
+            self.assertEqual(response.status_code, 302)
+            self.assertEqual(len(started), 1)
+            with main.db() as conn:
+                run = conn.execute("SELECT * FROM runs WHERE profile_id=?", (profile_id,)).fetchone()
+            self.assertEqual(run["status"], "running")
+            self.assertTrue(response.headers["Location"].endswith(f"/runs/{run['id']}"))
+            run_dir = pathlib.Path(run["run_dir"])
+
+            duplicate_id, duplicate_dir, created = main.reserve_manual_run(
+                {"id": profile_id}, "preview"
+            )
+            self.assertEqual(duplicate_id, run["id"])
+            self.assertIsNone(duplicate_dir)
+            self.assertFalse(created)
+        finally:
+            if run_dir:
+                import shutil
+                shutil.rmtree(run_dir, ignore_errors=True)
+            with main.db() as conn:
+                conn.execute("DELETE FROM runs WHERE profile_id=?", (profile_id,))
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
     def test_log_forwarding_payload_has_panos_fields_and_reference_guards(self):
         matches = [{
             "name": "traffic", "action_desc": "All traffic", "log_type": "traffic",

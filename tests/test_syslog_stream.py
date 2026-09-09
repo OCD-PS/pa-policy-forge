@@ -1,8 +1,10 @@
 import socket
+import threading
+import time
 
 import pytest
 
-from vendor.syslog_stream import SyslogFrameError, iter_syslog_frames
+from vendor.syslog_stream import SyslogFrameError, iter_syslog_frames, udp_server
 
 
 class ChunkSocket:
@@ -47,3 +49,30 @@ def test_socket_timeout_is_not_swallowed_by_framer():
 
     with pytest.raises(socket.timeout):
         list(iter_syslog_frames(TimeoutSocket(), max_message_bytes=64))
+
+
+def test_udp_server_bounds_concurrent_handlers():
+    entered = threading.Event()
+    release = threading.Event()
+    received = []
+
+    def callback(payload, _source):
+        received.append(payload)
+        entered.set()
+        release.wait(1)
+
+    server = udp_server(("127.0.0.1", 0), callback, max_workers=1)
+    serving = threading.Thread(target=server.serve_forever, daemon=True)
+    serving.start()
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        client.sendto(b"first", server.server_address)
+        assert entered.wait(1)
+        client.sendto(b"dropped-while-busy", server.server_address)
+        time.sleep(0.1)
+        assert received == [b"first"]
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        client.close()

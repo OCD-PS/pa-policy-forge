@@ -14,6 +14,7 @@ services:
       PPF_SYSLOG_MAX_MESSAGE_BYTES: "1048576"
       PPF_SYSLOG_TCP_TIMEOUT: "30"
       PPF_SYSLOG_TCP_MAX_CONNECTIONS: "64"
+      PPF_SYSLOG_UDP_MAX_WORKERS: "32"
       PPF_MAX_GIB: "50"
       PPF_BOOTSTRAP_PASSWORD: ${PPF_BOOTSTRAP_PASSWORD:-admin}
       PPF_TRUSTED_HOSTS: ${PPF_TRUSTED_HOSTS:-}
@@ -31,6 +32,10 @@ services:
       start_period: 20s
     security_opt:
       - no-new-privileges:true
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
     cap_drop:
       - ALL
     read_only: true

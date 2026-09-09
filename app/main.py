@@ -14,7 +14,6 @@ from pathlib import Path
 import secrets
 import shutil
 import signal
-import socketserver
 import sqlite3
 import ssl
 import subprocess
@@ -43,7 +42,7 @@ from app.certificates import (
     read_upload,
 )
 from vendor.paloalto_light_syslog import FlowStore, env_int, parse_panos_syslog
-from vendor.syslog_stream import tcp_server
+from vendor.syslog_stream import tcp_server, udp_server
 from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_single_replacements
 from app.workspace_access import (
     initialize_workspace_access, inherit_workspace_access, link_workspace_project,
@@ -327,8 +326,18 @@ def public_ui_record(value):
 app.jinja_env.filters["public_ui_record"] = public_ui_record
 
 
+class ClosingSQLiteConnection(sqlite3.Connection):
+    """Keep commit/rollback context semantics and always release the descriptor."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(APP_DB, timeout=30)
+    conn = sqlite3.connect(APP_DB, timeout=30, factory=ClosingSQLiteConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -505,6 +514,11 @@ def init_db() -> None:
                 raise RuntimeError("Set PPF_BOOTSTRAP_PASSWORD to admin or a unique value of at least 12 characters")
             conn.execute("INSERT INTO users(username,password_hash,must_change) VALUES(?,?,0)",
                          ("admin", password_hash(bootstrap_password)))
+        conn.execute(
+            "UPDATE runs SET status='failed',finished_at=strftime('%Y-%m-%d %H:%M:%S','now'),"
+            "output=CASE WHEN output='' THEN 'Run onderbroken door een applicatieherstart.' ELSE output END "
+            "WHERE status='running'"
+        )
 
 
 init_db()
@@ -561,10 +575,10 @@ def migration_target_profile(conn, choice: str):
     return profile
 
 
-def audit(action: str, detail: str = "") -> None:
+def audit(action: str, detail: str = "", username: str | None = None) -> None:
     with db() as conn:
         conn.execute("INSERT INTO audit(created_at,username,action,detail) VALUES(?,?,?,?)",
-                     (now(), session.get("username", "system") if has_request_context() else "system", action, detail[:1000]))
+                     (now(), username or (session.get("username", "system") if has_request_context() else "system"), action, detail[:1000]))
 
 
 def csrf() -> str:
@@ -7367,13 +7381,52 @@ def post_deploy_monitor_loop() -> None:
         time.sleep(300)
 
 
-def execute_run(profile, mode: str, disabled_override: bool | None = None, prepared=None) -> int:
-    push = mode == "push"
+def create_run(profile, mode: str) -> tuple[int, Path]:
     run_dir = RUNS / (datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{profile['id']}-{secrets.token_hex(3)}")
     run_dir.mkdir(mode=0o700)
     with db() as conn:
-        cur = conn.execute("INSERT INTO runs(profile_id,mode,status,started_at,run_dir) VALUES(?,?,?,?,?)", (profile["id"], mode, "running", now(), str(run_dir)))
-        run_id = cur.lastrowid
+        cur = conn.execute(
+            "INSERT INTO runs(profile_id,mode,status,started_at,run_dir) VALUES(?,?,?,?,?)",
+            (profile["id"], mode, "running", now(), str(run_dir)),
+        )
+        return int(cur.lastrowid), run_dir
+
+
+def reserve_manual_run(profile, mode: str) -> tuple[int, Path | None, bool]:
+    """Atomically reserve a user run, or return its already-running predecessor."""
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        active = conn.execute(
+            "SELECT id FROM runs WHERE profile_id=? AND mode IN ('preview','push') "
+            "AND status='running' ORDER BY id DESC LIMIT 1",
+            (profile["id"],),
+        ).fetchone()
+        if active:
+            return int(active["id"]), None, False
+        run_dir = RUNS / (datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{profile['id']}-{secrets.token_hex(3)}")
+        cur = conn.execute(
+            "INSERT INTO runs(profile_id,mode,status,started_at,run_dir) VALUES(?,?,?,?,?)",
+            (profile["id"], mode, "running", now(), str(run_dir)),
+        )
+        run_id = int(cur.lastrowid)
+    try:
+        run_dir.mkdir(mode=0o700)
+    except Exception as exc:
+        with db() as conn:
+            conn.execute(
+                "UPDATE runs SET status='failed',finished_at=?,output=? WHERE id=?",
+                (now(), str(exc)[-12000:], run_id),
+            )
+        raise
+    return run_id, run_dir, True
+
+
+def execute_run(
+    profile, mode: str, disabled_override: bool | None = None, prepared=None,
+    *, reserved_run: tuple[int, Path] | None = None, username: str | None = None,
+) -> int:
+    push = mode == "push"
+    run_id, run_dir = reserved_run or create_run(profile, mode)
     try:
         profile_fingerprint = build_fingerprint(profile, include_flows=False)
         flow_fingerprint = build_fingerprint(profile, include_flows=True)
@@ -7413,14 +7466,14 @@ def execute_run(profile, mode: str, disabled_override: bool | None = None, prepa
             try:
                 removed = prune_successful_run_history(profile["id"])
                 if removed:
-                    audit("policy-run-retention", f"profile={profile['name']} removed={removed} kept=5")
+                    audit("policy-run-retention", f"profile={profile['name']} removed={removed} kept=5", username)
             except Exception:
                 app.logger.exception("policy-run retention cleanup failed for profile %s", profile["id"])
-        audit("policy-prepared" if mode == "prepared" else "candidate-written" if push else "policy-preview", f"profile={profile['name']} run={run_id} rules={rules} reused={bool(prepared)} disabled={disabled_override if push else 'profile-default'}")
+        audit("policy-prepared" if mode == "prepared" else "candidate-written" if push else "policy-preview", f"profile={profile['name']} run={run_id} rules={rules} reused={bool(prepared)} disabled={disabled_override if push else 'profile-default'}", username)
         return run_id
     except Exception as exc:
         with db() as conn: conn.execute("UPDATE runs SET status='failed',finished_at=?,output=? WHERE id=?", (now(), str(exc)[-12000:], run_id))
-        audit("build-failed", f"profile={profile['name']} run={run_id} mode={mode}")
+        audit("build-failed", f"profile={profile['name']} run={run_id} mode={mode}", username)
         if mode != "prepared": raise
         return run_id
 
@@ -7441,6 +7494,16 @@ def fresh_prepared_run(profile):
     return None
 
 
+def execute_run_background(profile, mode, disabled_override, prepared, run_id, run_dir, username):
+    try:
+        execute_run(
+            profile, mode, disabled_override, prepared,
+            reserved_run=(run_id, run_dir), username=username,
+        )
+    except Exception:
+        app.logger.exception("policy run %s failed", run_id)
+
+
 @app.post("/profiles/<int:profile_id>/build")
 @login_required
 def build(profile_id):
@@ -7450,16 +7513,25 @@ def build(profile_id):
         disabled_override = request.form["disabled_override"] == "true"
     with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
     if not profile: return "Not found", 404
+    mode = "push" if push else "preview"
+    prepared = fresh_prepared_run(profile) if push else None
     try:
-        prepared = fresh_prepared_run(profile) if push else None
-        run_id = execute_run(profile, "push" if push else "preview", disabled_override, prepared)
-        with db() as conn: completed = conn.execute("SELECT rule_count FROM runs WHERE id=?", (run_id,)).fetchone()
-        suffix = " Voorbereide berekening hergebruikt." if prepared else ""
-        flash(("Candidateconfiguratie geschreven; geen commit/deployment uitgevoerd." if push else "Policy-preview gegenereerd.") + f" {completed['rule_count']} regels.{suffix}", "success")
+        run_id, run_dir, created = reserve_manual_run(profile, mode)
     except Exception as exc:
-        flash(f"Run mislukt: {exc}", "error")
-        with db() as conn: failed = conn.execute("SELECT id FROM runs WHERE profile_id=? ORDER BY id DESC LIMIT 1", (profile_id,)).fetchone()
-        run_id = failed["id"] if failed else 0
+        flash(f"Run kon niet worden gestart: {exc}", "error")
+        return redirect(url_for("index", edit_profile=profile_id))
+    if not created:
+        flash(f"Er loopt al een policy-run voor dit device (run #{run_id}).", "warning")
+        return redirect(url_for("run_detail", run_id=run_id))
+    username = session.get("username", "system")
+    threading.Thread(
+        target=execute_run_background,
+        args=(profile, mode, disabled_override, prepared, run_id, run_dir, username),
+        daemon=True,
+        name=f"policy-run-{run_id}",
+    ).start()
+    suffix = " De voorbereide berekening wordt hergebruikt." if prepared else ""
+    flash(f"{'Push' if push else 'Policy-preview'} gestart als run #{run_id}.{suffix}", "success")
     return redirect(url_for("run_detail", run_id=run_id))
 
 
@@ -7535,7 +7607,7 @@ def application_catalog_loop():
 @login_required
 def run_detail(run_id):
     with db() as conn:
-        run = conn.execute("SELECT runs.*,profiles.name profile_name FROM runs JOIN profiles ON profiles.id=runs.profile_id WHERE runs.id=?", (run_id,)).fetchone()
+        run = conn.execute("SELECT runs.*,profiles.name profile_name,profiles.target_type FROM runs JOIN profiles ON profiles.id=runs.profile_id WHERE runs.id=?", (run_id,)).fetchone()
         monitor_row = conn.execute("SELECT * FROM post_deploy_monitors WHERE run_id=?", (run_id,)).fetchone()
     if not run: return "Not found", 404
     review=[]; path=Path(run["run_dir"])/"review.csv"
@@ -7622,10 +7694,12 @@ def ingest_syslog(payload: bytes, source: str) -> None:
 
 
 def udp_loop():
-    class Handler(socketserver.BaseRequestHandler):
-        def handle(self):
-            ingest_syslog(self.request[0], self.client_address[0])
-    server=socketserver.ThreadingUDPServer(("0.0.0.0", int(os.getenv("PPF_SYSLOG_PORT","514"))),Handler); server.daemon_threads=True; server.serve_forever()
+    server = udp_server(
+        ("0.0.0.0", int(os.getenv("PPF_SYSLOG_PORT", "514"))),
+        ingest_syslog,
+        max_workers=env_int("PPF_SYSLOG_UDP_MAX_WORKERS", 32),
+    )
+    server.serve_forever()
 
 
 def tcp_loop():
