@@ -4431,6 +4431,11 @@ def config_workspace_pull(profile_id):
         profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
     if not profile or profile["target_type"] not in {"panorama", "panos"}:
         return "Not found", 404
+    error_redirect = (
+        url_for("index", run_profile=profile_id) + "#runs"
+        if request.form.get("return_to") == "runs"
+        else url_for("index", policy_profile=profile_id) + "#policy-management"
+    )
     try:
         _, endpoint, key, ctx = panos_profile_context(profile)
         root = policy_api.require_success(
@@ -4453,7 +4458,7 @@ def config_workspace_pull(profile_id):
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
     except Exception as exc:
         flash(f"Volledige configuratie niet opgehaald: {exc}", "error")
-        return redirect(url_for("index", policy_profile=profile_id) + "#policy-management")
+        return redirect(error_redirect)
 
 
 @app.get("/config-workspaces/<int:workspace_id>/export/<kind>")
@@ -7572,9 +7577,14 @@ def execute_run(
         output = (result.stdout + "\n" + result.stderr)[-12000:]
         if result.returncode: raise RuntimeError(output)
         with (run_dir / "review.csv").open(newline="") as fh: rules = sum(1 for _ in csv.DictReader(fh))
+        artifact_hashes = {
+            name: hashlib.sha256((run_dir / name).read_bytes()).hexdigest()
+            for name in ("flows.csv", "policy.xml", "review.csv")
+        }
         (run_dir / "fingerprint").write_text(json.dumps({
             "profile": profile_fingerprint,
             "flows": flow_fingerprint,
+            "artifacts": artifact_hashes,
             "prepared_at": int(time.time()),
         }))
         with db() as conn: conn.execute("UPDATE runs SET status='complete',finished_at=?,rule_count=?,output=? WHERE id=?", (now(), rules, output, run_id))
@@ -7612,6 +7622,48 @@ def fresh_prepared_run(profile):
     return None
 
 
+def reviewed_preview_for_push(run_id: int):
+    """Return the exact reviewed preview and its unchanged target profile."""
+    with db() as conn:
+        run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        profile = conn.execute("SELECT * FROM profiles WHERE id=?", (run["profile_id"],)).fetchone() if run else None
+    if not run or not profile:
+        raise ValueError("De gekozen policy-run bestaat niet meer.")
+    if run["mode"] != "preview" or run["status"] != "complete":
+        raise ValueError("Alleen een voltooide preview kan via API worden gepusht.")
+
+    runs_root = RUNS.resolve()
+    run_dir = Path(run["run_dir"]).resolve()
+    try:
+        run_dir.relative_to(runs_root)
+    except ValueError as exc:
+        raise ValueError("De preview heeft een ongeldig artifactpad.") from exc
+    if run_dir == runs_root or not run_dir.is_dir():
+        raise ValueError("De preview-artifacts zijn niet meer beschikbaar.")
+    required = ("flows.csv", "policy.xml", "review.csv", "fingerprint")
+    missing = [name for name in required if not (run_dir / name).is_file()]
+    if missing:
+        raise ValueError("De preview is onvolledig: " + ", ".join(missing))
+    try:
+        metadata = json.loads((run_dir / "fingerprint").read_text())
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("De preview-fingerprint is ongeldig.") from exc
+    if not hmac.compare_digest(str(metadata.get("profile", "")), build_fingerprint(profile, include_flows=False)):
+        raise ValueError("Het device, target of de policy-instellingen zijn gewijzigd. Maak eerst een nieuwe check.")
+    expected_hashes = metadata.get("artifacts")
+    if not isinstance(expected_hashes, dict):
+        raise ValueError("Deze oudere preview heeft nog geen artifactcontrole. Maak eerst een nieuwe check.")
+    for name in required[:3]:
+        actual = hashlib.sha256((run_dir / name).read_bytes()).hexdigest()
+        if not hmac.compare_digest(str(expected_hashes.get(name, "")), actual):
+            raise ValueError(f"Preview-artifact {name} is gewijzigd. Maak eerst een nieuwe check.")
+    with (run_dir / "review.csv").open(newline="") as handle:
+        review_rows = [row for row in csv.DictReader(handle) if row.get("preflight_status") != "duplicate-match-skip"]
+    if not review_rows or any(not row.get("name", "").strip() or not row.get("anchor_rule", "").strip() for row in review_rows):
+        raise ValueError("Niet elke gegenereerde regel heeft één bronregel voor positionering. API-push is geblokkeerd.")
+    return run, profile
+
+
 def execute_run_background(profile, mode, disabled_override, prepared, run_id, run_dir, username):
     try:
         execute_run(
@@ -7620,6 +7672,47 @@ def execute_run_background(profile, mode, disabled_override, prepared, run_id, r
         )
     except Exception:
         app.logger.exception("policy run %s failed", run_id)
+
+
+def policy_run_failure_details(output: str) -> dict[str, str | bool]:
+    text = str(output or "")
+    missing = re.search(
+        r"Cannot position generated policy (.+?): source policy (.+?) matched 0 rules",
+        text,
+    )
+    if missing:
+        generated = missing.group(1).strip().strip("'\"")
+        anchor = missing.group(2).strip().strip("'\"")
+        return {
+            "title": "Check geblokkeerd: bronregel ontbreekt",
+            "message": (
+                f"De opgeslagen logs voor {generated} verwijzen naar bronregel {anchor}, maar die bestaat niet "
+                "meer in de gekozen rulebase. Controleer of de regel werd verwijderd of hernoemd en of het "
+                "juiste target, VSYS of device group is gekozen. Zet de bronregel terug, of purge de oude flows "
+                "en verzamel nieuwe logs voordat je opnieuw controleert. Er is niets naar het target geschreven."
+            ),
+            "anchor_missing": True,
+        }
+    ambiguous = re.search(
+        r"Cannot position generated policy (.+?): source policy (.+?) matched (\d+) rules",
+        text,
+    )
+    if ambiguous:
+        anchor = ambiguous.group(2).strip().strip("'\"")
+        return {
+            "title": "Check geblokkeerd: bronregel is niet uniek",
+            "message": (
+                f"Bronregel {anchor} komt {ambiguous.group(3)} keer voor in de gekozen rulebase. "
+                "Maak de naam uniek of selecteer het juiste target en voer daarna een nieuwe check uit. "
+                "Er is niets naar het target geschreven."
+            ),
+            "anchor_missing": False,
+        }
+    return {
+        "title": "Run mislukt",
+        "message": "De run kon niet veilig worden afgerond. Bekijk de technische details of voer een nieuwe check uit.",
+        "anchor_missing": False,
+    }
 
 
 @app.post("/profiles/<int:profile_id>/build")
@@ -7631,6 +7724,9 @@ def build(profile_id):
         disabled_override = request.form["disabled_override"] == "true"
     with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
     if not profile: return "Not found", 404
+    if push:
+        flash("Open eerst een voltooide preview en gebruik daar de API-push. Zo wordt exact de nagekeken run gebruikt.", "warning")
+        return redirect(url_for("index", run_profile=profile_id) + "#runs")
     mode = "push" if push else "preview"
     prepared = fresh_prepared_run(profile) if push else None
     try:
@@ -7651,6 +7747,40 @@ def build(profile_id):
     suffix = " De voorbereide berekening wordt hergebruikt." if prepared else ""
     flash(f"{'Push' if push else 'Policy-preview'} gestart als run #{run_id}.{suffix}", "success")
     return redirect(url_for("run_detail", run_id=run_id))
+
+
+@app.post("/runs/<int:run_id>/push")
+@login_required
+def run_push(run_id):
+    try:
+        prepared, profile = reviewed_preview_for_push(run_id)
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("run_detail", run_id=run_id))
+    disabled_override = None
+    if request.form.get("disabled_override") in {"true", "false"}:
+        disabled_override = request.form["disabled_override"] == "true"
+    try:
+        push_run_id, run_dir, created = reserve_manual_run(profile, "push")
+    except Exception as exc:
+        flash(f"API-push kon niet worden gestart: {exc}", "error")
+        return redirect(url_for("run_detail", run_id=run_id))
+    if not created:
+        flash(f"Er loopt al een policy-run voor dit device (run #{push_run_id}).", "warning")
+        return redirect(url_for("run_detail", run_id=push_run_id))
+    username = session.get("username", "system")
+    threading.Thread(
+        target=execute_run_background,
+        args=(profile, "push", disabled_override, prepared, push_run_id, run_dir, username),
+        daemon=True,
+        name=f"policy-run-{push_run_id}",
+    ).start()
+    if profile["target_type"] == "scm":
+        message = f"API-push en SCM-deployment gestart als run #{push_run_id}, exact vanuit preview #{run_id}."
+    else:
+        message = f"API-push naar de candidate gestart als run #{push_run_id}, exact vanuit preview #{run_id}; er volgt geen commit."
+    flash(message, "success")
+    return redirect(url_for("run_detail", run_id=push_run_id))
 
 
 def prepare_loop():
@@ -7731,12 +7861,29 @@ def run_detail(run_id):
     review=[]; path=Path(run["run_dir"])/"review.csv"
     if path.exists():
         with path.open(newline="") as fh: review=list(csv.DictReader(fh))
+    positioned_review = [row for row in review if row.get("preflight_status") != "duplicate-match-skip"]
+    anchors = sorted({row.get("anchor_rule", "").strip() for row in positioned_review if row.get("anchor_rule", "").strip()})
+    pushable_preview = bool(positioned_review) and all(
+        row.get("name", "").strip() and row.get("anchor_rule", "").strip() for row in positioned_review
+    )
+    push_block_reason = ""
+    if run["mode"] == "preview" and run["status"] == "complete":
+        try:
+            reviewed_preview_for_push(run_id)
+        except ValueError as exc:
+            pushable_preview = False
+            push_block_reason = str(exc)
     monitor = None
     if monitor_row:
         monitor = dict(monitor_row)
         monitor["one_hour"] = json.loads(monitor["one_hour_json"]) if monitor["one_hour_json"] else None
         monitor["one_day"] = json.loads(monitor["one_day_json"]) if monitor["one_day_json"] else None
-    return render_template("run.html", run=run, review=review, monitor=monitor)
+    run_error = policy_run_failure_details(run["output"]) if run["status"] == "failed" else None
+    return render_template(
+        "run.html", run=run, review=review, monitor=monitor, anchors=anchors,
+        pushable_preview=pushable_preview, push_block_reason=push_block_reason,
+        run_error=run_error,
+    )
 
 
 @app.post("/runs/<int:run_id>/delete")

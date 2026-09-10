@@ -104,6 +104,185 @@ class TargetAdapterTests(unittest.TestCase):
                 conn.execute("DELETE FROM runs WHERE profile_id=?", (profile_id,))
                 conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
 
+    def test_run_push_reuses_the_exact_opened_preview(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("reviewed-preview-test", 1, "SERIAL-REVIEW", "192.0.2.11", "panorama", "{}", b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        preview_dir = pathlib.Path(tempfile.mkdtemp(prefix="reviewed-preview-", dir=main.RUNS))
+        (preview_dir / "flows.csv").write_text("serial,rule\nSERIAL-REVIEW,Discovery\n")
+        (preview_dir / "policy.xml").write_text("<config/>")
+        (preview_dir / "review.csv").write_text("name,anchor_rule\ngenerated,Discovery\n")
+        artifact_hashes = {
+            name: main.hashlib.sha256((preview_dir / name).read_bytes()).hexdigest()
+            for name in ("flows.csv", "policy.xml", "review.csv")
+        }
+        (preview_dir / "fingerprint").write_text(json.dumps({
+            "profile": main.build_fingerprint(profile, include_flows=False),
+            "flows": "reviewed-flow-state",
+            "artifacts": artifact_hashes,
+            "prepared_at": int(time.time()),
+        }))
+        with main.db() as conn:
+            preview_id = conn.execute(
+                "INSERT INTO runs(profile_id,mode,status,started_at,finished_at,rule_count,run_dir) VALUES(?,?,?,?,?,?,?)",
+                (profile_id, "preview", "complete", timestamp, timestamp, 1, str(preview_dir)),
+            ).lastrowid
+        started = []
+
+        class DeferredThread:
+            def __init__(self, *, target, args, daemon, name):
+                self.target, self.args, self.daemon, self.name = target, args, daemon, name
+
+            def start(self):
+                started.append(self)
+
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1; login["username"] = "test"; login["must_change"] = False; login["csrf"] = "push-csrf"
+        created_dirs = [preview_dir]
+        try:
+            with patch.object(main.threading, "Thread", DeferredThread):
+                response = client.post(
+                    f"/runs/{preview_id}/push", data={"csrf": "push-csrf"}, base_url="https://forge.test",
+                )
+            self.assertEqual(response.status_code, 302)
+            self.assertEqual(len(started), 1)
+            self.assertEqual(started[0].args[3]["id"], preview_id)
+            with main.db() as conn:
+                push_run = conn.execute(
+                    "SELECT * FROM runs WHERE profile_id=? AND mode='push'", (profile_id,),
+                ).fetchone()
+            self.assertIsNotNone(push_run)
+            self.assertTrue(response.headers["Location"].endswith(f"/runs/{push_run['id']}"))
+            created_dirs.append(pathlib.Path(push_run["run_dir"]))
+            (preview_dir / "policy.xml").write_text("<config><tampered/></config>")
+            with self.assertRaisesRegex(ValueError, "policy.xml is gewijzigd"):
+                main.reviewed_preview_for_push(preview_id)
+        finally:
+            import shutil
+            for path in created_dirs:
+                shutil.rmtree(path, ignore_errors=True)
+            with main.db() as conn:
+                conn.execute("DELETE FROM runs WHERE profile_id=?", (profile_id,))
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
+    def test_run_push_rejects_preview_after_target_settings_change(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("stale-preview-test", 1, "SERIAL-STALE", "192.0.2.12", "scm", "{}", b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        preview_dir = pathlib.Path(tempfile.mkdtemp(prefix="stale-preview-", dir=main.RUNS))
+        for name, value in (("flows.csv", "serial,rule\n"), ("policy.xml", "<config/>"), ("review.csv", "name,anchor_rule\n")):
+            (preview_dir / name).write_text(value)
+        (preview_dir / "fingerprint").write_text(json.dumps({
+            "profile": main.build_fingerprint(profile, include_flows=False), "flows": "old",
+            "artifacts": {
+                name: main.hashlib.sha256((preview_dir / name).read_bytes()).hexdigest()
+                for name in ("flows.csv", "policy.xml", "review.csv")
+            },
+            "prepared_at": int(time.time()),
+        }))
+        with main.db() as conn:
+            preview_id = conn.execute(
+                "INSERT INTO runs(profile_id,mode,status,started_at,finished_at,run_dir) VALUES(?,?,?,?,?,?)",
+                (profile_id, "preview", "complete", timestamp, timestamp, str(preview_dir)),
+            ).lastrowid
+            conn.execute("UPDATE profiles SET settings_json=?,updated_at=? WHERE id=?", ('{"folder":"changed"}', main.now(), profile_id))
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1; login["username"] = "test"; login["must_change"] = False; login["csrf"] = "push-csrf"
+        try:
+            with patch.object(main.threading, "Thread") as thread:
+                response = client.post(f"/runs/{preview_id}/push", data={"csrf": "push-csrf"}, base_url="https://forge.test")
+            self.assertEqual(response.status_code, 302)
+            thread.assert_not_called()
+            with main.db() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM runs WHERE profile_id=? AND mode='push'", (profile_id,)).fetchone()[0], 0)
+        finally:
+            import shutil
+            shutil.rmtree(preview_dir, ignore_errors=True)
+            with main.db() as conn:
+                conn.execute("DELETE FROM runs WHERE profile_id=?", (profile_id,))
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
+    def test_legacy_direct_push_route_redirects_to_reviewed_runs(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            profile_id = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("no-direct-push", 1, "SERIAL-NO-DIRECT", "192.0.2.20", "panos", "{}", b"", timestamp, timestamp),
+            ).lastrowid
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1; login["username"] = "test"; login["must_change"] = False; login["csrf"] = "direct-csrf"
+        try:
+            response = client.post(
+                f"/profiles/{profile_id}/build", data={"csrf": "direct-csrf", "mode": "push"},
+                base_url="https://forge.test",
+            )
+            self.assertEqual(response.status_code, 302)
+            self.assertIn(f"run_profile={profile_id}", response.headers["Location"])
+            with main.db() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM runs WHERE profile_id=?", (profile_id,)).fetchone()[0], 0)
+        finally:
+            with main.db() as conn:
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
+    def test_missing_anchor_failure_is_explained_without_exposing_traceback_first(self):
+        details = main.policy_run_failure_details(
+            "RuntimeError: Cannot position generated policy 'L3_Untrust-L3_Servers-ssl-80-001': "
+            "source policy 'Allow_EVCC_Untrust_to_RaspberryPi_HTTP' matched 0 rules"
+        )
+        self.assertEqual(details["title"], "Check geblokkeerd: bronregel ontbreekt")
+        self.assertIn("Allow_EVCC_Untrust_to_RaspberryPi_HTTP", details["message"])
+        self.assertIn("purge de oude flows", details["message"])
+        self.assertIn("niets naar het target geschreven", details["message"])
+        self.assertTrue(details["anchor_missing"])
+        template = (pathlib.Path(__file__).parents[1] / "app/templates/run.html").read_text()
+        self.assertIn("Technische details", template)
+        self.assertIn("Flows bekijken of purgen", template)
+
+    def test_policy_runs_device_header_offers_flavor_appropriate_configuration_fetch(self):
+        template = (pathlib.Path(__file__).parents[1] / "app/templates/app.html").read_text()
+        self.assertIn("url_for('config_workspace_pull',profile_id=selected_run_profile.id)", template)
+        self.assertIn("Candidate XML ophalen", template)
+        self.assertIn("Panorama XML ophalen", template)
+        self.assertIn("SCM-configuratie openen", template)
+        self.assertIn('name="return_to" value="runs"', template)
+
+    def test_candidate_xml_fetch_error_returns_to_selected_policy_runs_device(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            profile_id = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("xml-fetch-return", 1, "SERIAL-XML", "192.0.2.31", "panos", "{}", b"", timestamp, timestamp),
+            ).lastrowid
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1; login["username"] = "test"; login["must_change"] = False; login["csrf"] = "xml-csrf"
+        try:
+            with patch.object(main, "panos_profile_context", side_effect=RuntimeError("offline")):
+                response = client.post(
+                    f"/profiles/{profile_id}/config-workspaces/pull",
+                    data={"csrf": "xml-csrf", "return_to": "runs"},
+                    base_url="https://forge.test",
+                )
+            self.assertEqual(response.status_code, 302)
+            self.assertIn(f"run_profile={profile_id}", response.headers["Location"])
+            self.assertTrue(response.headers["Location"].endswith("#runs"))
+        finally:
+            with main.db() as conn:
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
     def test_log_forwarding_payload_has_panos_fields_and_reference_guards(self):
         matches = [{
             "name": "traffic", "action_desc": "All traffic", "log_type": "traffic",

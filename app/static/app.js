@@ -304,10 +304,10 @@
     var dialog = document.createElement("dialog");
     dialog.className = "push-dialog";
     dialog.innerHTML = '<div class="push-dialog-brand">OCD</div>' +
-      '<div class="push-dialog-body"><h2>Security policies disabled pushen?</h2>' +
+      '<div class="push-dialog-body"><h2>Status van nieuwe security policies</h2>' +
       '<div class="cluster push-dialog-actions">' +
-      '<button class="btn btn-primary" type="button" data-push-choice="true">Ja</button>' +
-      '<button class="btn" type="button" data-push-choice="false">Nee</button>' +
+      '<button class="btn btn-primary" type="button" data-push-choice="true">Uitgeschakeld pushen</button>' +
+      '<button class="btn" type="button" data-push-choice="false">Ingeschakeld pushen</button>' +
       '<button class="btn" type="button" data-push-cancel>Annuleren</button>' +
       '</div></div>';
     document.body.appendChild(dialog);

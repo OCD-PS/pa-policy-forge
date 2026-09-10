@@ -26,8 +26,13 @@ from vendor.bdnd_panos_policy_builder import (
     fetch_scm_zone_networks,
     merge_candidates,
     movable_anchor_map,
+    planned_rule_order,
+    push_prebuilt_candidate,
+    push_to_scm,
     rule_move_destination,
+    scm_fetch_rules,
     security_rule_covers,
+    verify_generated_rule_positions,
     add_member_list,
     build_xml,
 )
@@ -60,6 +65,20 @@ class SafetyTests(unittest.TestCase):
         self.assertIn('"PPF_SCM_DEPLOY_DEVICES": ",".join(profile_serials(profile))', app_text)
         config_block = app_text[app_text.index("def write_config"):app_text.index("def export_profile_flows")]
         self.assertNotIn("PPF_SCM_DEPLOY_DEVICES", config_block)
+
+    @patch("vendor.bdnd_panos_policy_builder.scm_http_request")
+    def test_scm_rule_inventory_is_fully_paginated_in_policy_order(self, request):
+        first = [{"id": str(index), "name": f"rule-{index}"} for index in range(200)]
+        last = {"id": "200", "name": "Discovery-on-page-two"}
+        request.side_effect = [
+            {"data": first, "total": "201"},
+            {"data": [last], "total": "201"},
+        ]
+        rules = scm_fetch_rules("https://api.example/security-rules", "token", {"folder": "Branch"}, "pre")
+        self.assertEqual(rules, [*first, last])
+        self.assertEqual(request.call_args_list[0].kwargs["params"]["offset"], "0")
+        self.assertEqual(request.call_args_list[1].kwargs["params"]["offset"], "200")
+        self.assertTrue(all(call.kwargs["params"]["position"] == "pre" for call in request.call_args_list))
 
     def test_run_history_is_profile_scoped_and_success_limited(self):
         app_text=(ROOT/"app/main.py").read_text()
@@ -448,6 +467,53 @@ class SafetyTests(unittest.TestCase):
         self.assertIn('for ordered_rule in payloads["rules"]:', text)
         self.assertNotIn('for generated_name, anchor_name in movable_anchor_map(review_rows).items():', text)
 
+    @patch("vendor.bdnd_panos_policy_builder.scm_upsert")
+    @patch("vendor.bdnd_panos_policy_builder.scm_fetch_rules")
+    @patch("vendor.bdnd_panos_policy_builder.build_scm_payloads")
+    @patch("vendor.bdnd_panos_policy_builder.get_scm_token", return_value="token")
+    def test_scm_missing_anchor_stops_before_any_candidate_write(self, _token, payloads, fetch_rules, upsert):
+        generated = {
+            "name": "r-generated", "from": ["trust"], "to": ["untrust"],
+            "source": ["any"], "destination": ["any"], "application": ["ssl"],
+            "service": ["application-default"], "action": "allow",
+        }
+        payloads.return_value = {
+            "tags": [], "addresses": [], "address_groups": [], "services": [],
+            "service_groups": [], "rules": [generated],
+        }
+        fetch_rules.return_value = [{"id": "other", "name": "Other"}]
+        deployment = DeploymentConfig(False, True, "", "pre", "", "vsys1", "", "", "", "", True)
+        scm = SCMConfig("id", "secret", "tsg", "token-url", "https://api.example/config/security/v1", "folder", "objects", "", "", "pre", "log")
+        with self.assertRaisesRegex(RuntimeError, "matched 0 rules"):
+            push_to_scm(
+                ET.ElementTree(ET.Element("config")), deployment, scm,
+                ZoneRoleConfig({}), ProfileGroupConfig("", "", "", ""),
+                [{"name": "r-generated", "anchor_rule": "Discovery", "preflight_status": "new"}],
+            )
+        upsert.assert_not_called()
+
+    def test_scm_failed_final_position_check_never_starts_deployment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xml_path = pathlib.Path(tmp) / "policy.xml"
+            review_path = pathlib.Path(tmp) / "review.csv"
+            xml_path.write_text("<config/>")
+            review_path.write_text("name,anchor_rule,disabled\nr-generated,Discovery,no\n")
+            builder = SimpleNamespace(xml_output=xml_path, review_csv=review_path, disabled=False)
+            deployment = SimpleNamespace(scm=True, panos_auto_push=True)
+            with patch("vendor.bdnd_panos_policy_builder.fetch_scm_inventory") as inventory, \
+                    patch("vendor.bdnd_panos_policy_builder.apply_existing_inventory", return_value={}), \
+                    patch("vendor.bdnd_panos_policy_builder.preflight_scm_rules", return_value={"new": 1}), \
+                    patch("vendor.bdnd_panos_policy_builder.remove_skipped_xml_rules", return_value=0), \
+                    patch("vendor.bdnd_panos_policy_builder.push_to_scm", side_effect=RuntimeError("final position mismatch")), \
+                    patch("vendor.bdnd_panos_policy_builder.deploy_scm_candidate") as deploy:
+                inventory.return_value = SimpleNamespace(summary=lambda: "test inventory")
+                with self.assertRaisesRegex(RuntimeError, "final position mismatch"):
+                    push_prebuilt_candidate(
+                        builder, ZoneRoleConfig({}), deployment, SimpleNamespace(),
+                        ProfileGroupConfig("", "", "", ""),
+                    )
+                deploy.assert_not_called()
+
     def test_client_rules_are_destination_centric_and_group_equal_app_sets(self):
         base = {
             "dst": "10.0.2.20", "src_zone": "clients", "dst_zone": "servers",
@@ -499,5 +565,63 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(rule_move_destination("Discovery", {"Discovery"}), ("before", "Discovery"))
         with self.assertRaisesRegex(RuntimeError, "was not found"):
             rule_move_destination("Missing", {"Discovery"})
+
+    def test_panos_rule_names_keep_their_literal_r_prefix(self):
+        planned = planned_rule_order(
+            [{"name": "Discovery"}], [{"name": "r-generated"}], {"r-generated": "Discovery"},
+        )
+        self.assertEqual([rule["name"] for rule in planned], ["r-generated", "Discovery"])
+
+    def test_position_verification_requires_direct_unambiguous_placement(self):
+        verify_generated_rule_positions(
+            [{"name": "existing"}, {"name": "r-one"}, {"name": "r-two"}, {"name": "Discovery"}],
+            [{"name": "r-one"}, {"name": "r-two"}],
+            {"r-one": "Discovery", "r-two": "Discovery"},
+        )
+        with self.assertRaisesRegex(RuntimeError, "not directly before"):
+            verify_generated_rule_positions(
+                [{"name": "r-one"}, {"name": "other"}, {"name": "Discovery"}],
+                [{"name": "r-one"}], {"r-one": "Discovery"},
+            )
+
+    def test_global_rule_is_not_created_from_multiple_source_policy_anchors(self):
+        base = {
+            "src_zone": "clients", "dst_zone": "servers", "proto": "icmp", "dport": "0",
+            "action": "allow", "repeat": "5", "bytes": "100", "app": "ping",
+        }
+        aggregates = aggregate_flows([
+            {**base, "src": "10.0.1.10", "dst": "10.0.2.10", "rule": "Discovery-A"},
+            {**base, "src": "10.0.1.11", "dst": "10.0.2.11", "rule": "Discovery-B"},
+        ], {"allow"})
+        tree, rows = build_xml(
+            aggregates, 1, 0, 10, 100, True, (), True, ("ping",), False, (), (), (),
+            ZoneRoleConfig({"clients": "client", "servers": "server"}),
+            DeploymentConfig(False, False, "", "pre", "", "vsys1", "", "", "", "", False),
+            "", ProfileGroupConfig("", "", "", ""),
+        )
+        names = {entry.attrib["name"] for entry in tree.findall(".//rules/entry")}
+        self.assertNotIn("Global-Internal-Ping-Traceroute", names)
+        self.assertEqual({row["anchor_rule"] for row in rows}, {"Discovery-A", "Discovery-B"})
+        with self.assertRaisesRegex(RuntimeError, "matched 2 rules"):
+            verify_generated_rule_positions(
+                [{"name": "r-one"}, {"name": "Discovery"}, {"name": "Discovery"}],
+                [{"name": "r-one"}], {"r-one": "Discovery"},
+            )
+
+    def test_run_ui_exposes_new_check_and_exact_preview_push(self):
+        app_template = (ROOT / "app/templates/app.html").read_text()
+        run_template = (ROOT / "app/templates/run.html").read_text()
+        self.assertIn("Nieuwe check", app_template)
+        self.assertIn("url_for('run_push',run_id=run.id)", run_template)
+        self.assertIn("Push via API en deploy", run_template)
+        self.assertIn("Push via API naar candidate", run_template)
+        self.assertIn("onmiddellijk voor", run_template)
+        self.assertNotIn('name="mode" value="push"', app_template)
+        self.assertIn("get_flashed_messages", run_template)
+        self.assertIn("Technische details", run_template)
+        js = (ROOT / "app/static/app.js").read_text()
+        self.assertIn("Uitgeschakeld pushen", js)
+        self.assertIn("Ingeschakeld pushen", js)
+
 
 if __name__ == "__main__": unittest.main()

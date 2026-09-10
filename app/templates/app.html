@@ -281,7 +281,7 @@
 {% if ep %}<a class="btn" href="{{url_for('index')}}#profiles">Annuleren</a>{% endif %}
 </div>
 </form>
-{% if ep %}<div class="device-flow-actions"><div><strong>Flow voor {{ep.name}}</strong><span>{{ep.flow_count}} geaggregeerde flows{% if not ep.configured %} · rond eerst de device-instellingen en zonemappings af{% endif %}</span></div><div class="cluster"><a class="btn" href="{{url_for('index',flow_profile=ep.id)}}#flows">Flows bekijken</a>{% if ep.configured %}<form method="post" action="{{url_for('build',profile_id=ep.id)}}"><input type="hidden" name="csrf" value="{{csrf_token()}}"><input type="hidden" name="mode" value="preview"><button class="btn" type="submit">Preview policy</button></form><a class="btn" href="{{url_for('index',policy_profile=ep.id)}}#policy-management">Policybeheer</a><a class="btn" href="{{url_for('index',run_profile=ep.id)}}#runs">Runs</a><form method="post" action="{{url_for('build',profile_id=ep.id)}}" data-push-options><input type="hidden" name="csrf" value="{{csrf_token()}}"><input type="hidden" name="mode" value="push"><button class="btn btn-primary" type="submit">Push</button></form>{% endif %}</div></div>{% endif %}
+{% if ep %}<div class="device-flow-actions"><div><strong>Flow voor {{ep.name}}</strong><span>{{ep.flow_count}} geaggregeerde flows{% if not ep.configured %} · rond eerst de device-instellingen en zonemappings af{% endif %}</span></div><div class="cluster"><a class="btn" href="{{url_for('index',flow_profile=ep.id)}}#flows">Flows bekijken</a>{% if ep.configured %}<form method="post" action="{{url_for('build',profile_id=ep.id)}}"><input type="hidden" name="csrf" value="{{csrf_token()}}"><input type="hidden" name="mode" value="preview"><button class="btn" type="submit">Preview policy</button></form><a class="btn" href="{{url_for('index',policy_profile=ep.id)}}#policy-management">Policybeheer</a><a class="btn" href="{{url_for('index',run_profile=ep.id)}}#runs">Runs</a>{% endif %}</div></div>{% endif %}
 </div>
 <div class="stack profile-card-list">{% for p in profiles %}<article class="card">
 <div class="card-header">
@@ -373,7 +373,19 @@
 <p class="eyebrow">{{selected_run_profile.target_type|upper}}</p>
 <h1>{{selected_run_profile.name}}</h1>
 </div>
-<div class="cluster"><a class="btn" href="{{url_for('index')}}#runs">Terug naar devices</a></div>
+<div class="cluster">
+{% if selected_run_profile.target_type in ['panos','panorama'] %}<form method="post" action="{{url_for('config_workspace_pull',profile_id=selected_run_profile.id)}}" data-config-pull>
+<input type="hidden" name="csrf" value="{{csrf_token()}}">
+<input type="hidden" name="return_to" value="runs">
+<button class="btn" type="submit">{{'Panorama XML ophalen' if selected_run_profile.target_type=='panorama' else 'Candidate XML ophalen'}}</button>
+</form>{% elif selected_run_profile.target_type=='scm' %}<a class="btn" href="{{url_for('index',policy_profile=selected_run_profile.id)}}#policy-management">SCM-configuratie openen</a>{% endif %}
+<form method="post" action="{{url_for('build',profile_id=selected_run_profile.id)}}">
+<input type="hidden" name="csrf" value="{{csrf_token()}}">
+<input type="hidden" name="mode" value="preview">
+<button class="btn btn-primary" type="submit">Nieuwe check</button>
+</form>
+<a class="btn" href="{{url_for('index')}}#runs">Terug naar devices</a>
+</div>
 </div>
 <div class="table-wrap">
 <table>

@@ -30,8 +30,8 @@ Self-hosted Palo Alto traffic-flow policy builder with an HTTPS web interface, U
 - The source security-policy name from each syslog flow is retained as its
   positioning anchor. Candidate rules are moved directly before that source
   policy in SCM, Panorama, or standalone PAN-OS. If the anchor is not present
-  in the selected target scope/rulebase, the generated rule is moved to the
-  bottom instead.
+  exactly once in the selected target scope/rulebase, the candidate push is
+  blocked. SCM deployment starts only after the final rule order is verified.
 - HTTP serves redirects only; every request on port 80 receives a permanent redirect to HTTPS.
 - Runtime databases, credentials, keys, certificates, logs, and generated artifacts stay outside Git.
 
@@ -92,8 +92,9 @@ For offline customers, transfer the repository plus a saved container image bund
 6. Assign each current zone a client, server, internet, or other role in the device
    workspace. Preview, policy management, run history, and push stay unavailable until
    both the management target and zone roles are configured.
-7. Generate a preview from the same device workspace and inspect/download the review CSV and XML.
-8. Use **Push** only after review. SCM-generated policies are written to the configured
+7. Generate a preview from the same device workspace or **Policy runs**, then inspect/download the review CSV and XML.
+8. Open that completed preview and use its API-push action only after review. The exact
+   preview artifacts and unchanged target settings are verified before writing. SCM-generated policies are written to the configured
    folder and deployed to the profile's HA targets. Panorama and standalone writes remain
    candidate-only and require their normal commit workflow.
 9. After the accepted rules are manually positioned and deployed, use **Flows purgen** on the profile to start a clean observation cycle. Profiles and run history are retained.

@@ -744,12 +744,14 @@ def build_xml(
     for aggregate in aggregates.values():
         if aggregate.key.rule:
             observed_anchor_rules[aggregate.key.rule] += aggregate.sessions
-    default_anchor_rule = observed_anchor_rules.most_common(1)[0][0] if observed_anchor_rules else ""
+    # A global rule can only inherit one unambiguous source-policy position.
+    # With logs from multiple source rules, keep the traffic as per-flow rules.
+    default_anchor_rule = next(iter(observed_anchor_rules)) if len(observed_anchor_rules) == 1 else ""
 
     for tag in tags:
         ensure_tag_object(tag_objects, tag, tag_names)
 
-    if global_ping_traceroute:
+    if global_ping_traceroute and default_anchor_rule:
         global_zones = sorted(zone for zone in zone_roles.zone_roles if not zone_roles.is_internet(zone))
         if global_zones:
             rule_names.add(GLOBAL_PING_TRACEROUTE_RULE_NAME)
@@ -800,7 +802,7 @@ def build_xml(
                 }
             )
 
-    if global_dns:
+    if global_dns and default_anchor_rule:
         internal_zones = sorted(zone for zone in zone_roles.zone_roles if not zone_roles.is_internet(zone))
         internet_zones = sorted(zone for zone in zone_roles.zone_roles if zone_roles.is_internet(zone))
         dns_egress_source_zones = infer_dns_egress_source_zones(
@@ -929,9 +931,9 @@ def build_xml(
             )
 
     suppressed_apps = ()
-    if global_ping_traceroute:
+    if global_ping_traceroute and default_anchor_rule:
         suppressed_apps += global_ping_traceroute_apps
-    if global_dns:
+    if global_dns and default_anchor_rule:
         suppressed_apps += global_dns_apps
     candidates = merge_candidates(aggregates, min_sessions, limit, zone_roles, suppressed_apps)
 
@@ -1785,10 +1787,25 @@ def scm_fetch_existing(
 
 
 def scm_fetch_rules(endpoint: str, token: str, container_params: dict[str, str], rulebase: str) -> list[dict[str, Any]]:
-    params = dict(container_params)
-    params["position"] = rulebase
-    response = scm_http_request("GET", endpoint, token, params=params)
-    return response_items(response)
+    page_size = 200
+    offset = 0
+    collected: list[dict[str, Any]] = []
+    while True:
+        params = {**container_params, "position": rulebase, "limit": str(page_size), "offset": str(offset)}
+        response = scm_http_request("GET", endpoint, token, params=params)
+        page = response_items(response)
+        collected.extend(page)
+        total_value = response.get("total") if isinstance(response, dict) else None
+        try:
+            total = int(total_value) if total_value is not None else None
+        except (TypeError, ValueError):
+            total = None
+        if not page or len(page) < page_size or (total is not None and len(collected) >= total):
+            break
+        offset += len(page)
+        if offset > 100_000:
+            raise RuntimeError("SCM security-rule pagination exceeded the safety limit")
+    return collected
 
 
 def scm_upsert(
@@ -1858,7 +1875,7 @@ SHADOW_MATCH_FIELDS = (
 
 
 def rule_name(payload: dict[str, Any]) -> str:
-    return normalized_scm_rule_name(str(payload.get("name", "")))
+    return str(payload.get("name", ""))
 
 
 def rule_enabled(payload: dict[str, Any]) -> bool:
@@ -1938,6 +1955,38 @@ def planned_rule_order(
         anchor_index = matching_indexes[0]
         planned.insert(anchor_index, generated)
     return planned
+
+
+def verify_generated_rule_positions(
+    current_rules: list[dict[str, Any]],
+    generated_rules: list[dict[str, Any]],
+    anchors: dict[str, str],
+    normalizer=lambda value: value,
+) -> None:
+    """Verify each generated block is contiguous and directly before its source rule."""
+    current_names = [normalizer(rule_name(rule)) for rule in current_rules]
+    expected_by_anchor: dict[str, list[str]] = {}
+    for generated in generated_rules:
+        generated_name = normalizer(rule_name(generated))
+        anchor_name = normalizer(anchors.get(generated_name, anchors.get(rule_name(generated), "")))
+        if not generated_name or not anchor_name:
+            raise RuntimeError(f"Cannot verify generated policy {rule_name(generated)!r}: source policy is missing")
+        expected_by_anchor.setdefault(anchor_name, []).append(generated_name)
+    for anchor_name, expected in expected_by_anchor.items():
+        anchor_indexes = [index for index, name in enumerate(current_names) if name == anchor_name]
+        if len(anchor_indexes) != 1:
+            raise RuntimeError(f"Cannot verify source policy {anchor_name!r}: matched {len(anchor_indexes)} rules")
+        for generated_name in expected:
+            matches = current_names.count(generated_name)
+            if matches != 1:
+                raise RuntimeError(f"Cannot verify generated policy {generated_name!r}: matched {matches} rules")
+        anchor_index = anchor_indexes[0]
+        actual = current_names[max(0, anchor_index - len(expected)):anchor_index]
+        if actual != expected:
+            raise RuntimeError(
+                f"Generated policies are not directly before source policy {anchor_name!r}: "
+                f"expected {expected!r}, found {actual!r}"
+            )
 
 
 def enforce_shadowing_gate(
@@ -2058,8 +2107,9 @@ def preflight_scm_rules(
     skipped = {normalized_scm_rule_name(row["name"]) for row in rows if row.get("preflight_status") == "duplicate-match-skip"}
     enforce_shadowing_gate(
         existing_rules,
-        [rule for rule in generated_payloads if rule_name(rule) not in skipped],
+        [rule for rule in generated_payloads if normalized_scm_rule_name(rule_name(rule)) not in skipped],
         movable_anchor_map(rows),
+        normalized_scm_rule_name,
     )
     return statuses
 
@@ -2368,20 +2418,24 @@ def push_to_scm(
         scm_upsert(f"{security_base}/security-rules", token, payload, rule_container, rule_params)
 
     current_rules = scm_fetch_rules(f"{security_base}/security-rules", token, rule_container, scm.scm_rulebase)
-    rules_by_name = {
-        normalized_scm_rule_name(str(rule["name"])): rule
-        for rule in current_rules
-        if rule.get("name") and rule.get("id")
-    }
+    rules_by_name: dict[str, list[dict[str, Any]]] = {}
+    for rule in current_rules:
+        if rule.get("name") and rule.get("id"):
+            rules_by_name.setdefault(normalized_scm_rule_name(str(rule["name"])), []).append(rule)
     for ordered_rule in payloads["rules"]:
         generated_name = rule_name(ordered_rule)
-        anchor_name = anchors.get(generated_name, "")
+        normalized_generated_name = normalized_scm_rule_name(generated_name)
+        anchor_name = anchors.get(normalized_generated_name, "")
         if not anchor_name:
-            continue
-        generated = rules_by_name.get(normalized_scm_rule_name(generated_name))
-        anchor = rules_by_name.get(normalized_scm_rule_name(anchor_name))
-        if not generated:
-            raise RuntimeError(f"Cannot move generated policy {generated_name!r}: rule was not returned by SCM")
+            raise RuntimeError(f"Cannot move generated policy {generated_name!r}: source policy is missing")
+        generated_matches = rules_by_name.get(normalized_generated_name, [])
+        anchor_matches = rules_by_name.get(normalized_scm_rule_name(anchor_name), [])
+        if len(generated_matches) != 1:
+            raise RuntimeError(f"Cannot move generated policy {generated_name!r}: matched {len(generated_matches)} SCM rules")
+        if len(anchor_matches) != 1:
+            raise RuntimeError(f"Cannot move source policy {anchor_name!r}: matched {len(anchor_matches)} SCM rules")
+        generated = generated_matches[0]
+        anchor = anchor_matches[0]
         destination, _ = rule_move_destination(anchor_name, set(rules_by_name), normalized_scm_rule_name)
         move_payload = {"destination": destination, "rulebase": scm.scm_rulebase, "destination_rule": anchor["id"]}
         scm_http_request(
@@ -2391,8 +2445,11 @@ def push_to_scm(
             payload=move_payload,
         )
 
-    # PA Policy Forge intentionally stops after writing candidate objects and
-    # rules. It must never trigger an SCM candidate push/deployment job.
+    positioned_rules = scm_fetch_rules(f"{security_base}/security-rules", token, rule_container, scm.scm_rulebase)
+    verify_generated_rule_positions(positioned_rules, payloads["rules"], anchors, normalized_scm_rule_name)
+
+    # Rule placement is verified here before the caller may start the explicit,
+    # device-scoped SCM deployment job.
 
 
 def push_to_device(xml_path: Path, deployment: DeploymentConfig, review_rows: list[dict[str, str]]) -> None:
@@ -2462,6 +2519,12 @@ def push_to_device(xml_path: Path, deployment: DeploymentConfig, review_rows: li
                 ),
                 f"move {generated_name} before {anchor_name}",
             )
+        positioned_entries = fetch_panos_rule_entries(deployment)
+        verify_generated_rule_positions(
+            [xml_rule_payload(entry) for entry in positioned_entries],
+            [xml_rule_payload(entry) for entry in generated_entries],
+            anchors,
+        )
     finally:
         if copied and upload_path.exists():
             upload_path.unlink()
