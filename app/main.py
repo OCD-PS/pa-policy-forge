@@ -1727,7 +1727,30 @@ def fetch_object_catalog(profile, object_type: str) -> list[dict]:
         )
         cached = _read_json_cache(cache_path)
         stale = cached is None or time.time() - cache_path.stat().st_mtime >= 1800
-        if cached is not None:
+        server_profile_reference = object_type == "log-forwarding" and kind in {
+            "syslog-server-profiles", "email-server-profiles",
+            "snmp-trap-server-profiles", "http-server-profiles",
+        }
+        if server_profile_reference and stale:
+            # These options are needed immediately while editing a log-forwarding
+            # profile. An asynchronous refresh left an empty/stale picker on the
+            # page until the user reloaded it, so refresh these small catalogs
+            # synchronously and keep the last cache only as an error fallback.
+            try:
+                source = fetch_scm_objects(profile, kind)
+                _write_json_cache(cache_path, source)
+                with _catalog_refresh_lock:
+                    _catalog_errors.pop((profile_id, kind), None)
+                    _catalog_retry_after.pop((profile_id, kind), None)
+            except Exception as exc:
+                with _catalog_refresh_lock:
+                    _catalog_errors[(profile_id, kind)] = f"{type(exc).__name__}: ophalen mislukt"
+                app.logger.warning(
+                    "server profile catalog refresh failed for profile=%s kind=%s error=%s",
+                    profile_id, kind, type(exc).__name__,
+                )
+                source = cached if cached is not None else []
+        elif cached is not None:
             if stale and not network_reference:
                 refresh_catalog_async(profile, kind, cache_path)
             source = cached
@@ -4585,7 +4608,20 @@ def config_workspace_push(workspace_id):
             raise RuntimeError("Dit target ondersteunt geen volledige PAN-OS XML-load")
         path = workspace_config_path(workspace)
         expected = "panorama" if profile["target_type"] == "panorama" else "panos"
-        parse_snapshot(path.read_bytes(), expected_kind=expected)
+        workspace_xml = path.read_bytes()
+        parse_snapshot(workspace_xml, expected_kind=expected)
+        if profile["target_type"] == "panos":
+            candidate_analysis = panos_candidate_analysis(workspace_xml)
+            invalid_zones = candidate_analysis.get("unresolved_zone_references", [])
+            if invalid_zones:
+                details = "; ".join(invalid_zones[:8])
+                remainder = len(invalid_zones) - 8
+                if remainder > 0:
+                    details += f"; en nog {remainder}"
+                raise RuntimeError(
+                    "Candidate niet geladen: zoneverwijzingen moeten bestaan binnen dezelfde VSYS. "
+                    + details
+                )
         _, endpoint, key, ctx = panos_profile_context(profile)
         if profile["target_type"] in {"panos", "panorama"}:
             active_root = policy_api.require_success(

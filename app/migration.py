@@ -2606,9 +2606,36 @@ def panos_candidate_analysis(
             if (member.text or "").strip()
         )
     unresolved_applications = sorted(application_references - application_definitions)
+    # PAN-OS zone names are local to a VSYS. A zone that exists in vsys1 does
+    # not make a policy reference in vsys2 valid; checking a device-wide union
+    # would hide precisely the multi-VSYS error the candidate validator must
+    # catch. Panorama rules are excluded here because their effective zones are
+    # resolved through device-group/template relationships, not this XML node.
+    unresolved_zones = []
+    for device in root.findall("./devices/entry"):
+        for vsys in device.findall("./vsys/entry"):
+            vsys_name = str(vsys.get("name", "")).strip() or "<unnamed-vsys>"
+            zone_names = {
+                str(entry.get("name", "")).strip()
+                for entry in vsys.findall("./zone/entry")
+                if str(entry.get("name", "")).strip()
+            }
+            for rulebase_name in ("rulebase", "pre-rulebase", "post-rulebase"):
+                for rule in vsys.findall(f"./{rulebase_name}/*/rules/entry"):
+                    rule_name = str(rule.get("name", "")).strip() or "<unnamed-rule>"
+                    for field in ("from", "to"):
+                        for member in rule.findall(f"./{field}/member"):
+                            zone = str(member.text or "").strip()
+                            if zone and zone.casefold() != "any" and zone not in zone_names:
+                                unresolved_zones.append(
+                                    f"vsys {vsys_name}: {rule_name} -> {field} -> {zone}"
+                                )
     analysis["unresolved_application_references"] = unresolved_applications
+    analysis["unresolved_zone_references"] = sorted(set(unresolved_zones), key=str.casefold)
     analysis["unresolved_references"] = sorted(
-        set(analysis["unresolved_references"]) | set(unresolved_applications)
+        set(analysis["unresolved_references"])
+        | set(unresolved_applications)
+        | set(analysis["unresolved_zone_references"])
     )
     return analysis
 
