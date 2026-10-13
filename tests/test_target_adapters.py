@@ -579,7 +579,6 @@ class TargetAdapterTests(unittest.TestCase):
 
     def test_offline_workspace_templates_compile(self):
         main.app.jinja_env.get_template("app.html")
-        main.app.jinja_env.get_template("workspace_push.html")
         main.app.jinja_env.get_template("workspace_object_preview.html")
 
     def test_internal_xml_fields_are_not_serialized_into_gui_records(self):
@@ -1223,7 +1222,6 @@ class TargetAdapterTests(unittest.TestCase):
                 f"/config-workspaces/{workspace_id}/edit?workspace_view=objects",
                 f"/config-workspaces/{workspace_id}/edit?workspace_view=network",
                 f"/config-workspaces/{workspace_id}/edit?workspace_view=device",
-                f"/config-workspaces/{workspace_id}/push-preview",
                 f"/?policy_profile={profile_id}&policy_source=choose",
             ]
             parser = NavigationTargets()

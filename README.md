@@ -135,7 +135,8 @@ Network, or Device view. Network and Device records open in an orange PAN-OS-sty
 editor with grouped tabs, typed booleans, multi-value chips, rename, duplicate,
 delete, and a mandatory preview. Internal navigation and form targets are covered
 by authenticated route-and-fragment regression tests.
-This high-impact action requires typing the workspace name and never commits the
+Clicking the push action loads the snapshot into the target candidate and reports
+whether PAN-OS loaded and validated it successfully. It never commits the
 candidate automatically. Device groups, templates, VSYS selections, and unknown
 XML nodes remain preserved so later graphical editors can operate as scoped diffs
 without reconstructing or dropping unsupported configuration.

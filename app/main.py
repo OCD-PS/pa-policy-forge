@@ -4562,8 +4562,7 @@ def config_workspace_push_preview(workspace_id):
     if block_reason:
         flash(f"API-load geblokkeerd: {block_reason}", "error")
         return redirect(url_for("migration_project", project_id=output["project_id"]))
-    metadata = json.loads(workspace["metadata_json"] or "{}")
-    return render_template("workspace_push.html", workspace=workspace, metadata=metadata)
+    return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
 
 
 @app.post("/config-workspaces/<int:workspace_id>/push")
@@ -4579,9 +4578,6 @@ def config_workspace_push(workspace_id):
     if block_reason:
         flash(f"API-load geblokkeerd: {block_reason}", "error")
         return redirect(url_for("migration_project", project_id=output["project_id"]))
-    if request.form.get("confirm_name", "") != workspace["name"]:
-        flash("API-load gestopt: de workspacenaam kwam niet overeen.", "error")
-        return redirect(url_for("config_workspace_push_preview", workspace_id=workspace_id))
     try:
         with db() as conn:
             profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
