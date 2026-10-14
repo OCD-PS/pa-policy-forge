@@ -1399,9 +1399,9 @@ PANOS_OBJECT_NODES = {
     "application-groups": "application-group", "application-filters": "application-filter",
     "services": "service", "service-groups": "service-group", "tags": "tag", "zones": "zone",
     "hip-profiles": "hip-profiles", "schedules": "schedule", "security-profile-groups": "profile-group",
-    "log-forwarding": "log-settings/profiles", "syslog-server-profiles": "server-profile/syslog",
-    "email-server-profiles": "server-profile/email", "snmp-trap-server-profiles": "server-profile/snmptrap",
-    "http-server-profiles": "server-profile/http",
+    "log-forwarding": "log-settings/profiles", "syslog-server-profiles": "log-settings/syslog",
+    "email-server-profiles": "log-settings/email", "snmp-trap-server-profiles": "log-settings/snmptrap",
+    "http-server-profiles": "log-settings/http",
 }
 
 
