@@ -249,7 +249,23 @@
 <input name="endpoint" value="{{ep.endpoint if ep else ''}}" placeholder="https://10.0.0.10" required>
 </div>
 <div class="field">
-<label>VSYS</label>
+<label>VSYS-modus</label>
+<select name="vsys_mode" data-vsys-mode-select>
+<option value="single" {% if not ep or ep.vsys_mode != 'multi' %}selected{% endif %}>Single VSYS</option>
+<option value="multi" {% if ep and ep.vsys_mode == 'multi' %}selected{% endif %}>Multi-VSYS</option>
+</select>
+</div>
+<div class="field" data-vsys-count-field hidden>
+<label>Verwacht aantal VSYS</label>
+<select name="vsys_count" data-vsys-count-select disabled>
+{% for count in range(2, 33) %}<option value="{{count}}" {% if ep and (ep.vsys_count|int) == count %}selected{% endif %}>{{count}}</option>{% endfor %}
+</select>
+</div>
+<div class="field full" data-vsys-note hidden>
+<small>De API-import neemt de volledige configuratie op. Dit aantal wordt vergeleken met de VSYS die in de opgehaalde config worden gevonden.</small>
+</div>
+<div class="field">
+<label>VSYS voor flow policies</label>
 <input name="vsys" value="{{ep.vsys if ep else 'vsys1'}}">
 </div>
 <div class="field">

@@ -297,6 +297,24 @@
     });
   }
 
+  function setupVsysMode() {
+    all("[data-vsys-mode-select]").forEach(function (select) {
+      var form = select.closest("form");
+      if (!form) return;
+      var countField = form.querySelector("[data-vsys-count-field]");
+      var note = form.querySelector("[data-vsys-note]");
+      var countSelect = form.querySelector("[data-vsys-count-select]");
+      function update() {
+        var multi = select.value === "multi";
+        if (countField) countField.hidden = !multi;
+        if (note) note.hidden = !multi;
+        if (countSelect) countSelect.disabled = !multi;
+      }
+      select.addEventListener("change", update);
+      update();
+    });
+  }
+
   function setupPushOptions() {
     var forms = all("form[data-push-options]");
     if (!forms.length) return;
@@ -1220,6 +1238,7 @@
     runSetup("migration-filter-types", setupMigrationFilterTypes);
     runSetup("migration-zone-mapping", setupMigrationZoneMapping);
     runSetup("targets", setupConditionalTargets);
+    runSetup("vsys-mode", setupVsysMode);
     runSetup("migration-target-dialog", setupMigrationTargetDialog);
     runSetup("policy-member-dialogs", setupPolicyMemberDialogs);
     runSetup("push-options", setupPushOptions);

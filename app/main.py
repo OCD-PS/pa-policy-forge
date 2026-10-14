@@ -4478,6 +4478,14 @@ def config_workspace_pull(profile_id):
         if config is None:
             raise RuntimeError("API-antwoord bevat geen volledige configuratie")
         xml_bytes = normalized_config_xml(config)
+        discovered_vsys_count = None
+        expected_vsys_count = None
+        if profile["target_type"] == "panos":
+            _, snapshot = parse_snapshot(xml_bytes, expected_kind="panos")
+            discovered_vsys_count = len(available_scopes(snapshot))
+            saved_settings = profile_settings(profile)
+            if saved_settings.get("vsys_mode") == "multi":
+                expected_vsys_count = int(saved_settings.get("vsys_count") or 0)
         workspace_id = store_config_workspace(
             profile,
             request.form.get("name", "").strip() or f"{profile['name']} candidate {now()}",
@@ -4486,7 +4494,17 @@ def config_workspace_pull(profile_id):
             "api",
         )
         set_active_config_workspace(profile_id, workspace_id)
-        flash("Volledige candidateconfiguratie via API opgehaald.", "success")
+        if discovered_vsys_count is None:
+            message = "Volledige candidateconfiguratie via API opgehaald."
+        elif expected_vsys_count and expected_vsys_count != discovered_vsys_count:
+            message = (
+                f"Volledige candidateconfiguratie via API opgehaald: "
+                f"{discovered_vsys_count} VSYS gevonden, terwijl {expected_vsys_count} verwacht waren. "
+                "De volledige config is behouden."
+            )
+        else:
+            message = f"Volledige candidateconfiguratie via API opgehaald: {discovered_vsys_count} VSYS gevonden."
+        flash(message, "success")
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
     except Exception as exc:
         flash(f"Volledige configuratie niet opgehaald: {exc}", "error")
@@ -6947,6 +6965,13 @@ def profile_save():
         if profile_id and target_type not in TARGET_TYPES: raise ValueError("Kies waar dit device wordt beheerd")
         rulebase = request.form.get("rulebase", "pre")
         if rulebase not in {"pre", "post"}: raise ValueError("Rulebase moet pre of post zijn")
+        vsys_mode = request.form.get("vsys_mode", "single")
+        if vsys_mode not in {"single", "multi"}: raise ValueError("Kies single-VSYS of multi-VSYS")
+        vsys_count_raw = request.form.get("vsys_count", "")
+        old_settings = profile_settings(existing_profile) if existing_profile else {}
+        vsys_count = int(vsys_count_raw or old_settings.get("vsys_count") or 2)
+        if vsys_mode == "multi" and not 2 <= vsys_count <= 32:
+            raise ValueError("Het verwachte aantal VSYS moet tussen 2 en 32 liggen")
         active_serial = request.form.get("serial", "").strip()
         if not active_serial:
             raise ValueError("Serienummer van de actieve firewall is verplicht")
@@ -6968,6 +6993,8 @@ def profile_save():
             "global_dns": request.form.get("global_dns") == "on" if profile_id else True,
             "endpoint": validate_panos_endpoint(request.form.get("endpoint", "")) if profile_id and target_type in {"panorama", "panos"} else "",
             "vsys": request.form.get("vsys", "vsys1").strip(),
+            "vsys_mode": vsys_mode,
+            "vsys_count": vsys_count,
             "device_group": request.form.get("device_group", "").strip(),
             "rulebase": rulebase,
             "folder": request.form.get("folder", "").strip(),
