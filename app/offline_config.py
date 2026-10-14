@@ -161,7 +161,7 @@ CONFIG_SECTION_PATHS = {
         "certificates": (".//certificate",),
         "certificate-management": (".//ssl-decrypt",),
         "local-user-database": (".//local-user-database",),
-        "server-profiles": (".//server-profile", ".//log-settings/syslog", ".//log-settings/email", ".//log-settings/snmptrap", ".//log-settings/http"),
+        "server-profiles": (".//server-profile",),
         "log-settings": (".//log-settings",),
         "high-availability": (".//high-availability",),
         "user-identification": (".//user-id-collector",),
@@ -224,7 +224,7 @@ CONFIG_CREATE_SCHEMAS = {
              '<entry name=""><authentication-profiles><member /></authentication-profiles><use-domain-find-profile>yes</use-domain-find-profile></entry>', ("authentication-profiles",)),
     "local-user-group": ("device", "local-user-database", "location", "local-user-database/user-group", "Local User Group",
              '<entry name=""><user><member /></user></entry>', ("user",)),
-    "syslog-server-profile": ("device", "server-profiles", "location", "log-settings/syslog", "Syslog Server Profile",
+    "syslog-server-profile": ("device", "server-profiles", "location", "server-profile/syslog", "Syslog Server Profile",
              '<entry name=""><server><entry name="server-1"><server /><transport>UDP</transport><port>514</port><format>BSD</format><facility>LOG_USER</facility></entry></server></entry>', ("server/entry/server",)),
 }
 
@@ -1004,7 +1004,7 @@ def scoped_server_profiles(xml_bytes: bytes, scope: str, parsed=None) -> list[di
         if scope_root is None:
             continue
         for kind, node in SERVER_PROFILE_NODES.items():
-            for entry in scope_root.findall(f"./log-settings/{node}/entry"):
+            for entry in scope_root.findall(f"./server-profile/{node}/entry"):
                 name = entry.get("name", "").strip()
                 key = (kind, name)
                 if name and key not in seen:

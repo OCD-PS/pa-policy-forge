@@ -12,8 +12,8 @@ from app import main
 
 class ConfigPushDeltaTests(unittest.TestCase):
     def test_changed_syslog_server_profile_is_one_edit_at_profile_entry(self):
-        current = b"""<config><shared><log-settings><syslog><entry name="Pa_Policy_Forge"><server /></entry></syslog></log-settings></shared></config>"""
-        desired = b"""<config><shared><log-settings><syslog><entry name="Pa_Policy_Forge"><server><entry name="PolicyForge"><server>10.74.80.46</server><transport>UDP</transport><port>514</port><format>BSD</format><facility>LOG_USER</facility></entry></server></entry></syslog></log-settings></shared></config>"""
+        current = b"""<config><shared><server-profile><syslog><entry name="Pa_Policy_Forge"><server /></entry></syslog></server-profile></shared></config>"""
+        desired = b"""<config><shared><server-profile><syslog><entry name="Pa_Policy_Forge"><server><entry name="PolicyForge"><server>10.74.80.46</server><transport>UDP</transport><port>514</port><format>BSD</format><facility>LOG_USER</facility></entry></server></entry></syslog></server-profile></shared></config>"""
 
         changes = main.config_push_delta(current, desired)
 
@@ -22,7 +22,7 @@ class ConfigPushDeltaTests(unittest.TestCase):
         self.assertEqual(change["action"], "edit")
         self.assertEqual(
             change["xpath"],
-            "/config/shared/log-settings/syslog/entry[@name='Pa_Policy_Forge']",
+            "/config/shared/server-profile/syslog/entry[@name='Pa_Policy_Forge']",
         )
         payload = ET.fromstring(change["element"])
         self.assertEqual(payload.tag, "entry")
@@ -46,15 +46,15 @@ class ConfigPushDeltaTests(unittest.TestCase):
         self.assertEqual(change["family"], "policy:security")
 
     def test_new_shared_syslog_profile_is_one_set_at_profile_collection(self):
-        current = b"""<config><shared><log-settings><syslog /></log-settings></shared></config>"""
-        desired = b"""<config><shared><log-settings><syslog><entry name="Pa_Policy_Forge"><server><entry name="PolicyForge"><server>10.74.80.46</server><transport>UDP</transport><port>514</port></entry></server></entry></syslog></log-settings></shared></config>"""
+        current = b"""<config><shared><server-profile><syslog /></server-profile></shared></config>"""
+        desired = b"""<config><shared><server-profile><syslog><entry name="Pa_Policy_Forge"><server><entry name="PolicyForge"><server>10.74.80.46</server><transport>UDP</transport><port>514</port></entry></server></entry></syslog></server-profile></shared></config>"""
 
         changes = main.config_push_delta(current, desired)
 
         self.assertEqual(len(changes), 1)
         change = changes[0]
         self.assertEqual(change["action"], "set")
-        self.assertEqual(change["xpath"], "/config/shared/log-settings/syslog")
+        self.assertEqual(change["xpath"], "/config/shared/server-profile/syslog")
         payload = ET.fromstring(change["element"])
         self.assertEqual(payload.tag, "entry")
         self.assertEqual(payload.attrib["name"], "Pa_Policy_Forge")

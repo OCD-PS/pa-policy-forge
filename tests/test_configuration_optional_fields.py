@@ -92,7 +92,7 @@ class ConfigurationOptionalFieldsTests(unittest.TestCase):
         self.assertIn(b"192.0.2.44", result)
 
     def test_syslog_optional_fields_apply_to_each_actual_server(self):
-        source = self.insert("./devices/entry/vsys/entry", '''<log-settings><syslog><entry name="audit-item"><server><entry name="first"><server>192.0.2.10</server></entry><entry name="second"><server>192.0.2.11</server><port>601</port></entry></server></entry></syslog></log-settings>''')
+        source = self.insert("./devices/entry/vsys/entry", '''<server-profile><syslog><entry name="audit-item"><server><entry name="first"><server>192.0.2.10</server></entry><entry name="second"><server>192.0.2.11</server><port>601</port></entry></server></entry></syslog></server-profile>''')
         record = self.record(source, "server-profiles", view="device")
         formats = [self.field(record, "Server / Entry / Format", n) for n in (0, 1)]
         self.assertTrue(all(field["optional"] and field["value"] == "" for field in formats))
@@ -187,7 +187,7 @@ class ConfigurationOptionalFieldsTests(unittest.TestCase):
         self.assertEqual(self.save(source, record), normalized_config_xml(root))
 
     def test_future_existing_enum_is_retained_without_allowing_unknown_new_choice(self):
-        source = self.insert("./devices/entry/vsys/entry", '<log-settings><syslog><entry name="audit-item"><server><entry name="future-server"><server>192.0.2.12</server><transport>FUTURE-TLS</transport></entry></server></entry></syslog></log-settings>')
+        source = self.insert("./devices/entry/vsys/entry", '<server-profile><syslog><entry name="audit-item"><server><entry name="future-server"><server>192.0.2.12</server><transport>FUTURE-TLS</transport></entry></server></entry></syslog></server-profile>')
         record = self.record(source, "server-profiles", view="device")
         transport = self.field(record, "Server / Entry / Transport")
         self.assertIn("FUTURE-TLS", transport["options"])
