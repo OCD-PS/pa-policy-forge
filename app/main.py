@@ -4608,7 +4608,8 @@ _PUSH_POLICY_NODES = {
 _PUSH_ENTRY_COLLECTIONS = set(_PUSH_OBJECT_NODES) | set(_PUSH_POLICY_NODES) | {
     "rules", "zone", "ethernet", "aggregate-ethernet", "loopback", "tunnel", "vlan",
     "virtual-router", "logical-router", "virtual-wire", "ipsec", "gre", "dhcp", "dns-proxy",
-    "qos", "lldp", "server-profile", "log-settings", "high-availability", "global-protect-portal",
+    "qos", "lldp", "server-profile", "log-settings", "syslog", "email", "snmptrap", "http", "server",
+    "high-availability", "global-protect-portal",
     "global-protect-gateway", "authentication-profile", "authentication-sequence", "user-id-collector",
     "vm-info-source", "routing-profile", "profiles", "local-user-database", "admin-roles",
 }
@@ -4741,7 +4742,7 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes) -> list[dict]:
             after_map = {child.get("name"): child for child in after_children}
             for name in dict.fromkeys((*before_map.keys(), *after_map.keys())):
                 left, right = before_map.get(name), after_map.get(name)
-                walk(left, right, node_path(parent_path, right or left), here_parts)
+                walk(left, right, node_path(parent_path, after), here_parts)
             if before_order != after_order:
                 for position, name in enumerate(reversed(after_order)):
                     entry_path = f"{node_path(parent_path, after)}/entry[@name={policy_api.xpath_literal(name)}]"
@@ -4757,8 +4758,7 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes) -> list[dict]:
         after_map = {node_key(node, index): node for index, node in enumerate(after_children)}
         for key in dict.fromkeys((*before_map.keys(), *after_map.keys())):
             left, right = before_map.get(key), after_map.get(key)
-            anchor = right or left
-            walk(left, right, node_path(parent_path, anchor), here_parts)
+            walk(left, right, node_path(parent_path, after), here_parts)
 
     # Root node is fixed at /config. Start with direct children to keep API XPaths rooted correctly.
     before_children = {child.tag: child for child in list(before_root)}
