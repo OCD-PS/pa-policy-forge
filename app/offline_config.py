@@ -161,7 +161,7 @@ CONFIG_SECTION_PATHS = {
         "certificates": (".//certificate",),
         "certificate-management": (".//ssl-decrypt",),
         "local-user-database": (".//local-user-database",),
-        "server-profiles": (".//server-profile", ".//log-settings/syslog"),
+        "server-profiles": (".//server-profile",),
         "log-settings": (".//log-settings",),
         "high-availability": (".//high-availability",),
         "user-identification": (".//user-id-collector",),
@@ -169,6 +169,12 @@ CONFIG_SECTION_PATHS = {
         # Operational software and license pages are intentionally not mapped
         # to candidate XML writes.  They are not ordinary configuration nodes.
     },
+}
+
+# PAN-OS permits these device configuration objects in Shared or a VSYS.
+# Keep this selector narrow because other Device pages have different owners.
+PANOS_LOCATION_SECTIONS = {
+    "device": {"authentication-profile", "authentication-sequence", "local-user-database", "server-profiles"},
 }
 
 # Immutable bootstrap schemas for empty sections.  These are candidate editor
@@ -210,15 +216,15 @@ CONFIG_CREATE_SCHEMAS = {
              '<entry name=""><interval>3</interval><threshold>5</threshold><action>wait-recover</action></entry>', ()),
     "lldp": ("network", "lldp", "device", "network", "LLDP",
              '<lldp><enable>no</enable></lldp>', ()),
-    "authentication-local": ("device", "authentication-profile", "vsys", "authentication-profile", "Local Database Authentication",
+    "authentication-local": ("device", "authentication-profile", "location", "authentication-profile", "Local Database Authentication",
              '<entry name=""><method><local-database /></method><allow-list><member /></allow-list><user-domain /><username-modifier>%USERINPUT%</username-modifier></entry>', ("allow-list",)),
-    "authentication-ldap": ("device", "authentication-profile", "vsys", "authentication-profile", "LDAP Authentication",
+    "authentication-ldap": ("device", "authentication-profile", "location", "authentication-profile", "LDAP Authentication",
              '<entry name=""><method><ldap><server-profile /><login-attribute>sAMAccountName</login-attribute></ldap></method><allow-list><member /></allow-list><user-domain /><username-modifier>%USERINPUT%</username-modifier></entry>', ("method/ldap/server-profile", "allow-list")),
-    "authentication-sequence": ("device", "authentication-sequence", "vsys", "authentication-sequence", "Authentication Sequence",
+    "authentication-sequence": ("device", "authentication-sequence", "location", "authentication-sequence", "Authentication Sequence",
              '<entry name=""><authentication-profiles><member /></authentication-profiles><use-domain-find-profile>yes</use-domain-find-profile></entry>', ("authentication-profiles",)),
-    "local-user-group": ("device", "local-user-database", "vsys", "local-user-database/user-group", "Local User Group",
+    "local-user-group": ("device", "local-user-database", "location", "local-user-database/user-group", "Local User Group",
              '<entry name=""><user><member /></user></entry>', ("user",)),
-    "syslog-server-profile": ("device", "server-profiles", "vsys", "log-settings/syslog", "Syslog Server Profile",
+    "syslog-server-profile": ("device", "server-profiles", "location", "server-profile/syslog", "Syslog Server Profile",
              '<entry name=""><server><entry name="server-1"><server /><transport>UDP</transport><port>514</port><format>BSD</format><facility>LOG_USER</facility></entry></server></entry>', ("server/entry/server",)),
 }
 
@@ -1362,7 +1368,11 @@ def configuration_records(
     parents = _element_parents(root)
     records: list[dict] = []
     seen_sections: set[int] = set()
-    for owner, source in _config_roots(root, snapshot, scope, template):
+    config_roots = _config_roots(root, snapshot, scope, template)
+    if snapshot.kind == "panos" and section in PANOS_LOCATION_SECTIONS.get(view, set()):
+        selected_root = _scope_root(root, snapshot, scope)
+        config_roots = [(scope, selected_root)] if selected_root is not None else []
+    for owner, source in config_roots:
         search_source = source
         if view == "network" and section == "zones" and snapshot.kind != "panorama":
             scoped_root = _scope_root(root, snapshot, scope)
@@ -1517,6 +1527,8 @@ def _configuration_creation_owner(root, snapshot, scope, template, owner_kind):
         raise OfflineConfigError("De configuratie bevat geen doel-device")
     if owner_kind == "device":
         return device
+    if owner_kind == "location" and snapshot.kind == "panos":
+        return _ensure_scope_root(root, snapshot, scope)
     vsyses = device.findall("./vsys/entry")
     owner = next((item for item in vsyses if item.get("name") == scope), None)
     if owner is None and snapshot.kind == "panorama" and len(vsyses) == 1:

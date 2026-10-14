@@ -60,7 +60,7 @@ from app.migration import (
     reconcile_model, scm_items, restore_migration_source_topology,
 )
 from app.offline_config import (
-    OBJECT_NODES, POLICY_NODES, OfflineConfigError, available_scopes, available_templates,
+    OBJECT_NODES, POLICY_NODES, PANOS_LOCATION_SECTIONS, OfflineConfigError, available_scopes, available_templates,
     apply_configuration_changes, apply_object_changes, configuration_inventory,
     create_basic_network_entry, configuration_create_templates, create_configuration_entry,
     configuration_records as scoped_configuration_records,
@@ -1408,9 +1408,13 @@ PANOS_OBJECT_NODES = {
 def panos_object_bases(profile, object_type: str) -> list[str]:
     settings = json.loads(profile["settings_json"] or "{}")
     if object_type == "applications": return ["/config/predefined"]
-    if object_type in {"syslog-server-profiles", "email-server-profiles", "snmp-trap-server-profiles", "http-server-profiles"}:
-        return ["/config/shared"]
     device = policy_api.xpath_literal("localhost.localdomain")
+    server_profile_types = {"syslog-server-profiles", "email-server-profiles", "snmp-trap-server-profiles", "http-server-profiles"}
+    if object_type in server_profile_types:
+        if profile["target_type"] == "panorama":
+            return ["/config/shared"]
+        vsys = policy_api.xpath_literal(settings.get("vsys", "vsys1"))
+        return ["/config/shared", f"/config/devices/entry[@name={device}]/vsys/entry[@name={vsys}]"]
     if object_type == "zones" and profile["target_type"] == "panorama":
         vsys = policy_api.xpath_literal(settings.get("vsys", "vsys1"))
         _, endpoint, key, ctx = panos_profile_context(profile)
@@ -3560,8 +3564,12 @@ def config_workspace_editor(workspace_id):
         workspace_view = request.args.get("workspace_view", "policies")
         if workspace_view not in {"policies", "objects", "network", "device"}:
             workspace_view = "policies"
+        config_section = request.args.get("config_section", "").strip()
         scopes = available_scopes(snapshot)
-        if snapshot.kind == "panos" and workspace_view in {"policies", "objects"}:
+        if snapshot.kind == "panos" and (
+            workspace_view in {"policies", "objects"}
+            or config_section in PANOS_LOCATION_SECTIONS.get(workspace_view, set())
+        ):
             scopes = ["Shared", *scopes]
         if not scopes:
             raise OfflineConfigError("Geen device group of VSYS gevonden")
@@ -3598,7 +3606,6 @@ def config_workspace_editor(workspace_id):
         object_total = 0
         object_page_count = 1
         edit_object_name = request.args.get("edit_object", "")
-        config_section = request.args.get("config_section", "").strip()
         templates = available_templates(snapshot)
         requested_template = request.args.get("template", "").strip()
         preferred_template = referenced_template(snapshot, scope)
