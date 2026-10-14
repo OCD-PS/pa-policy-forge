@@ -1879,7 +1879,9 @@ def workspace_url_category_catalog(workspace_id):
     scope = request.args.get("scope", "").strip()
     try:
         xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
-        if scope not in available_scopes(snapshot): raise OfflineConfigError("De gekozen scope bestaat niet")
+        valid_scopes = set(available_scopes(snapshot))
+        if snapshot.kind == "panos": valid_scopes.add("Shared")
+        if scope not in valid_scopes: raise OfflineConfigError("De gekozen scope bestaat niet")
         items = []
         for object_type in ("custom-url-categories", "external-dynamic-lists"):
             _, objects = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
@@ -3555,21 +3557,26 @@ def config_workspace_editor(workspace_id):
         if not workspace_profile:
             raise OfflineConfigError("Het gekoppelde firewallprofiel bestaat niet meer")
         xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
+        workspace_view = request.args.get("workspace_view", "policies")
+        if workspace_view not in {"policies", "objects", "network", "device"}:
+            workspace_view = "policies"
         scopes = available_scopes(snapshot)
+        if snapshot.kind == "panos" and workspace_view in {"policies", "objects"}:
+            scopes = ["Shared", *scopes]
         if not scopes:
             raise OfflineConfigError("Geen device group of VSYS gevonden")
         workspace_contexts = dict(session.get("workspace_contexts") or {})
         saved_context = dict(workspace_contexts.get(str(workspace_id)) or {})
         requested_scope = request.args.get("scope", "").strip()
         if requested_scope and requested_scope not in scopes:
-            raise OfflineConfigError("De gekozen scope bestaat niet")
+            if requested_scope == "Shared" and snapshot.kind == "panos":
+                requested_scope = ""
+            else:
+                raise OfflineConfigError("De gekozen scope bestaat niet")
         scope = requested_scope or saved_context.get("scope", "")
         if scope not in scopes:
             non_shared_scopes = [value for value in scopes if value != "Shared"]
-            scope = non_shared_scopes[0] if snapshot.kind == "panorama" and non_shared_scopes else scopes[0]
-        workspace_view = request.args.get("workspace_view", "policies")
-        if workspace_view not in {"policies", "objects", "network", "device"}:
-            workspace_view = "policies"
+            scope = non_shared_scopes[0] if non_shared_scopes else scopes[0]
         policy_kind = request.args.get("policy_kind", "security")
         if policy_kind not in POLICY_NODES:
             policy_kind = "security"
@@ -4633,6 +4640,21 @@ def config_push_family(path_parts: tuple[str, ...]) -> tuple[str, str]:
     return f"other:{top}", f"Other · {top.replace('-', ' ').title()}"
 
 
+def config_push_scope(xpath: str) -> str:
+    """Return the PAN-OS location that owns an XPath change."""
+    if re.search(r"/shared(?:/|$)", xpath):
+        return "Shared"
+    for node in ("device-group", "template-stack", "template", "vsys"):
+        match = re.search(rf"/{node}/entry\[@name=(.*?)\]", xpath)
+        if not match:
+            continue
+        literal = match.group(1).strip()
+        if len(literal) >= 2 and literal[0] == literal[-1] and literal[0] in "'\"":
+            return literal[1:-1]
+        return "Scope"
+    return "Global"
+
+
 def config_push_delta(base_xml: bytes, desired_xml: bytes) -> list[dict]:
     """Return exact candidate XML node changes; never constructs a whole-config load."""
     before_root = SafeET.fromstring(base_xml)
@@ -4736,6 +4758,13 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes) -> list[dict]:
     after_children = {child.tag: child for child in list(after_root)}
     for tag in dict.fromkeys((*before_children.keys(), *after_children.keys())):
         walk(before_children.get(tag), after_children.get(tag), "/config", ("config",))
+    # Keep same-named families separate by owner. A Shared object is a different
+    # API write target from an identically named object inside a VSYS.
+    for change in changes:
+        change["scope"] = config_push_scope(change["xpath"])
+        change["selection_key"] = json.dumps(
+            [change["scope"], change["family"]], ensure_ascii=False, separators=(",", ":")
+        )
     # Prerequisites first; removals in reverse order so consumers go before dependencies.
     rank = {"object": 10, "network": 20, "device": 30, "other": 35, "policy": 40}
     for change in changes:
@@ -4804,11 +4833,16 @@ def config_workspace_push_preview(workspace_id):
         changes = config_push_delta(current, desired)
         families = {}
         for item in changes:
-            row = families.setdefault(item["family"], {"key": item["family"], "label": item["label"], "count": 0, "names": []})
+            row = families.setdefault(item["selection_key"], {
+                "key": item["selection_key"], "scope": item["scope"],
+                "family": item["family"],
+                "label": item["label"],
+                "count": 0, "names": [],
+            })
             row["count"] += 1
             if item["name"] and item["name"] not in row["names"] and len(row["names"]) < 8:
                 row["names"].append(item["name"])
-        families = sorted(families.values(), key=lambda item: (item["label"].casefold(), item["key"]))
+        families = sorted(families.values(), key=lambda item: (item["scope"].casefold(), item["label"].casefold(), item["key"]))
         return render_template(
             "config_workspace_push_preview.html", workspace=workspace, profile=profile,
             families=families, change_count=len(changes), candidate_sha256=hashlib.sha256(current).hexdigest(),
@@ -4847,19 +4881,29 @@ def config_workspace_push(workspace_id):
         if not hmac.compare_digest(live_fingerprint, request.form.get("candidate_sha256", "")):
             raise RuntimeError("De targetcandidate wijzigde sinds de preview; maak een nieuwe preview")
         changes = config_push_delta(current_xml, workspace_xml)
-        available = {item["family"] for item in changes}
-        if "protected" in selected:
-            raise RuntimeError("Management- en administratorinstellingen zijn beschermd tegen workspace-push")
+        available = {item["selection_key"] for item in changes}
         if not selected.issubset(available):
-            raise RuntimeError("De geselecteerde pushfamilie hoort niet bij deze candidatepreview")
-        chosen = [item for item in changes if item["family"] in selected]
+            raise RuntimeError("De geselecteerde scope/familie hoort niet bij deze candidatepreview")
+        chosen = [item for item in changes if item["selection_key"] in selected]
+        if any(item["family"] == "protected" for item in chosen):
+            raise RuntimeError("Management-, administrator- en credentialinstellingen zijn beschermd tegen workspace-push")
         if not chosen:
             raise RuntimeError("De selectie bevat geen wijzigingen")
         if profile["target_type"] == "panos":
             analysis = panos_candidate_analysis(workspace_xml)
             invalid_zones = analysis.get("unresolved_zone_references", [])
-            if invalid_zones and any(item["family"].startswith("policy:") for item in chosen):
-                raise RuntimeError("Candidate bevat zoneverwijzingen buiten de geselecteerde VSYS; los die eerst op")
+            selected_policy_scopes = {
+                item["scope"] for item in chosen if item["family"].startswith("policy:")
+            }
+            relevant_zone_errors = [
+                issue for issue in invalid_zones
+                if "Shared" in selected_policy_scopes
+                or any(issue.startswith(f"vsys {scope}:") for scope in selected_policy_scopes)
+            ]
+            if relevant_zone_errors:
+                raise RuntimeError(
+                    "Candidate bevat zoneverwijzingen die ongeldig zijn voor de geselecteerde VSYS; los die eerst op"
+                )
         for change in chosen:
             params = {"type": "config", "action": change["action"], "xpath": change["xpath"], "key": key}
             if change["action"] in {"set", "edit"}:

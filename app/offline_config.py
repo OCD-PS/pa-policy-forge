@@ -590,6 +590,15 @@ def _scope_root(root: ET.Element, snapshot: ConfigSnapshot, scope: str) -> ET.El
     return next((entry for entry in root.findall("./devices/entry/vsys/entry") if entry.get("name") == scope), None)
 
 
+def _ensure_scope_root(root: ET.Element, snapshot: ConfigSnapshot, scope: str) -> ET.Element:
+    existing = _scope_root(root, snapshot, scope)
+    if existing is not None:
+        return existing
+    if scope == "Shared":
+        return ET.SubElement(root, "shared")
+    raise OfflineConfigError("De gekozen scope bestaat niet meer")
+
+
 def _members(entry: ET.Element, field: str) -> list[str]:
     return [node.text or "" for node in entry.findall(f"./{field}/member") if node.text]
 
@@ -703,7 +712,7 @@ def scoped_policies(xml_bytes: bytes, scope: str, kind: str, rulebase: str = "pr
     if snapshot.kind == "panorama" and rulebase not in {"pre", "post"}:
         raise OfflineConfigError("Panorama rulebase moet pre of post zijn")
     records = []
-    chain = _scope_chain(snapshot, scope) if snapshot.kind == "panorama" else (["Shared", scope] if root.find("./shared") is not None else [scope])
+    chain = _scope_chain(snapshot, scope) if snapshot.kind == "panorama" else (["Shared"] if scope == "Shared" else (["Shared", scope] if root.find("./shared") is not None else [scope]))
     for owner in chain:
         scope_root = _scope_root(root, snapshot, owner)
         if scope_root is None:
@@ -967,7 +976,7 @@ def scoped_objects(xml_bytes: bytes, scope: str, object_type: str, parsed=None) 
     node = OBJECT_NODES.get(object_type)
     if not node:
         raise OfflineConfigError(f"Onbekend objecttype: {object_type}")
-    chain = _scope_chain(snapshot, scope) if snapshot.kind == "panorama" else (["Shared", scope] if root.find("./shared") is not None else [scope])
+    chain = _scope_chain(snapshot, scope) if snapshot.kind == "panorama" else (["Shared"] if scope == "Shared" else (["Shared", scope] if root.find("./shared") is not None else [scope]))
     records = []
     for owner in chain:
         scope_root = _scope_root(root, snapshot, owner)
@@ -981,7 +990,7 @@ def scoped_objects(xml_bytes: bytes, scope: str, object_type: str, parsed=None) 
 def scoped_server_profiles(xml_bytes: bytes, scope: str, parsed=None) -> list[dict]:
     """Return server-profile names visible to a policy/log-forwarding scope."""
     root, snapshot = parsed if parsed is not None else parse_snapshot(xml_bytes)
-    chain = _scope_chain(snapshot, scope) if snapshot.kind == "panorama" else (["Shared", scope] if root.find("./shared") is not None else [scope])
+    chain = _scope_chain(snapshot, scope) if snapshot.kind == "panorama" else (["Shared"] if scope == "Shared" else (["Shared", scope] if root.find("./shared") is not None else [scope]))
     records = []
     seen = set()
     for owner in chain:
@@ -1013,9 +1022,7 @@ def apply_object_changes(xml_bytes: bytes, scope: str, object_type: str, changes
     if object_type not in OBJECT_NODES:
         raise OfflineConfigError("Onbekend objecttype")
     root, snapshot = parse_snapshot(xml_bytes)
-    scope_root = _scope_root(root, snapshot, scope)
-    if scope_root is None:
-        raise OfflineConfigError("De gekozen scope bestaat niet meer")
+    scope_root = _ensure_scope_root(root, snapshot, scope)
     node_path = OBJECT_NODES[object_type]
     container = scope_root
     for part in node_path.split("/"):
@@ -1828,9 +1835,7 @@ def replace_policy_in_snapshot(xml_bytes: bytes, scope: str, kind: str, rulebase
 def _policy_rules_root(root: ET.Element, snapshot: ConfigSnapshot, scope: str, kind: str, rulebase: str) -> ET.Element:
     if kind not in POLICY_NODES:
         raise OfflineConfigError(f"Onbekend policytype: {kind}")
-    scope_root = _scope_root(root, snapshot, scope)
-    if scope_root is None:
-        raise OfflineConfigError("De gekozen scope bestaat niet meer")
+    scope_root = _ensure_scope_root(root, snapshot, scope)
     base_tag = f"{rulebase}-rulebase" if snapshot.kind == "panorama" else "rulebase"
     base = scope_root.find(f"./{base_tag}")
     if base is None:

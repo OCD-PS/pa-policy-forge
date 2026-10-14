@@ -129,18 +129,25 @@ stores the complete normalized XML with a SHA-256 fingerprint, and inventories:
 
 The workspace navigation is vertical and independently collapsible. Complete XML
 and best-effort set-command exports are available. A complete snapshot can be
-compared with the live candidate and selectively written by configuration family.
+compared with the live candidate and selectively written by configuration
+location and family. Standalone PAN-OS policy and object views offer Shared plus
+each discovered VSYS; Shared entries appear as inherited, read-only records while
+editing a VSYS. Shared and VSYS-local rules or objects can be edited in their own
+location. Panorama keeps Shared/device-group inheritance and template ownership.
 Supported entries in the vertical tree link directly to their policy, object,
 Network, or Device view. Network and Device records open in an orange PAN-OS-style
 editor with grouped tabs, typed booleans, multi-value chips, rename, duplicate,
 delete, and a mandatory preview. Internal navigation and form targets are covered
 by authenticated route-and-fragment regression tests.
-The incremental push preview lists candidate differences by family. Only checked
-families are written through exact PAN-OS XML API `set`, `edit`, and `delete`
-operations; it does not load or replace the full `/config`. The preview is tied to
-the candidate fingerprint and stops if the target candidate changes before apply.
-Objects and network prerequisites are written before policy families, with
-deletions in reverse dependency order. PAN-OS full validation runs after the writes;
+The incremental push preview lists candidate differences by location and
+configuration family. Shared, each VSYS, Panorama device groups, and templates
+remain separate selections, even when a family name is the same. Only checked
+location/family combinations are written through exact PAN-OS XML API `set`,
+`edit`, and `delete` operations; it does not load or replace the full `/config`.
+The preview is tied to the candidate fingerprint and stops if the target candidate
+changes before apply. Objects and network prerequisites are written before policy
+families, so selecting a Shared object and a VSYS policy writes the object first;
+deletions run in reverse dependency order. PAN-OS full validation runs after the writes;
 the app never commits or deploys. Protected management identity and administrator
 settings cannot be replaced from a workspace. Panorama and standalone use the
 same incremental flow while their XML paths retain the selected device-group,
