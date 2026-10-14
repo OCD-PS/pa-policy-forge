@@ -3108,6 +3108,29 @@ def apply_scm_migration(profile, model: MigrationModel) -> int:
         service=metadata.get("service") or "objects"; endpoint_name=metadata.get("endpoint","tags")
         endpoint=policy_api.scm_api_root(scm.scm_api_base)+f"/config/{service}/v1/{endpoint_name}"
         policy_api.scm_http_request("POST",endpoint,token,payload={**raw_item_payload(item),**container}); count+=1
+    def apply_extra(kind, item):
+        payload=raw_item_payload(item)
+        if kind in MIGRATION_SCM_EXTRA_OBJECTS or kind == "security_profiles":
+            object_type=MIGRATION_SCM_EXTRA_OBJECTS.get(kind)
+            if kind == "security_profiles": object_type=MIGRATION_SCM_SECURITY_PROFILES.get(str(item.get("profile_type", "")))
+            if not object_type or object_type not in SCM_OBJECT_TYPES:
+                raise MigrationError(f"Geen SCM security-profilemapping voor {item.get('profile_type','')}")
+            metadata=SCM_OBJECT_TYPES[object_type]; scm,token,container=migration_scm_container(profile,object_type,str(item.get("target_context", "")))
+            service=metadata.get("service") or "objects"; endpoint_name=metadata.get("endpoint",object_type)
+            endpoint=policy_api.scm_api_root(scm.scm_api_base)+f"/config/{service}/v1/{endpoint_name}"
+            policy_api.scm_http_request("POST",endpoint,token,payload={**payload,**container}); return 1
+        if kind in MIGRATION_SCM_NETWORK_ENDPOINTS:
+            view,endpoint_name=MIGRATION_SCM_NETWORK_ENDPOINTS[kind]; scm,token,container=migration_scm_container(profile,"zones",str(item.get("target_context", "")))
+            endpoint=policy_api.scm_api_root(scm.scm_api_base)+f"/config/{view}/v1/{endpoint_name}"
+            policy_api.scm_http_request("POST",endpoint,token,payload={**payload,**container}); return 1
+        return 0
+
+    # Create all supported object/profile/network dependencies before any policy family.
+    for kind,items in model.extras.items():
+        if kind in {"tags", *MIGRATION_SCM_EXTRA_POLICIES}:
+            continue
+        for item in items:
+            count += apply_extra(kind, item)
     for item in scm_items(model):
         kind = item["kind"]
         if kind.startswith("policy:"):
@@ -3128,29 +3151,15 @@ def apply_scm_migration(profile, model: MigrationModel) -> int:
             policy_api.scm_http_request("POST", endpoint, token, payload=payload)
         count += 1
     for kind,items in model.extras.items():
-        if kind == "tags":
+        if kind not in MIGRATION_SCM_EXTRA_POLICIES:
             continue
         for item in items:
             payload=raw_item_payload(item)
-            if kind in MIGRATION_SCM_EXTRA_OBJECTS or kind == "security_profiles":
-                object_type=MIGRATION_SCM_EXTRA_OBJECTS.get(kind)
-                if kind == "security_profiles": object_type=MIGRATION_SCM_SECURITY_PROFILES.get(str(item.get("profile_type", "")))
-                if not object_type or object_type not in SCM_OBJECT_TYPES:
-                    raise MigrationError(f"Geen SCM security-profilemapping voor {item.get('profile_type','')}")
-                metadata=SCM_OBJECT_TYPES[object_type]; scm,token,container=migration_scm_container(profile,object_type,str(item.get("target_context", "")))
-                service=metadata.get("service") or "objects"; endpoint_name=metadata.get("endpoint",object_type)
-                endpoint=policy_api.scm_api_root(scm.scm_api_base)+f"/config/{service}/v1/{endpoint_name}"
-                policy_api.scm_http_request("POST",endpoint,token,payload={**payload,**container}); count+=1
-            elif kind in MIGRATION_SCM_EXTRA_POLICIES:
-                policy_kind=MIGRATION_SCM_EXTRA_POLICIES[kind]
-                if policy_kind in SCM_UNAVAILABLE_POLICY_TYPES: raise MigrationError(f"{policy_kind} is niet beschikbaar in SCM")
-                service,endpoint_name,_=SCM_POLICY_TYPES[policy_kind]; scm,token,container=migration_scm_container(profile,"policies",str(item.get("target_context", "")))
-                endpoint=policy_api.scm_api_root(scm.scm_api_base)+f"/config/{service}/v1/{endpoint_name}"
-                policy_api.scm_http_request("POST",endpoint,token,payload={**payload,**container},params={"position":scm.scm_rulebase}); count+=1
-            elif kind in MIGRATION_SCM_NETWORK_ENDPOINTS:
-                view,endpoint_name=MIGRATION_SCM_NETWORK_ENDPOINTS[kind]; scm,token,container=migration_scm_container(profile,"zones",str(item.get("target_context", "")))
-                endpoint=policy_api.scm_api_root(scm.scm_api_base)+f"/config/{view}/v1/{endpoint_name}"
-                policy_api.scm_http_request("POST",endpoint,token,payload={**payload,**container}); count+=1
+            policy_kind=MIGRATION_SCM_EXTRA_POLICIES[kind]
+            if policy_kind in SCM_UNAVAILABLE_POLICY_TYPES: raise MigrationError(f"{policy_kind} is niet beschikbaar in SCM")
+            service,endpoint_name,_=SCM_POLICY_TYPES[policy_kind]; scm,token,container=migration_scm_container(profile,"policies",str(item.get("target_context", "")))
+            endpoint=policy_api.scm_api_root(scm.scm_api_base)+f"/config/{service}/v1/{endpoint_name}"
+            policy_api.scm_http_request("POST",endpoint,token,payload={**payload,**container},params={"position":scm.scm_rulebase}); count+=1
     invalidate_profile_caches(profile["id"])
     return count
 
@@ -4552,6 +4561,187 @@ def panos_management_invariants(xml_bytes: bytes) -> dict[str, object]:
     return values
 
 
+_PUSH_OBJECT_NODES = {
+    "address": "Addresses", "address-group": "Address groups", "application": "Applications",
+    "application-group": "Application groups", "application-filter": "Application filters",
+    "service": "Services", "service-group": "Service groups", "tag": "Tags",
+    "schedule": "Schedules", "region": "Regions", "external-list": "External dynamic lists",
+}
+_PUSH_POLICY_NODES = {
+    "security": "Security policies", "nat": "NAT policies", "qos": "QoS policies",
+    "pbf": "PBF policies", "decryption": "Decryption policies",
+    "application-override": "Application override policies", "authentication": "Authentication policies",
+    "tunnel-inspect": "Tunnel inspection policies", "dos": "DoS policies", "sdwan": "SD-WAN policies",
+}
+_PUSH_ENTRY_COLLECTIONS = set(_PUSH_OBJECT_NODES) | set(_PUSH_POLICY_NODES) | {
+    "rules", "zone", "ethernet", "aggregate-ethernet", "loopback", "tunnel", "vlan",
+    "virtual-router", "logical-router", "virtual-wire", "ipsec", "gre", "dhcp", "dns-proxy",
+    "qos", "lldp", "server-profile", "log-settings", "high-availability", "global-protect-portal",
+    "global-protect-gateway", "authentication-profile", "authentication-sequence", "user-id-collector",
+    "vm-info-source", "routing-profile", "profiles", "local-user-database", "admin-roles",
+}
+
+
+def config_push_family(path_parts: tuple[str, ...]) -> tuple[str, str]:
+    """Map an XML path to a user-selectable push family and dependency rank."""
+    parts = tuple(part.split("[", 1)[0] for part in path_parts)
+    for index, part in enumerate(parts):
+        if part in _PUSH_POLICY_NODES and any(p in {"rulebase", "pre-rulebase", "post-rulebase"} for p in parts[:index]):
+            label = _PUSH_POLICY_NODES[part]
+            return f"policy:{part}", label
+    for index, part in enumerate(parts):
+        if part in _PUSH_OBJECT_NODES and any(p in {"shared", "vsys", "device-group", "template"} for p in parts[:index]):
+            label = _PUSH_OBJECT_NODES[part]
+            return f"object:{part}", label
+    if "deviceconfig" in parts:
+        return "protected", "Device identity and management settings"
+    if "network" in parts:
+        section = parts[parts.index("network") + 1] if parts.index("network") + 1 < len(parts) else "network"
+        return f"network:{section}", f"Network · {section.replace('-', ' ').title()}"
+    for part in ("zone", "interface", "virtual-router", "logical-router", "ipsec", "global-protect"):
+        if part in parts:
+            return f"network:{part}", f"Network · {part.replace('-', ' ').title()}"
+    if any(part in {"deviceconfig", "mgt-config", "high-availability", "server-profile", "log-settings", "authentication-profile", "authentication-sequence", "user-id-collector", "vm-info-source"} for part in parts):
+        # Admin identities and authentication secrets must never be replaced by a stale snapshot.
+        if "mgt-config" in parts or "users" in parts or "password" in parts or "phash" in parts:
+            return "protected", "Protected access settings"
+        section = next((part for part in reversed(parts) if part in {"deviceconfig", "high-availability", "server-profile", "log-settings", "authentication-profile", "authentication-sequence", "user-id-collector", "vm-info-source"}), "device")
+        return f"device:{section}", f"Device · {section.replace('-', ' ').title()}"
+    if "profiles" in parts:
+        index = parts.index("profiles")
+        section = parts[index + 1] if index + 1 < len(parts) else "profiles"
+        return f"object:profile:{section}", f"Security profiles · {section.replace('-', ' ').title()}"
+    top = next((part for part in parts if part not in {"config", "devices", "entry", "shared", "vsys", "device-group", "template", "config"}), "configuration")
+    return f"other:{top}", f"Other · {top.replace('-', ' ').title()}"
+
+
+def config_push_delta(base_xml: bytes, desired_xml: bytes) -> list[dict]:
+    """Return exact candidate XML node changes; never constructs a whole-config load."""
+    before_root = SafeET.fromstring(base_xml)
+    after_root = SafeET.fromstring(desired_xml)
+    changes = []
+
+    def node_key(node, ordinal):
+        if node.tag == "entry" and node.get("name") is not None:
+            return (node.tag, node.get("name"))
+        return (node.tag, ordinal)
+
+    def node_path(parent_path, node):
+        if node.tag == "entry" and node.get("name") is not None:
+            return f"{parent_path}/entry[@name={policy_api.xpath_literal(node.get('name', ''))}]"
+        return f"{parent_path}/{node.tag}"
+
+    def add(action, xpath, element, parts, protected_source=None):
+        family, label = config_push_family(parts)
+        source = element if element is not None else protected_source
+        if source is not None and any(
+            any(token in str(node.tag).casefold() for token in ("password", "phash", "secret", "private-key"))
+            or str(node.tag).casefold() == "certificate"
+            for node in source.iter()
+        ):
+            family, label = "protected", "Credential or certificate configuration"
+        changes.append({"action": action, "xpath": xpath, "element": ET.tostring(element, encoding="unicode") if element is not None else "",
+                        "family": family, "label": label, "name": element.get("name", "") if element is not None else xpath.rsplit("/", 1)[-1]})
+
+    def walk(before, after, parent_path, parts):
+        if before is None or after is None:
+            node = after if after is not None else before
+            parent_name = parent_path.rsplit("/", 1)[-1].split("[", 1)[0]
+            if node.tag == "entry" and parent_name in {"devices", "vsys", "device-group", "template", "template-stack", "shared"}:
+                changes.append({"action": "blocked", "xpath": node_path(parent_path, node), "element": "",
+                                "family": "protected", "label": "Structural scopes (not supported)",
+                                "name": node.get("name", "scope")})
+                return
+            if node.tag == "entry" and parent_name in _PUSH_ENTRY_COLLECTIONS:
+                add("set" if before is None else "delete", parent_path if before is None else node_path(parent_path, node),
+                    node if before is None else None, parts + (node.tag,), protected_source=before)
+                return
+            if list(node):
+                # Descend through containers so deleting a missing stale subtree does
+                # not replace/delete a whole VSYS, device group, or object collection.
+                for index, child in enumerate(list(node)):
+                    walk(None if before is None else child, child if after is not None else None,
+                         node_path(parent_path, node), parts + (node.tag,))
+                return
+            path = node_path(parent_path, node)
+            if before is None:
+                add("set", parent_path, after, parts + (after.tag,))
+            else:
+                add("delete", path, None, parts + (before.tag,), protected_source=before)
+            return
+        here_parts = parts + (after.tag,)
+        parent_name = parent_path.rsplit("/", 1)[-1].split("[", 1)[0]
+        if before.tag == "entry" and parent_name in _PUSH_ENTRY_COLLECTIONS:
+            if ET.tostring(before, encoding="unicode") != ET.tostring(after, encoding="unicode"):
+                add("edit", node_path(parent_path, after), after, here_parts, protected_source=before)
+            return
+        if before.text != after.text or before.attrib != after.attrib:
+            # Replacing a repeated-list container by XPath is ambiguous; replace its nearest named entry instead.
+            add("edit", node_path(parent_path, after), after, here_parts)
+            return
+        before_children, after_children = list(before), list(after)
+        before_counts, after_counts = {}, {}
+        for child in before_children: before_counts[child.tag] = before_counts.get(child.tag, 0) + 1
+        for child in after_children: after_counts[child.tag] = after_counts.get(child.tag, 0) + 1
+        named_entries = (
+            after.tag == "rules"
+            and all(child.tag == "entry" and child.get("name") for child in (*before_children, *after_children))
+        )
+        if named_entries:
+            before_order = [child.get("name") for child in before_children]
+            after_order = [child.get("name") for child in after_children]
+            before_map = {child.get("name"): child for child in before_children}
+            after_map = {child.get("name"): child for child in after_children}
+            for name in dict.fromkeys((*before_map.keys(), *after_map.keys())):
+                left, right = before_map.get(name), after_map.get(name)
+                walk(left, right, node_path(parent_path, right or left), here_parts)
+            if before_order != after_order:
+                for position, name in enumerate(reversed(after_order)):
+                    entry_path = f"{node_path(parent_path, after)}/entry[@name={policy_api.xpath_literal(name)}]"
+                    family, label = config_push_family(here_parts)
+                    changes.append({"action": "move", "xpath": entry_path, "element": "", "family": family,
+                                    "label": label, "name": name, "where": "top", "order_index": position})
+            return
+        if any(count > 1 for count in (*before_counts.values(), *after_counts.values())):
+            if ET.tostring(before, encoding="unicode") != ET.tostring(after, encoding="unicode"):
+                add("edit", node_path(parent_path, after), after, here_parts, protected_source=before)
+            return
+        before_map = {node_key(node, index): node for index, node in enumerate(before_children)}
+        after_map = {node_key(node, index): node for index, node in enumerate(after_children)}
+        for key in dict.fromkeys((*before_map.keys(), *after_map.keys())):
+            left, right = before_map.get(key), after_map.get(key)
+            anchor = right or left
+            walk(left, right, node_path(parent_path, anchor), here_parts)
+
+    # Root node is fixed at /config. Start with direct children to keep API XPaths rooted correctly.
+    before_children = {child.tag: child for child in list(before_root)}
+    after_children = {child.tag: child for child in list(after_root)}
+    for tag in dict.fromkeys((*before_children.keys(), *after_children.keys())):
+        walk(before_children.get(tag), after_children.get(tag), "/config", ("config",))
+    # Prerequisites first; removals in reverse order so consumers go before dependencies.
+    rank = {"object": 10, "network": 20, "device": 30, "other": 35, "policy": 40}
+    for change in changes:
+        prefix = change["family"].split(":", 1)[0]
+        change["rank"] = rank.get(prefix, 35)
+    return sorted(changes, key=lambda item: (
+        1 if item["action"] == "move" else 0,
+        item.get("order_index", 0) if item["action"] == "move" else (item["rank"] if item["action"] != "delete" else 100-item["rank"]),
+        item["family"], item["name"],
+    ))
+
+
+def fetch_panos_candidate_xml(profile) -> tuple[str, str, object, bytes]:
+    _, endpoint, key, ctx = panos_profile_context(profile)
+    root = policy_api.require_success(
+        panos_api_post(endpoint, {"type": "config", "action": "get", "xpath": "/config", "key": key}, ctx),
+        "candidateconfiguratie ophalen",
+    )
+    config = root.find("./result/config")
+    if config is None:
+        raise RuntimeError("Target gaf geen candidateconfiguratie terug")
+    return endpoint, key, ctx, normalized_config_xml(config)
+
+
 def wait_panos_job(endpoint: str, key: str, ctx, job_id: str, timeout: int = 300) -> dict[str, object]:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -4583,9 +4773,31 @@ def config_workspace_push_preview(workspace_id):
         flash("Koppel eerst een push target aan het migratieproject.", "error")
         return redirect(url_for("migration_project", project_id=output["project_id"])) if output else redirect(url_for("migration_home"))
     if block_reason:
-        flash(f"API-load geblokkeerd: {block_reason}", "error")
+        flash(f"Incremental push geblokkeerd: {block_reason}", "error")
         return redirect(url_for("migration_project", project_id=output["project_id"]))
-    return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
+    try:
+        with db() as conn:
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+        if not profile or profile["target_type"] not in {"panorama", "panos"}:
+            raise RuntimeError("Dit target gebruikt geen PAN-OS XML API")
+        desired = workspace_config_path(workspace).read_bytes()
+        parse_snapshot(desired, expected_kind="panorama" if profile["target_type"] == "panorama" else "panos")
+        _, _, _, current = fetch_panos_candidate_xml(profile)
+        changes = config_push_delta(current, desired)
+        families = {}
+        for item in changes:
+            row = families.setdefault(item["family"], {"key": item["family"], "label": item["label"], "count": 0, "names": []})
+            row["count"] += 1
+            if item["name"] and item["name"] not in row["names"] and len(row["names"]) < 8:
+                row["names"].append(item["name"])
+        families = sorted(families.values(), key=lambda item: (item["label"].casefold(), item["key"]))
+        return render_template(
+            "config_workspace_push_preview.html", workspace=workspace, profile=profile,
+            families=families, change_count=len(changes), candidate_sha256=hashlib.sha256(current).hexdigest(),
+        )
+    except Exception as exc:
+        flash(f"Push-preview niet gemaakt: {exc}", "error")
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
 
 
 @app.post("/config-workspaces/<int:workspace_id>/push")
@@ -4599,59 +4811,48 @@ def config_workspace_push(workspace_id):
         flash("Koppel eerst een push target aan het migratieproject.", "error")
         return redirect(url_for("migration_project", project_id=output["project_id"])) if output else redirect(url_for("migration_home"))
     if block_reason:
-        flash(f"API-load geblokkeerd: {block_reason}", "error")
+        flash(f"Incremental push geblokkeerd: {block_reason}", "error")
         return redirect(url_for("migration_project", project_id=output["project_id"]))
+    applied_changes = 0
     try:
         with db() as conn:
             profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
         if not profile or profile["target_type"] not in {"panorama", "panos"}:
-            raise RuntimeError("Dit target ondersteunt geen volledige PAN-OS XML-load")
-        path = workspace_config_path(workspace)
-        expected = "panorama" if profile["target_type"] == "panorama" else "panos"
-        workspace_xml = path.read_bytes()
-        parse_snapshot(workspace_xml, expected_kind=expected)
+            raise RuntimeError("Dit target ondersteunt geen PAN-OS XML candidate-writes")
+        selected = set(request.form.getlist("family"))
+        if not selected or len(selected) > 200:
+            raise RuntimeError("Selecteer minstens één configuratiefamilie")
+        workspace_xml = workspace_config_path(workspace).read_bytes()
+        parse_snapshot(workspace_xml, expected_kind="panorama" if profile["target_type"] == "panorama" else "panos")
+        endpoint, key, ctx, current_xml = fetch_panos_candidate_xml(profile)
+        live_fingerprint = hashlib.sha256(current_xml).hexdigest()
+        if not hmac.compare_digest(live_fingerprint, request.form.get("candidate_sha256", "")):
+            raise RuntimeError("De targetcandidate wijzigde sinds de preview; maak een nieuwe preview")
+        changes = config_push_delta(current_xml, workspace_xml)
+        available = {item["family"] for item in changes}
+        if "protected" in selected:
+            raise RuntimeError("Management- en administratorinstellingen zijn beschermd tegen workspace-push")
+        if not selected.issubset(available):
+            raise RuntimeError("De geselecteerde pushfamilie hoort niet bij deze candidatepreview")
+        chosen = [item for item in changes if item["family"] in selected]
+        if not chosen:
+            raise RuntimeError("De selectie bevat geen wijzigingen")
         if profile["target_type"] == "panos":
-            candidate_analysis = panos_candidate_analysis(workspace_xml)
-            invalid_zones = candidate_analysis.get("unresolved_zone_references", [])
-            if invalid_zones:
-                details = "; ".join(invalid_zones[:8])
-                remainder = len(invalid_zones) - 8
-                if remainder > 0:
-                    details += f"; en nog {remainder}"
-                raise RuntimeError(
-                    "Candidate niet geladen: zoneverwijzingen moeten bestaan binnen dezelfde VSYS. "
-                    + details
-                )
-        _, endpoint, key, ctx = panos_profile_context(profile)
-        if profile["target_type"] in {"panos", "panorama"}:
-            active_root = policy_api.require_success(
-                panos_api_post(endpoint, {"type": "config", "action": "show", "xpath": "/config", "key": key}, ctx),
-                "actieve managementconfiguratie ophalen",
-            )
-            active_config = active_root.find("./result/config")
-            if active_config is None:
-                raise RuntimeError("Firewall gaf geen actieve configuratie terug")
-            active_xml = normalized_config_xml(active_config)
-            if panos_management_invariants(active_xml) != panos_management_invariants(path.read_bytes()):
-                raise RuntimeError(
-                    "managementbescherming: IP, gateway, DNS, hostname of administratorconfig wijkt af"
-                )
-        imported_name = f"ppf-{workspace_id}-{secrets.token_hex(3)}.xml"[:31]
-        import_path = path.with_name(imported_name)
-        shutil.copyfile(path, import_path)
-        import_path.chmod(0o600)
-        try:
+            analysis = panos_candidate_analysis(workspace_xml)
+            invalid_zones = analysis.get("unresolved_zone_references", [])
+            if invalid_zones and any(item["family"].startswith("policy:") for item in chosen):
+                raise RuntimeError("Candidate bevat zoneverwijzingen buiten de geselecteerde VSYS; los die eerst op")
+        for change in chosen:
+            params = {"type": "config", "action": change["action"], "xpath": change["xpath"], "key": key}
+            if change["action"] in {"set", "edit"}:
+                params["element"] = change["element"]
+            if change["action"] == "move":
+                params["where"] = change["where"]
             policy_api.require_success(
-                policy_api.api_post_multipart(endpoint, {"type": "import", "category": "configuration", "key": key}, import_path, ctx),
-                "volledige configuratie uploaden",
+                panos_api_post(endpoint, params, ctx),
+                f"{change['action']} {change['label']} {change['name']}",
             )
-            load_command = f"<load><config><from>{html.escape(imported_name, quote=False)}</from></config></load>"
-            policy_api.require_success(
-                panos_api_post(endpoint, {"type": "op", "cmd": load_command, "key": key}, ctx),
-                "volledige configuratie naar candidate laden",
-            )
-        finally:
-            import_path.unlink(missing_ok=True)
+            applied_changes += 1
         validation_root = policy_api.require_success(
             panos_api_post(endpoint, {"type": "op", "cmd": "<validate><full></full></validate>", "key": key}, ctx),
             "PAN-OS candidatevalidatie starten",
@@ -4661,17 +4862,18 @@ def config_workspace_push(workspace_id):
             "status": "FIN", "result": "OK", "details": [],
         }
         audit(
-            "config-workspace-loaded",
-            f"workspace={workspace_id} profile={profile['name']} sha256={workspace['sha256']} validate={validation.get('result','')}",
+            "config-workspace-incremental-push",
+            f"workspace={workspace_id} profile={profile['name']} families={','.join(sorted(selected))} changes={len(chosen)} validate={validation.get('result','')}",
         )
         if validation.get("result") != "OK":
             details = [value for value in validation.get("details", []) if "invalid" in value.casefold()]
             message = "; ".join(details[-8:]) or "PAN-OS meldde een ongeldige candidate"
             flash(f"Candidate geladen maar validatie mislukt; er is niet gecommit: {message}", "error")
         else:
-            flash("Candidate geladen en succesvol door PAN-OS gevalideerd; er is niet gecommit.", "success")
+            flash(f"{len(chosen)} wijzigingen uit {len(selected)} configuratiefamilie(s) naar de candidate geschreven en gevalideerd; niet gecommit.", "success")
     except Exception as exc:
-        flash(f"Volledige XML niet geladen: {exc}", "error")
+        partial = f"; {applied_changes} wijziging(en) staan al in de uncommitted candidate" if applied_changes else ""
+        flash(f"Incremental push gestopt{partial}: {exc}", "error")
     return redirect(url_for("index", policy_profile=workspace["profile_id"]) + "#policy-management")
 
 

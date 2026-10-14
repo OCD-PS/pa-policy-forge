@@ -1,0 +1,11 @@
+<!doctype html><html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Incremental push · PA Policy Forge</title><link rel="stylesheet" href="{{url_for('static',filename='app.css',v=asset_version)}}"></head><body>
+<header class="topbar"><div class="brand">OCD <span>PA Policy Forge</span></div></header><main class="content narrow">
+<section class="card stack"><p class="eyebrow">{{profile.name}} · {{profile.target_type|upper}} CANDIDATE</p><h1>Incremental push</h1>
+<p>Vergelijking met de actuele candidate. Alleen de aangevinkte families worden met gerichte XML API-wijzigingen geschreven. De rest van de configuratie blijft buiten deze push. Er wordt niet gecommit.</p>
+{% if families %}<form method="post" action="{{url_for('config_workspace_push',workspace_id=workspace.id)}}"><input type="hidden" name="csrf" value="{{csrf_token()}}"><input type="hidden" name="candidate_sha256" value="{{candidate_sha256}}">
+<div class="table-wrap"><table><thead><tr><th>Selecteer</th><th>Configuratiefamilie</th><th>Wijzigingen</th><th>Voorbeelden</th></tr></thead><tbody>
+{% for item in families %}<tr><td>{% if item.key=='protected' %}<span class="badge">Beschermd</span>{% else %}<input type="checkbox" name="family" value="{{item.key}}" aria-label="Selecteer {{item.label}}">{% endif %}</td><td>{{item.label}}</td><td>{{item.count}}</td><td class="mono">{{item.names|join(', ')}}</td></tr>{% endfor %}
+</tbody></table></div><p class="muted">{{change_count}} kandidaatwijziging(en) gevonden. Objecten en netwerk worden vóór policies geschreven; verwijderingen lopen in omgekeerde afhankelijkheidsvolgorde.</p>
+<div class="cluster" style="justify-content:flex-end"><a class="btn" href="{{url_for('config_workspace_editor',workspace_id=workspace.id)}}">Terug</a><button class="btn btn-primary" type="submit">Geselecteerde families naar candidate schrijven</button></div></form>
+{% else %}<div class="callout">Geen verschillen gevonden tussen workspace en actuele candidate.</div><div class="cluster"><a class="btn" href="{{url_for('config_workspace_editor',workspace_id=workspace.id)}}">Terug</a></div>{% endif %}
+</section></main></body></html>

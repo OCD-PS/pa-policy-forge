@@ -128,18 +128,23 @@ stores the complete normalized XML with a SHA-256 fingerprint, and inventories:
   Device navigation tree.
 
 The workspace navigation is vertical and independently collapsible. Complete XML
-and best-effort set-command exports are available. A complete snapshot can also be
-uploaded through the target XML API and loaded as the new candidate configuration.
+and best-effort set-command exports are available. A complete snapshot can be
+compared with the live candidate and selectively written by configuration family.
 Supported entries in the vertical tree link directly to their policy, object,
 Network, or Device view. Network and Device records open in an orange PAN-OS-style
 editor with grouped tabs, typed booleans, multi-value chips, rename, duplicate,
 delete, and a mandatory preview. Internal navigation and form targets are covered
 by authenticated route-and-fragment regression tests.
-Clicking the push action loads the snapshot into the target candidate and reports
-whether PAN-OS loaded and validated it successfully. It never commits the
-candidate automatically. Device groups, templates, VSYS selections, and unknown
-XML nodes remain preserved so later graphical editors can operate as scoped diffs
-without reconstructing or dropping unsupported configuration.
+The incremental push preview lists candidate differences by family. Only checked
+families are written through exact PAN-OS XML API `set`, `edit`, and `delete`
+operations; it does not load or replace the full `/config`. The preview is tied to
+the candidate fingerprint and stops if the target candidate changes before apply.
+Objects and network prerequisites are written before policy families, with
+deletions in reverse dependency order. PAN-OS full validation runs after the writes;
+the app never commits or deploys. Protected management identity and administrator
+settings cannot be replaced from a workspace. Panorama and standalone use the
+same incremental flow while their XML paths retain the selected device-group,
+template, or VSYS ownership.
 
 The offline editor resolves Panorama policy and object inheritance from Shared
 through parent device groups to the selected device group. Inherited entries are
@@ -184,6 +189,10 @@ rename/delete/enable/disable transformations, duplicate and unresolved-reference
 live profile pulls, portable project bundles, full XML export, and set-command export.
 SCM mappings are preflighted before candidate writes so an unsupported selected family
 cannot result in a silent partial migration.
+SCM candidate writes remain native per-object/per-policy API calls; the migration
+family mapping controls which families are created, mapped, or ignored. Tags,
+objects, security profiles, and network prerequisites are written before policy
+families. The subsequent SCM deployment remains a separate explicit action.
 
 The Migration Control Center adds an explicit source-family decision (`map`, `create`,
 `ignore`, or `review`), mandatory per-item topology mapping, saved AND/OR filters, bulk
