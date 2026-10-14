@@ -258,7 +258,7 @@
 <div class="field" data-vsys-count-field hidden>
 <label>Verwacht aantal VSYS</label>
 <select name="vsys_count" data-vsys-count-select disabled>
-{% for count in range(2, 33) %}<option value="{{count}}" {% if ep and (ep.vsys_count|int) == count %}selected{% endif %}>{{count}}</option>{% endfor %}
+{% for count in range(2, 33) %}<option value="{{count}}" {% if ep and (ep.vsys_count|default(2, true)|int) == count %}selected{% endif %}>{{count}}</option>{% endfor %}
 </select>
 </div>
 <div class="field full" data-vsys-note hidden>
