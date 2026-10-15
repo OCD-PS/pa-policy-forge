@@ -111,5 +111,56 @@ class ConfigPushDeltaTests(unittest.TestCase):
         self.assertEqual(moves[0]["dst"], "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys2']/rulebase/security/rules/entry[@name='Keep1']")
 
 
+    def test_appending_named_entries_does_not_edit_the_previous_entry_tail(self):
+        current = b"""<config>
+  <devices>
+    <entry name="localhost.localdomain">
+      <vsys>
+        <entry name="vsys2">
+          <address>
+            <entry name="srvfixsnmp_10_10_101_186">
+              <ip-netmask>10.10.101.186</ip-netmask>
+            </entry>
+          </address>
+          <rulebase><security><rules>
+            <entry name="cleanup-rule"><from><member>any</member></from><to><member>any</member></to><action>drop</action></entry>
+          </rules></security></rulebase>
+        </entry>
+      </vsys>
+    </entry>
+  </devices>
+</config>"""
+        desired = b"""<config>
+  <devices>
+    <entry name="localhost.localdomain">
+      <vsys>
+        <entry name="vsys2">
+          <address>
+            <entry name="srvfixsnmp_10_10_101_186">
+              <ip-netmask>10.10.101.186</ip-netmask>
+            </entry>
+            <entry name="PF_E2E_ADDR"><ip-netmask>203.0.113.78/32</ip-netmask></entry>
+          </address>
+          <rulebase><security><rules>
+            <entry name="cleanup-rule"><from><member>any</member></from><to><member>any</member></to><action>drop</action></entry>
+            <entry name="PF_E2E_RULE"><action>allow</action><disabled>yes</disabled></entry>
+          </rules></security></rulebase>
+        </entry>
+      </vsys>
+    </entry>
+  </devices>
+</config>"""
+
+        changes = main.config_push_delta(current, desired)
+
+        self.assertEqual(
+            {(change["action"], change["name"], change["scope"], change["family"]) for change in changes},
+            {
+                ("set", "PF_E2E_ADDR", "vsys2", "object:address"),
+                ("set", "PF_E2E_RULE", "vsys2", "policy:security"),
+            },
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

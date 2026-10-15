@@ -4732,6 +4732,17 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes) -> list[dict]:
         changes.append({"action": action, "xpath": xpath, "element": ET.tostring(element, encoding="unicode") if element is not None else "",
                         "family": family, "label": label, "name": element.get("name", "") if element is not None else xpath.rsplit("/", 1)[-1]})
 
+    def xml_content_signature(element):
+        # Ignore indentation-only text between XML elements. ElementTree includes
+        # an element's tail in tostring(), so appending a sibling can otherwise
+        # make the preceding unchanged PAN-OS entry look edited.
+        return (
+            element.tag,
+            tuple(sorted(element.attrib.items())),
+            (element.text or "").strip(),
+            tuple(xml_content_signature(child) for child in list(element)),
+        )
+
     def is_admin_role_ui_metadata(xpath):
         # PAN-OS returns UI permission catalogs beneath admin-role entries with
         # inconsistent contents across candidate reads. These are role ACL metadata,
@@ -4776,7 +4787,7 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes) -> list[dict]:
         here_parts = parts + (after.tag,)
         parent_name = parent_path.rsplit("/", 1)[-1].split("[", 1)[0]
         if before.tag == "entry" and parent_name in _PUSH_ENTRY_COLLECTIONS:
-            if ET.tostring(before, encoding="unicode") != ET.tostring(after, encoding="unicode"):
+            if xml_content_signature(before) != xml_content_signature(after):
                 add("edit", node_path(parent_path, after), after, here_parts, protected_source=before)
             return
         if before.text != after.text or before.attrib != after.attrib:
@@ -4818,7 +4829,7 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes) -> list[dict]:
                     previous_name = name
             return
         if any(count > 1 for count in (*before_counts.values(), *after_counts.values())):
-            if ET.tostring(before, encoding="unicode") != ET.tostring(after, encoding="unicode"):
+            if xml_content_signature(before) != xml_content_signature(after):
                 add("edit", node_path(parent_path, after), after, here_parts, protected_source=before)
             return
         before_map = {node_key(node, index): node for index, node in enumerate(before_children)}
