@@ -4807,7 +4807,10 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes) -> list[dict]:
             if xml_content_signature(before) != xml_content_signature(after):
                 add("edit", node_path(parent_path, after), after, here_parts, protected_source=before)
             return
-        if before.text != after.text or before.attrib != after.attrib:
+        # PAN-OS API XML and workspace XML use different indentation. Container
+        # whitespace is formatting, not a configuration edit; comparing it raw
+        # can collapse a multi-VSYS change into one protected /config/devices edit.
+        if (before.text or "").strip() != (after.text or "").strip() or before.attrib != after.attrib:
             # Replacing a repeated-list container by XPath is ambiguous; replace its nearest named entry instead.
             add("edit", node_path(parent_path, after), after, here_parts)
             return

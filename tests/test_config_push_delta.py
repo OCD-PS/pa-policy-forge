@@ -98,6 +98,30 @@ class ConfigPushDeltaTests(unittest.TestCase):
         self.assertFalse(any(change["family"] == "other:configuration" for change in changes))
 
 
+    def test_device_container_indentation_does_not_hide_vsys_changes(self):
+        current = b"""<config>
+  <devices>
+    <entry name="localhost.localdomain">
+      <vsys>
+        <entry name="vsys1"><address /></entry>
+        <entry name="vsys2"><address><entry name="Existing"><ip-netmask>192.0.2.1/32</ip-netmask></entry></address><rulebase><security><rules><entry name="Keep"><action>allow</action></entry></rules></security></rulebase></entry>
+      </vsys>
+    </entry>
+  </devices>
+</config>"""
+        desired = b"""<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address /></entry><entry name="vsys2"><address><entry name="Existing"><ip-netmask>192.0.2.1/32</ip-netmask></entry><entry name="PF_E2E_ADDR"><ip-netmask>203.0.113.79/32</ip-netmask></entry></address><rulebase><security><rules><entry name="Keep"><action>allow</action></entry><entry name="PF_E2E_RULE"><action>deny</action><disabled>yes</disabled></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
+
+        changes = main.config_push_delta(current, desired)
+
+        self.assertEqual(
+            {(change["action"], change["name"], change["scope"], change["family"]) for change in changes},
+            {
+                ("set", "PF_E2E_ADDR", "vsys2", "object:address"),
+                ("set", "PF_E2E_RULE", "vsys2", "policy:security"),
+            },
+        )
+
+
     def test_inserted_policy_moves_only_the_new_rule_to_its_anchor(self):
         current = b"""<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys2"><rulebase><security><rules><entry name="Keep1"><action>allow</action></entry><entry name="Keep2"><action>deny</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
         desired = b"""<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys2"><rulebase><security><rules><entry name="Keep1"><action>allow</action></entry><entry name="PF_E2E_RULE"><action>deny</action><disabled>yes</disabled></entry><entry name="Keep2"><action>deny</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
