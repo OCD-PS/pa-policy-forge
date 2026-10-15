@@ -76,5 +76,19 @@ class ConfigPushDeltaTests(unittest.TestCase):
         self.assertEqual(payload.attrib["name"], "Pa_Policy_Forge")
 
 
+    def test_multi_vsys_additions_are_diffed_per_named_entry(self):
+        current = b"""<config><devices><entry name=\"localhost.localdomain\"><vsys><entry name=\"vsys1\"><address><entry name=\"Existing1\"><ip-netmask>192.0.2.1/32</ip-netmask></entry></address><rulebase><security><rules><entry name=\"Keep1\"><action>allow</action></entry></rules></security></rulebase></entry><entry name=\"vsys2\"><address><entry name=\"Existing2\"><ip-netmask>192.0.2.2/32</ip-netmask></entry></address><rulebase><security><rules><entry name=\"Keep2\"><action>allow</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
+        desired = b"""<config><devices><entry name=\"localhost.localdomain\"><vsys><entry name=\"vsys1\"><address><entry name=\"Existing1\"><ip-netmask>192.0.2.1/32</ip-netmask></entry></address><rulebase><security><rules><entry name=\"Keep1\"><action>allow</action></entry></rules></security></rulebase></entry><entry name=\"vsys2\"><address><entry name=\"Existing2\"><ip-netmask>192.0.2.2/32</ip-netmask></entry><entry name=\"PF_E2E_ADDR\"><ip-netmask>203.0.113.79/32</ip-netmask></entry></address><rulebase><security><rules><entry name=\"Keep2\"><action>allow</action></entry><entry name=\"PF_E2E_RULE\"><action>deny</action><disabled>yes</disabled></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
+
+        changes = main.config_push_delta(current, desired)
+        address = next(change for change in changes if change["name"] == "PF_E2E_ADDR")
+        rule = next(change for change in changes if change["name"] == "PF_E2E_RULE" and change["action"] == "set")
+
+        self.assertEqual((address["action"], address["scope"], address["family"]), ("set", "vsys2", "object:address"))
+        self.assertEqual((rule["scope"], rule["family"]), ("vsys2", "policy:security"))
+        self.assertTrue(any(change["action"] == "move" and change["name"] == "PF_E2E_RULE" for change in changes))
+        self.assertFalse(any(change["family"] == "other:configuration" for change in changes))
+
+
 if __name__ == "__main__":
     unittest.main()

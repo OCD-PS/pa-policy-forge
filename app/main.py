@@ -4771,9 +4771,8 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes) -> list[dict]:
         before_counts, after_counts = {}, {}
         for child in before_children: before_counts[child.tag] = before_counts.get(child.tag, 0) + 1
         for child in after_children: after_counts[child.tag] = after_counts.get(child.tag, 0) + 1
-        named_entries = (
-            after.tag == "rules"
-            and all(child.tag == "entry" and child.get("name") for child in (*before_children, *after_children))
+        named_entries = bool(before_children or after_children) and all(
+            child.tag == "entry" and child.get("name") for child in (*before_children, *after_children)
         )
         if named_entries:
             before_order = [child.get("name") for child in before_children]
@@ -4783,7 +4782,7 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes) -> list[dict]:
             for name in dict.fromkeys((*before_map.keys(), *after_map.keys())):
                 left, right = before_map.get(name), after_map.get(name)
                 walk(left, right, node_path(parent_path, after), here_parts)
-            if before_order != after_order:
+            if after.tag == "rules" and before_order != after_order:
                 for position, name in enumerate(reversed(after_order)):
                     entry_path = f"{node_path(parent_path, after)}/entry[@name={policy_api.xpath_literal(name)}]"
                     family, label = config_push_family(here_parts)
