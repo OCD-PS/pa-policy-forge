@@ -162,5 +162,27 @@ class ConfigPushDeltaTests(unittest.TestCase):
         )
 
 
+    def test_specific_policy_members_replace_exclusive_wildcards(self):
+        policy = {
+            "from": ["any", "Trust"], "to": ["any", "Server"],
+            "source": ["any", "test-host"], "destination": ["any", "test-group"],
+            "application": ["any", "ssl"], "service": ["application-default", "tcp-8443"],
+            "source_user": ["any", "test-user"], "source_hip": ["any", "compliant"],
+            "destination_user": ["any", "test-service-user"],
+            "destination_hip": ["any", "managed"], "category": ["any", "business"],
+            "untouched": ["any"],
+        }
+
+        normalized = main.normalize_policy_wildcard_members(policy)
+
+        self.assertEqual(normalized["source"], ["test-host"])
+        self.assertEqual(normalized["destination"], ["test-group"])
+        self.assertEqual(normalized["service"], ["tcp-8443"])
+        self.assertEqual(normalized["from"], ["Trust"])
+        self.assertEqual(normalized["application"], ["ssl"])
+        self.assertEqual(normalized["untouched"], ["any"])
+        self.assertEqual(policy["source"], ["any", "test-host"])
+
+
 if __name__ == "__main__":
     unittest.main()

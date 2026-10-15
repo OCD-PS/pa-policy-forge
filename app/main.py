@@ -2268,6 +2268,22 @@ POLICY_REFERENCE_BUILTINS = {
 }
 
 
+def normalize_policy_wildcard_members(policy: dict) -> dict:
+    """Keep PAN-OS wildcard members exclusive when concrete values are chosen."""
+    exclusive = {
+        "from": {"any"}, "to": {"any"}, "source": {"any"}, "destination": {"any"},
+        "source_user": {"any"}, "source_hip": {"any"},
+        "destination_user": {"any"}, "destination_hip": {"any"},
+        "application": {"any"}, "service": {"any", "application-default"}, "category": {"any"},
+    }
+    normalized = dict(policy)
+    for field, special_values in exclusive.items():
+        values = list(normalized.get(field, []) or [])
+        if any(value not in special_values for value in values):
+            normalized[field] = [value for value in values if value not in special_values]
+    return normalized
+
+
 def extend_policy_catalog_with_current(catalog: list[dict], policies: list[dict]) -> list[dict]:
     """Add valid predefined values already present in the current rulebase."""
     result = list(catalog)
@@ -3797,6 +3813,7 @@ def config_workspace_policy_preview(workspace_id):
         updated["name"] = updated_name
         for field in OFFLINE_POLICY_FIELDS:
             updated[field] = split_values(request.form.get(field, ""))
+        updated = normalize_policy_wildcard_members(updated)
         updated["action"] = request.form.get("action", "").strip()
         updated["description"] = request.form.get("description", "").strip()
         updated["log_setting"] = request.form.get("log_setting", "").strip()
