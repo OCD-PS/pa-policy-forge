@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import copy
+from difflib import SequenceMatcher
 import hashlib
 import html
 import hmac
@@ -4783,11 +4784,23 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes) -> list[dict]:
                 left, right = before_map.get(name), after_map.get(name)
                 walk(left, right, node_path(parent_path, after), here_parts)
             if after.tag == "rules" and before_order != after_order:
-                for position, name in enumerate(reversed(after_order)):
-                    entry_path = f"{node_path(parent_path, after)}/entry[@name={policy_api.xpath_literal(name)}]"
-                    family, label = config_push_family(here_parts)
-                    changes.append({"action": "move", "xpath": entry_path, "element": "", "family": family,
-                                    "label": label, "name": name, "where": "top", "order_index": position})
+                after_names = set(after_order)
+                simulated_order = [name for name in before_order if name in after_names]
+                simulated_order.extend(name for name in after_order if name not in before_map)
+                unchanged = set()
+                for block in SequenceMatcher(None, simulated_order, after_order, autojunk=False).get_matching_blocks():
+                    unchanged.update(after_order[block.b:block.b + block.size])
+                previous_name = None
+                for position, name in enumerate(after_order):
+                    if name not in unchanged:
+                        entry_path = f"{node_path(parent_path, after)}/entry[@name={policy_api.xpath_literal(name)}]"
+                        family, label = config_push_family(here_parts)
+                        change = {"action": "move", "xpath": entry_path, "element": "", "family": family,
+                                   "label": label, "name": name, "where": "top" if previous_name is None else "after", "order_index": position}
+                        if previous_name is not None:
+                            change["dst"] = f"{node_path(parent_path, after)}/entry[@name={policy_api.xpath_literal(previous_name)}]"
+                        changes.append(change)
+                    previous_name = name
             return
         if any(count > 1 for count in (*before_counts.values(), *after_counts.values())):
             if ET.tostring(before, encoding="unicode") != ET.tostring(after, encoding="unicode"):
@@ -4971,6 +4984,8 @@ def config_workspace_push(workspace_id):
                 params["element"] = change["element"]
             if change["action"] == "move":
                 params["where"] = change["where"]
+                if change.get("dst"):
+                    params["dst"] = change["dst"]
             policy_api.require_success(
                 panos_api_post(endpoint, params, ctx),
                 f"{change['action']} {change['label']} {change['name']}",

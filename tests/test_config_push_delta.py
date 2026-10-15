@@ -86,8 +86,21 @@ class ConfigPushDeltaTests(unittest.TestCase):
 
         self.assertEqual((address["action"], address["scope"], address["family"]), ("set", "vsys2", "object:address"))
         self.assertEqual((rule["scope"], rule["family"]), ("vsys2", "policy:security"))
-        self.assertTrue(any(change["action"] == "move" and change["name"] == "PF_E2E_RULE" for change in changes))
+        self.assertFalse(any(change["action"] == "move" for change in changes))
         self.assertFalse(any(change["family"] == "other:configuration" for change in changes))
+
+
+    def test_inserted_policy_moves_only_the_new_rule_to_its_anchor(self):
+        current = b"""<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys2"><rulebase><security><rules><entry name="Keep1"><action>allow</action></entry><entry name="Keep2"><action>deny</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
+        desired = b"""<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys2"><rulebase><security><rules><entry name="Keep1"><action>allow</action></entry><entry name="PF_E2E_RULE"><action>deny</action><disabled>yes</disabled></entry><entry name="Keep2"><action>deny</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
+
+        changes = main.config_push_delta(current, desired)
+        moves = [change for change in changes if change["action"] == "move"]
+
+        self.assertEqual(len(moves), 1)
+        self.assertEqual(moves[0]["name"], "PF_E2E_RULE")
+        self.assertEqual(moves[0]["where"], "after")
+        self.assertEqual(moves[0]["dst"], "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys2']/rulebase/security/rules/entry[@name='Keep1']")
 
 
 if __name__ == "__main__":
