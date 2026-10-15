@@ -4732,7 +4732,22 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes) -> list[dict]:
         changes.append({"action": action, "xpath": xpath, "element": ET.tostring(element, encoding="unicode") if element is not None else "",
                         "family": family, "label": label, "name": element.get("name", "") if element is not None else xpath.rsplit("/", 1)[-1]})
 
+    def is_admin_role_ui_metadata(xpath):
+        # PAN-OS returns UI permission catalogs beneath admin-role entries with
+        # inconsistent contents across candidate reads. These are role ACL metadata,
+        # not device log settings or server profiles, and must never become push ops.
+        return "/admin-role/" in xpath and any(
+            marker in xpath
+            for marker in (
+                "/role/device/webui/device/log-settings",
+                "/role/device/webui/device/server-profile",
+            )
+        )
+
     def walk(before, after, parent_path, parts):
+        node = after if after is not None else before
+        if node is not None and is_admin_role_ui_metadata(node_path(parent_path, node)):
+            return
         if before is None or after is None:
             node = after if after is not None else before
             parent_name = parent_path.rsplit("/", 1)[-1].split("[", 1)[0]

@@ -76,6 +76,14 @@ class ConfigPushDeltaTests(unittest.TestCase):
         self.assertEqual(payload.attrib["name"], "Pa_Policy_Forge")
 
 
+    def test_admin_role_ui_permission_catalogs_are_not_pushable_device_profiles(self):
+        current = b"""<config><shared><admin-role><entry name="Read only"><role><device><webui><device><server-profile><dns /><syslog /></server-profile><log-settings><system><enable>yes</enable></system></log-settings></device></webui></device></role></entry></admin-role></shared><predefined><admin-role><entry name="securityadmin"><role><device><webui><device><server-profile><ldap /></server-profile><log-settings><traffic><enable>yes</enable></traffic></log-settings></device></webui></device></role></entry></admin-role></predefined></config>"""
+        desired = b"""<config><shared><admin-role><entry name="Read only"><role><device><webui><device><server-profile><radius /></server-profile></device></webui></device></role></entry></admin-role></shared><predefined><admin-role><entry name="securityadmin"><role><device><webui><device><server-profile><syslog /></server-profile><log-settings><system><enable>no</enable></system></log-settings></device></webui></device></role></entry></admin-role></predefined></config>"""
+
+        changes = main.config_push_delta(current, desired)
+
+        self.assertEqual(changes, [])
+
     def test_multi_vsys_additions_are_diffed_per_named_entry(self):
         current = b"""<config><devices><entry name=\"localhost.localdomain\"><vsys><entry name=\"vsys1\"><address><entry name=\"Existing1\"><ip-netmask>192.0.2.1/32</ip-netmask></entry></address><rulebase><security><rules><entry name=\"Keep1\"><action>allow</action></entry></rules></security></rulebase></entry><entry name=\"vsys2\"><address><entry name=\"Existing2\"><ip-netmask>192.0.2.2/32</ip-netmask></entry></address><rulebase><security><rules><entry name=\"Keep2\"><action>allow</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
         desired = b"""<config><devices><entry name=\"localhost.localdomain\"><vsys><entry name=\"vsys1\"><address><entry name=\"Existing1\"><ip-netmask>192.0.2.1/32</ip-netmask></entry></address><rulebase><security><rules><entry name=\"Keep1\"><action>allow</action></entry></rules></security></rulebase></entry><entry name=\"vsys2\"><address><entry name=\"Existing2\"><ip-netmask>192.0.2.2/32</ip-netmask></entry><entry name=\"PF_E2E_ADDR\"><ip-netmask>203.0.113.79/32</ip-netmask></entry></address><rulebase><security><rules><entry name=\"Keep2\"><action>allow</action></entry><entry name=\"PF_E2E_RULE\"><action>deny</action><disabled>yes</disabled></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
