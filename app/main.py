@@ -1399,9 +1399,9 @@ PANOS_OBJECT_NODES = {
     "application-groups": "application-group", "application-filters": "application-filter",
     "services": "service", "service-groups": "service-group", "tags": "tag", "zones": "zone",
     "hip-profiles": "hip-profiles", "schedules": "schedule", "security-profile-groups": "profile-group",
-    "log-forwarding": "log-settings/profiles", "syslog-server-profiles": "server-profile/syslog",
-    "email-server-profiles": "server-profile/email", "snmp-trap-server-profiles": "server-profile/snmptrap",
-    "http-server-profiles": "server-profile/http",
+    "log-forwarding": "log-settings/profiles", "syslog-server-profiles": "log-settings/syslog",
+    "email-server-profiles": "log-settings/email", "snmp-trap-server-profiles": "log-settings/snmptrap",
+    "http-server-profiles": "log-settings/http",
 }
 
 
@@ -4859,6 +4859,21 @@ def config_workspace_push_preview(workspace_id):
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
 
 
+def concise_incremental_push_error(exc: Exception) -> str:
+    message = str(exc)
+    api_error = re.search(r"(?P<context>(?:set|edit|delete) .*?) failed: status='(?P<status>[^']+)' code='(?P<code>[^']+)' msg=", message)
+    if api_error:
+        code = api_error.group("code")
+        if code == "13":
+            reason = "PAN-OS herkent dit configuratiepad niet"
+        elif code == "16" or api_error.group("status").casefold() == "unauth":
+            reason = "PAN-OS weigert de API-aanroep"
+        else:
+            reason = "PAN-OS heeft de wijziging geweigerd"
+        return f"{api_error.group('context')}: {reason} (code {code})"
+    return message if len(message) <= 220 else message[:217].rstrip() + "…"
+
+
 @app.post("/config-workspaces/<int:workspace_id>/push")
 @login_required
 def config_workspace_push(workspace_id):
@@ -4941,8 +4956,15 @@ def config_workspace_push(workspace_id):
         else:
             flash(f"{len(chosen)} wijzigingen uit {len(selected)} configuratiefamilie(s) naar de candidate geschreven en gevalideerd; niet gecommit.", "success")
     except Exception as exc:
-        partial = f"; {applied_changes} wijziging(en) staan al in de uncommitted candidate" if applied_changes else ""
-        flash(f"Incremental push gestopt{partial}: {exc}", "error")
+        app.logger.exception(
+            "Incremental push failed for workspace=%s after %s write(s)",
+            workspace_id, applied_changes,
+        )
+        state = (
+            f"{applied_changes} wijziging(en) staan al in de candidate; niet gecommit"
+            if applied_changes else "candidate niet gewijzigd"
+        )
+        flash(f"Incremental push gestopt: {concise_incremental_push_error(exc)}; {state}.", "error")
     return redirect(url_for("index", policy_profile=workspace["profile_id"]) + "#policy-management")
 
 
