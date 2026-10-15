@@ -17,6 +17,10 @@ fake_panos=Flask("fake-panos")
 def fake_api():
     if request.values.get("type") == "keygen":
         return Response("<response status='success'><result><key>e2e-key</key></result></response>", mimetype="application/xml")
+    xpath = request.values.get("xpath", "")
+    if request.values.get("type") == "config" and request.values.get("action") == "get" and xpath.endswith("/rulebase/security/rules"):
+        rules = """<entry name="allow-web-out"><from><member>trust</member></from><to><member>untrust</member></to><source><member>any</member></source><destination><member>any</member></destination><application><member>any</member></application><service><member>any</member></service><action>allow</action><disabled>yes</disabled></entry>"""
+        return Response(f"<response status='success'><result>{rules}</result></response>", mimetype="application/xml")
     return Response("<response status='success'><result><config/></result></response>", mimetype="application/xml")
 
 fake_server=make_server("127.0.0.1",0,fake_panos,ssl_context="adhoc")

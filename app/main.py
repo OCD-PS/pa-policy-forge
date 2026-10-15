@@ -4663,10 +4663,50 @@ def config_push_scope(xpath: str) -> str:
     return "Global"
 
 
+def normalize_legacy_server_profile_paths(xml_bytes: bytes) -> bytes:
+    """Move legacy workspace server profiles under PAN-OS log-settings paths."""
+    root = SafeET.fromstring(xml_bytes)
+    profile_types = ("syslog", "email", "snmptrap", "http")
+    for scope in list(root.iter()):
+        legacy_profiles = scope.find("server-profile")
+        if legacy_profiles is None:
+            continue
+        for profile_type in profile_types:
+            legacy = legacy_profiles.find(profile_type)
+            if legacy is None:
+                continue
+            log_settings = scope.find("log-settings")
+            if log_settings is None:
+                log_settings = ET.Element("log-settings")
+                scope.append(log_settings)
+            current = log_settings.find(profile_type)
+            if current is None:
+                legacy_profiles.remove(legacy)
+                log_settings.append(legacy)
+                continue
+            for child in list(legacy):
+                name = child.get("name") if child.tag == "entry" else None
+                existing = next(
+                    (item for item in list(current)
+                     if name is not None and item.tag == "entry" and item.get("name") == name),
+                    None,
+                )
+                if existing is not None:
+                    position = list(current).index(existing)
+                    current.remove(existing)
+                    current.insert(position, child)
+                else:
+                    current.append(child)
+            legacy_profiles.remove(legacy)
+        if not list(legacy_profiles) and not (legacy_profiles.text or "").strip() and not legacy_profiles.attrib:
+            scope.remove(legacy_profiles)
+    return ET.tostring(root, encoding="utf-8")
+
+
 def config_push_delta(base_xml: bytes, desired_xml: bytes) -> list[dict]:
     """Return exact candidate XML node changes; never constructs a whole-config load."""
     before_root = SafeET.fromstring(base_xml)
-    after_root = SafeET.fromstring(desired_xml)
+    after_root = SafeET.fromstring(normalize_legacy_server_profile_paths(desired_xml))
     changes = []
 
     def node_key(node, ordinal):

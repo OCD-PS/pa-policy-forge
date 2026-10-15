@@ -61,5 +61,20 @@ class ConfigPushDeltaTests(unittest.TestCase):
         self.assertEqual(payload.find("./server/entry").attrib["name"], "PolicyForge")
 
 
+    def test_legacy_shared_syslog_profile_uses_pan_os_log_settings_path(self):
+        current = b"""<config><shared><log-settings><syslog /></log-settings></shared></config>"""
+        desired = b"""<config><shared><server-profile><syslog><entry name="Pa_Policy_Forge"><server><entry name="PolicyForge"><server>10.74.80.46</server><transport>UDP</transport><port>514</port></entry></server></entry></syslog></server-profile></shared></config>"""
+
+        changes = main.config_push_delta(current, desired)
+
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["action"], "set")
+        self.assertEqual(changes[0]["xpath"], "/config/shared/log-settings/syslog")
+        self.assertEqual(changes[0]["family"], "device:log-settings")
+        payload = ET.fromstring(changes[0]["element"])
+        self.assertEqual(payload.tag, "entry")
+        self.assertEqual(payload.attrib["name"], "Pa_Policy_Forge")
+
+
 if __name__ == "__main__":
     unittest.main()
