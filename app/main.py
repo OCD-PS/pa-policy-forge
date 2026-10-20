@@ -70,7 +70,7 @@ from app.offline_config import (
     object_fingerprint as offline_object_fingerprint,
     policy_fingerprint as offline_policy_fingerprint, render_set_commands,
     panos_ui_decorate_record, scoped_server_profiles,
-    replace_policy_in_snapshot, insert_policy_in_snapshot,
+    replace_policy_in_snapshot, replace_policies_in_snapshot, insert_policy_in_snapshot,
     delete_policies_from_snapshot, move_policies_in_snapshot,
     safe_workspace_path, scoped_objects,
     scoped_policies, snapshot_sha256, referenced_template,
@@ -3922,12 +3922,14 @@ def config_workspace_policy_bulk_preview(workspace_id):
         if not changes:
             raise OfflineConfigError("De gekozen bulkbewerking veroorzaakt geen wijzigingen")
         if request.form.get("direct_save") == "yes":
-            new_xml = workspace_config_path(workspace).read_bytes()
-            for change in changes:
-                new_xml = replace_policy_in_snapshot(
-                    new_xml, scope, kind, rulebase, change["policy_name"],
-                    change["fingerprint"], change["replacement_xml"],
-                )
+            new_xml = replace_policies_in_snapshot(
+                xml_bytes, scope, kind, rulebase,
+                [{
+                    "name": change["policy_name"],
+                    "expected_fingerprint": change["fingerprint"],
+                    "replacement_xml": change["replacement_xml"],
+                } for change in changes],
+            )
             new_id = store_workspace_edit_version(workspace, new_xml, "bulk edit")
             audit("config-workspace-policy-bulk-edited", f"source={workspace['id']} workspace={new_id} scope={scope} rules={len(changes)}")
             flash("Opgeslagen", "success")
@@ -4012,9 +4014,15 @@ def config_workspace_policy_bulk_apply(draft_id):
         draft = json.loads(draft_path.read_text())
         workspace = workspace_row(int(draft["workspace_id"]))
         if not workspace: raise OfflineConfigError("De bronworkspace bestaat niet meer")
-        new_xml = workspace_config_path(workspace).read_bytes()
-        for change in draft["changes"]:
-            new_xml = replace_policy_in_snapshot(new_xml, draft["scope"], draft["kind"], draft["rulebase"], change["policy_name"], change["fingerprint"], change["replacement_xml"])
+        new_xml = replace_policies_in_snapshot(
+            workspace_config_path(workspace).read_bytes(),
+            draft["scope"], draft["kind"], draft["rulebase"],
+            [{
+                "name": change["policy_name"],
+                "expected_fingerprint": change["fingerprint"],
+                "replacement_xml": change["replacement_xml"],
+            } for change in draft["changes"]],
+        )
         with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
         if not profile: raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
         new_id = store_config_workspace(profile, f"{workspace['name']} · bulk edit {now()}", workspace["original_name"], new_xml, workspace_version_source(workspace))

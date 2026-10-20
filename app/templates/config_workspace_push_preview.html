@@ -2,10 +2,11 @@
 <header class="topbar"><div class="brand">OCD <span>PA Policy Forge</span></div></header><main class="content narrow">
 <section class="card stack"><p class="eyebrow">{{profile.name}} · {{profile.target_type|upper}} CANDIDATE</p><h1>Incremental push</h1>
 <p>Vergelijking met de actuele candidate. Alleen de aangevinkte scope/familie-combinaties worden met gerichte XML API-wijzigingen geschreven. De rest van de configuratie blijft buiten deze push. Er wordt niet gecommit.</p>
-{% if families %}<form method="post" action="{{url_for('config_workspace_push',workspace_id=workspace.id)}}"><input type="hidden" name="csrf" value="{{csrf_token()}}"><input type="hidden" name="candidate_sha256" value="{{candidate_sha256}}">
+{% if families %}<form method="post" action="{{url_for('config_workspace_push',workspace_id=workspace.id)}}" data-incremental-push><input type="hidden" name="csrf" value="{{csrf_token()}}"><input type="hidden" name="candidate_sha256" value="{{candidate_sha256}}">
 <div class="table-wrap"><table><thead><tr><th>Selecteer</th><th>Locatie</th><th>Configuratiefamilie</th><th>Wijzigingen</th><th>Voorbeelden</th></tr></thead><tbody>
 {% for item in families %}<tr><td>{% if item.family=='protected' %}<span class="badge">Beschermd</span>{% else %}<input type="checkbox" name="family" value="{{item.key}}" aria-label="Selecteer {{item.label}}">{% endif %}</td><td>{{item.scope}}</td><td>{{item.label}}</td><td>{{item.count}}</td><td class="mono">{{item.names|join(', ')}}</td></tr>{% endfor %}
 </tbody></table></div><p class="muted">{{change_count}} kandidaatwijziging(en) gevonden. Objecten en netwerk worden vóór policies geschreven; verwijderingen lopen in omgekeerde afhankelijkheidsvolgorde.</p>
+<div class="config-pull-progress" data-incremental-push-progress hidden aria-live="polite"><div class="progress" role="progressbar" aria-label="Incremental push bezig"><div class="progress-bar progress-indeterminate"></div></div><p class="help">Wijzigingen naar de candidate schrijven en valideren…</p></div>
 <div class="cluster" style="justify-content:flex-end"><a class="btn" href="{{url_for('config_workspace_editor',workspace_id=workspace.id)}}">Terug</a><button class="btn btn-primary" type="submit">Geselecteerde families naar candidate schrijven</button></div></form>
 {% else %}<div class="callout">Geen verschillen gevonden tussen workspace en actuele candidate.</div><div class="cluster"><a class="btn" href="{{url_for('config_workspace_editor',workspace_id=workspace.id)}}">Terug</a></div>{% endif %}
-</section></main></body></html>
+</section></main><script src="{{url_for('static',filename='app.js',v=asset_version)}}"></script></body></html>

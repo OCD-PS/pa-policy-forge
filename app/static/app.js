@@ -518,7 +518,7 @@
       var policyCatalog = JSON.parse(policyCatalogNode.textContent || "[]"); var pickerTarget = null; var pickerSelections = new Set();
       var bulkFormForCatalog = document.querySelector("[data-policy-bulk-form]"); var catalogFormAction = bulkFormForCatalog ? (bulkFormForCatalog.getAttribute("action") || "") : ""; var catalogProfileMatch = catalogFormAction.match(/\/policies\/(\d+)\/preview/); var workspaceApplicationState = document.querySelector("[data-workspace-application-catalog]"); var applicationPolls = 0;
       var pickerKinds = {from:["zones"],to:["zones"],source:["addresses","address-groups"],destination:["addresses","address-groups"],application:["applications","application-groups","application-filters"],service:["services","service-groups"],tag:["tags"],source_user:["$current"],destination_user:["$current"],source_hip:["hip-profiles"],destination_hip:["hip-profiles"],category:["custom-url-categories","predefined-url-categories"],schedule:["schedules"],log_setting:["log-forwarding"],profile_group:["security-profile-groups"],to_interface:["interfaces"],source_translation_address:["addresses","address-groups"],source_translation_interface:["interfaces"],destination_translation_address:["addresses","address-groups"]};
-      var createKinds = {from:"zones",to:"zones",source:"addresses",destination:"addresses",application:"application-groups",service:"services",tag:"tags",log_setting:"log-forwarding",source_translation_address:"addresses",destination_translation_address:"addresses"};
+      var createKinds = {from:"zones",to:"zones",source:"addresses",destination:"addresses",application:"application-groups",service:"services",tag:"tags",category:"custom-url-categories",log_setting:"log-forwarding",profile_group:"security-profile-groups",source_translation_address:"addresses",destination_translation_address:"addresses"};
       function addPickedValue(name) { if (!pickerTarget) return; if (typeof pickerTarget._addTagValue === "function") { pickerTarget._addTagValue(name); } else if (typeof pickerTarget._addTokenValue === "function") { pickerTarget._addTokenValue(name); } else if (typeof pickerTarget._addScalarValue === "function") { pickerTarget._addScalarValue(name); } else if (pickerTarget.hasAttribute("data-bulk-entry")) { pickerTarget.value = name; pickerTarget.closest("[data-bulk-field]").querySelector("[data-bulk-add-button]").click(); } else { pickerTarget.value = name; } }
       function updatePickerCount() { var count = valuePicker.querySelector("[data-policy-picker-selected-count]"); if (count) count.textContent = pickerSelections.size; }
       function renderPolicyPicker(query) { var field = pickerTarget ? pickerTarget.dataset.pickerField : ""; var kinds = pickerKinds[field] || []; var candidates = policyCatalog.filter(function (item) { return kinds.includes(item.kind); }); if (kinds.includes("$current")) { var datasetKeys = {source_user:"sourceUser",destination_user:"destinationUser",source_hip:"sourceHip",destination_hip:"destinationHip",profile_group:"profileGroup",log_setting:"logSetting"}; var key = datasetKeys[field] || field; var seen = new Set(); rows.forEach(function (policyRow) { (policyRow.dataset[key] || "").split("|||").filter(Boolean).forEach(function (name) { if (!seen.has(name)) { seen.add(name); candidates.push({name:name,kind:"huidige rulebase"}); } }); }); } var results = valuePicker.querySelector("[data-policy-picker-results]"); results.innerHTML = ""; candidates.filter(function (item) { return (!pickerTarget || typeof pickerTarget._hasPickerValue !== "function" || !pickerTarget._hasPickerValue(item.name)) && (!query || item.name.toLocaleLowerCase().includes(query)); }).forEach(function (item) { var row = document.createElement("div"); row.className = "member-result" + (pickerSelections.has(item.name) ? " is-selected" : ""); var copy = document.createElement("div"); var strong = document.createElement("strong"); strong.textContent = item.name; var small = document.createElement("small"); small.textContent = item.kind; copy.appendChild(strong); copy.appendChild(small); var button = document.createElement("button"); button.className = "btn btn-small"; button.type = "button"; button.textContent = pickerSelections.has(item.name) ? "Geselecteerd" : "Selecteer"; function toggleSelection() { if (pickerSelections.has(item.name)) pickerSelections.delete(item.name); else { if (pickerTarget && pickerTarget.dataset.pickerCardinality === "one") pickerSelections.clear(); pickerSelections.add(item.name); } updatePickerCount(); renderPolicyPicker(query); } button.addEventListener("click", function (event) { event.stopPropagation(); toggleSelection(); }); row.addEventListener("click", toggleSelection); row.appendChild(copy); row.appendChild(button); results.appendChild(row); }); if (!results.children.length) { var empty = document.createElement("div"); empty.className = "muted member-result"; empty.textContent = "Geen bestaand compatibel object gevonden."; results.appendChild(empty); } updatePickerCount(); }
@@ -606,7 +606,7 @@
       dialog.showModal();
     });
     all("[data-bulk-field]", dialog).forEach(function (fieldNode) {
-      var input = fieldNode.querySelector("[data-bulk-entry]"); input._hasPickerValue = function (value) { return (fieldNode._currentValues || []).includes(value) || Boolean(fieldNode._addedValues && fieldNode._addedValues.has(value)); }; var hidden = fieldNode.querySelector("[data-bulk-add]"); var button = fieldNode.querySelector("[data-bulk-add-button]");
+      var input = fieldNode.querySelector("[data-bulk-entry]"); input._hasPickerValue = function (value) { return Boolean(fieldNode._addedValues && fieldNode._addedValues.has(value)); }; var hidden = fieldNode.querySelector("[data-bulk-add]"); var button = fieldNode.querySelector("[data-bulk-add-button]");
       function addValue(exactValue) {
         var additions = exactValue === undefined ? splitEntry(input.value, fieldNode.dataset.bulkField) : [exactValue]; if (!additions.length) return;
         additions.forEach(function (value) { fieldNode._addedValues.add(value); });
@@ -618,6 +618,35 @@
       button.addEventListener("click", function () { if (!input.readOnly) addValue(); });
       input.addEventListener("keydown", function (event) { var tagDelimiter = fieldNode.dataset.bulkField === "tag" && (event.key === "," || (event.key === " " && !tagQuoteOpen(input.value))); if (event.key === "Enter" || tagDelimiter) { event.preventDefault(); addValue(); } });
     });
+    function showPolicyOperationProgress(event) {
+      var form = event.target;
+      var button = event.submitter;
+      if (!button || button.disabled) return;
+      var isDelete = button.hasAttribute("data-policy-delete");
+      var bulkDialog = form.closest("[data-policy-bulk-dialog]");
+      var isBulkList = form.matches("[data-policy-bulk-form]");
+      if (!isDelete && !bulkDialog && !isBulkList) return;
+      if (!isDelete && button.hasAttribute("data-policy-selection-action")) return;
+      button.disabled = true;
+      button.textContent = isDelete ? "Verwijderen..." : "Opslaan...";
+      form.setAttribute("aria-busy", "true");
+      var status = document.createElement("div");
+      status.className = "bulk-operation-status help";
+      status.setAttribute("role", "status");
+      status.setAttribute("aria-live", "polite");
+      status.textContent = isDelete ? "Policies worden verwijderd..." : "Bulkbewerking wordt verwerkt...";
+      var bar = document.createElement("div");
+      bar.className = "progress";
+      bar.setAttribute("aria-hidden", "true");
+      var fill = document.createElement("div");
+      fill.className = "progress-bar progress-indeterminate";
+      bar.appendChild(fill);
+      status.appendChild(bar);
+      var host = bulkDialog ? bulkDialog.querySelector(".bulk-dialog-actions") : button.closest(".policy-actionbar, .object-actionbar");
+      if (!host) host = form;
+      host.insertAdjacentElement("afterend", status);
+    }
+    document.addEventListener("submit", showPolicyOperationProgress);
     var policyBulkForm = document.querySelector("[data-policy-bulk-form]"); if (policyBulkForm) policyBulkForm.addEventListener("submit", function () { all("[data-bulk-field]", dialog).forEach(function (fieldNode) { var entry = fieldNode.querySelector("[data-bulk-entry]"); if (entry && entry.value.trim()) fieldNode._addBulkValue(); }); });
     var policyDelete = document.querySelector("[data-policy-delete]"); if (policyDelete) policyDelete.addEventListener("click", function (event) { if (!window.confirm("Geselecteerde policies verwijderen?")) event.preventDefault(); });
     all("[data-policy-tab]", dialog).forEach(function (tab) {
@@ -879,6 +908,8 @@
       });
     });
     var fields = all("[data-offline-policy-field]");
+    var bulkDialog = document.querySelector("[data-policy-bulk-dialog]");
+    var bulkFields = bulkDialog ? all("[data-bulk-field],[data-bulk-scalar-field]", bulkDialog) : [];
     fields.forEach(function (field) {
       var hidden = field.querySelector("[data-offline-policy-input]");
       var entry = field.querySelector("[data-offline-policy-entry]");
@@ -898,34 +929,38 @@
     var offlineForm = offlineDialog && offlineDialog.querySelector("form"); if (offlineForm) offlineForm.addEventListener("submit", function () { fields.forEach(function (field) { var entry = field.querySelector("[data-offline-policy-entry]"); if (entry && entry.value.trim()) field._offlineAddValue(entry.value); }); });
     var picker = document.querySelector("[data-offline-policy-picker]");
     var catalogNode = document.querySelector("[data-offline-policy-catalog]");
-    if (picker && catalogNode && fields.length) {
+    if (picker && catalogNode && (fields.length || bulkFields.length)) {
       var catalog = JSON.parse(catalogNode.textContent || "[]"); var activeField = null; var selected = new Set(); var currentQuery = "";
       var applicationState = document.querySelector("[data-workspace-application-catalog]"); var applicationPolls = 0;
       function updateSelectedCount() { var count = picker.querySelector("[data-policy-picker-selected-count]"); if (count) count.textContent = selected.size; }
       function renderPicker(query) {
         currentQuery = query;
         var results = picker.querySelector("[data-offline-policy-picker-results]"); results.innerHTML = "";
-        var entry = activeField && activeField.querySelector("[data-offline-policy-entry]");
-        var kinds = entry ? (entry.dataset.offlinePolicyKinds || "").split(/\s+/).filter(Boolean) : [];
+        var entry = activeField && activeField.querySelector("[data-offline-policy-entry],[data-bulk-entry],[data-bulk-scalar-entry]");
+        var kinds = entry ? (entry.dataset.offlinePolicyKinds || entry.dataset.pickerKinds || "").split(/\s+/).filter(Boolean) : [];
         var candidates = catalog.filter(function (item) { return kinds.includes(item.kind); });
-        if (kinds.includes("current") && activeField) { var seen = new Set(candidates.map(function (item) { return item.name; })); activeField._offlineValues.forEach(function (name) { if (!seen.has(name)) { seen.add(name); candidates.push({name:name,kind:"huidige configuratie"}); } }); }
-        candidates.filter(function (item) { return (!activeField || !activeField._offlineValues.has(item.name)) && (!query || item.name.toLocaleLowerCase().includes(query)); }).forEach(function (item) { var row = document.createElement("div"); row.className = "member-result" + (selected.has(item.name) ? " is-selected" : ""); var copy = document.createElement("div"); var strong = document.createElement("strong"); strong.textContent = item.name; var small = document.createElement("small"); small.textContent = item.kind; copy.appendChild(strong); copy.appendChild(small); var button = document.createElement("button"); button.type = "button"; button.className = "btn btn-small"; button.textContent = selected.has(item.name) ? "Geselecteerd" : "Selecteer"; function toggleSelection() { if (selected.has(item.name)) selected.delete(item.name); else { if (activeField && activeField.dataset.offlineCardinality === "one") selected.clear(); selected.add(item.name); } updateSelectedCount(); renderPicker(query); } button.addEventListener("click", function (event) { event.stopPropagation(); toggleSelection(); }); row.addEventListener("click", toggleSelection); row.appendChild(copy); row.appendChild(button); results.appendChild(row); });
+        var currentValues = activeField && (activeField._offlineValues || activeField._currentValues);
+        if (kinds.includes("current") && currentValues) { var seen = new Set(candidates.map(function (item) { return item.name; })); currentValues.forEach(function (name) { if (!seen.has(name)) { seen.add(name); candidates.push({name:name,kind:"huidige configuratie"}); } }); }
+        var isBulkField = Boolean(activeField && (activeField.hasAttribute("data-bulk-field") || activeField.hasAttribute("data-bulk-scalar-field")));
+        candidates.filter(function (item) { return (!isBulkField && currentValues && currentValues.has && currentValues.has(item.name)) ? false : (!query || item.name.toLocaleLowerCase().includes(query)); }).forEach(function (item) { var row = document.createElement("div"); row.className = "member-result" + (selected.has(item.name) ? " is-selected" : ""); var copy = document.createElement("div"); var strong = document.createElement("strong"); strong.textContent = item.name; var small = document.createElement("small"); small.textContent = item.kind; copy.appendChild(strong); copy.appendChild(small); var button = document.createElement("button"); button.type = "button"; button.className = "btn btn-small"; button.textContent = selected.has(item.name) ? "Geselecteerd" : "Selecteer"; function toggleSelection() { if (selected.has(item.name)) selected.delete(item.name); else { if (activeField && (activeField.dataset.offlineCardinality === "one" || activeField.hasAttribute("data-bulk-scalar-field"))) selected.clear(); selected.add(item.name); } updateSelectedCount(); renderPicker(query); } button.addEventListener("click", function (event) { event.stopPropagation(); toggleSelection(); }); row.addEventListener("click", toggleSelection); row.appendChild(copy); row.appendChild(button); results.appendChild(row); });
         if (!results.children.length) { var empty = document.createElement("div"); empty.className = "muted member-result"; empty.textContent = "Geen bestaande compatibele waarde gevonden."; results.appendChild(empty); }
         updateSelectedCount();
       }
-      function loadWorkspaceApplications() { if (!applicationState) return; var status = picker.querySelector("[data-policy-picker-status]"); if (status) status.textContent = "Application database wordt geladen…"; fetch(applicationState.dataset.workspaceApplicationCatalog, {headers:{"Accept":"application/json"}}).then(function (response) { if (!response.ok) throw new Error("HTTP " + response.status); return response.json(); }).then(function (data) { var existing = new Set(catalog.filter(function (item) { return item.kind === "applications"; }).map(function (item) { return item.name; })); (data.items || []).forEach(function (item) { if (!existing.has(item.name)) { existing.add(item.name); catalog.push(item); } }); if (status) status.textContent = data.error ? "Applicatiecatalogus kon niet worden bijgewerkt." : data.ready ? data.items.length + " applicaties beschikbaar." : data.refreshing ? "Application database wordt geladen…" : "Geen application database beschikbaar."; if (activeField && activeField.querySelector("[data-offline-policy-entry]").dataset.offlinePolicyKinds.includes("applications")) renderPicker(currentQuery); if (!data.ready && data.refreshing && applicationPolls < 40) { applicationPolls += 1; setTimeout(loadWorkspaceApplications, 3000); } }).catch(function () { if (status) status.textContent = "Applicatiecatalogus kon niet worden bijgewerkt."; }); }
+      function loadWorkspaceApplications() { if (!applicationState) return; var status = picker.querySelector("[data-policy-picker-status]"); if (status) status.textContent = "Application database wordt geladen…"; fetch(applicationState.dataset.workspaceApplicationCatalog, {headers:{"Accept":"application/json"}}).then(function (response) { if (!response.ok) throw new Error("HTTP " + response.status); return response.json(); }).then(function (data) { var existing = new Set(catalog.filter(function (item) { return item.kind === "applications"; }).map(function (item) { return item.name; })); (data.items || []).forEach(function (item) { if (!existing.has(item.name)) { existing.add(item.name); catalog.push(item); } }); if (status) status.textContent = data.error ? "Applicatiecatalogus kon niet worden bijgewerkt." : data.ready ? data.items.length + " applicaties beschikbaar." : data.refreshing ? "Application database wordt geladen…" : "Geen application database beschikbaar."; var activeEntry = activeField && activeField.querySelector("[data-offline-policy-entry],[data-bulk-entry],[data-bulk-scalar-entry]"); if (activeEntry && (activeEntry.dataset.offlinePolicyKinds || activeEntry.dataset.pickerKinds || "").includes("applications")) renderPicker(currentQuery); if (!data.ready && data.refreshing && applicationPolls < 40) { applicationPolls += 1; setTimeout(loadWorkspaceApplications, 3000); } }).catch(function () { if (status) status.textContent = "Applicatiecatalogus kon niet worden bijgewerkt."; }); }
       function updateOfflineCreateLink(field) {
         var row = picker.querySelector("[data-policy-picker-create-row]"); var link = picker.querySelector("[data-policy-picker-create]");
-        var kindByField = {from:"zones",to:"zones",source:"addresses",destination:"addresses",application:"application-groups",service:"services",tag:"tags",log_setting:"log-forwarding",source_translation_address:"addresses",destination_translation_address:"addresses"};
-        var kind = kindByField[field.dataset.offlinePolicyField]; var action = offlineForm ? offlineForm.getAttribute("action") || "" : ""; var workspaceMatch = action.match(/\/config-workspaces\/(\d+)\//); var scope = offlineForm && offlineForm.querySelector('[name="scope"]');
+        var fieldName = field.dataset.offlinePolicyField || field.dataset.bulkField || field.dataset.bulkScalarField || "";
+        var kindByField = {from:"zones",to:"zones",source:"addresses",destination:"addresses",application:"application-groups",service:"services",tag:"tags",category:"custom-url-categories",log_setting:"log-forwarding",profile_group:"security-profile-groups",source_translation_address:"addresses",destination_translation_address:"addresses"};
+        var kind = kindByField[fieldName]; var ownerForm = field.closest("form") || offlineForm; var action = ownerForm ? ownerForm.getAttribute("action") || "" : ""; var workspaceMatch = action.match(/\/config-workspaces\/(\d+)\//); var scope = ownerForm && ownerForm.querySelector('[name="scope"]');
         if (!row || !link || !kind || !workspaceMatch) { if (row) row.hidden = true; return; }
         link.href = "/config-workspaces/" + workspaceMatch[1] + "/edit?scope=" + encodeURIComponent(scope ? scope.value : "") + "&workspace_view=" + (kind === "zones" ? "network&config_section=zones" : "objects&object_type=" + encodeURIComponent(kind) + "&add_object=1"); row.hidden = false;
       }
-      function openOfflinePicker(field) { var entry = field.querySelector("[data-offline-policy-entry]"); activeField = field; selected.clear(); if (offlineDialog && picker.parentElement !== offlineDialog) offlineDialog.appendChild(picker); picker.hidden = false; var status = picker.querySelector("[data-policy-picker-status]"); if (status) status.textContent = ""; var filter = picker.querySelector("[data-offline-policy-picker-filter]"); filter.value = ""; updateOfflineCreateLink(field); renderPicker(""); window.requestAnimationFrame(function () { filter.focus(); }); if (entry.dataset.offlinePolicyKinds.includes("applications")) { applicationPolls = 0; loadWorkspaceApplications(); } }
-      fields.forEach(function (field) { var entry = field.querySelector("[data-offline-policy-entry]"); entry.addEventListener("focus", function () { openOfflinePicker(field); }); var choose = field.querySelector("[data-offline-policy-add]"); if (choose && entry.readOnly) choose.addEventListener("click", function () { openOfflinePicker(field); }); });
+      function openOfflinePicker(field) { var entry = field.querySelector("[data-offline-policy-entry],[data-bulk-entry],[data-bulk-scalar-entry]"); activeField = field; selected.clear(); var ownerDialog = field.closest("dialog"); if (ownerDialog && picker.parentElement !== ownerDialog) ownerDialog.appendChild(picker); picker.hidden = false; var status = picker.querySelector("[data-policy-picker-status]"); if (status) status.textContent = ""; var filter = picker.querySelector("[data-offline-policy-picker-filter]"); filter.value = ""; updateOfflineCreateLink(field); renderPicker(""); window.requestAnimationFrame(function () { filter.focus(); }); if ((entry.dataset.offlinePolicyKinds || entry.dataset.pickerKinds || "").includes("applications")) { applicationPolls = 0; loadWorkspaceApplications(); } }
+      function bindOfflinePickerField(field) { var entry = field.querySelector("[data-offline-policy-entry],[data-bulk-entry],[data-bulk-scalar-entry]"); if (!entry) return; entry.addEventListener("focus", function () { openOfflinePicker(field); }); var choose = field.querySelector("[data-offline-policy-add],[data-bulk-add-button],[data-bulk-scalar-choose]"); if (choose && entry.readOnly) choose.addEventListener("click", function () { openOfflinePicker(field); }); }
+      fields.forEach(bindOfflinePickerField); bulkFields.forEach(bindOfflinePickerField);
       picker.querySelector("[data-offline-policy-picker-filter]").addEventListener("input", function (event) { renderPicker(event.target.value.toLocaleLowerCase().trim()); });
       picker.querySelector("[data-offline-policy-picker-close]").addEventListener("click", function () { picker.hidden = true; });
-      var addSelected = picker.querySelector("[data-policy-picker-add-selected]"); if (addSelected) addSelected.addEventListener("click", function () { if (!activeField) return; selected.forEach(function (name) { activeField._offlineAddValue(name, true); }); selected.clear(); updateSelectedCount(); picker.hidden = true; });
+      var addSelected = picker.querySelector("[data-policy-picker-add-selected]"); if (addSelected) addSelected.addEventListener("click", function () { if (!activeField) return; selected.forEach(function (name) { if (activeField._offlineAddValue) activeField._offlineAddValue(name, true); else if (activeField._addBulkValue) activeField._addBulkValue(name); else if (activeField._addScalarValue) activeField._addScalarValue(name); }); selected.clear(); updateSelectedCount(); picker.hidden = true; });
     }
   }
 
@@ -937,6 +972,17 @@
         var progress = form.querySelector("[data-config-pull-progress]");
         if (button) { button.disabled = true; button.textContent = "Configuratie ophalen…"; }
         if (status) { status.hidden = false; status.textContent = "Verbinden en volledige candidateconfiguratie ophalen…"; }
+        if (progress) progress.hidden = false;
+      });
+    });
+  }
+
+  function setupIncrementalPushProgress() {
+    all("form[data-incremental-push]").forEach(function (form) {
+      form.addEventListener("submit", function () {
+        var button = form.querySelector('button[type="submit"]');
+        var progress = form.querySelector("[data-incremental-push-progress]");
+        if (button) { button.disabled = true; button.textContent = "Push bezig…"; }
         if (progress) progress.hidden = false;
       });
     });
@@ -1247,6 +1293,7 @@
     runSetup("offline-policy", setupOfflinePolicyTabs);
     runSetup("configuration-editor", setupWorkspaceConfigurationEditor);
     runSetup("pull-progress", setupConfigPullProgress);
+    runSetup("incremental-push-progress", setupIncrementalPushProgress);
     runSetup("workspace-objects", setupWorkspaceObjects);
     runSetup("workspace-context", setupWorkspaceContextLoading);
   });

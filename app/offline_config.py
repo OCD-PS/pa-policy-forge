@@ -1817,7 +1817,13 @@ def policy_fingerprint(record: dict) -> str:
     return hashlib.sha256(record["_xml"].encode()).hexdigest()
 
 
-def replace_policy_in_snapshot(xml_bytes: bytes, scope: str, kind: str, rulebase: str, name: str, expected_fingerprint: str, replacement_xml: str) -> bytes:
+def replace_policies_in_snapshot(
+    xml_bytes: bytes, scope: str, kind: str, rulebase: str,
+    replacements: list[dict[str, str]],
+) -> bytes:
+    """Replace several policies in one parse/serialization pass."""
+    if not replacements:
+        return xml_bytes
     root, snapshot = parse_snapshot(xml_bytes)
     scope_root = _scope_root(root, snapshot, scope)
     if scope_root is None:
@@ -1826,22 +1832,40 @@ def replace_policy_in_snapshot(xml_bytes: bytes, scope: str, kind: str, rulebase
     rules = scope_root.find(f"{base}/{POLICY_NODES[kind]}/rules")
     if rules is None:
         raise OfflineConfigError("De gekozen rulebase bestaat niet")
-    current = next((entry for entry in rules.findall("./entry") if entry.get("name") == name), None)
-    if current is None:
-        raise OfflineConfigError("De policy bestaat niet meer")
-    current_record = policy_record(current, kind, scope, rulebase, True)
-    if policy_fingerprint(current_record) != expected_fingerprint:
-        raise OfflineConfigError("De policy is intussen gewijzigd; pas de wijziging opnieuw toe")
-    replacement = SafeET.fromstring(replacement_xml)
-    if replacement.tag != "entry" or not replacement.get("name"):
-        raise OfflineConfigError("Ongeldige vervangende policy")
-    collision = next((entry for entry in rules.findall("./entry") if entry is not current and entry.get("name") == replacement.get("name")), None)
-    if collision is not None:
-        raise OfflineConfigError(f"Policy {replacement.get('name')} bestaat al in deze rulebase")
-    index = list(rules).index(current)
-    rules.remove(current)
-    rules.insert(index, replacement)
+    entries = list(rules.findall("./entry"))
+    current_by_name = {entry.get("name", ""): entry for entry in entries}
+    requested = [item.get("name", "") for item in replacements]
+    if len(requested) != len(set(requested)):
+        raise OfflineConfigError("Dezelfde policy is meer dan één keer geselecteerd")
+    replacement_by_name = {}
+    for item in replacements:
+        name = item.get("name", "")
+        current = current_by_name.get(name)
+        if current is None:
+            raise OfflineConfigError(f"Policy {name or '(zonder naam)'} bestaat niet meer")
+        current_record = policy_record(current, kind, scope, rulebase, True)
+        if policy_fingerprint(current_record) != item.get("expected_fingerprint", ""):
+            raise OfflineConfigError(f"Policy {name} is intussen gewijzigd; pas de wijziging opnieuw toe")
+        replacement = SafeET.fromstring(item.get("replacement_xml", ""))
+        replacement_name = replacement.get("name", "")
+        if replacement.tag != "entry" or not replacement_name:
+            raise OfflineConfigError("Ongeldige vervangende policy")
+        if replacement_name != name and replacement_name in current_by_name:
+            raise OfflineConfigError(f"Policy {replacement_name} bestaat al in deze rulebase")
+        replacement_by_name[name] = replacement
+    for index, current in enumerate(entries):
+        replacement = replacement_by_name.get(current.get("name", ""))
+        if replacement is not None:
+            rules.remove(current)
+            rules.insert(index, replacement)
     return normalized_config_xml(root)
+
+
+def replace_policy_in_snapshot(xml_bytes: bytes, scope: str, kind: str, rulebase: str, name: str, expected_fingerprint: str, replacement_xml: str) -> bytes:
+    return replace_policies_in_snapshot(
+        xml_bytes, scope, kind, rulebase,
+        [{"name": name, "expected_fingerprint": expected_fingerprint, "replacement_xml": replacement_xml}],
+    )
 
 
 def _policy_rules_root(root: ET.Element, snapshot: ConfigSnapshot, scope: str, kind: str, rulebase: str) -> ET.Element:
