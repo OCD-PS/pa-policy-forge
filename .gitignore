@@ -9,3 +9,4 @@ runs/
 *.crt
 *.pfx
 node_modules/
+.pytest_cache/
