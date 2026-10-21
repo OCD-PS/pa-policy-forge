@@ -149,6 +149,16 @@ PANOS_POLICY_NODES = {
     "dos": "dos", "sdwan": "sdwan",
 }
 
+PANOS_GEO_REGION_CODES = frozenset("""
+AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ
+CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM
+FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS
+IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML
+MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM
+PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD
+TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW
+""".split())
+
 SCM_OBJECT_TYPES = {
     "addresses": {"label": "Addresses", "creatable": True},
     "address-groups": {"label": "Address Groups", "creatable": True},
@@ -1798,6 +1808,13 @@ def fetch_object_catalog(profile, object_type: str) -> list[dict]:
         with ThreadPoolExecutor(max_workers=min(8, len(related)), thread_name_prefix="catalog") as pool:
             for items in pool.map(catalog_kind, related):
                 catalog.extend(items)
+    if object_type == "policy-picker":
+        known = {(item["name"], item["kind"]) for item in catalog}
+        catalog.extend(
+            {"name": code, "kind": "regions"}
+            for code in sorted(PANOS_GEO_REGION_CODES)
+            if (code, "regions") not in known
+        )
     if object_type == "log-forwarding":
         profiles = _read_json_cache(OBJECT_CACHE / f"{profile_id}-log-forwarding.json")
         if profiles is None:
@@ -2249,7 +2266,7 @@ def validate_policy_zones(policy: dict, zone_names: set[str]) -> None:
 
 POLICY_REFERENCE_KINDS = {
     "from": {"zones"}, "to": {"zones"},
-    "source": {"addresses", "address-groups"}, "destination": {"addresses", "address-groups"},
+    "source": {"addresses", "address-groups", "regions"}, "destination": {"addresses", "address-groups", "regions"},
     "source_hip": {"hip-profiles"}, "destination_hip": {"hip-profiles"},
     "application": {"applications", "application-groups", "application-filters"},
     "service": {"services", "service-groups"}, "tag": {"tags"},
@@ -2285,16 +2302,35 @@ def normalize_policy_wildcard_members(policy: dict) -> dict:
 
 
 def extend_policy_catalog_with_current(catalog: list[dict], policies: list[dict]) -> list[dict]:
-    """Add valid predefined values already present in the current rulebase."""
+    """Add predefined values already in use in the current rulebase."""
     result = list(catalog)
     seen = {(item.get("name", ""), item.get("kind", "")) for item in result}
+    current_value_kinds = {
+        "application": "applications",
+        "service": "services",
+        "category": "predefined-url-categories",
+    }
     for policy in policies:
-        for name in policy.get("category", []) or []:
-            key = (name, "predefined-url-categories")
-            if name and name != "any" and key not in seen:
-                seen.add(key)
-                result.append({"name": name, "kind": "predefined-url-categories"})
+        for field, kind in current_value_kinds.items():
+            for name in policy.get(field, []) or []:
+                key = (name, kind)
+                if name and name not in {"any", "application-default"} and key not in seen:
+                    seen.add(key)
+                    result.append({"name": name, "kind": kind})
     return result
+
+
+def is_native_policy_address(field: str, value: str) -> bool:
+    if field not in {"source", "destination"}:
+        return False
+    token = str(value or "").strip()
+    if token.upper() in PANOS_GEO_REGION_CODES:
+        return True
+    try:
+        ipaddress.ip_network(token, strict=False)
+        return True
+    except ValueError:
+        return False
 
 
 def validate_policy_references(policy: dict, catalog: list[dict], changed_fields: set[str], allow_zone_freeform: bool = False) -> None:
@@ -2313,12 +2349,22 @@ def validate_policy_references(policy: dict, catalog: list[dict], changed_fields
         permitted = set(POLICY_REFERENCE_BUILTINS.get(field, set()))
         for kind in POLICY_REFERENCE_KINDS[field]:
             permitted.update(available.get(kind, set()))
-        missing = sorted({str(value) for value in values if str(value) and str(value) not in permitted})
+        missing = sorted({
+            str(value).strip() for value in values
+            if str(value).strip()
+            and str(value).strip() not in permitted
+            and not is_native_policy_address(field, str(value))
+        })
         if missing:
-            target = next(iter(POLICY_REFERENCE_KINDS[field])).replace("-", " ")
+            if field in {"source", "destination"}:
+                target = "een address object/groep, regio-landcode of IPv4/IPv6-adres"
+            elif field in {"source_translation_address", "destination_translation_address"}:
+                target = "een address object of groep"
+            else:
+                target = sorted(POLICY_REFERENCE_KINDS[field])[0].replace("-", " ")
             raise ValueError(
                 f"{field.replace('_', ' ').title()} verwijst naar niet-bestaande waarden: {', '.join(missing)}. "
-                f"Maak deze eerst aan onder {target}."
+                f"Gebruik {target}."
             )
 
 
@@ -3481,7 +3527,7 @@ def workspace_policy_reference_catalog(xml_bytes: bytes, scope: str, parsed, pro
     seen = set()
     for catalog_type in (
         "addresses", "address-groups", "applications", "application-groups", "application-filters",
-        "services", "service-groups", "tags", "hip-profiles", "custom-url-categories", "schedules",
+        "services", "service-groups", "tags", "regions", "hip-profiles", "custom-url-categories", "schedules",
         "security-profile-groups", "log-forwarding",
     ):
         _, catalog_objects = scoped_objects(xml_bytes, scope, catalog_type, parsed=parsed)
@@ -3490,6 +3536,11 @@ def workspace_policy_reference_catalog(xml_bytes: bytes, scope: str, parsed, pro
             if key not in seen:
                 seen.add(key)
                 catalog.append({"name": item["name"], "kind": catalog_type})
+    for code in sorted(PANOS_GEO_REGION_CODES):
+        key = (code, "regions")
+        if key not in seen:
+            seen.add(key)
+            catalog.append({"name": code, "kind": "regions"})
     template = referenced_template(snapshot, scope) if snapshot.kind == "panorama" else ""
     zone_inventory = configuration_inventory(xml_bytes, scope, template, parsed=parsed)["network"] if (snapshot.kind != "panorama" or template) else []
     for kind, inventory_name in (("zones", "Zones"), ("interfaces", "Interfaces")):

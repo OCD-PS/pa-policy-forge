@@ -321,6 +321,40 @@ class TargetAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "maximaal één"):
             main.validate_policy_references({"log_setting": "one,two"}, catalog, {"log_setting"})
 
+    def test_policy_source_and_destination_accept_regions_and_native_ip_addresses(self):
+        policy = {
+            "source": ["CN", "RU", "192.0.2.10", "2001:db8::1/64"],
+            "destination": ["US", "198.51.100.0/24", "2001:db8:1::/48"],
+        }
+        main.validate_policy_references(policy, [], {"source", "destination"})
+        with self.assertRaisesRegex(ValueError, "address object/groep"):
+            main.validate_policy_references(
+                {"source": ["not-an-address"]}, [], {"source"}
+            )
+        with self.assertRaisesRegex(ValueError, "niet-bestaande"):
+            main.validate_policy_references(
+                {"application": ["192.0.2.10"]}, [], {"application"}
+            )
+
+    def test_policy_picker_exposes_geo_regions_even_when_not_in_config(self):
+        class EmptyCatalogPool:
+            def __init__(self, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def map(self, _callback, _items):
+                return []
+
+        with patch.object(main, "ThreadPoolExecutor", EmptyCatalogPool):
+            catalog = main.fetch_object_catalog({"id": 987654, "target_type": "panos"}, "policy-picker")
+        regions = {(item["name"], item["kind"]) for item in catalog}
+        self.assertTrue({("CN", "regions"), ("RU", "regions"), ("US", "regions")} <= regions)
+
     def test_nat_and_zone_reference_fields_require_existing_objects(self):
         catalog = [
             {"name": "ethernet1/1", "kind": "interfaces"},
@@ -335,7 +369,7 @@ class TargetAdapterTests(unittest.TestCase):
             "name": "Internet", "network": {"layer3": ["ethernet1/1"]},
             "zone_protection_profile": "strict", "log_setting": "forward-all",
         }, "zones", catalog)
-        with self.assertRaisesRegex(ValueError, "Maak deze eerst aan"):
+        with self.assertRaisesRegex(ValueError, "Gebruik een address object of groep"):
             main.validate_policy_references(
                 {"destination_translation_address": "missing"}, catalog,
                 {"destination_translation_address"},
@@ -365,7 +399,7 @@ class TargetAdapterTests(unittest.TestCase):
         self.assertIn('data-zone-reference-kind="interfaces"', app_template)
         self.assertIn('data-zone-reference-kind="zone-protection-profiles"', app_template)
         self.assertIn('data-zone-reference-kind="log-forwarding"', app_template)
-        self.assertIn('function prepareBulkScalars()', javascript)
+        self.assertIn('function prepareBulkScalars(preserve)', javascript)
         self.assertIn('Geen bestaande compatibele waarde gevonden.', javascript)
 
     def test_panorama_policy_xpath_uses_device_group_and_pre_rulebase(self):
@@ -1389,7 +1423,10 @@ class TargetAdapterTests(unittest.TestCase):
                 conn.execute("DELETE FROM config_workspaces WHERE profile_id=?", (profile_id,))
                 conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
 
-    def test_offline_policy_rename_and_fields_are_applied_to_a_new_workspace(self):
+    @patch("app.main.default_application_items", return_value=[
+        {"name": "ssl"}, {"name": "web-browsing"}, {"name": "dns"},
+    ])
+    def test_offline_policy_rename_and_fields_are_applied_to_a_new_workspace(self, _application_catalog):
         timestamp = main.now()
         with main.db() as conn:
             cursor = conn.execute(
@@ -1442,7 +1479,10 @@ class TargetAdapterTests(unittest.TestCase):
                 conn.execute("DELETE FROM config_workspaces WHERE profile_id=?", (profile_id,))
                 conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
 
-    def test_offline_policy_bulk_edit_applies_multiple_rules_atomically(self):
+    @patch("app.main.default_application_items", return_value=[
+        {"name": "ssl"}, {"name": "web-browsing"}, {"name": "dns"},
+    ])
+    def test_offline_policy_bulk_edit_applies_multiple_rules_atomically(self, _application_catalog):
         timestamp = main.now()
         with main.db() as conn:
             cursor = conn.execute(
