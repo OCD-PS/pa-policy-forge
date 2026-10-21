@@ -18,6 +18,99 @@
     return ((String(value).match(/'/g) || []).length % 2 === 1) || ((String(value).match(/"/g) || []).length % 2 === 1);
   }
 
+  var restoredPolicyBulkState = null;
+  var policyBulkStateStorageKey = "ppf-unsaved-policy-bulk-state";
+
+  function policyBulkControlKey(control) {
+    if (control.name) return "name:" + control.name;
+    var field = control.closest("[data-bulk-field],[data-bulk-scalar-field]");
+    if (!field) return "";
+    var fieldName = field.dataset.bulkField || field.dataset.bulkScalarField || "";
+    if (control.hasAttribute("data-bulk-entry")) return "entry:" + fieldName;
+    if (control.hasAttribute("data-bulk-scalar-entry")) return "scalar-entry:" + fieldName;
+    return "";
+  }
+
+  function saveOpenPolicyBulkState() {
+    var dialog = document.querySelector("[data-policy-bulk-dialog]");
+    var form = dialog && dialog.closest("form[data-policy-bulk-form]");
+    if (!dialog || !dialog.open || !form) return;
+    try {
+      var controls = all("input[name],select[name],textarea[name],[data-bulk-entry],[data-bulk-scalar-entry]", dialog).filter(function (control) {
+        return control.name !== "csrf" && control.type !== "password";
+      });
+      var state = {
+        url: window.location.href,
+        selected: all("[data-policy-select]:checked", form).map(function (control) { return control.value; }),
+        controls: controls.map(function (control) {
+          return {
+            key: policyBulkControlKey(control),
+            name: control.name,
+            type: control.type,
+            value: control.multiple ? all("option", control).filter(function (option) { return option.selected; }).map(function (option) { return option.value; }) : control.value,
+            checked: control.checked
+          };
+        }),
+        activeTab: (dialog.querySelector("[data-policy-tab].is-active") || {}).dataset?.policyTab || ""
+      };
+      window.sessionStorage.setItem(policyBulkStateStorageKey, JSON.stringify(state));
+    } catch (_) {}
+  }
+
+  function clearSavedPolicyBulkState() {
+    try { window.sessionStorage.removeItem(policyBulkStateStorageKey); } catch (_) {}
+  }
+
+  function restorePolicyBulkState() {
+    try {
+      var raw = window.sessionStorage.getItem(policyBulkStateStorageKey);
+      if (!raw) return;
+      var state = JSON.parse(raw);
+      if (!state || state.url !== window.location.href) return;
+      window.sessionStorage.removeItem(policyBulkStateStorageKey);
+      var dialog = document.querySelector("[data-policy-bulk-dialog]");
+      var form = dialog && dialog.closest("form[data-policy-bulk-form]");
+      if (!dialog || !form) return;
+      var selected = new Set(state.selected || []);
+      all("[data-policy-select]", form).forEach(function (control) { control.checked = selected.has(control.value); });
+      var controls = all("input[name],select[name],textarea[name],[data-bulk-entry],[data-bulk-scalar-entry]", dialog).filter(function (control) {
+        return control.name !== "csrf" && control.type !== "password";
+      });
+      (state.controls || []).forEach(function (saved, index) {
+        var control = controls[index];
+        if (!control || control.name !== saved.name || policyBulkControlKey(control) !== saved.key) return;
+        if (control.type === "checkbox" || control.type === "radio") control.checked = Boolean(saved.checked);
+        else if (control.multiple && Array.isArray(saved.value)) {
+          all("option", control).forEach(function (option) { option.selected = saved.value.includes(option.value); });
+        } else control.value = saved.value;
+      });
+      restoredPolicyBulkState = state;
+    } catch (_) {
+      try { window.sessionStorage.removeItem(policyBulkStateStorageKey); } catch (_) {}
+    }
+  }
+
+  function setupPolicyBulkStatePersistence() {
+    var submitting = false;
+    var dialog = document.querySelector("[data-policy-bulk-dialog]");
+    if (dialog) {
+      dialog.addEventListener("cancel", clearSavedPolicyBulkState);
+      dialog.addEventListener("close", clearSavedPolicyBulkState);
+    }
+    document.addEventListener("click", function (event) {
+      if (event.target.closest("[data-policy-picker-create]")) saveOpenPolicyBulkState();
+    });
+    document.addEventListener("submit", function (event) {
+      if (event.target.matches("form[data-policy-bulk-form]")) {
+        submitting = true;
+        try { window.sessionStorage.removeItem(policyBulkStateStorageKey); } catch (_) {}
+      }
+    }, true);
+    window.addEventListener("pagehide", function () {
+      if (!submitting) saveOpenPolicyBulkState();
+    });
+  }
+
   function activateSection(id, updateHash) {
     if (!id) return;
     var section = document.getElementById(id);
@@ -517,7 +610,7 @@
     if (valuePicker && policyCatalogNode) {
       var policyCatalog = JSON.parse(policyCatalogNode.textContent || "[]"); var pickerTarget = null; var pickerSelections = new Set();
       var bulkFormForCatalog = document.querySelector("[data-policy-bulk-form]"); var catalogFormAction = bulkFormForCatalog ? (bulkFormForCatalog.getAttribute("action") || "") : ""; var catalogProfileMatch = catalogFormAction.match(/\/policies\/(\d+)\/preview/); var workspaceApplicationState = document.querySelector("[data-workspace-application-catalog]"); var applicationPolls = 0;
-      var pickerKinds = {from:["zones"],to:["zones"],source:["addresses","address-groups"],destination:["addresses","address-groups"],application:["applications","application-groups","application-filters"],service:["services","service-groups"],tag:["tags"],source_user:["$current"],destination_user:["$current"],source_hip:["hip-profiles"],destination_hip:["hip-profiles"],category:["custom-url-categories","predefined-url-categories"],schedule:["schedules"],log_setting:["log-forwarding"],profile_group:["security-profile-groups"],to_interface:["interfaces"],source_translation_address:["addresses","address-groups"],source_translation_interface:["interfaces"],destination_translation_address:["addresses","address-groups"]};
+      var pickerKinds = {from:["zones"],to:["zones"],source:["addresses","address-groups","regions"],destination:["addresses","address-groups","regions"],application:["applications","application-groups","application-filters"],service:["services","service-groups"],tag:["tags"],source_user:["$current"],destination_user:["$current"],source_hip:["hip-profiles"],destination_hip:["hip-profiles"],category:["custom-url-categories","predefined-url-categories"],schedule:["schedules"],log_setting:["log-forwarding"],profile_group:["security-profile-groups"],to_interface:["interfaces"],source_translation_address:["addresses","address-groups"],source_translation_interface:["interfaces"],destination_translation_address:["addresses","address-groups"]};
       var createKinds = {from:"zones",to:"zones",source:"addresses",destination:"addresses",application:"application-groups",service:"services",tag:"tags",category:"custom-url-categories",log_setting:"log-forwarding",profile_group:"security-profile-groups",source_translation_address:"addresses",destination_translation_address:"addresses"};
       function addPickedValue(name) { if (!pickerTarget) return; if (typeof pickerTarget._addTagValue === "function") { pickerTarget._addTagValue(name); } else if (typeof pickerTarget._addTokenValue === "function") { pickerTarget._addTokenValue(name); } else if (typeof pickerTarget._addScalarValue === "function") { pickerTarget._addScalarValue(name); } else if (pickerTarget.hasAttribute("data-bulk-entry")) { pickerTarget.value = name; pickerTarget.closest("[data-bulk-field]").querySelector("[data-bulk-add-button]").click(); } else { pickerTarget.value = name; } }
       function updatePickerCount() { var count = valuePicker.querySelector("[data-policy-picker-selected-count]"); if (count) count.textContent = pickerSelections.size; }
@@ -529,8 +622,12 @@
       function openPolicyValuePicker(input, fieldName) { pickerTarget = input; pickerTarget.dataset.pickerField = fieldName || input.dataset.pickerField; pickerSelections.clear(); var pickerStatus = valuePicker.querySelector("[data-policy-picker-status]"); if (pickerStatus) pickerStatus.textContent = ""; var activeDialog = input.closest("dialog"); if (activeDialog && valuePicker.parentElement !== activeDialog) activeDialog.appendChild(valuePicker); valuePicker.hidden = false; valuePicker.querySelector("[data-policy-picker-title]").textContent = "Bestaande waarden voor " + pickerTarget.dataset.pickerField.replace(/_/g, " "); var filter = valuePicker.querySelector("[data-policy-picker-filter]"); filter.value = ""; updateCreateObjectLink(pickerTarget.dataset.pickerField); renderPolicyPicker(""); if (pickerTarget.dataset.pickerField === "application") { applicationPolls = 0; loadApplications(); } }
       all("[data-picker-field]").forEach(function (input) {
         if (!pickerKinds[input.dataset.pickerField]) return;
-        input.addEventListener("focus", function () { openPolicyValuePicker(input); });
+        if (input.readOnly) input.addEventListener("focus", function () { openPolicyValuePicker(input); });
         input.addEventListener("input", function () { if (pickerTarget === input && !input.readOnly) valuePicker.hidden = true; });
+      });
+      all("[data-bulk-picker-button]").forEach(function (button) {
+        var input = button.closest(".token-input") && button.closest(".token-input").querySelector("[data-picker-field]");
+        if (input) button.addEventListener("click", function () { openPolicyValuePicker(input); });
       });
       var singleTagPicker = document.querySelector("[data-single-tag-picker]"); if (singleTagPicker && singleTagEntry) singleTagPicker.addEventListener("click", function () { openPolicyValuePicker(singleTagEntry, "tag"); });
       valuePicker.querySelector("[data-policy-picker-filter]").addEventListener("input", function (event) { renderPolicyPicker(event.target.value.toLocaleLowerCase().trim()); });
@@ -541,7 +638,7 @@
 
     var dialog = document.querySelector("[data-policy-bulk-dialog]");
     var opener = document.querySelector("[data-open-policy-bulk]");
-    function prepareBulkScalars() {
+    function prepareBulkScalars(preserve) {
       all("[data-bulk-scalar-field]", dialog).forEach(function (fieldNode) {
         var hidden = fieldNode.querySelector("[data-bulk-scalar-value]");
         var entry = fieldNode.querySelector("[data-bulk-scalar-entry]");
@@ -559,7 +656,8 @@
         }
         entry._addScalarValue = function (value) { hidden.value = String(value || "").trim(); entry.value = ""; render(hidden.value); };
         entry._hasPickerValue = function (value) { return hidden.value === value; };
-        hidden.value = ""; render("");
+        if (!preserve) hidden.value = "";
+        render(hidden.value);
       });
     }
     function selectedRows() { return rows.filter(function (row) { var checkbox = row.querySelector("[data-policy-select]"); return checkbox && checkbox.checked; }); }
@@ -587,13 +685,15 @@
       });
       if (!values.length && !added.size) { var empty = document.createElement("span"); empty.className = "muted small"; empty.textContent = "Geen bestaande waarden"; container.appendChild(empty); }
     }
-    function prepareBulkFields() {
+    function prepareBulkFields(preserve) {
       var selected = selectedRows(); var datasetKeys = {source_user: "sourceUser", destination_user: "destinationUser", source_hip: "sourceHip", destination_hip: "destinationHip"};
       all("[data-bulk-field]", dialog).forEach(function (fieldNode) {
         var field = fieldNode.dataset.bulkField; var dataKey = datasetKeys[field] || field; var values = []; var seen = new Set();
         selected.forEach(function (row) { (row.dataset[dataKey] || "").split("|||").filter(Boolean).forEach(function (value) { if (!seen.has(value)) { seen.add(value); values.push(value); } }); });
-        var removed = new Set(); var added = new Set(); fieldNode._removedValues = removed; fieldNode._addedValues = added; fieldNode._currentValues = values;
-        fieldNode.querySelector("[data-bulk-remove]").value = ""; fieldNode.querySelector("[data-bulk-add]").value = ""; fieldNode.querySelector("[data-bulk-entry]").value = "";
+        var removeInput = fieldNode.querySelector("[data-bulk-remove]"); var addInput = fieldNode.querySelector("[data-bulk-add]");
+        var removed = new Set(preserve ? splitEntry(removeInput.value, field) : []); var added = new Set(preserve ? splitEntry(addInput.value, field) : []);
+        fieldNode._removedValues = removed; fieldNode._addedValues = added; fieldNode._currentValues = values;
+        if (!preserve) { removeInput.value = ""; addInput.value = ""; fieldNode.querySelector("[data-bulk-entry]").value = ""; }
         renderBulkField(fieldNode, values, removed, added);
       });
     }
@@ -601,8 +701,8 @@
       var count = all("[data-policy-select]:checked").length;
       if (!count) { window.alert("Selecteer minstens één policy."); return; }
       dialog.querySelector("[data-policy-selected-count]").textContent = count;
-      prepareBulkFields();
-      prepareBulkScalars();
+      prepareBulkFields(false);
+      prepareBulkScalars(false);
       dialog.showModal();
     });
     all("[data-bulk-field]", dialog).forEach(function (fieldNode) {
@@ -657,6 +757,21 @@
     });
     var cancel = document.querySelector("[data-policy-bulk-cancel]");
     if (cancel) cancel.addEventListener("click", function () { dialog.close(); });
+    if (dialog && restoredPolicyBulkState) {
+      var restoredCount = selectedRows().length;
+      if (restoredCount) {
+        dialog.querySelector("[data-policy-selected-count]").textContent = restoredCount;
+        prepareBulkFields(true);
+        prepareBulkScalars(true);
+        var activeTab = restoredPolicyBulkState.activeTab;
+        if (activeTab) {
+          all("[data-policy-tab]", dialog).forEach(function (tab) { tab.classList.toggle("is-active", tab.dataset.policyTab === activeTab); });
+          all("[data-policy-panel]", dialog).forEach(function (panel) { panel.classList.toggle("is-active", panel.dataset.policyPanel === activeTab); });
+        }
+        dialog.showModal();
+      }
+      restoredPolicyBulkState = null;
+    }
     applyFilter(); updateActionCount();
   }
 
@@ -956,7 +1071,7 @@
         link.href = "/config-workspaces/" + workspaceMatch[1] + "/edit?scope=" + encodeURIComponent(scope ? scope.value : "") + "&workspace_view=" + (kind === "zones" ? "network&config_section=zones" : "objects&object_type=" + encodeURIComponent(kind) + "&add_object=1"); row.hidden = false;
       }
       function openOfflinePicker(field) { var entry = field.querySelector("[data-offline-policy-entry],[data-bulk-entry],[data-bulk-scalar-entry]"); activeField = field; selected.clear(); var ownerDialog = field.closest("dialog"); if (ownerDialog && picker.parentElement !== ownerDialog) ownerDialog.appendChild(picker); picker.hidden = false; var status = picker.querySelector("[data-policy-picker-status]"); if (status) status.textContent = ""; var filter = picker.querySelector("[data-offline-policy-picker-filter]"); filter.value = ""; updateOfflineCreateLink(field); renderPicker(""); window.requestAnimationFrame(function () { filter.focus(); }); if ((entry.dataset.offlinePolicyKinds || entry.dataset.pickerKinds || "").includes("applications")) { applicationPolls = 0; loadWorkspaceApplications(); } }
-      function bindOfflinePickerField(field) { var entry = field.querySelector("[data-offline-policy-entry],[data-bulk-entry],[data-bulk-scalar-entry]"); if (!entry) return; entry.addEventListener("focus", function () { openOfflinePicker(field); }); var choose = field.querySelector("[data-offline-policy-add],[data-bulk-add-button],[data-bulk-scalar-choose]"); if (choose && entry.readOnly) choose.addEventListener("click", function () { openOfflinePicker(field); }); }
+      function bindOfflinePickerField(field) { var entry = field.querySelector("[data-offline-policy-entry],[data-bulk-entry],[data-bulk-scalar-entry]"); if (!entry) return; if (entry.readOnly) entry.addEventListener("focus", function () { openOfflinePicker(field); }); var choose = field.querySelector("[data-offline-policy-add],[data-bulk-add-button],[data-bulk-scalar-choose]"); if (choose && entry.readOnly) choose.addEventListener("click", function () { openOfflinePicker(field); }); var openPicker = field.querySelector("[data-offline-policy-open-picker],[data-bulk-picker-button]"); if (openPicker) openPicker.addEventListener("click", function () { openOfflinePicker(field); }); }
       fields.forEach(bindOfflinePickerField); bulkFields.forEach(bindOfflinePickerField);
       picker.querySelector("[data-offline-policy-picker-filter]").addEventListener("input", function (event) { renderPicker(event.target.value.toLocaleLowerCase().trim()); });
       picker.querySelector("[data-offline-policy-picker-close]").addEventListener("click", function () { picker.hidden = true; });
@@ -1267,6 +1382,8 @@
   }
 
   document.addEventListener("DOMContentLoaded", function () {
+    restorePolicyBulkState();
+    setupPolicyBulkStatePersistence();
     function runSetup(name, callback) {
       try { callback(); }
       catch (error) { console.error("PA Policy Forge UI setup failed: " + name, error); }

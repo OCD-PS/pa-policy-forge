@@ -9,13 +9,14 @@ const { JSDOM } = require('jsdom');
 const source = fs.readFileSync(path.join(__dirname, '..', 'app', 'static', 'app.js'), 'utf8');
 const styles = fs.readFileSync(path.join(__dirname, '..', 'app', 'static', 'app.css'), 'utf8');
 
-async function page(markup) {
-  const dom = new JSDOM(markup, {url: 'https://forge.test/', runScripts: 'outside-only', pretendToBeVisual:true});
+async function page(markup, options = {}) {
+  const dom = new JSDOM(markup, {url: options.url || 'https://forge.test/', runScripts: 'outside-only', pretendToBeVisual:true});
+  for (const [key, value] of Object.entries(options.sessionStorage || {})) dom.window.sessionStorage.setItem(key, value);
   await new Promise(resolve => dom.window.addEventListener('load', resolve, {once: true}));
   const errors = [];
   dom.window.console.error = (...args) => errors.push(args.join(' '));
   dom.window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
-  dom.window.HTMLDialogElement.prototype.close = function () { this.open = false; };
+  dom.window.HTMLDialogElement.prototype.close = function () { this.open = false; this.dispatchEvent(new dom.window.Event('close')); };
   dom.window.eval(source);
   dom.window.document.dispatchEvent(new dom.window.Event('DOMContentLoaded'));
   return {dom, window: dom.window, document: dom.window.document, errors};
@@ -116,6 +117,65 @@ test('offline policy picker rows support multiple selections like object groups'
   document.querySelector('[data-policy-picker-add-selected]').click();
   assert.equal(document.querySelector('[data-offline-policy-input]').value, 'one,two');
   assert.deepEqual(errors, []); dom.window.close();
+});
+
+function policyBulkStateMarkup() {
+  return `<form data-policy-bulk-form action="/policies/42/preview">
+    <table><tbody><tr data-policy-row data-tag="existing"><td><input type="checkbox" data-policy-select value="rule-1"></td></tr></tbody></table>
+    <span data-policy-action-count></span><button type="button" data-open-policy-bulk>Bulk edit</button>
+    <dialog data-policy-bulk-dialog><span data-policy-selected-count></span>
+      <button type="button" data-policy-tab="source" class="is-active"></button>
+      <button type="button" data-policy-tab="actions"></button>
+      <div data-policy-panel="source" class="is-active">
+        <div data-bulk-field="source"><div data-bulk-values></div><input data-bulk-entry data-picker-field="source"><button type="button" data-bulk-add-button></button><input type="hidden" name="source_add" data-bulk-add><input type="hidden" name="source_remove" data-bulk-remove></div>
+        <div data-bulk-scalar-field="log_setting"><div data-bulk-scalar-values></div><input data-bulk-scalar-entry data-picker-field="log_setting"><input type="hidden" name="log_setting" data-bulk-scalar-value></div>
+      </div>
+      <div data-policy-panel="actions"></div>
+      <button type="button" data-policy-bulk-cancel>Cancel</button>
+    </dialog>
+  </form><a href="/objects/new" target="_blank" data-policy-picker-create>Create object</a>`;
+}
+
+test('bulk policy edits survive opening object creation and reloading the policy page', async () => {
+  const url = 'https://forge.test/?policy_profile=42#policy-management';
+  const {dom, document, window} = await page(policyBulkStateMarkup(), {url});
+  document.querySelector('[data-policy-select]').click();
+  document.querySelector('[data-open-policy-bulk]').click();
+  document.querySelector('[data-bulk-add]').value = 'new-address';
+  document.querySelector('[data-bulk-remove]').value = 'existing';
+  document.querySelector('[data-bulk-entry]').value = 'typed but not added';
+  document.querySelector('[data-bulk-scalar-value]').value = 'send-to-siem';
+  document.querySelector('[data-policy-tab="actions"]').click();
+  document.querySelector('[data-policy-picker-create]').addEventListener('click', event => event.preventDefault(), {once:true, capture:true});
+  document.querySelector('[data-policy-picker-create]').click();
+  const saved = window.sessionStorage.getItem('ppf-unsaved-policy-bulk-state');
+  assert.ok(saved, 'opening object creation should save the current bulk edit');
+  dom.window.close();
+
+  const restored = await page(policyBulkStateMarkup(), {url, sessionStorage: {'ppf-unsaved-policy-bulk-state': saved}});
+  assert.equal(restored.document.querySelector('[data-policy-bulk-dialog]').open, true);
+  assert.equal(restored.document.querySelector('[data-policy-select]').checked, true);
+  assert.equal(restored.document.querySelector('[data-bulk-add]').value, 'new-address');
+  assert.equal(restored.document.querySelector('[data-bulk-remove]').value, 'existing');
+  assert.equal(restored.document.querySelector('[data-bulk-entry]').value, 'typed but not added');
+  assert.equal(restored.document.querySelector('[data-bulk-scalar-value]').value, 'send-to-siem');
+  assert.equal(restored.document.querySelector('[data-policy-tab="actions"]').classList.contains('is-active'), true);
+  assert.deepEqual(restored.errors, []);
+  restored.dom.window.close();
+});
+
+test('cancelling a bulk dialog clears state saved for object creation', async () => {
+  const {dom, document, window} = await page(policyBulkStateMarkup());
+  document.querySelector('[data-policy-select]').click();
+  document.querySelector('[data-open-policy-bulk]').click();
+  document.querySelector('[data-policy-picker-create]').addEventListener('click', event => event.preventDefault(), {once:true, capture:true});
+  document.querySelector('[data-policy-picker-create]').click();
+  assert.ok(window.sessionStorage.getItem('ppf-unsaved-policy-bulk-state'));
+
+  document.querySelector('[data-policy-bulk-cancel]').click();
+  assert.equal(document.querySelector('[data-policy-bulk-dialog]').open, false);
+  assert.equal(window.sessionStorage.getItem('ppf-unsaved-policy-bulk-state'), null);
+  dom.window.close();
 });
 
 function createSchemas() {
