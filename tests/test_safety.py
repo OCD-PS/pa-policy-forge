@@ -145,36 +145,53 @@ class SafetyTests(unittest.TestCase):
         installer=(ROOT/"install.sh").read_text()
         self.assertIn("s/[[:space:]]+#.*$//", installer)
         self.assertIn("s/^[[:space:]]+//; s/[[:space:]]+$//", installer)
-        self.assertIn('case "$bootstrap_password_value" in', installer)
+        self.assertIn("resolve_compose_bootstrap_password", installer)
         self.assertIn('if [[ -z "$bootstrap_password_value" ]]; then', installer)
         self.assertIn('[[ "$bootstrap_password_value" == *\'$\'* ]] && ! is_compose_single_quoted_literal', installer)
         self.assertIn("Compose interpolation syntax", installer)
         self.assertIn("single-quoted in `.env`", (ROOT/"README.md").read_text())
         self.assertIn("bash -n install.sh", (ROOT/".github/workflows/ci.yml").read_text())
 
-    def test_compose_comment_parser_preserves_hashes_inside_quotes(self):
+    def test_compose_bootstrap_guard_handles_comments_interpolation_and_blank_values(self):
         bash=shutil.which("bash")
         if not bash:
             self.skipTest("bash is required to exercise the installer parser")
         installer=(ROOT/"install.sh").read_text()
         start=installer.index("strip_compose_comment() {")
-        end=installer.index("\nis_compose_single_quoted_literal() {", start)
-        helper=installer[start:end]
-        script=helper+'\nfor value do printf "<%s>\\n" "$(strip_compose_comment "$value")"; done'
+        end=installer.index('\nenv_file="$APP_DIR/.env"', start)
+        helpers=installer[start:end]
+        script=helpers+'''\nfor value do
+  if resolve_compose_bootstrap_password "$value"; then
+    printf '<ok:%s>\\n' "$bootstrap_password_value"
+  else
+    status=$?
+    printf '<error:%s>\\n' "$status"
+  fi
+done'''
         values=[
-            "'pa$word # long-password'",
-            "'pa$word # long-password' # trailing comment",
-            '"$word # literal" # trailing comment',
-            "$word # interpolation",
+            "",
             "   # comment-only",
+            "'' # empty quoted value",
+            "'   '",
+            "${BOOTSTRAP_PASSWORD}",
+            "'pa$word # long-password' # trailing comment",
+            '"${BOOTSTRAP_PASSWORD}"',
+            "'$word # literal' # trailing comment",
+            "$word # interpolation",
+            "'\"pa$word # quoted-literal\"' # trailing comment",
         ]
         result=subprocess.run([bash, "-c", script, "parser-test", *values], capture_output=True, text=True, check=True)
         self.assertEqual(result.stdout.splitlines(), [
-            "<'pa$word # long-password'>",
-            "<'pa$word # long-password'>",
-            '<"$word # literal">',
-            "<$word>",
-            "<>",
+            "<error:1>",
+            "<error:1>",
+            "<error:1>",
+            "<error:1>",
+            "<error:2>",
+            "<ok:pa$word # long-password>",
+            "<error:2>",
+            "<ok:$word # literal>",
+            "<error:2>",
+            '<ok:"pa$word # quoted-literal">',
         ])
 
     def test_fresh_install_has_no_default_bootstrap_login(self):
