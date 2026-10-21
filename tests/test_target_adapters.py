@@ -321,6 +321,40 @@ class TargetAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "maximaal één"):
             main.validate_policy_references({"log_setting": "one,two"}, catalog, {"log_setting"})
 
+    def test_indexed_policy_reference_validation_matches_catalog_validation(self):
+        catalog = [
+            {"name": "inside", "kind": "zones"},
+            {"name": "192.0.2.0/24", "kind": "addresses"},
+            {"name": "CN", "kind": "regions"},
+            {"name": "ssl", "kind": "applications"},
+            {"name": "tcp-443", "kind": "services"},
+            {"name": "adult", "kind": "predefined-url-categories"},
+            {"name": "forward-all", "kind": "log-forwarding"},
+        ]
+        index = main.build_policy_reference_index(catalog)
+        cases = [
+            ({"from": ["inside"], "source": ["192.0.2.0/24", "CN"],
+              "application": ["ssl"], "service": ["tcp-443"], "category": ["adult"],
+              "log_setting": "forward-all"},
+             {"from", "source", "application", "service", "category", "log_setting"}),
+            ({"application": ["missing-app"]}, {"application"}),
+            ({"log_setting": "one,two"}, {"log_setting"}),
+        ]
+
+        def outcome(policy, changed_fields, source):
+            try:
+                main.validate_policy_references(policy, source, changed_fields)
+            except ValueError as exc:
+                return str(exc)
+            return None
+
+        for policy, changed_fields in cases:
+            with self.subTest(policy=policy):
+                self.assertEqual(
+                    outcome(policy, changed_fields, catalog),
+                    outcome(policy, changed_fields, index),
+                )
+
     def test_policy_source_and_destination_accept_regions_and_native_ip_addresses(self):
         policy = {
             "source": ["CN", "RU", "192.0.2.10", "2001:db8::1/64"],
@@ -1497,12 +1531,14 @@ class TargetAdapterTests(unittest.TestCase):
         with client.session_transaction(base_url="https://forge.test") as login:
             login["user_id"] = 1; login["username"] = "test"; login["must_change"] = False; login["csrf"] = "bulk-csrf"
         try:
-            preview = client.post(
-                f"/config-workspaces/{workspace_id}/policies/bulk-preview",
-                data={"csrf": "bulk-csrf", "scope": "vsys1", "policy_kind": "security", "rulebase": "standard", "policy_name": ["one", "two"], "tag_add": "bulk-edited", "application_add": "dns", "action": "deny"},
-                base_url="https://forge.test",
-            )
+            with patch.object(main, "build_policy_reference_index", wraps=main.build_policy_reference_index) as index_builder:
+                preview = client.post(
+                    f"/config-workspaces/{workspace_id}/policies/bulk-preview",
+                    data={"csrf": "bulk-csrf", "scope": "vsys1", "policy_kind": "security", "rulebase": "standard", "policy_name": ["one", "two"], "tag_add": "bulk-edited", "application_add": "dns", "action": "deny"},
+                    base_url="https://forge.test",
+                )
             self.assertEqual(preview.status_code, 200)
+            self.assertEqual(index_builder.call_count, 1)
             parser = NavigationTargets(); parser.feed(preview.data.decode())
             action = next(item for item in parser.actions if "/config-workspaces/policy-bulk-drafts/" in item)
             applied = client.post(action, data={"csrf": "bulk-csrf"}, base_url="https://forge.test")
@@ -1518,6 +1554,48 @@ class TargetAdapterTests(unittest.TestCase):
             for item in workspaces: main.workspace_config_path(item).unlink(missing_ok=True)
             with main.db() as conn:
                 conn.execute("DELETE FROM config_workspaces WHERE profile_id=?", (profile_id,)); conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
+    def test_online_policy_bulk_preview_builds_one_reference_index(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("online-bulk-index", 1, "SERIAL-INDEX", "192.0.2.10", "panos", "{}", b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+        policies = [{
+            "id": name, "name": name, "tag": [], "from": ["any"], "to": ["any"],
+            "source": ["any"], "destination": ["any"], "source_user": ["any"],
+            "destination_user": ["any"], "source_hip": ["any"], "destination_hip": ["any"],
+            "application": ["any"], "service": ["application-default"], "category": ["any"],
+            "action": "allow", "disabled": False, "description": "",
+            "log_setting": "", "profile_group": "", "schedule": "",
+        } for name in ("one", "two")]
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1
+            login["username"] = "test"
+            login["must_change"] = False
+            login["csrf"] = "online-bulk-csrf"
+        before_drafts = set(main.POLICY_DRAFTS.glob("*.json"))
+        try:
+            with (
+                patch.object(main, "fetch_scm_policy_type", return_value=policies),
+                patch.object(main, "fetch_object_catalog", return_value=[{"name": "bulk-tag", "kind": "tags"}]),
+                patch.object(main, "build_policy_reference_index", wraps=main.build_policy_reference_index) as index_builder,
+            ):
+                preview = client.post(
+                    f"/policies/{profile_id}/preview",
+                    data={"csrf": "online-bulk-csrf", "policy_kind": "security", "policy_id": ["one", "two"], "tag_add": "bulk-tag"},
+                    base_url="https://forge.test",
+                )
+            self.assertEqual(preview.status_code, 200)
+            self.assertEqual(index_builder.call_count, 1)
+        finally:
+            for path in set(main.POLICY_DRAFTS.glob("*.json")) - before_drafts:
+                path.unlink(missing_ok=True)
+            with main.db() as conn:
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
 
     def test_oversized_form_is_rejected(self):
         client = main.app.test_client()
