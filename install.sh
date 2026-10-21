@@ -50,11 +50,12 @@ fi
 install -d -m 0755 "$APP_DIR"
 install -d -o "$APP_UID" -g "$APP_GID" -m 0700 "$DATA_DIR"
 install -d -o "$APP_UID" -g "$APP_GID" -m 0700 "$APP_DIR/certs"
+install -d -m 0755 "$APP_DIR/trust"
 if [[ "$SOURCE_DIR" != "$APP_DIR" ]]; then
   install -d -m 0755 "$APP_DIR/app" "$APP_DIR/vendor"
   cp -a "$SOURCE_DIR/app/." "$APP_DIR/app/"
   cp -a "$SOURCE_DIR/vendor/." "$APP_DIR/vendor/"
-  cp -a "$SOURCE_DIR/Dockerfile" "$SOURCE_DIR/docker-compose.yml" "$SOURCE_DIR/requirements.txt" "$APP_DIR/"
+  cp -a "$SOURCE_DIR/Dockerfile" "$SOURCE_DIR/docker-compose.yml" "$SOURCE_DIR/requirements.in" "$SOURCE_DIR/requirements.txt" "$APP_DIR/"
   [[ ! -f "$SOURCE_DIR/.dockerignore" ]] || cp -a "$SOURCE_DIR/.dockerignore" "$APP_DIR/"
 fi
 
@@ -94,17 +95,98 @@ chmod 0600 "$appliance_config"
 
 host_fqdn="$(hostname -f 2>/dev/null || true)"
 trusted_hosts="$(printf '%s\n' "$detected_ip" "$bind_address" "$host_fqdn" "$fqdn" 127.0.0.1 localhost | awk 'NF && !seen[$0]++' | paste -sd, -)"
+
+strip_compose_comment() {
+  local value="$1" candidate quote i char next suffix
+  candidate="${value#"${value%%[![:space:]]*}"}"
+  if [[ "$candidate" == \'* || "$candidate" == \"* ]]; then
+    value="$candidate"
+    quote="${value:0:1}"
+    i=1
+    while (( i < ${#value} )); do
+      char="${value:i:1}"
+      if [[ "$char" == "\\" ]]; then
+        next="${value:i+1:1}"
+        if [[ "$quote" == "'" && "$next" == "'" ]] || [[ "$quote" == '"' ]]; then
+          i=$((i + 2))
+          continue
+        fi
+      fi
+      if [[ "$char" == "$quote" ]]; then
+        suffix="${value:i+1}"
+        if [[ "$suffix" =~ ^[[:space:]]+# ]]; then
+          value="${value:0:i+1}"
+        fi
+        break
+      fi
+      i=$((i + 1))
+    done
+  else
+    value="$(printf '%s\n' "$value" | sed -E 's/[[:space:]]+#.*$//')"
+  fi
+  value="${value%$'\n'}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+is_compose_single_quoted_literal() {
+  local value="$1" inner i char next
+  [[ ${#value} -ge 2 && "${value:0:1}" == "'" && "${value: -1}" == "'" ]] || return 1
+  inner="${value:1:${#value}-2}"
+  i=0
+  while (( i < ${#inner} )); do
+    char="${inner:i:1}"
+    if [[ "$char" == "'" ]]; then
+      return 1
+    fi
+    if [[ "$char" == "\\" ]]; then
+      next="${inner:i+1:1}"
+      if [[ "$next" == "'" ]]; then
+        i=$((i + 2))
+        continue
+      fi
+    fi
+    i=$((i + 1))
+  done
+  return 0
+}
 env_file="$APP_DIR/.env"
 if [[ ! -s "$env_file" ]]; then
   umask 077
   {
-    printf 'PPF_BOOTSTRAP_PASSWORD=admin\n'
     printf 'PPF_TRUSTED_HOSTS=%s\n' "$trusted_hosts"
     printf 'PPF_BIND_ADDRESS=%s\n' "$bind_address"
     printf 'PPF_FQDN=%s\n' "$fqdn"
   } > "$env_file"
 fi
-grep -q '^PPF_BOOTSTRAP_PASSWORD=' "$env_file" || printf 'PPF_BOOTSTRAP_PASSWORD=admin\n' >> "$env_file"
+bootstrap_password_entry="$(sed -n 's/^PPF_BOOTSTRAP_PASSWORD=//p' "$env_file" | tail -n 1)"
+bootstrap_password_value="$(strip_compose_comment "$bootstrap_password_entry")"
+if [[ "$bootstrap_password_value" == *'$'* ]] && ! is_compose_single_quoted_literal "$bootstrap_password_value"; then
+  echo "PPF_BOOTSTRAP_PASSWORD contains Compose interpolation syntax; use single quotes in $env_file for a literal value." >&2
+  exit 1
+fi
+case "$bootstrap_password_value" in
+  \"*\"|\'*\') bootstrap_password_value="${bootstrap_password_value:1:${#bootstrap_password_value}-2}" ;;
+esac
+bootstrap_password_value="$(printf '%s\n' "$bootstrap_password_value" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+if [[ -z "$bootstrap_password_value" ]]; then
+  bootstrap_password="${PPF_BOOTSTRAP_PASSWORD:-}"
+  if [[ -z "$bootstrap_password" || ${#bootstrap_password} -lt 12 ]]; then
+    echo "Set PPF_BOOTSTRAP_PASSWORD to a unique password of at least 12 characters before installing." >&2
+    exit 1
+  fi
+  if [[ "$bootstrap_password" == *$'\n'* || "$bootstrap_password" == *$'\r'* ]]; then
+    echo "PPF_BOOTSTRAP_PASSWORD cannot contain line breaks." >&2
+    exit 1
+  fi
+  if [[ -n "$bootstrap_password_entry" ]]; then
+    echo "PPF_BOOTSTRAP_PASSWORD is empty in $env_file; set it before installing." >&2
+    exit 1
+  fi
+  escaped_bootstrap_password="${bootstrap_password//\'/\\\'}"
+  printf "PPF_BOOTSTRAP_PASSWORD='%s'\n" "$escaped_bootstrap_password" >> "$env_file"
+fi
 grep -q '^PPF_TRUSTED_HOSTS=' "$env_file" || printf 'PPF_TRUSTED_HOSTS=%s\n' "$trusted_hosts" >> "$env_file"
 grep -q '^PPF_BIND_ADDRESS=' "$env_file" || printf 'PPF_BIND_ADDRESS=%s\n' "$bind_address" >> "$env_file"
 grep -q '^PPF_FQDN=' "$env_file" || printf 'PPF_FQDN=%s\n' "$fqdn" >> "$env_file"
@@ -148,5 +230,5 @@ PY
 display_host="${fqdn:-$detected_ip}"
 echo "PA Policy Forge is available on https://$display_host"
 echo "HTTP requests on port 80 are redirected to HTTPS."
-echo "Initial login: admin / admin"
+echo "Initial login: admin using the configured bootstrap password; change it at first login."
 echo "A self-signed certificate is active until an FQDN certificate is uploaded in Settings."

@@ -1,10 +1,10 @@
-FROM python:3.14-slim
+FROM python:3.14-slim@sha256:fbecd461fc72d21b2143c6eaba25143738079154a6d0ea3da3aec724f50eed4a
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 RUN groupadd --system --gid 10001 forge && useradd --system --uid 10001 --gid 10001 --create-home forge
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt && pip uninstall --yes setuptools msgpack
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt && pip uninstall --yes setuptools msgpack
 COPY app ./app
 COPY vendor ./vendor
 RUN mkdir -p /data /certs && chown -R forge:forge /data /app

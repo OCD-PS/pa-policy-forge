@@ -636,14 +636,16 @@ class TargetAdapterTests(unittest.TestCase):
             self.assertEqual(response.status_code, 302)
             self.assertEqual(response.headers["Location"], "/login")
 
-    def test_default_login_is_not_forced_to_change_password(self):
+    def test_bootstrap_account_must_change_password_before_using_app(self):
         client = main.app.test_client()
         with client.session_transaction(base_url="https://forge.test") as login:
             login["user_id"] = 1
             login["username"] = "admin"
             login["must_change"] = True
         response = client.get("/", base_url="https://forge.test")
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/change-password")
+        self.assertEqual(client.get("/change-password", base_url="https://forge.test").status_code, 200)
 
     def test_offline_workspace_templates_compile(self):
         main.app.jinja_env.get_template("app.html")
