@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import copy
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 import hashlib
 import html
@@ -2285,6 +2286,28 @@ POLICY_REFERENCE_BUILTINS = {
 }
 
 
+@dataclass(frozen=True)
+class PolicyReferenceIndex:
+    allowed_by_field: dict[str, frozenset[str]]
+
+
+def build_policy_reference_index(catalog: list[dict]) -> PolicyReferenceIndex:
+    """Precompute each policy field's allowed values for repeated validation."""
+    available_by_kind = defaultdict(set)
+    for item in catalog:
+        name = item.get("name", "")
+        if name:
+            available_by_kind[item.get("kind", "")].add(name)
+
+    allowed_by_field = {}
+    for field, kinds in POLICY_REFERENCE_KINDS.items():
+        allowed = set(POLICY_REFERENCE_BUILTINS.get(field, ()))
+        for kind in kinds:
+            allowed.update(available_by_kind.get(kind, ()))
+        allowed_by_field[field] = frozenset(allowed)
+    return PolicyReferenceIndex(allowed_by_field)
+
+
 def normalize_policy_wildcard_members(policy: dict) -> dict:
     """Keep PAN-OS wildcard members exclusive when concrete values are chosen."""
     exclusive = {
@@ -2333,10 +2356,13 @@ def is_native_policy_address(field: str, value: str) -> bool:
         return False
 
 
-def validate_policy_references(policy: dict, catalog: list[dict], changed_fields: set[str], allow_zone_freeform: bool = False) -> None:
-    available = {}
-    for item in catalog:
-        available.setdefault(item.get("kind", ""), set()).add(item.get("name", ""))
+def validate_policy_references(
+    policy: dict,
+    catalog: list[dict] | PolicyReferenceIndex,
+    changed_fields: set[str],
+    allow_zone_freeform: bool = False,
+) -> None:
+    reference_index = catalog if isinstance(catalog, PolicyReferenceIndex) else build_policy_reference_index(catalog)
     for field in changed_fields & {"log_setting", "profile_group", "schedule"}:
         value = str(policy.get(field, "") or "")
         if "," in value:
@@ -2346,9 +2372,7 @@ def validate_policy_references(policy: dict, catalog: list[dict], changed_fields
             continue
         raw = policy.get(field, [])
         values = raw if isinstance(raw, list) else ([raw] if raw else [])
-        permitted = set(POLICY_REFERENCE_BUILTINS.get(field, set()))
-        for kind in POLICY_REFERENCE_KINDS[field]:
-            permitted.update(available.get(kind, set()))
+        permitted = reference_index.allowed_by_field[field]
         missing = sorted({
             str(value).strip() for value in values
             if str(value).strip()
@@ -3957,13 +3981,14 @@ def config_workspace_policy_bulk_preview(workspace_id):
             xml_bytes, scope, (parsed_root, parsed_snapshot), workspace_profile
         )
         reference_catalog = extend_policy_catalog_with_current(reference_catalog, policies)
+        reference_index = build_policy_reference_index(reference_catalog)
         changes = []
         for before in selected:
             after = apply_bulk_operations(before, operations)
             if after != before:
                 changed_fields = {field for field in set(before) | set(after) if before.get(field) != after.get(field)}
                 validate_policy_references(
-                    after, reference_catalog, changed_fields,
+                    after, reference_index, changed_fields,
                     allow_zone_freeform=parsed_snapshot.kind == "panorama" and not referenced_template(parsed_snapshot, scope),
                 )
                 changes.append({
@@ -7394,13 +7419,14 @@ def policy_bulk_preview(profile_id):
         selected = [policy for policy in current if policy["id"] in selected_ids]
         if len(selected) != len(selected_ids): raise ValueError("Niet alle geselecteerde policies bestaan nog. Vernieuw de rulebase.")
         reference_catalog = extend_policy_catalog_with_current(fetch_object_catalog(profile, "policy-picker"), current)
+        reference_index = build_policy_reference_index(reference_catalog)
         changes = []; zones_changed = profile["target_type"] != "panorama" and any(operations[field]["add"] or operations[field]["remove"] for field in ("from", "to")); zone_names = {item.get("name", "") for item in fetch_scm_objects(profile, "zones")} if zones_changed else set()
         for policy in selected:
             updated = apply_bulk_operations(policy, operations)
             if zones_changed: validate_policy_zones(updated, zone_names)
             if updated != policy:
                 changed_fields = {field for field in set(policy) | set(updated) if policy.get(field) != updated.get(field)}
-                validate_policy_references(updated, reference_catalog, changed_fields, allow_zone_freeform=profile["target_type"] == "panorama")
+                validate_policy_references(updated, reference_index, changed_fields, allow_zone_freeform=profile["target_type"] == "panorama")
                 changes.append({"before": policy, "after": updated, "fingerprint": policy_fingerprint(policy)})
         if not changes: raise ValueError("De gekozen bulkbewerking veroorzaakt geen wijzigingen.")
         draft_id = secrets.token_urlsafe(18)
