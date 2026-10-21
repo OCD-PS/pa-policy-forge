@@ -10,6 +10,9 @@
 
 - Inspect the full diff, call sites, tests, and existing conventions before editing.
 - Prefer focused changes and the fastest meaningful checks; run the relevant suite for affected code.
+- Write code in a clear, consistent structure that follows the repository's existing layers and naming conventions. Keep functions and modules focused, avoid unnecessary duplication or clever abstractions, and make data flow and side effects easy to follow.
+- Add comments or docstrings where they explain why a choice exists, a non-obvious invariant, a protocol/API quirk, or a security boundary. Do not add comments that merely restate the code.
+- Treat security as a design requirement throughout implementation: validate untrusted input at boundaries, enforce authorization and least privilege, avoid injection and unsafe XML handling, constrain outbound requests to prevent SSRF, keep secrets out of logs/errors, and fail safely. Review the complete changed path for security consequences before finishing.
 - Review authorization, validation, secret handling, injection/SSRF, error handling, logging, and performance where relevant.
 - For every implementation change and scheduled code review, assign a separate read-only Vulnerability Reviewer using `.agents/skills/pa-policy-forge-vulnerability-review/SKILL.md`. Review source dependencies, lockfiles, container base/runtime images, and host/runtime packages when reachable; check current vendor advisories and CVEs, and verify exact affected/fixed versions and exposure. Include PAN-OS single/multi-VSYS and Shared, Panorama, and SCM when application behavior is affected.
 - The Vulnerability Reviewer reports findings with evidence and recommended fixes; the implementation agent owns remediation. Do not claim a live host or image is clean when access is unavailable, and distinguish confirmed matches from provisional reports or unverified assets.
