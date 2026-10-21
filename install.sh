@@ -151,6 +151,18 @@ is_compose_single_quoted_literal() {
   done
   return 0
 }
+resolve_compose_bootstrap_password() {
+  local value="$1"
+  bootstrap_password_value="$(strip_compose_comment "$value")"
+  if [[ "$bootstrap_password_value" == *'$'* ]] && ! is_compose_single_quoted_literal "$bootstrap_password_value"; then
+    return 2
+  fi
+  if [[ "${bootstrap_password_value:0:1}" == "'" && "${bootstrap_password_value: -1}" == "'" ]] || [[ "${bootstrap_password_value:0:1}" == '"' && "${bootstrap_password_value: -1}" == '"' ]]; then
+    bootstrap_password_value="${bootstrap_password_value:1:${#bootstrap_password_value}-2}"
+  fi
+  bootstrap_password_value="$(printf '%s\n' "$bootstrap_password_value" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  [[ -n "$bootstrap_password_value" ]]
+}
 env_file="$APP_DIR/.env"
 if [[ ! -s "$env_file" ]]; then
   umask 077
@@ -161,15 +173,15 @@ if [[ ! -s "$env_file" ]]; then
   } > "$env_file"
 fi
 bootstrap_password_entry="$(sed -n 's/^PPF_BOOTSTRAP_PASSWORD=//p' "$env_file" | tail -n 1)"
-bootstrap_password_value="$(strip_compose_comment "$bootstrap_password_entry")"
-if [[ "$bootstrap_password_value" == *'$'* ]] && ! is_compose_single_quoted_literal "$bootstrap_password_value"; then
-  echo "PPF_BOOTSTRAP_PASSWORD contains Compose interpolation syntax; use single quotes in $env_file for a literal value." >&2
-  exit 1
+if resolve_compose_bootstrap_password "$bootstrap_password_entry"; then
+  :
+else
+  bootstrap_password_status=$?
+  if [[ "$bootstrap_password_status" -eq 2 ]]; then
+    echo "PPF_BOOTSTRAP_PASSWORD contains Compose interpolation syntax; use single quotes in $env_file for a literal value." >&2
+    exit 1
+  fi
 fi
-case "$bootstrap_password_value" in
-  \"*\"|\'*\') bootstrap_password_value="${bootstrap_password_value:1:${#bootstrap_password_value}-2}" ;;
-esac
-bootstrap_password_value="$(printf '%s\n' "$bootstrap_password_value" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
 if [[ -z "$bootstrap_password_value" ]]; then
   bootstrap_password="${PPF_BOOTSTRAP_PASSWORD:-}"
   if [[ -z "$bootstrap_password" || ${#bootstrap_password} -lt 12 ]]; then
