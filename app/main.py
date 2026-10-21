@@ -43,6 +43,7 @@ from app.certificates import (
     install_certificate,
     read_upload,
 )
+from vendor.panos_tls import create_panos_ssl_context
 from vendor.paloalto_light_syslog import FlowStore, env_int, parse_panos_syslog
 from vendor.syslog_stream import tcp_server, udp_server
 from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_single_replacements
@@ -522,10 +523,12 @@ def init_db() -> None:
         if "candidate_at" not in monitor_columns:
             conn.execute("ALTER TABLE post_deploy_monitors ADD COLUMN candidate_at TEXT NOT NULL DEFAULT ''")
         if not conn.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
-            bootstrap_password = os.getenv("PPF_BOOTSTRAP_PASSWORD", "admin") or "admin"
-            if bootstrap_password != "admin" and (len(bootstrap_password) < 12 or password_is_blocked(bootstrap_password)):
-                raise RuntimeError("Set PPF_BOOTSTRAP_PASSWORD to admin or a unique value of at least 12 characters")
-            conn.execute("INSERT INTO users(username,password_hash,must_change) VALUES(?,?,0)",
+            bootstrap_password = os.getenv("PPF_BOOTSTRAP_PASSWORD", "")
+            if len(bootstrap_password) < 12 or password_is_blocked(bootstrap_password):
+                raise RuntimeError(
+                    "A new installation requires PPF_BOOTSTRAP_PASSWORD with at least 12 non-default characters"
+                )
+            conn.execute("INSERT INTO users(username,password_hash,must_change) VALUES(?,?,1)",
                          ("admin", password_hash(bootstrap_password)))
         conn.execute(
             "UPDATE runs SET status='failed',finished_at=strftime('%Y-%m-%d %H:%M:%S','now'),"
@@ -612,6 +615,10 @@ def protect_csrf():
             return "Not found", 404
     if request.method == "POST" and not hmac.compare_digest(request.form.get("csrf", ""), session.get("csrf", "-")):
         return "Invalid CSRF token", 400
+    if session.get("user_id") and session.get("must_change") and request.endpoint not in {
+        "change_password", "logout", "static", "healthz",
+    }:
+        return redirect(url_for("change_password"))
 
 
 @app.after_request
@@ -679,8 +686,10 @@ def login():
         password_valid = password_ok(request.form.get("password", ""), user["password_hash"] if user else _dummy_password_hash)
         if user and password_valid:
             clear_login_failures(client, username)
-            session.clear(); session.permanent = True; session["user_id"] = user["id"]; session["username"] = user["username"]; session["must_change"] = False; csrf()
+            session.clear(); session.permanent = True; session["user_id"] = user["id"]; session["username"] = user["username"]; session["must_change"] = bool(user["must_change"]); csrf()
             audit("login")
+            if session["must_change"]:
+                return redirect(url_for("change_password"))
             return redirect(url_for("index"))
         login_rate_limited(client, username, record_failure=True)
         flash("Ongeldige gebruikersnaam of wachtwoord.", "error")
@@ -1087,7 +1096,7 @@ def panos_profile_context(profile):
     if not endpoint: raise ValueError("PAN-OS/Panorama endpoint ontbreekt")
     profile_id = int(profile["id"]) if "id" in profile.keys() else 0
     profile_version = str(profile["updated_at"]) if "updated_at" in profile.keys() else ""
-    ctx = ssl._create_unverified_context()
+    ctx = create_panos_ssl_context()
     if profile_id:
         with _panos_key_cache_lock:
             cached = _panos_key_cache.get(profile_id)
@@ -7780,6 +7789,7 @@ def build_fingerprint(profile, include_flows: bool = True) -> str:
         },
         "secret": hashlib.sha256(bytes(profile["secret_blob"] or b"")).hexdigest(),
         "builder": hashlib.sha256((BASE / "vendor/bdnd_panos_policy_builder.py").read_bytes()).hexdigest(),
+        "panos_tls": hashlib.sha256((BASE / "vendor/panos_tls.py").read_bytes()).hexdigest(),
     }
     if include_flows: state["flows"] = [dict(row) for row in flow_state]
     return hashlib.sha256(json.dumps(state, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -8084,6 +8094,7 @@ def execute_run(
         if not count: raise ValueError("Geen geaggregeerde flows voor deze firewall")
         shutil.copy(BASE / "vendor/bdnd_panos_policy_builder.py", run_dir)
         shutil.copy(BASE / "vendor/bdnd_bpa_policy_builder.py", run_dir)
+        shutil.copy(BASE / "vendor/panos_tls.py", run_dir)
         run_secret = write_config(profile, run_dir, push, disabled_override)
         run_env = {**os.environ,
             "PPF_PANOS_USERNAME": run_secret.get("username", ""), "PPF_PANOS_PASSWORD": run_secret.get("password", ""),

@@ -16,7 +16,8 @@ services:
       PPF_SYSLOG_TCP_MAX_CONNECTIONS: "64"
       PPF_SYSLOG_UDP_MAX_WORKERS: "32"
       PPF_MAX_GIB: "50"
-      PPF_BOOTSTRAP_PASSWORD: ${PPF_BOOTSTRAP_PASSWORD:-admin}
+      PPF_BOOTSTRAP_PASSWORD: ${PPF_BOOTSTRAP_PASSWORD:-}
+      PPF_PANOS_CA_BUNDLE: ${PPF_PANOS_CA_BUNDLE:-}
       PPF_TRUSTED_HOSTS: ${PPF_TRUSTED_HOSTS:-}
       PPF_CERT_DIR: /certs
       PPF_APPLIANCE_CONFIG: /data/appliance.json
@@ -24,8 +25,9 @@ services:
     volumes:
       - /var/lib/pa-policy-forge:/data
       - /opt/pa-policy-forge/certs:/certs
+      - /opt/pa-policy-forge/trust:/etc/pa-policy-forge/trust:ro
     healthcheck:
-      test: ["CMD", "python3", "-c", "import socket,ssl,urllib.request; urllib.request.urlopen('https://127.0.0.1:8443/healthz',context=ssl._create_unverified_context(),timeout=5); socket.create_connection(('127.0.0.1',5514),2).close()"]
+      test: ["CMD", "python3", "-c", "import socket,ssl,urllib.request; c=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); c.check_hostname=False; c.verify_mode=ssl.CERT_NONE; r=urllib.request.urlopen('https://127.0.0.1:8443/healthz',context=c,timeout=5); assert r.status==200; socket.create_connection(('127.0.0.1',5514),2).close()"]
       interval: 30s
       timeout: 8s
       retries: 3

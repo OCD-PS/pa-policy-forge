@@ -48,11 +48,42 @@ Ports:
 - `514/udp`: PAN-OS syslog
 - `514/tcp`: PAN-OS syslog using RFC 6587 octet-counting or newline framing
 
-The default login is `admin` / `admin`. For the current lab workflow PA Policy
-Forge does not force a password change. Direct Docker Compose deployments may
-override the initial password through `PPF_BOOTSTRAP_PASSWORD`. Change this
-behavior before using the application in a customer or otherwise untrusted
-environment.
+On a fresh install, configure a unique `PPF_BOOTSTRAP_PASSWORD` of at least 12
+characters before starting Compose or running the installer. The application
+fails closed if no valid bootstrap password is configured, and the `admin`
+account must change that password at first login. Existing databases are left
+untouched: changing or removing the bootstrap environment variable never resets
+an existing account. Store the value in the root-owned, mode-0600
+`/opt/pa-policy-forge/.env`; do not commit it. Values containing `$` must be
+single-quoted in `.env` so Compose treats them as literal characters rather
+than variable interpolation. For example: `PPF_BOOTSTRAP_PASSWORD='pa$word-long'`.
+
+PAN-OS and Panorama API calls verify the server certificate chain and hostname.
+The system trust store is used by default. To trust a private or self-signed
+device CA, place its PEM certificate under `/opt/pa-policy-forge/trust/` and set
+`PPF_PANOS_CA_BUNDLE` in `.env` to its container path, for example
+`/etc/pa-policy-forge/trust/firewall-ca.pem`. The mounted trust directory is
+read-only in the app container. The configured device endpoint must still match
+a DNS name or IP address in the certificate SAN. SCM continues using the normal
+system CA trust and does not use this PAN-OS-specific bundle.
+
+Runtime direct dependency versions are maintained in `requirements.in`; the
+hash-locked `requirements.txt` is generated with pip-tools and installed with
+`--require-hashes`. After changing direct dependencies, regenerate the lock
+with the separately hash-locked toolchain (`requirements-lock-tools.txt`):
+
+```bash
+python -m pip install --require-hashes -r requirements-lock-tools.txt
+python -m piptools compile --resolver=backtracking --generate-hashes --strip-extras --output-file=requirements.txt requirements.in
+python -m piptools compile --resolver=backtracking --generate-hashes --strip-extras --output-file=requirements-dev.txt requirements-dev.in
+python -m piptools compile --resolver=backtracking --generate-hashes --allow-unsafe --strip-extras --output-file=requirements-lock-tools.txt requirements-lock-tools.in
+```
+
+CI installs the hash-locked runtime and test dependency files. The lock-generation
+toolchain is kept separate and is not installed by CI.
+
+The Dockerfile also pins the official Python 3.14 slim multi-platform image by
+manifest digest.
 
 The installer also pins the published container ports to the appliance's
 primary address through `PPF_BIND_ADDRESS`. Override `PPF_BIND_ADDRESS` and
@@ -83,7 +114,8 @@ For offline customers, transfer the repository plus a saved container image bund
 
 ## First workflow
 
-1. Log in with the configured bootstrap account.
+1. Log in as `admin` with the configured bootstrap password and choose a new
+   password when prompted.
 2. Configure one or more PAN-OS firewalls to forward TRAFFIC logs to UDP or TCP 514.
 3. Confirm each serial appears under discovered firewalls.
 4. Add a firewall profile with its active and optional passive serial/source IP.

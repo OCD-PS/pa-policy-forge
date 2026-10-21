@@ -37,6 +37,7 @@ from bdnd_bpa_policy_builder import (
     credential_urlopen,
     safe_name,
 )
+from panos_tls import create_panos_ssl_context
 
 DEFAULT_GLOBAL_PING_TRACEROUTE_APPS = ("ping", "traceroute")
 GLOBAL_PING_TRACEROUTE_RULE_NAME = "Global-Ping-Traceroute-allow"
@@ -1555,7 +1556,7 @@ def add_xml_inventory_section(inventory: ExistingConfigInventory, kind: str, ent
 
 
 def fetch_panos_inventory(deployment: DeploymentConfig) -> ExistingConfigInventory:
-    ctx = ssl._create_unverified_context()
+    ctx = create_panos_ssl_context()
     key = panos_api_key(deployment, ctx)
     device_name = xpath_literal("localhost.localdomain")
     if deployment.panorama:
@@ -2127,7 +2128,7 @@ def rules_xpath(deployment: DeploymentConfig) -> str:
 
 
 def fetch_panos_rule_entries(deployment: DeploymentConfig) -> list[ET.Element]:
-    ctx = ssl._create_unverified_context()
+    ctx = create_panos_ssl_context()
     key = panos_api_key(deployment, ctx)
     response = require_success(
         api_get(
@@ -2456,7 +2457,7 @@ def push_to_device(xml_path: Path, deployment: DeploymentConfig, review_rows: li
     if not deployment.panos_endpoint or not deployment.panos_username or not deployment.panos_password:
         raise RuntimeError("Auto-push requested but panos endpoint/username/password is incomplete")
 
-    ctx = ssl._create_unverified_context()
+    ctx = create_panos_ssl_context()
     key = panos_api_key(deployment, ctx)
     existing_entries = fetch_panos_rule_entries(deployment)
     existing_rule_names = {entry.attrib["name"] for entry in existing_entries if entry.attrib.get("name")}

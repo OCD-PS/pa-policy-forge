@@ -1,8 +1,10 @@
 import pathlib
 import ipaddress
+import shutil
 import sys
 import tempfile
 import gc
+import subprocess
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -129,15 +131,83 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("wait_for_healthy pa-policy-forge-http", installer)
         self.assertIn('chown "$APP_UID:$APP_GID" "$certificate" "$private_key"', installer)
 
-    def test_distribution_uses_documented_default_bootstrap_login(self):
+    def test_service_healthcheck_does_not_depend_on_certificate_trust(self):
+        compose=(ROOT/"docker-compose.yml").read_text()
+        healthcheck=compose.split("    healthcheck:", 1)[1].split("\n    security_opt:", 1)[0]
+        self.assertIn("127.0.0.1", healthcheck)
+        self.assertIn("https://127.0.0.1:8443/healthz", healthcheck)
+        self.assertIn("5514", healthcheck)
+        self.assertNotIn("/certs/tls.crt", healthcheck)
+        self.assertIn("c.check_hostname=False", healthcheck)
+        self.assertIn("c.verify_mode=ssl.CERT_NONE", healthcheck)
+
+    def test_installer_rejects_blank_resolved_bootstrap_password(self):
+        installer=(ROOT/"install.sh").read_text()
+        self.assertIn("s/[[:space:]]+#.*$//", installer)
+        self.assertIn("s/^[[:space:]]+//; s/[[:space:]]+$//", installer)
+        self.assertIn('case "$bootstrap_password_value" in', installer)
+        self.assertIn('if [[ -z "$bootstrap_password_value" ]]; then', installer)
+        self.assertIn('[[ "$bootstrap_password_value" == *\'$\'* ]] && ! is_compose_single_quoted_literal', installer)
+        self.assertIn("Compose interpolation syntax", installer)
+        self.assertIn("single-quoted in `.env`", (ROOT/"README.md").read_text())
+        self.assertIn("bash -n install.sh", (ROOT/".github/workflows/ci.yml").read_text())
+
+    def test_compose_comment_parser_preserves_hashes_inside_quotes(self):
+        bash=shutil.which("bash")
+        if not bash:
+            self.skipTest("bash is required to exercise the installer parser")
+        installer=(ROOT/"install.sh").read_text()
+        start=installer.index("strip_compose_comment() {")
+        end=installer.index("\nis_compose_single_quoted_literal() {", start)
+        helper=installer[start:end]
+        script=helper+'\nfor value do printf "<%s>\\n" "$(strip_compose_comment "$value")"; done'
+        values=[
+            "'pa$word # long-password'",
+            "'pa$word # long-password' # trailing comment",
+            '"$word # literal" # trailing comment',
+            "$word # interpolation",
+            "   # comment-only",
+        ]
+        result=subprocess.run([bash, "-c", script, "parser-test", *values], capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout.splitlines(), [
+            "<'pa$word # long-password'>",
+            "<'pa$word # long-password'>",
+            '<"$word # literal">',
+            "<$word>",
+            "<>",
+        ])
+
+    def test_fresh_install_has_no_default_bootstrap_login(self):
         compose=(ROOT/"docker-compose.yml").read_text()
         installer=(ROOT/"install.sh").read_text()
         self.assertNotIn("OCD1234!", compose)
-        self.assertIn("${PPF_BOOTSTRAP_PASSWORD:-admin}", compose)
-        self.assertIn("PPF_BOOTSTRAP_PASSWORD=admin", installer)
-        self.assertIn("Initial login: admin / admin", installer)
+        self.assertIn("${PPF_BOOTSTRAP_PASSWORD:-}", compose)
+        self.assertNotIn("${PPF_BOOTSTRAP_PASSWORD:-admin}", compose)
+        workflow=(ROOT/".github/workflows/ci.yml").read_text()
+        self.assertIn("python -m pip install --require-hashes -r requirements-dev.txt", workflow)
+        self.assertNotIn("requirements-lock-tools.txt", workflow)
+        self.assertNotIn("pip-tools", (ROOT/"requirements-dev.txt").read_text())
+        self.assertNotIn("PPF_BOOTSTRAP_PASSWORD=admin", installer)
+        self.assertNotIn("Initial login: admin / admin", installer)
         app_text=(ROOT/"app/main.py").read_text()
-        self.assertIn('INSERT INTO users(username,password_hash,must_change) VALUES(?,?,0)', app_text)
+        self.assertIn('INSERT INTO users(username,password_hash,must_change) VALUES(?,?,1)', app_text)
+        self.assertIn('session["must_change"] = bool(user["must_change"])', app_text)
+
+    def test_panos_tls_verification_is_shared_and_scm_keeps_default_verification(self):
+        tls_text=(ROOT/"vendor/panos_tls.py").read_text()
+        app_text=(ROOT/"app/main.py").read_text()
+        panos_text=(ROOT/"vendor/bdnd_panos_policy_builder.py").read_text()
+        self.assertIn("ssl.create_default_context(ssl.Purpose.SERVER_AUTH)", tls_text)
+        self.assertIn("context.load_verify_locations(cafile=bundle)", tls_text)
+        self.assertNotIn("_create_unverified_context", app_text + panos_text)
+        self.assertIn("with credential_urlopen(request, timeout=120) as response:", panos_text)
+
+    def test_runtime_uses_hash_lock_and_pinned_official_python_image_digest(self):
+        dockerfile=(ROOT/"Dockerfile").read_text()
+        requirements=(ROOT/"requirements.txt").read_text()
+        self.assertRegex(dockerfile, r"FROM python:3\.14-slim@sha256:[0-9a-f]{64}")
+        self.assertIn("--require-hashes -r requirements.txt", dockerfile)
+        self.assertIn("--hash=sha256:", requirements)
 
     def test_untrusted_api_xml_uses_defusedxml(self):
         text=(ROOT/"vendor/bdnd_panos_policy_builder.py").read_text()
