@@ -248,6 +248,11 @@ tbody tr:hover { background: rgba(255,255,255,.02); }
 .flash.is-leaving { opacity: 0; transform: translateX(20px); transition: .2s ease; }
 .callout { border-left: 4px solid var(--orange); padding: 14px 16px; background: var(--orange-soft); color: #ddd; }
 .callout strong { color: #fff; }
+.callout-warning { border-left-color: #e9a23b; }
+.certificate-details { display: grid; grid-template-columns: minmax(150px, 190px) minmax(0, 1fr); gap: 10px 16px; margin: 20px 0; }
+.certificate-details dt { color: var(--muted); }
+.certificate-details dd { margin: 0; overflow-wrap: anywhere; }
+.certificate-details code { user-select: all; }
 
 /* Login */
 .login-page { display: grid; min-height: 100vh; grid-template-columns: minmax(320px, 560px) minmax(0, 1fr); }

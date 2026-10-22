@@ -63,9 +63,22 @@ The system trust store is used by default. To trust a private or self-signed
 device CA, place its PEM certificate under `/opt/pa-policy-forge/trust/` and set
 `PPF_PANOS_CA_BUNDLE` in `.env` to its container path, for example
 `/etc/pa-policy-forge/trust/firewall-ca.pem`. The mounted trust directory is
-read-only in the app container. The configured device endpoint must still match
-a DNS name or IP address in the certificate SAN. SCM continues using the normal
-system CA trust and does not use this PAN-OS-specific bundle.
+read-only in the app container. SCM continues using the normal system CA trust
+and does not use this PAN-OS-specific bundle.
+
+For a PAN-OS/Panorama endpoint certificate that is not issued by a trusted CA,
+open the device profile and choose **Controleer certificaat**. Policy Forge only
+reads the TLS certificate at this stage; it does not send API credentials. Review
+the SHA-256 fingerprint and verify it with an independent trusted source before
+explicitly accepting it. The accepted leaf certificate is pinned to that exact
+profile endpoint. Certificate validity is still checked. A changed certificate
+blocks API calls until its new fingerprint is reviewed and explicitly accepted;
+the page shows the previous and current fingerprints. A certificate without a
+matching endpoint SAN requires a separate, clearly labelled confirmation and
+uses the exact pinned certificate as endpoint identity. Expired certificates
+and CA certificates cannot be pinned. Changing the profile endpoint clears the
+pin. This exception applies only to the selected PAN-OS/Panorama profile; it
+does not alter TLS verification for SCM, GitHub, or other services.
 
 Runtime direct dependency versions are maintained in `requirements.in`; the
 hash-locked `requirements.txt` is generated with pip-tools and installed with

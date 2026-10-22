@@ -608,6 +608,147 @@ class TargetAdapterTests(unittest.TestCase):
         finally:
             main.app.config["TRUSTED_HOSTS"] = previous_hosts
 
+    def test_panos_certificate_pin_requires_current_fingerprint_and_authenticated_post(self):
+        stamp = main.now()
+        with main.db() as conn:
+            profile_id = int(conn.execute(
+                "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("TLS pin test", "panos", '{"endpoint":"https://fw.example"}', stamp, stamp),
+            ).lastrowid)
+        current_certificate = {
+            "pem": "-----BEGIN CERTIFICATE-----\npublic-certificate\n-----END CERTIFICATE-----\n",
+            "fingerprint": "AA" * 32,
+            "subject": "CN=fw.example",
+            "issuer": "CN=fw.example",
+            "common_name": "fw.example",
+            "dns_names": ["fw.example"],
+            "ip_names": [],
+            "not_before": stamp,
+            "not_after": "2099-01-01T00:00:00+00:00",
+            "valid_now": True,
+            "hostname_matches": True,
+            "is_ca_certificate": False,
+            "verified_by_current_policy": False,
+        }
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1
+            login["username"] = "admin"
+            login["must_change"] = False
+            login["csrf"] = "panos-pin-csrf"
+        try:
+            with patch.object(main, "create_panos_ssl_context", return_value=object()), patch.object(main, "inspect_panos_certificate", return_value=current_certificate):
+                response = client.post(
+                    f"/profiles/{profile_id}/tls-certificate",
+                    base_url="https://forge.test",
+                    data={"csrf": "panos-pin-csrf", "fingerprint": "BB" * 32},
+                )
+            self.assertEqual(response.status_code, 200)
+            with main.db() as conn:
+                settings = json.loads(conn.execute(
+                    "SELECT settings_json FROM profiles WHERE id=?", (profile_id,)
+                ).fetchone()[0])
+            self.assertNotIn("tls_pinned_fingerprint", settings)
+
+            with patch.object(main, "create_panos_ssl_context", return_value=object()), patch.object(main, "inspect_panos_certificate", return_value=current_certificate):
+                response = client.post(
+                    f"/profiles/{profile_id}/tls-certificate",
+                    base_url="https://forge.test",
+                    data={"csrf": "panos-pin-csrf", "fingerprint": current_certificate["fingerprint"]},
+                )
+            self.assertEqual(response.status_code, 200)
+            with main.db() as conn:
+                settings = json.loads(conn.execute(
+                    "SELECT settings_json FROM profiles WHERE id=?", (profile_id,)
+                ).fetchone()[0])
+            self.assertEqual(settings["tls_pinned_fingerprint"], current_certificate["fingerprint"])
+            self.assertEqual(settings["tls_pinned_endpoint"], "https://fw.example")
+
+            with patch.object(main, "inspect_panos_certificate", side_effect=OSError("unreachable")):
+                response = client.get(
+                    f"/profiles/{profile_id}/tls-certificate",
+                    base_url="https://forge.test",
+                )
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("remove_pin", response.get_data(as_text=True))
+
+            with patch.object(main, "inspect_panos_certificate") as inspect_certificate:
+                response = client.post(
+                    f"/profiles/{profile_id}/tls-certificate",
+                    base_url="https://forge.test",
+                    data={"remove_pin": "yes"},
+                )
+            self.assertEqual(response.status_code, 400)
+            inspect_certificate.assert_not_called()
+            with main.db() as conn:
+                settings = json.loads(conn.execute(
+                    "SELECT settings_json FROM profiles WHERE id=?", (profile_id,)
+                ).fetchone()[0])
+            self.assertEqual(settings["tls_pinned_fingerprint"], current_certificate["fingerprint"])
+
+            with patch.object(main, "inspect_panos_certificate") as inspect_certificate:
+                response = client.post(
+                    f"/profiles/{profile_id}/tls-certificate",
+                    base_url="https://forge.test",
+                    data={"csrf": "panos-pin-csrf", "remove_pin": "yes"},
+                )
+            self.assertEqual(response.status_code, 302)
+            inspect_certificate.assert_not_called()
+            with main.db() as conn:
+                settings = json.loads(conn.execute(
+                    "SELECT settings_json FROM profiles WHERE id=?", (profile_id,)
+                ).fetchone()[0])
+            self.assertNotIn("tls_pinned_certificate", settings)
+            self.assertNotIn("tls_pinned_fingerprint", settings)
+            self.assertNotIn("tls_pinned_endpoint", settings)
+            self.assertNotIn("tls_allow_hostname_mismatch", settings)
+
+            # Restore the fixture pin so the rotation checks below exercise an existing trust decision.
+            settings.update({
+                "tls_pinned_certificate": current_certificate["pem"],
+                "tls_pinned_fingerprint": current_certificate["fingerprint"],
+                "tls_pinned_endpoint": "https://fw.example",
+                "tls_allow_hostname_mismatch": False,
+            })
+            with main.db() as conn:
+                conn.execute(
+                    "UPDATE profiles SET settings_json=?,updated_at=? WHERE id=?",
+                    (json.dumps(settings), main.now(), profile_id),
+                )
+
+            rotated_certificate = {**current_certificate, "fingerprint": "CC" * 32, "hostname_matches": False}
+            with patch.object(main, "create_panos_ssl_context", return_value=object()), patch.object(main, "inspect_panos_certificate", return_value=rotated_certificate):
+                response = client.post(
+                    f"/profiles/{profile_id}/tls-certificate",
+                    base_url="https://forge.test",
+                    data={"csrf": "panos-pin-csrf", "fingerprint": rotated_certificate["fingerprint"]},
+                )
+            with main.db() as conn:
+                settings = json.loads(conn.execute(
+                    "SELECT settings_json FROM profiles WHERE id=?", (profile_id,)
+                ).fetchone()[0])
+            self.assertEqual(settings["tls_pinned_fingerprint"], current_certificate["fingerprint"])
+
+            with patch.object(main, "create_panos_ssl_context", return_value=object()), patch.object(main, "inspect_panos_certificate", return_value=rotated_certificate):
+                response = client.post(
+                    f"/profiles/{profile_id}/tls-certificate",
+                    base_url="https://forge.test",
+                    data={
+                        "csrf": "panos-pin-csrf",
+                        "fingerprint": rotated_certificate["fingerprint"],
+                        "accept_hostname_mismatch": "yes",
+                    },
+                )
+            with main.db() as conn:
+                settings = json.loads(conn.execute(
+                    "SELECT settings_json FROM profiles WHERE id=?", (profile_id,)
+                ).fetchone()[0])
+            self.assertEqual(settings["tls_pinned_fingerprint"], rotated_certificate["fingerprint"])
+            self.assertTrue(settings["tls_allow_hostname_mismatch"])
+        finally:
+            with main.db() as conn:
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
     def test_profile_names_are_html_escaped(self):
         payload = '<img src=x onerror="alert(1)">'
         stamp = main.now()

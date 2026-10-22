@@ -218,6 +218,7 @@
 <div class="field">
 <label>Panorama endpoint</label>
 <input name="endpoint" value="{{ep.endpoint if ep else ''}}" placeholder="https://10.0.0.10" required>
+{% if ep and ep.target_type=='panorama' %}<a class="btn btn-small" href="{{url_for('panos_certificate_review',profile_id=ep.id)}}">Controleer certificaat</a>{% endif %}
 </div>
 <div class="field">
 <label>Device group</label>
@@ -247,6 +248,7 @@
 <div class="field">
 <label>Firewall endpoint</label>
 <input name="endpoint" value="{{ep.endpoint if ep else ''}}" placeholder="https://10.0.0.10" required>
+{% if ep and ep.target_type=='panos' %}<a class="btn btn-small" href="{{url_for('panos_certificate_review',profile_id=ep.id)}}">Controleer certificaat</a>{% endif %}
 </div>
 <div class="field">
 <label>VSYS-modus</label>
