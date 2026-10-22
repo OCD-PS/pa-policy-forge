@@ -27,7 +27,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from app import main
 from vendor import bdnd_panos_policy_builder as policy_api
-from vendor.panos_tls import create_panos_ssl_context
+from vendor.panos_tls import create_panos_ssl_context, inspect_panos_certificate
 
 
 class SecurityHardeningTests(unittest.TestCase):
@@ -153,6 +153,27 @@ class SecurityHardeningTests(unittest.TestCase):
                 )
                 with urllib.request.urlopen(url, context=trusted, timeout=3) as response:
                     self.assertEqual(response.read(), b"ok")
+                pinned = create_panos_ssl_context(pinned_certificate=cert_file.read_text(encoding="ascii"))
+                self.assertEqual(pinned.verify_mode, ssl.CERT_REQUIRED)
+                self.assertTrue(pinned.check_hostname)
+                self.assertNotIn(
+                    ca_certificate.public_bytes(serialization.Encoding.DER),
+                    pinned.get_ca_certs(binary_form=True),
+                )
+                with urllib.request.urlopen(url, context=pinned, timeout=3) as response:
+                    self.assertEqual(response.read(), b"ok")
+                with self.assertRaises(urllib.error.URLError):
+                    urllib.request.urlopen(
+                        url.replace("127.0.0.1", "localhost"), context=pinned, timeout=3
+                    )
+                inspected = inspect_panos_certificate(
+                    url.rstrip("/"), context=create_panos_ssl_context()
+                )
+                self.assertFalse(inspected["verified_by_current_policy"])
+                self.assertTrue(inspected["hostname_matches"])
+                self.assertEqual(inspected["fingerprint"], certificate.fingerprint(hashes.SHA256()).hex().upper())
+                trusted_inspection = inspect_panos_certificate(url.rstrip("/"), context=trusted)
+                self.assertTrue(trusted_inspection["verified_by_current_policy"])
                 with self.assertRaises(urllib.error.URLError):
                     urllib.request.urlopen(
                         url.replace("127.0.0.1", "localhost"),

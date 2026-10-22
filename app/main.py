@@ -31,6 +31,8 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache, wraps
 
 from cryptography.fernet import Fernet
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
 from defusedxml import ElementTree as SafeET
 from flask import Flask, Response, flash, has_request_context, redirect, render_template, request, send_file, session, url_for
 
@@ -43,7 +45,7 @@ from app.certificates import (
     install_certificate,
     read_upload,
 )
-from vendor.panos_tls import create_panos_ssl_context
+from vendor.panos_tls import create_panos_ssl_context, inspect_panos_certificate
 from vendor.paloalto_light_syslog import FlowStore, env_int, parse_panos_syslog
 from vendor.syslog_stream import tcp_server, udp_server
 from app.policy_bulk import POLICY_LIST_FIELDS, apply_bulk_operations, apply_single_replacements
@@ -1096,7 +1098,22 @@ def panos_profile_context(profile):
     if not endpoint: raise ValueError("PAN-OS/Panorama endpoint ontbreekt")
     profile_id = int(profile["id"]) if "id" in profile.keys() else 0
     profile_version = str(profile["updated_at"]) if "updated_at" in profile.keys() else ""
-    ctx = create_panos_ssl_context()
+    pinned_certificate = settings.get("tls_pinned_certificate", "")
+    pinned_endpoint = settings.get("tls_pinned_endpoint", "")
+    pinned_fingerprint = settings.get("tls_pinned_fingerprint", "")
+    allow_pinned_hostname_mismatch = bool(settings.get("tls_allow_hostname_mismatch", False))
+    if pinned_certificate:
+        try:
+            certificate = x509.load_pem_x509_certificate(pinned_certificate.encode("ascii"))
+            actual_fingerprint = certificate.fingerprint(hashes.SHA256()).hex().upper()
+        except (ValueError, UnicodeEncodeError) as exc:
+            raise ValueError("Het opgeslagen firewallcertificaat is ongeldig; controleer het certificaat opnieuw") from exc
+        if actual_fingerprint != pinned_fingerprint or pinned_endpoint != endpoint:
+            raise ValueError("Het vertrouwde firewallcertificaat hoort niet bij dit endpoint; controleer het certificaat opnieuw")
+    ctx = create_panos_ssl_context(
+        pinned_certificate=pinned_certificate or None,
+        allow_pinned_hostname_mismatch=allow_pinned_hostname_mismatch,
+    )
     if profile_id:
         with _panos_key_cache_lock:
             cached = _panos_key_cache.get(profile_id)
@@ -5007,6 +5024,130 @@ def wait_panos_job(endpoint: str, key: str, ctx, job_id: str, timeout: int = 300
     raise TimeoutError(f"PAN-OS job {job_id} duurde langer dan {timeout} seconden")
 
 
+@app.route("/profiles/<int:profile_id>/tls-certificate", methods=["GET", "POST"])
+@login_required
+def panos_certificate_review(profile_id):
+    """Inspect and explicitly trust a PAN-OS/Panorama endpoint certificate."""
+    with db() as conn:
+        profile = conn.execute("SELECT * FROM profiles WHERE id=? AND system=0", (profile_id,)).fetchone()
+    if not profile:
+        return "Not found", 404
+    if profile["target_type"] not in {"panos", "panorama"}:
+        flash("Certificaatuitzonderingen gelden alleen voor PAN-OS en Panorama.", "error")
+        return redirect(url_for("index", edit_profile=profile_id) + "#profiles")
+
+    return_workspace_id = request.values.get("return_workspace_id", type=int)
+    if return_workspace_id:
+        with db() as conn:
+            matching_workspace = conn.execute(
+                "SELECT id FROM config_workspaces WHERE id=? AND profile_id=?",
+                (return_workspace_id, profile_id),
+            ).fetchone()
+        if not matching_workspace:
+            return_workspace_id = None
+
+    settings = json.loads(profile["settings_json"] or "{}")
+    try:
+        endpoint = validate_panos_endpoint(settings.get("endpoint", ""))
+    except ValueError as exc:
+        flash(f"Het firewallendpoint is ongeldig: {exc}", "error")
+        return redirect(url_for("index", edit_profile=profile_id) + "#profiles")
+    if not endpoint:
+        flash("Sla eerst een HTTPS-endpoint op in het firewallprofiel.", "error")
+        return redirect(url_for("index", edit_profile=profile_id) + "#profiles")
+
+    old_fingerprint = settings.get("tls_pinned_fingerprint", "")
+    old_endpoint = settings.get("tls_pinned_endpoint", "")
+    old_certificate = settings.get("tls_pinned_certificate", "") if old_endpoint == endpoint else ""
+    if request.method == "POST" and request.form.get("remove_pin") == "yes":
+        for key in (
+            "tls_pinned_certificate",
+            "tls_pinned_fingerprint",
+            "tls_pinned_endpoint",
+            "tls_allow_hostname_mismatch",
+        ):
+            settings.pop(key, None)
+        with db() as conn:
+            updated = conn.execute(
+                "UPDATE profiles SET settings_json=?,updated_at=? "
+                "WHERE id=? AND settings_json=? AND updated_at=?",
+                (json.dumps(settings), now(), profile_id, profile["settings_json"], profile["updated_at"]),
+            )
+        if updated.rowcount != 1:
+            flash("Het profiel is intussen gewijzigd. Herlaad de certificaatcontrole en probeer opnieuw.", "error")
+        else:
+            invalidate_profile_caches(profile_id)
+            audit("panos-certificate-pin-removed", f"profile={profile['name']}")
+            flash("De certificaatpin is verwijderd. Volgende verbindingen gebruiken opnieuw de ingestelde CA-vertrouwensketen.", "success")
+        return redirect(url_for(
+            "panos_certificate_review",
+            profile_id=profile_id,
+            return_workspace_id=return_workspace_id,
+        ))
+
+    try:
+        current = inspect_panos_certificate(
+            endpoint,
+            context=create_panos_ssl_context(
+                pinned_certificate=old_certificate or None,
+                allow_pinned_hostname_mismatch=bool(settings.get("tls_allow_hostname_mismatch", False)),
+            ),
+        )
+        current["verified_by_profile_pin"] = bool(
+            old_certificate
+            and current["fingerprint"] == old_fingerprint
+            and old_endpoint == endpoint
+        )
+        if request.method == "POST":
+            submitted_fingerprint = request.form.get("fingerprint", "").strip().upper()
+            if submitted_fingerprint != current["fingerprint"]:
+                flash("Het certificaat veranderde tijdens de controle. Vergelijk de nieuwe gegevens opnieuw.", "error")
+            elif current["verified_by_current_policy"]:
+                flash("Dit certificaat wordt al vertrouwd; er is geen uitzondering nodig.", "success")
+            elif not current["valid_now"]:
+                flash("Dit certificaat is verlopen of nog niet geldig. Het kan niet worden vertrouwd.", "error")
+            elif not current["hostname_matches"] and request.form.get("accept_hostname_mismatch") != "yes":
+                flash("De endpointnaam staat niet in de SAN van dit certificaat. Herstel de endpoint/certificaatnaam; vertrouw deze mismatch niet.", "error")
+            elif current["is_ca_certificate"]:
+                flash("Dit is een CA-certificaat, geen endpointcertificaat. Configureer de CA-bundel in plaats van dit certificaat vast te pinnen.", "error")
+            else:
+                settings.update({
+                    "tls_pinned_certificate": current["pem"],
+                    "tls_pinned_fingerprint": current["fingerprint"],
+                    "tls_pinned_endpoint": endpoint,
+                    "tls_allow_hostname_mismatch": not current["hostname_matches"],
+                })
+                with db() as conn:
+                    updated = conn.execute(
+                        "UPDATE profiles SET settings_json=?,updated_at=? "
+                        "WHERE id=? AND settings_json=? AND updated_at=?",
+                        (json.dumps(settings), now(), profile_id, profile["settings_json"], profile["updated_at"]),
+                    )
+                if updated.rowcount != 1:
+                    flash("Het profiel is intussen gewijzigd. Herlaad de certificaatcontrole en vergelijk opnieuw.", "error")
+                else:
+                    invalidate_profile_caches(profile_id)
+                    audit("panos-certificate-pinned", f"profile={profile['name']}")
+                    flash("Certificaatfingerprint voor dit endpoint opgeslagen. De volgende API-verbinding blijft de geldigheid en dit certificaat controleren.", "success")
+                    old_fingerprint = current["fingerprint"]
+                    old_endpoint = endpoint
+                    if return_workspace_id:
+                        return redirect(url_for("config_workspace_push_preview", workspace_id=return_workspace_id))
+    except Exception as exc:
+        current = None
+        flash(f"Certificaat kon niet worden opgehaald: {exc}", "error")
+
+    return render_template(
+        "panos_certificate_review.html",
+        profile=profile,
+        endpoint=endpoint,
+        current=current,
+        old_fingerprint=old_fingerprint,
+        old_endpoint=old_endpoint,
+        return_workspace_id=return_workspace_id,
+    )
+
+
 @app.get("/config-workspaces/<int:workspace_id>/push-preview")
 @login_required
 def config_workspace_push_preview(workspace_id):
@@ -5046,7 +5187,19 @@ def config_workspace_push_preview(workspace_id):
             families=families, change_count=len(changes), candidate_sha256=hashlib.sha256(current).hexdigest(),
         )
     except Exception as exc:
-        flash(f"Push-preview niet gemaakt: {exc}", "error")
+        if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, ssl.SSLCertVerificationError):
+            flash(
+                "Push-preview niet gemaakt: het PAN-OS-certificaat wordt niet vertrouwd of is gewijzigd. "
+                "Controleer de fingerprint en bevestig alleen een verwachte wijziging.",
+                "error",
+            )
+            return redirect(url_for(
+                "panos_certificate_review",
+                profile_id=profile["id"],
+                return_workspace_id=workspace_id,
+            ))
+        else:
+            flash(f"Push-preview niet gemaakt: {exc}", "error")
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
 
 
@@ -7272,6 +7425,17 @@ def profile_save():
             "passive_serial": passive_serial,
             "passive_source_ip": optional_ip_address(request.form.get("passive_source_ip", "")),
         }
+        if (
+            existing_profile
+            and existing_profile["target_type"] == target_type
+            and old_settings.get("endpoint") == settings["endpoint"]
+            and target_type in {"panos", "panorama"}
+        ):
+            # Keep a previously confirmed endpoint certificate only while its exact
+            # target identity remains unchanged.
+            for key in ("tls_pinned_certificate", "tls_pinned_fingerprint", "tls_pinned_endpoint", "tls_allow_hostname_mismatch"):
+                if old_settings.get(key):
+                    settings[key] = old_settings[key]
         if preserved_workspace_id:
             settings["config_workspace_id"] = preserved_workspace_id
         supplied = {k: request.form.get(k, "") for k in ("username", "password", "client_id", "client_secret", "tsg_id")}

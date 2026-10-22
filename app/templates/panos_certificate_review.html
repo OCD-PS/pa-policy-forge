@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Firewallcertificaat · PA Policy Forge</title>
+<link rel="stylesheet" href="{{url_for('static',filename='app.css',v=asset_version)}}">
+</head>
+<body>
+<main class="content" style="max-width:900px;margin:2rem auto">
+<div class="page-header">
+  <div><p class="eyebrow">{{profile.name}} · {{profile.target_type|upper}}</p><h1>Firewallcertificaat controleren</h1><p class="lede">Endpoint: {{endpoint}}</p></div>
+  <a class="btn" href="{{url_for('index',edit_profile=profile.id)}}#profiles">Terug naar profiel</a>
+</div>
+{% with messages=get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="flash flash-{{category}}"><div class="flash-body">{{message}}</div></div>{% endfor %}{% endwith %}
+{% if current %}
+<section class="card">
+  <h2>Certificaat dat de endpoint presenteert</h2>
+  {% if current.verified_by_profile_pin %}<div class="callout"><strong>Het opgeslagen endpointcertificaat komt overeen.</strong><br>De certificate pin is geldig voor dit profiel. Er zijn geen API-aanmeldgegevens verstuurd tijdens deze inspectie.</div>{% elif current.verified_by_current_policy %}<div class="callout"><strong>Normale TLS-controle is geslaagd.</strong><br>De certificaatketen en endpointnaam worden al vertrouwd. Er is geen uitzondering nodig.</div>{% else %}<div class="callout"><strong>Policy Forge vertrouwt dit certificaat nog niet.</strong><br>Er is alleen een TLS-handshake uitgevoerd; er zijn geen API-aanmeldgegevens verstuurd.</div>{% endif %}
+  <dl class="certificate-details">
+    <dt>SHA-256 fingerprint</dt><dd><code>{{current.fingerprint}}</code></dd>
+    {% if old_fingerprint %}<dt>Eerder vertrouwd</dt><dd><code>{{old_fingerprint}}</code>{% if old_fingerprint==current.fingerprint and old_endpoint==endpoint %} · gelijk aan opgeslagen fingerprint{% elif old_endpoint==endpoint %} · WIJZIGD voor dit endpoint{% endif %}</dd><dt>Eerder vertrouwd endpoint</dt><dd>{{old_endpoint}}</dd>{% endif %}
+    <dt>Subject</dt><dd>{{current.subject}}</dd>
+    <dt>Issuer</dt><dd>{{current.issuer}}</dd>
+    <dt>Common name</dt><dd>{{current.common_name or '—'}}</dd>
+    <dt>DNS SANs</dt><dd>{{current.dns_names|join(', ') or 'geen'}}</dd>
+    <dt>IP SANs</dt><dd>{{current.ip_names|join(', ') or 'geen'}}</dd>
+    <dt>Geldig vanaf</dt><dd>{{current.not_before}}</dd>
+    <dt>Geldig tot</dt><dd>{{current.not_after}}</dd>
+  </dl>
+  {% if not current.verified_by_current_policy %}
+  <div class="callout callout-warning"><strong>Controleer de fingerprint via een onafhankelijk vertrouwd kanaal.</strong><br>De eerste verbinding kan anders door een tussenpartij worden onderschept. Bij een gewijzigd certificaat: verifieer eerst de geplande vernieuwing en fingerprint bij de firewallbeheerder. Verlopen certificaten en CA-certificaten kunnen niet als uitzondering worden opgeslagen. {% if not current.hostname_matches %}Bij deze expliciete SAN-uitzondering wordt de exacte, bevestigde certificaatpin gebruikt voor de endpointidentiteit.{% endif %}</div>
+  {% if current.valid_now and not current.is_ca_certificate %}
+  <form method="post" class="cluster">
+    <input type="hidden" name="csrf" value="{{csrf_token()}}">
+    <input type="hidden" name="fingerprint" value="{{current.fingerprint}}">
+    {% if return_workspace_id %}<input type="hidden" name="return_workspace_id" value="{{return_workspace_id}}">{% endif %}
+    {% if current.hostname_matches %}<button class="btn btn-primary" type="submit">Ik heb deze fingerprint gecontroleerd; vertrouw dit endpointcertificaat</button>
+    {% else %}<button class="btn btn-danger" type="submit" name="accept_hostname_mismatch" value="yes">Ik heb de fingerprint onafhankelijk gecontroleerd; vertrouw ondanks SAN-mismatch</button>{% endif %}
+  </form>
+  {% else %}<p class="help">Vertrouwen is geblokkeerd totdat geldigheid, endpointnaam en certificaatsoort kloppen.</p>{% endif %}
+  {% endif %}
+</section>
+{% else %}<section class="card"><div class="empty-state"><strong>Certificaat niet beschikbaar</strong>Controleer of het endpoint bereikbaar is en probeer opnieuw.</div></section>{% endif %}
+{% if old_fingerprint %}
+<section class="card">
+  <h2>Opgeslagen uitzondering</h2>
+  <p>Dit profiel vertrouwt momenteel de fingerprint <code>{{old_fingerprint}}</code> voor endpoint {{old_endpoint}}.</p>
+  <form method="post" class="cluster certificate-unpin-form">
+    <input type="hidden" name="csrf" value="{{csrf_token()}}">
+    <input type="hidden" name="remove_pin" value="yes">
+    {% if return_workspace_id %}<input type="hidden" name="return_workspace_id" value="{{return_workspace_id}}">{% endif %}
+    <button class="btn btn-danger" type="submit">Verwijder opgeslagen certificaatvertrouwen</button>
+    <span class="help">Daarna geldt opnieuw alleen de ingestelde CA-vertrouwensketen.</span>
+  </form>
+</section>
+{% endif %}
+</main>
+</body>
+</html>
