@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+from unittest.mock import patch
 
 os.environ.setdefault("PPF_DATA_DIR", tempfile.mkdtemp(prefix="forge-push-delta-test-"))
 os.environ.setdefault("PPF_SYSLOG_PORT", "55142")
@@ -74,6 +75,33 @@ class ConfigPushDeltaTests(unittest.TestCase):
         payload = ET.fromstring(changes[0]["element"])
         self.assertEqual(payload.tag, "entry")
         self.assertEqual(payload.attrib["name"], "Pa_Policy_Forge")
+
+    def test_preparsed_desired_config_matches_xml_path_without_mutating_cached_root(self):
+        current = b"<config><shared><log-settings><syslog /></log-settings></shared></config>"
+        desired = b"<config><shared><server-profile><syslog><entry name=\"Pa_Policy_Forge\"><server /></entry></syslog></server-profile></shared></config>"
+        desired_root, _ = main.parse_snapshot(desired, expected_kind="panos")
+
+        expected = main.config_push_delta(current, desired)
+        actual = main.config_push_delta(current, desired, desired_root=desired_root)
+
+        self.assertEqual(actual, expected)
+        self.assertIsNotNone(desired_root.find("./shared/server-profile/syslog"))
+        self.assertIsNone(desired_root.find("./shared/log-settings/syslog"))
+
+    def test_preview_candidate_cache_reuses_only_the_recent_read(self):
+        main._candidate_preview_cache.clear()
+        profile = {"id": 37, "updated_at": "2026-10-23T12:00:00Z"}
+        candidate = b"<config><shared /></config>"
+        try:
+            with patch.object(main, "fetch_panos_candidate_xml", return_value=("", "", None, candidate)) as fetch:
+                first = main.fetch_panos_candidate_xml_for_preview(profile)
+                second = main.fetch_panos_candidate_xml_for_preview(profile)
+
+            self.assertEqual(first, (candidate, False))
+            self.assertEqual(second, (candidate, True))
+            fetch.assert_called_once_with(profile)
+        finally:
+            main._candidate_preview_cache.clear()
 
 
     def test_admin_role_ui_permission_catalogs_are_not_pushable_device_profiles(self):
