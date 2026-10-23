@@ -4758,6 +4758,7 @@ _PUSH_ENTRY_COLLECTIONS = set(_PUSH_OBJECT_NODES) | set(_PUSH_POLICY_NODES) | {
     "global-protect-gateway", "authentication-profile", "authentication-sequence", "user-id-collector",
     "vm-info-source", "routing-profile", "profiles", "local-user-database", "admin-roles",
 }
+_PANOS_RESPONSE_METADATA_ATTRIBUTES = frozenset({"admin", "dirtyId", "time"})
 
 
 def config_push_family(path_parts: tuple[str, ...]) -> tuple[str, str]:
@@ -4858,6 +4859,13 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes, desired_root=None) ->
     before_root = SafeET.fromstring(base_xml)
     # Cached roots are shared across requests, so normalize a private copy before diffing.
     after_root = copy.deepcopy(desired_root) if desired_root is not None else SafeET.fromstring(desired_xml)
+    # PAN-OS adds these response-only attributes to config nodes returned by its
+    # XML API. They are not part of the candidate configuration and otherwise
+    # make the diff replace a whole device subtree, hiding selectable changes.
+    for root in (before_root, after_root):
+        for node in root.iter():
+            for attribute in _PANOS_RESPONSE_METADATA_ATTRIBUTES:
+                node.attrib.pop(attribute, None)
     normalize_legacy_server_profile_root(after_root)
     changes = []
 
