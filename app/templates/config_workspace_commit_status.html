@@ -1,0 +1,11 @@
+<!doctype html><html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Commitstatus · PA Policy Forge</title><link rel="stylesheet" href="{{url_for('static',filename='app.css',v=asset_version)}}"></head><body>
+<header class="topbar"><div class="brand">OCD <span>PA Policy Forge</span></div></header><main class="content narrow">
+<section class="card stack" data-config-workspace-commit-status data-status-url="{{status_url}}" data-terminal="{{'true' if status['terminal'] else 'false'}}">
+<p class="eyebrow">{{profile.name}} · {{profile.target_type|upper}}</p><h1>Incremental push · commitstatus</h1>
+<p>Commitjob {% if commit['job_id'] %}<span class="mono">{{commit['job_id']}}</span>{% else %}zonder bevestigd jobnummer{% endif %} · gestart {{commit['submitted_at']}}</p>
+{% if profile.target_type == 'panorama' %}<p class="help">Dit commit is op Panorama uitgevoerd. Het uitrollen naar beheerde firewalls via Commit-All staat hier los van.</p>{% endif %}
+<div class="callout" role="status" aria-live="polite"><strong data-commit-status-label>{{status['label']}}</strong><span data-commit-progress>{% if status['progress'] is not none %} · {{status['progress']}}%{% endif %}</span><p data-commit-status-error>{{status['error']}}</p></div>
+<p data-commit-status-cadence class="help">Status wordt maximaal eenmaal per minuut bij het target gecontroleerd.</p>
+<ul data-commit-status-details>{% for detail in status['details'] %}<li>{{detail}}</li>{% endfor %}</ul>
+<div class="cluster"><button class="btn" type="button" data-commit-status-refresh>Status verversen</button><a class="btn" href="{{url_for('config_workspace_push_preview',workspace_id=workspace.id)}}">Terug naar incremental push</a></div>
+</section></main><script src="{{url_for('static',filename='app.js',v=asset_version)}}"></script></body></html>

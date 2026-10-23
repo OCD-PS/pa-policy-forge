@@ -1094,12 +1094,82 @@
 
   function setupIncrementalPushProgress() {
     all("form[data-incremental-push]").forEach(function (form) {
+      var button = form.querySelector('button[type="submit"]');
+      var commitOption = form.querySelector("[data-commit-after-push]");
+      function updateButtonLabel() {
+        if (button) button.textContent = commitOption && commitOption.checked
+          ? "Geselecteerde families schrijven en committen"
+          : "Geselecteerde families naar candidate schrijven";
+      }
+      if (commitOption) commitOption.addEventListener("change", updateButtonLabel);
       form.addEventListener("submit", function () {
-        var button = form.querySelector('button[type="submit"]');
         var progress = form.querySelector("[data-incremental-push-progress]");
         if (button) { button.disabled = true; button.textContent = "Push bezig…"; }
         if (progress) progress.hidden = false;
       });
+    });
+  }
+
+  function setupCommitStatusPolling() {
+    all("[data-config-workspace-commit-status]").forEach(function (root) {
+      var label = root.querySelector("[data-commit-status-label]");
+      var progress = root.querySelector("[data-commit-progress]");
+      var error = root.querySelector("[data-commit-status-error]");
+      var cadence = root.querySelector("[data-commit-status-cadence]");
+      var details = root.querySelector("[data-commit-status-details]");
+      var refresh = root.querySelector("[data-commit-status-refresh]");
+      var statusUrl = root.dataset.statusUrl;
+      var timer = null;
+      var terminal = root.dataset.terminal === "true";
+      if (!statusUrl || terminal) return;
+
+      function schedule(seconds) {
+        if (timer) window.clearTimeout(timer);
+        var delay = Math.max(1, Number(seconds) || 60);
+        if (cadence) cadence.textContent = "Volgende targetcontrole over " + Math.ceil(delay) + " seconden.";
+        timer = window.setTimeout(check, delay * 1000);
+      }
+
+      function renderStatus(data) {
+        if (label && data.label) label.textContent = data.label;
+        if (progress) progress.textContent = data.progress === null || data.progress === undefined ? "" : " · " + data.progress + "%";
+        if (error) error.textContent = data.error || "";
+        if (details) {
+          details.replaceChildren();
+          (Array.isArray(data.details) ? data.details : []).forEach(function (item) {
+            var entry = document.createElement("li");
+            entry.textContent = String(item);
+            details.appendChild(entry);
+          });
+        }
+        terminal = data.terminal === true;
+        root.dataset.terminal = terminal ? "true" : "false";
+        if (terminal) {
+          if (timer) window.clearTimeout(timer);
+          if (cadence) cadence.textContent = "Commitstatus is definitief.";
+        } else {
+          schedule(data.retry_after || 60);
+        }
+      }
+
+      function check() {
+        if (terminal) return;
+        if (refresh) refresh.disabled = true;
+        fetch(statusUrl, { credentials: "same-origin", cache: "no-store" })
+          .then(function (response) {
+            if (!response.ok) throw new Error("Status kon niet worden opgehaald.");
+            return response.json();
+          })
+          .then(renderStatus)
+          .catch(function () {
+            if (error) error.textContent = "Statuscontrole mislukt. Er volgt over maximaal één minuut een nieuwe poging.";
+            schedule(60);
+          })
+          .finally(function () { if (refresh) refresh.disabled = false; });
+      }
+
+      if (refresh) refresh.addEventListener("click", function () { check(); });
+      check();
     });
   }
 
@@ -1411,6 +1481,7 @@
     runSetup("configuration-editor", setupWorkspaceConfigurationEditor);
     runSetup("pull-progress", setupConfigPullProgress);
     runSetup("incremental-push-progress", setupIncrementalPushProgress);
+    runSetup("workspace-commit-status", setupCommitStatusPolling);
     runSetup("workspace-objects", setupWorkspaceObjects);
     runSetup("workspace-context", setupWorkspaceContextLoading);
   });
