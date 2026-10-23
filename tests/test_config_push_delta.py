@@ -46,6 +46,19 @@ class ConfigPushDeltaTests(unittest.TestCase):
         self.assertEqual(change["scope"], "vsys1")
         self.assertEqual(change["family"], "policy:security")
 
+    def test_disabling_existing_security_rule_is_selectable(self):
+        current = b"""<config><devices><entry name=\"localhost.localdomain\"><vsys><entry name=\"vsys2\"><rulebase><security><rules><entry name=\"Allow trusted clients\"><action>allow</action><disabled>no</disabled></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
+        desired = b"""<config><devices><entry name=\"localhost.localdomain\"><vsys><entry name=\"vsys2\"><rulebase><security><rules><entry name=\"Allow trusted clients\"><action>allow</action><disabled>yes</disabled></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
+
+        changes = main.config_push_delta(current, desired)
+
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["action"], "edit")
+        self.assertEqual(changes[0]["scope"], "vsys2")
+        self.assertEqual(changes[0]["family"], "policy:security")
+        self.assertEqual(changes[0]["selection_key"], '["vsys2","policy:security"]')
+        self.assertEqual(ET.fromstring(changes[0]["element"]).findtext("disabled"), "yes")
+
     def test_new_shared_syslog_profile_is_one_set_at_profile_collection(self):
         current = b"""<config><shared><log-settings><syslog /></log-settings></shared></config>"""
         desired = b"""<config><shared><log-settings><syslog><entry name="Pa_Policy_Forge"><server><entry name="PolicyForge"><server>10.74.80.46</server><transport>UDP</transport><port>514</port></entry></server></entry></syslog></log-settings></shared></config>"""

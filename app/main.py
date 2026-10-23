@@ -5309,6 +5309,9 @@ def config_workspace_push_preview(workspace_id):
             if item["name"] and item["name"] not in row["names"] and len(row["names"]) < 8:
                 row["names"].append(item["name"])
         families = sorted(families.values(), key=lambda item: (item["scope"].casefold(), item["label"].casefold(), item["key"]))
+        selectable_change_count = sum(
+            item["count"] for item in families if item["family"] != "protected"
+        )
         with db() as conn:
             latest_commit = conn.execute(
                 "SELECT id,job_id,status,result,submitted_at FROM config_workspace_commits "
@@ -5325,7 +5328,7 @@ def config_workspace_push_preview(workspace_id):
         return render_template(
             "config_workspace_push_preview.html", workspace=workspace, profile=profile,
             families=families, change_count=len(changes), candidate_sha256=hashlib.sha256(current).hexdigest(),
-            latest_commit=latest_commit,
+            latest_commit=latest_commit, selectable_change_count=selectable_change_count,
         )
     except Exception as exc:
         if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, ssl.SSLCertVerificationError):
@@ -5496,8 +5499,8 @@ def config_workspace_push(workspace_id):
         if not profile or profile["target_type"] not in {"panorama", "panos"}:
             raise RuntimeError("Dit target ondersteunt geen PAN-OS XML candidate-writes")
         selected = set(request.form.getlist("family"))
-        if not selected or len(selected) > 200:
-            raise RuntimeError("Selecteer minstens één configuratiefamilie")
+        if len(selected) > 200:
+            raise RuntimeError("Selecteer maximaal 200 configuratiefamilies")
         expected_kind = "panorama" if profile["target_type"] == "panorama" else "panos"
         workspace_xml, desired_root, desired_snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
         if desired_snapshot.kind != expected_kind:
@@ -5508,6 +5511,14 @@ def config_workspace_push(workspace_id):
         if not hmac.compare_digest(live_fingerprint, request.form.get("candidate_sha256", "")):
             raise RuntimeError("De targetcandidate wijzigde sinds de preview; maak een nieuwe preview")
         changes = config_push_delta(current_xml, workspace_xml, desired_root=desired_root)
+        selectable_changes = [item for item in changes if item["family"] != "protected"]
+        if not selected:
+            if changes and not selectable_changes:
+                raise RuntimeError(
+                    "Alle gevonden wijzigingen zijn beschermd en kunnen niet worden gepusht. "
+                    "Controleer of de gewenste wijziging in deze workspace is opgeslagen"
+                )
+            raise RuntimeError("Selecteer minstens één selecteerbare configuratiefamilie")
         available = {item["selection_key"] for item in changes}
         if not selected.issubset(available):
             raise RuntimeError("De geselecteerde scope/familie hoort niet bij deze candidatepreview")
