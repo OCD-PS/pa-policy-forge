@@ -59,6 +59,58 @@ class ConfigPushDeltaTests(unittest.TestCase):
         self.assertEqual(changes[0]["selection_key"], '["vsys2","policy:security"]')
         self.assertEqual(ET.fromstring(changes[0]["element"]).findtext("disabled"), "yes")
 
+    def test_policy_rename_is_selectable_when_pan_os_response_metadata_is_present(self):
+        current = b"""<config version=\"12.1.0\" admin=\"admin\" dirtyId=\"14\" time=\"2026/10/23 10:13:50\"><shared><certificate><entry name=\"fw-cert\"><private-key>old-placeholder</private-key></entry></certificate></shared><devices admin=\"admin\" dirtyId=\"14\" time=\"2026/10/23 10:13:50\"><entry name=\"localhost.localdomain\" admin=\"admin\" dirtyId=\"14\" time=\"2026/10/23 10:13:50\"><vsys admin=\"admin\" dirtyId=\"14\" time=\"2026/10/23 10:13:50\"><entry name=\"vsys1\" admin=\"admin\" dirtyId=\"14\" time=\"2026/10/23 10:13:50\"><rulebase><security><rules><entry name=\"Block_US_RU_CN_TO_DMZ-F5\"><action>deny</action></entry></rules></security></rulebase></entry><entry name=\"vsys2\"><rulebase><security><rules><entry name=\"Unchanged\"><action>allow</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
+        desired = b"""<config version=\"12.1.0\"><shared><certificate><entry name=\"fw-cert\"><private-key>new-placeholder</private-key></entry></certificate></shared><devices><entry name=\"localhost.localdomain\"><vsys><entry name=\"vsys1\"><rulebase><security><rules><entry name=\"Block_US_RU_CN_TO_DMZ-F5 test\"><action>deny</action></entry></rules></security></rulebase></entry><entry name=\"vsys2\"><rulebase><security><rules><entry name=\"Unchanged\"><action>allow</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
+
+        changes = main.config_push_delta(current, desired)
+
+        self.assertEqual(
+            {(change["action"], change["scope"], change["family"]) for change in changes},
+            {
+                ("set", "vsys1", "policy:security"),
+                ("delete", "vsys1", "policy:security"),
+                ("edit", "Shared", "protected"),
+            },
+        )
+        self.assertTrue(all(change["xpath"] != "/config/devices" for change in changes))
+        for change in changes:
+            if not change["element"]:
+                continue
+            payload = ET.fromstring(change["element"])
+            self.assertTrue(all(
+                not {"admin", "dirtyId", "time"}.intersection(node.attrib)
+                for node in payload.iter()
+            ))
+
+    def test_panorama_pre_rule_rename_ignores_response_metadata(self):
+        current = b"""<config><devices admin=\"admin\" dirtyId=\"8\" time=\"2026/10/23 10:13:50\"><entry name=\"localhost.localdomain\" admin=\"admin\" dirtyId=\"8\" time=\"2026/10/23 10:13:50\"><device-group admin=\"admin\" dirtyId=\"8\" time=\"2026/10/23 10:13:50\"><entry name=\"HQ\" admin=\"admin\" dirtyId=\"8\" time=\"2026/10/23 10:13:50\"><pre-rulebase><security><rules><entry name=\"Old shared rule\"><action>allow</action></entry></rules></security></pre-rulebase></entry></device-group></entry></devices></config>"""
+        desired = b"""<config><devices><entry name=\"localhost.localdomain\"><device-group><entry name=\"HQ\"><pre-rulebase><security><rules><entry name=\"Renamed shared rule\"><action>allow</action></entry></rules></security></pre-rulebase></entry></device-group></entry></devices></config>"""
+
+        changes = main.config_push_delta(current, desired)
+
+        self.assertEqual(
+            {(change["action"], change["scope"], change["family"]) for change in changes},
+            {
+                ("set", "HQ", "policy:security"),
+                ("delete", "HQ", "policy:security"),
+            },
+        )
+
+    def test_shared_policy_rename_ignores_response_metadata(self):
+        current = b"""<config><shared admin=\"admin\" dirtyId=\"9\" time=\"2026/10/23 10:13:50\"><pre-rulebase><security><rules><entry name=\"Old shared rule\"><action>allow</action></entry></rules></security></pre-rulebase></shared></config>"""
+        desired = b"""<config><shared><pre-rulebase><security><rules><entry name=\"Renamed shared rule\"><action>allow</action></entry></rules></security></pre-rulebase></shared></config>"""
+
+        changes = main.config_push_delta(current, desired)
+
+        self.assertEqual(
+            {(change["action"], change["scope"], change["family"]) for change in changes},
+            {
+                ("set", "Shared", "policy:security"),
+                ("delete", "Shared", "policy:security"),
+            },
+        )
+
     def test_new_shared_syslog_profile_is_one_set_at_profile_collection(self):
         current = b"""<config><shared><log-settings><syslog /></log-settings></shared></config>"""
         desired = b"""<config><shared><log-settings><syslog><entry name="Pa_Policy_Forge"><server><entry name="PolicyForge"><server>10.74.80.46</server><transport>UDP</transport><port>514</port></entry></server></entry></syslog></log-settings></shared></config>"""
