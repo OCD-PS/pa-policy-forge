@@ -10,6 +10,7 @@ import hmac
 import io
 import ipaddress
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -425,6 +426,16 @@ def init_db() -> None:
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
           FOREIGN KEY(profile_id) REFERENCES profiles(id)
         );
+        CREATE TABLE IF NOT EXISTS config_workspace_commits (
+          id INTEGER PRIMARY KEY, workspace_id INTEGER NOT NULL, profile_id INTEGER NOT NULL,
+          target_type TEXT NOT NULL, target_endpoint_sha256 TEXT NOT NULL,
+          job_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'SUBMITTING',
+          result TEXT NOT NULL DEFAULT '', progress INTEGER, details_json TEXT NOT NULL DEFAULT '[]',
+          submitted_at TEXT NOT NULL, last_checked_at REAL NOT NULL DEFAULT 0,
+          last_error TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_workspace_commits_latest
+          ON config_workspace_commits(workspace_id, id DESC);
         CREATE TABLE IF NOT EXISTS migration_projects (
           id INTEGER PRIMARY KEY, name TEXT NOT NULL, target_profile_id INTEGER NOT NULL,
           base_workspace_id INTEGER, topology TEXT NOT NULL DEFAULT 'active-passive',
@@ -5024,6 +5035,66 @@ def wait_panos_job(endpoint: str, key: str, ctx, job_id: str, timeout: int = 300
     raise TimeoutError(f"PAN-OS job {job_id} duurde langer dan {timeout} seconden")
 
 
+PANOS_COMMIT_POLL_INTERVAL_SECONDS = 60
+PANOS_TERMINAL_JOB_STATES = {"FIN", "FAIL", "ERROR", "CANCEL", "CANCELLED"}
+
+
+def config_workspace_commit_payload(row, retry_after: int = 0) -> dict[str, object]:
+    status = str(row["status"] or "UNKNOWN").upper()
+    result = str(row["result"] or "").upper()
+    terminal = status in PANOS_TERMINAL_JOB_STATES or status == "FIN" or (status == "UNKNOWN" and not row["job_id"])
+    if status == "FIN" and result == "NO_CHANGES":
+        label = "Geen wijzigingen om te committen"
+    elif status == "FIN" and result == "OK":
+        label = "Commit geslaagd"
+    elif status in PANOS_TERMINAL_JOB_STATES or (status == "FIN" and result != "OK"):
+        label = "Commit mislukt"
+    elif status == "ACT":
+        label = f"Commit bezig ({row['progress']}%)" if row["progress"] is not None else "Commit bezig"
+    elif status == "PEND":
+        label = "Commit staat in de wachtrij"
+    elif status == "SUBMITTING":
+        label = "Commit wordt gestart"
+    else:
+        label = "Commitstatus onbekend"
+    try:
+        details = json.loads(row["details_json"] or "[]")
+    except (TypeError, json.JSONDecodeError):
+        details = []
+    if not isinstance(details, list):
+        details = []
+    return {
+        "job_id": row["job_id"],
+        "status": status,
+        "result": result,
+        "progress": row["progress"],
+        "label": label,
+        "terminal": terminal,
+        "details": [str(item)[:500] for item in details[:16]],
+        "error": str(row["last_error"] or "")[:500],
+        "retry_after": max(0, int(retry_after)),
+    }
+
+
+def panos_commit_job_details(job: ET.Element) -> list[str]:
+    details = []
+    for path in ("./warnings/line", "./details/line"):
+        details.extend((item.text or "").strip() for item in job.findall(path))
+    plain_details = (job.findtext("./details") or "").strip()
+    if plain_details:
+        details.append(plain_details)
+    return [item[:500] for item in details if item][:16]
+
+
+def audit_workspace_commit(action: str, detail: str) -> None:
+    try:
+        audit(action, detail)
+    except Exception:
+        # Never turn an already-submitted firewall commit into an apparent failure
+        # just because the local audit write had a transient database error.
+        app.logger.exception("Failed to write incremental commit audit event")
+
+
 @app.route("/profiles/<int:profile_id>/tls-certificate", methods=["GET", "POST"])
 @login_required
 def panos_certificate_review(profile_id):
@@ -5182,9 +5253,16 @@ def config_workspace_push_preview(workspace_id):
             if item["name"] and item["name"] not in row["names"] and len(row["names"]) < 8:
                 row["names"].append(item["name"])
         families = sorted(families.values(), key=lambda item: (item["scope"].casefold(), item["label"].casefold(), item["key"]))
+        with db() as conn:
+            latest_commit = conn.execute(
+                "SELECT id,job_id,status,result,submitted_at FROM config_workspace_commits "
+                "WHERE workspace_id=? ORDER BY id DESC LIMIT 1",
+                (workspace_id,),
+            ).fetchone()
         return render_template(
             "config_workspace_push_preview.html", workspace=workspace, profile=profile,
             families=families, change_count=len(changes), candidate_sha256=hashlib.sha256(current).hexdigest(),
+            latest_commit=latest_commit,
         )
     except Exception as exc:
         if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, ssl.SSLCertVerificationError):
@@ -5201,6 +5279,121 @@ def config_workspace_push_preview(workspace_id):
         else:
             flash(f"Push-preview niet gemaakt: {exc}", "error")
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
+
+
+def config_workspace_commit_row(workspace_id: int, commit_id: int):
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM config_workspace_commits WHERE id=? AND workspace_id=?",
+            (commit_id, workspace_id),
+        ).fetchone()
+
+
+@app.get("/config-workspaces/<int:workspace_id>/commits/<int:commit_id>")
+@login_required
+def config_workspace_commit_status(workspace_id: int, commit_id: int):
+    workspace = workspace_row(workspace_id)
+    commit = config_workspace_commit_row(workspace_id, commit_id)
+    if not workspace or not commit or int(commit["profile_id"]) != int(workspace["profile_id"]):
+        return "Not found", 404
+    profile = {"name": workspace["profile_name"], "target_type": commit["target_type"]}
+    return render_template(
+        "config_workspace_commit_status.html",
+        workspace=workspace,
+        profile=profile,
+        commit=commit,
+        status=config_workspace_commit_payload(commit),
+        status_url=url_for("config_workspace_commit_status_api", workspace_id=workspace_id, commit_id=commit_id),
+    )
+
+
+@app.get("/config-workspaces/<int:workspace_id>/commits/<int:commit_id>/status")
+@login_required
+def config_workspace_commit_status_api(workspace_id: int, commit_id: int):
+    workspace = workspace_row(workspace_id)
+    commit = config_workspace_commit_row(workspace_id, commit_id)
+    if not workspace or not commit or int(commit["profile_id"]) != int(workspace["profile_id"]):
+        return {"error": "Not found"}, 404
+
+    if not commit["job_id"] or config_workspace_commit_payload(commit)["terminal"]:
+        return config_workspace_commit_payload(commit)
+
+    checked_at = time.time()
+    retry_after = max(0, math.ceil(PANOS_COMMIT_POLL_INTERVAL_SECONDS - (checked_at - float(commit["last_checked_at"] or 0))))
+    if retry_after:
+        return config_workspace_commit_payload(commit, retry_after=retry_after)
+
+    with db() as conn:
+        claimed = conn.execute(
+            "UPDATE config_workspace_commits SET last_checked_at=? WHERE id=? AND workspace_id=? "
+            "AND last_checked_at<=?",
+            (checked_at, commit_id, workspace_id, checked_at - PANOS_COMMIT_POLL_INTERVAL_SECONDS),
+        ).rowcount
+        commit = conn.execute(
+            "SELECT * FROM config_workspace_commits WHERE id=? AND workspace_id=?",
+            (commit_id, workspace_id),
+        ).fetchone()
+    if not claimed:
+        remaining = max(1, math.ceil(PANOS_COMMIT_POLL_INTERVAL_SECONDS - (time.time() - float(commit["last_checked_at"] or 0))))
+        return config_workspace_commit_payload(commit, retry_after=remaining)
+
+    try:
+        if not re.fullmatch(r"[0-9]{1,12}", str(commit["job_id"])):
+            raise ValueError("PAN-OS gaf geen geldig commit-jobnummer terug")
+        with db() as conn:
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (commit["profile_id"],)).fetchone()
+        if not profile or profile["target_type"] != commit["target_type"] or profile["target_type"] not in {"panos", "panorama"}:
+            raise ValueError("Het push target is gewijzigd; commitstatus wordt niet op een ander target opgevraagd")
+        settings = json.loads(profile["settings_json"] or "{}")
+        endpoint = validate_panos_endpoint(settings.get("endpoint", ""))
+        endpoint_hash = hashlib.sha256(endpoint.encode("utf-8")).hexdigest()
+        if not hmac.compare_digest(endpoint_hash, commit["target_endpoint_sha256"]):
+            raise ValueError("Het firewallendpoint is gewijzigd; commitstatus wordt niet op een ander target opgevraagd")
+        _, endpoint, key, ctx = panos_profile_context(profile)
+        root = policy_api.require_success(
+            panos_api_post(endpoint, {
+                "type": "op", "cmd": f"<show><jobs><id>{commit['job_id']}</id></jobs></show>", "key": key,
+            }, ctx),
+            f"PAN-OS commitjob {commit['job_id']} ophalen",
+        )
+        job = root.find(".//job")
+        if job is None:
+            raise RuntimeError("PAN-OS gaf geen commitjobstatus terug")
+        status = (job.findtext("status") or "UNKNOWN").strip().upper()
+        if not re.fullmatch(r"[A-Z_]{1,16}", status):
+            status = "UNKNOWN"
+        result = (job.findtext("result") or "").strip().upper()[:32]
+        progress_text = (job.findtext("progress") or "").strip()
+        progress = int(progress_text) if progress_text.isdigit() and int(progress_text) <= 100 else None
+        details = panos_commit_job_details(job)
+        with db() as conn:
+            conn.execute(
+                "UPDATE config_workspace_commits SET status=?,result=?,progress=?,details_json=?,last_error='' "
+                "WHERE id=? AND workspace_id=?",
+                (status, result, progress, json.dumps(details, ensure_ascii=False), commit_id, workspace_id),
+            )
+            updated = conn.execute(
+                "SELECT * FROM config_workspace_commits WHERE id=? AND workspace_id=?",
+                (commit_id, workspace_id),
+            ).fetchone()
+        if status in PANOS_TERMINAL_JOB_STATES or (status == "FIN" and result != "OK"):
+            audit_workspace_commit(
+                "config-workspace-incremental-commit-finished",
+                f"workspace={workspace_id} profile={commit['profile_id']} job={commit['job_id']} status={status} result={result}",
+            )
+        return config_workspace_commit_payload(updated)
+    except Exception as exc:
+        error = concise_incremental_push_error(exc)
+        with db() as conn:
+            conn.execute(
+                "UPDATE config_workspace_commits SET last_error=? WHERE id=? AND workspace_id=?",
+                (error[:500], commit_id, workspace_id),
+            )
+            updated = conn.execute(
+                "SELECT * FROM config_workspace_commits WHERE id=? AND workspace_id=?",
+                (commit_id, workspace_id),
+            ).fetchone()
+        return config_workspace_commit_payload(updated, retry_after=PANOS_COMMIT_POLL_INTERVAL_SECONDS)
 
 
 def concise_incremental_push_error(exc: Exception) -> str:
@@ -5232,6 +5425,8 @@ def config_workspace_push(workspace_id):
         flash(f"Incremental push geblokkeerd: {block_reason}", "error")
         return redirect(url_for("migration_project", project_id=output["project_id"]))
     applied_changes = 0
+    commit_record_id = None
+    commit_requested = request.form.get("commit_after_push") == "yes"
     try:
         with db() as conn:
             profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
@@ -5299,6 +5494,87 @@ def config_workspace_push(workspace_id):
             details = [value for value in validation.get("details", []) if "invalid" in value.casefold()]
             message = "; ".join(details[-8:]) or "PAN-OS meldde een ongeldige candidate"
             flash(f"Candidate geladen maar validatie mislukt; er is niet gecommit: {message}", "error")
+        elif commit_requested:
+            commit_record_id = None
+            endpoint_hash = hashlib.sha256(endpoint.encode("utf-8")).hexdigest()
+            with db() as conn:
+                cursor = conn.execute(
+                    "INSERT INTO config_workspace_commits "
+                    "(workspace_id,profile_id,target_type,target_endpoint_sha256,status,submitted_at,last_checked_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (workspace_id, profile["id"], profile["target_type"], endpoint_hash,
+                     "SUBMITTING", now(), time.time()),
+                )
+                commit_record_id = int(cursor.lastrowid)
+            try:
+                status = ""
+                result = ""
+                commit_response = panos_api_post(
+                    endpoint,
+                    {"type": "commit", "cmd": f"<commit><description>PA Policy Forge incremental push workspace {workspace_id}</description></commit>", "key": key},
+                    ctx,
+                )
+                commit_root = ET.fromstring(commit_response)
+                response_code = commit_root.get("code", "")
+                response_text = " ".join(value.strip() for value in commit_root.itertext() if value.strip())
+                if commit_root.get("status") != "success":
+                    if response_code == "19" and "no changes to commit" in response_text.casefold():
+                        status, result = "FIN", "NO_CHANGES"
+                        details = ["PAN-OS meldde dat er geen kandidaatwijzigingen meer te committen waren."]
+                        last_error = ""
+                        with db() as conn:
+                            conn.execute(
+                                "UPDATE config_workspace_commits SET status=?,result=?,details_json=?,last_error=? WHERE id=?",
+                                (status, result, json.dumps(details, ensure_ascii=False), last_error, commit_record_id),
+                            )
+                        audit_workspace_commit(
+                            "config-workspace-incremental-commit-finished",
+                            f"workspace={workspace_id} profile={profile['id']} status={status} result={result}",
+                        )
+                    else:
+                        policy_api.require_success(commit_response, "PAN-OS commit starten")
+                if commit_root.get("status") != "success":
+                    job_id = ""
+                else:
+                    job_id = (commit_root.findtext(".//job") or "").strip()
+                if job_id and re.fullmatch(r"[0-9]{1,12}", job_id):
+                    with db() as conn:
+                        conn.execute(
+                            "UPDATE config_workspace_commits SET job_id=?,status='PEND',result='PEND' WHERE id=?",
+                            (job_id, commit_record_id),
+                        )
+                    audit_workspace_commit(
+                        "config-workspace-incremental-commit-started",
+                        f"workspace={workspace_id} profile={profile['id']} job={job_id} target={profile['target_type']}",
+                    )
+                else:
+                    if status == "FIN" and result == "NO_CHANGES":
+                        pass
+                    else:
+                        status, result = "UNKNOWN", ""
+                        details = []
+                        last_error = "PAN-OS gaf geen herkenbaar commit-jobnummer terug; controleer de Tasks op het target."
+                        with db() as conn:
+                            conn.execute(
+                                "UPDATE config_workspace_commits SET status=?,result=?,details_json=?,last_error=? WHERE id=?",
+                                (status, result, json.dumps(details, ensure_ascii=False), last_error, commit_record_id),
+                            )
+                        audit_workspace_commit(
+                            "config-workspace-incremental-commit-unknown",
+                            f"workspace={workspace_id} profile={profile['id']} status={status} result={result}",
+                        )
+            except Exception as exc:
+                status = "FAIL" if isinstance(exc, RuntimeError) else "UNKNOWN"
+                error = concise_incremental_push_error(exc)
+                with db() as conn:
+                    conn.execute(
+                        "UPDATE config_workspace_commits SET status=?,result=?,last_error=? WHERE id=?",
+                        (status, "FAIL" if status == "FAIL" else "", error[:500], commit_record_id),
+                    )
+                audit_workspace_commit(
+                    "config-workspace-incremental-commit-failed" if status == "FAIL" else "config-workspace-incremental-commit-unknown",
+                    f"workspace={workspace_id} profile={profile['id']} status={status}",
+                )
         else:
             flash(f"{len(chosen)} wijzigingen uit {len(selected)} configuratiefamilie(s) naar de candidate geschreven en gevalideerd; niet gecommit.", "success")
     except Exception as exc:
@@ -5311,6 +5587,8 @@ def config_workspace_push(workspace_id):
             if applied_changes else "candidate niet gewijzigd"
         )
         flash(f"Incremental push gestopt: {concise_incremental_push_error(exc)}; {state}.", "error")
+    if commit_record_id is not None:
+        return redirect(url_for("config_workspace_commit_status", workspace_id=workspace_id, commit_id=commit_record_id))
     return redirect(url_for("index", policy_profile=workspace["profile_id"]) + "#policy-management")
 
 
