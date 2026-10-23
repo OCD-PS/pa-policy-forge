@@ -98,6 +98,12 @@ PREPARE_INTERVAL = max(300, int(os.getenv("PPF_PREPARE_INTERVAL", "1800")))
 PREPARE_INITIAL_DELAY = max(30, int(os.getenv("PPF_PREPARE_INITIAL_DELAY", "60")))
 PREPARE_MAX_AGE = PREPARE_INTERVAL + 300
 LOGIN_WINDOW_SECONDS = 900
+CANDIDATE_PREVIEW_CACHE_TTL_SECONDS = 10
+CANDIDATE_PREVIEW_CACHE_MAX_ENTRIES = 2
+CANDIDATE_PREVIEW_CACHE_MAX_BYTES = 16 * 1024 * 1024
+_candidate_preview_cache: dict[tuple[int, str], tuple[float, bytes]] = {}
+_candidate_preview_cache_generation = 0
+_candidate_preview_cache_lock = threading.Lock()
 LOGIN_MAX_FAILURES = 10
 BLOCKED_PASSWORD_SHA256 = {
     "421d2f00ccdd4ccccf0455cdd0557d5af23dc70b06c83b94cf210ba9d4f3bf58",
@@ -4805,6 +4811,12 @@ def config_push_scope(xpath: str) -> str:
 def normalize_legacy_server_profile_paths(xml_bytes: bytes) -> bytes:
     """Move legacy workspace server profiles under PAN-OS log-settings paths."""
     root = SafeET.fromstring(xml_bytes)
+    normalize_legacy_server_profile_root(root)
+    return ET.tostring(root, encoding="utf-8")
+
+
+def normalize_legacy_server_profile_root(root) -> None:
+    """Normalize a parsed config root in place without reparsing its XML bytes."""
     profile_types = ("syslog", "email", "snmptrap", "http")
     for scope in list(root.iter()):
         legacy_profiles = scope.find("server-profile")
@@ -4839,13 +4851,14 @@ def normalize_legacy_server_profile_paths(xml_bytes: bytes) -> bytes:
             legacy_profiles.remove(legacy)
         if not list(legacy_profiles) and not (legacy_profiles.text or "").strip() and not legacy_profiles.attrib:
             scope.remove(legacy_profiles)
-    return ET.tostring(root, encoding="utf-8")
 
 
-def config_push_delta(base_xml: bytes, desired_xml: bytes) -> list[dict]:
+def config_push_delta(base_xml: bytes, desired_xml: bytes, desired_root=None) -> list[dict]:
     """Return exact candidate XML node changes; never constructs a whole-config load."""
     before_root = SafeET.fromstring(base_xml)
-    after_root = SafeET.fromstring(normalize_legacy_server_profile_paths(desired_xml))
+    # Cached roots are shared across requests, so normalize a private copy before diffing.
+    after_root = copy.deepcopy(desired_root) if desired_root is not None else SafeET.fromstring(desired_xml)
+    normalize_legacy_server_profile_root(after_root)
     changes = []
 
     def node_key(node, ordinal):
@@ -5013,6 +5026,39 @@ def fetch_panos_candidate_xml(profile) -> tuple[str, str, object, bytes]:
     if config is None:
         raise RuntimeError("Target gaf geen candidateconfiguratie terug")
     return endpoint, key, ctx, normalized_config_xml(config)
+
+
+def fetch_panos_candidate_xml_for_preview(profile) -> tuple[bytes, bool]:
+    """Reuse a very recent read for previews; push requests always fetch live XML."""
+    cache_key = (int(profile["id"]), str(profile["updated_at"]))
+    now_monotonic = time.monotonic()
+    with _candidate_preview_cache_lock:
+        generation = _candidate_preview_cache_generation
+        cached = _candidate_preview_cache.get(cache_key)
+        if cached and cached[0] > now_monotonic:
+            return cached[1], True
+        _candidate_preview_cache.pop(cache_key, None)
+
+    _, _, _, candidate_xml = fetch_panos_candidate_xml(profile)
+    if len(candidate_xml) <= CANDIDATE_PREVIEW_CACHE_MAX_BYTES:
+        expires_at = time.monotonic() + CANDIDATE_PREVIEW_CACHE_TTL_SECONDS
+        with _candidate_preview_cache_lock:
+            if _candidate_preview_cache_generation == generation:
+                if cache_key not in _candidate_preview_cache and len(_candidate_preview_cache) >= CANDIDATE_PREVIEW_CACHE_MAX_ENTRIES:
+                    oldest_key = min(_candidate_preview_cache, key=lambda key: _candidate_preview_cache[key][0])
+                    _candidate_preview_cache.pop(oldest_key, None)
+                _candidate_preview_cache[cache_key] = (expires_at, candidate_xml)
+    return candidate_xml, False
+
+
+def invalidate_candidate_preview_cache(profile_id: int) -> None:
+    """Discard cached candidates after this app starts changing a target."""
+    global _candidate_preview_cache_generation
+    with _candidate_preview_cache_lock:
+        profile_id = int(profile_id)
+        _candidate_preview_cache_generation += 1
+        for cache_key in [key for key in _candidate_preview_cache if key[0] == profile_id]:
+            _candidate_preview_cache.pop(cache_key, None)
 
 
 def wait_panos_job(endpoint: str, key: str, ctx, job_id: str, timeout: int = 300) -> dict[str, object]:
@@ -5233,14 +5279,24 @@ def config_workspace_push_preview(workspace_id):
         flash(f"Incremental push geblokkeerd: {block_reason}", "error")
         return redirect(url_for("migration_project", project_id=output["project_id"]))
     try:
+        preview_started = time.perf_counter()
         with db() as conn:
             profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
         if not profile or profile["target_type"] not in {"panorama", "panos"}:
             raise RuntimeError("Dit target gebruikt geen PAN-OS XML API")
-        desired = workspace_config_path(workspace).read_bytes()
-        parse_snapshot(desired, expected_kind="panorama" if profile["target_type"] == "panorama" else "panos")
-        _, _, _, current = fetch_panos_candidate_xml(profile)
-        changes = config_push_delta(current, desired)
+        expected_kind = "panorama" if profile["target_type"] == "panorama" else "panos"
+        phase_started = time.perf_counter()
+        desired, desired_root, desired_snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
+        if desired_snapshot.kind != expected_kind:
+            label = "Panorama" if expected_kind == "panorama" else "standalone firewall"
+            raise OfflineConfigError(f"Deze configuratie lijkt niet afkomstig van het gekozen {label}-profiel")
+        workspace_parse_ms = (time.perf_counter() - phase_started) * 1000
+        phase_started = time.perf_counter()
+        current, candidate_cache_hit = fetch_panos_candidate_xml_for_preview(profile)
+        candidate_fetch_ms = (time.perf_counter() - phase_started) * 1000
+        phase_started = time.perf_counter()
+        changes = config_push_delta(current, desired, desired_root=desired_root)
+        delta_ms = (time.perf_counter() - phase_started) * 1000
         families = {}
         for item in changes:
             row = families.setdefault(item["selection_key"], {
@@ -5259,6 +5315,13 @@ def config_workspace_push_preview(workspace_id):
                 "WHERE workspace_id=? ORDER BY id DESC LIMIT 1",
                 (workspace_id,),
             ).fetchone()
+        app.logger.info(
+            "Incremental push preview timing workspace_id=%s desired_bytes=%s workspace_parse_ms=%.1f "
+            "candidate_fetch_ms=%.1f candidate_cache_hit=%s candidate_bytes=%s delta_ms=%.1f "
+            "change_count=%s total_ms=%.1f",
+            workspace_id, len(desired), workspace_parse_ms, candidate_fetch_ms, candidate_cache_hit,
+            len(current), delta_ms, len(changes), (time.perf_counter() - preview_started) * 1000,
+        )
         return render_template(
             "config_workspace_push_preview.html", workspace=workspace, profile=profile,
             families=families, change_count=len(changes), candidate_sha256=hashlib.sha256(current).hexdigest(),
@@ -5435,13 +5498,16 @@ def config_workspace_push(workspace_id):
         selected = set(request.form.getlist("family"))
         if not selected or len(selected) > 200:
             raise RuntimeError("Selecteer minstens één configuratiefamilie")
-        workspace_xml = workspace_config_path(workspace).read_bytes()
-        parse_snapshot(workspace_xml, expected_kind="panorama" if profile["target_type"] == "panorama" else "panos")
+        expected_kind = "panorama" if profile["target_type"] == "panorama" else "panos"
+        workspace_xml, desired_root, desired_snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
+        if desired_snapshot.kind != expected_kind:
+            label = "Panorama" if expected_kind == "panorama" else "standalone firewall"
+            raise OfflineConfigError(f"Deze configuratie lijkt niet afkomstig van het gekozen {label}-profiel")
         endpoint, key, ctx, current_xml = fetch_panos_candidate_xml(profile)
         live_fingerprint = hashlib.sha256(current_xml).hexdigest()
         if not hmac.compare_digest(live_fingerprint, request.form.get("candidate_sha256", "")):
             raise RuntimeError("De targetcandidate wijzigde sinds de preview; maak een nieuwe preview")
-        changes = config_push_delta(current_xml, workspace_xml)
+        changes = config_push_delta(current_xml, workspace_xml, desired_root=desired_root)
         available = {item["selection_key"] for item in changes}
         if not selected.issubset(available):
             raise RuntimeError("De geselecteerde scope/familie hoort niet bij deze candidatepreview")
@@ -5450,6 +5516,7 @@ def config_workspace_push(workspace_id):
             raise RuntimeError("Management-, administrator- en credentialinstellingen zijn beschermd tegen workspace-push")
         if not chosen:
             raise RuntimeError("De selectie bevat geen wijzigingen")
+        invalidate_candidate_preview_cache(int(profile["id"]))
         if profile["target_type"] == "panos":
             analysis = panos_candidate_analysis(workspace_xml)
             invalid_zones = analysis.get("unresolved_zone_references", [])
