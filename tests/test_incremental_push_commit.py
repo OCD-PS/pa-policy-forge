@@ -170,6 +170,46 @@ class IncrementalPushCommitTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(count, 0)
 
+    def test_protected_only_preview_explains_why_no_family_can_be_selected(self):
+        candidate = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="e2e-address"><ip-netmask>192.0.2.44/32</ip-netmask></entry></address></entry></vsys></entry></devices><mgt-config><users><entry name="admin"><phash>redacted-test-value</phash></entry></users></mgt-config></config>'
+        ))
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), candidate)):
+            response = self.client.get(
+                f"/config-workspaces/{self.workspace_id}/push-preview",
+                base_url="https://forge.test",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        page = response.get_data(as_text=True)
+        self.assertIn("Beschermd", page)
+        self.assertIn("Er zijn alleen beschermde configuratiewijzigingen gevonden", page)
+        self.assertNotIn('data-incremental-push', page)
+        self.assertNotIn('name="family"', page)
+
+    def test_empty_selection_for_protected_only_diff_has_specific_error(self):
+        candidate = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="e2e-address"><ip-netmask>192.0.2.44/32</ip-netmask></entry></address></entry></vsys></entry></devices><mgt-config><users><entry name="admin"><phash>redacted-test-value</phash></entry></users></mgt-config></config>'
+        ))
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), candidate)):
+            response = self.client.post(
+                f"/config-workspaces/{self.workspace_id}/push",
+                base_url="https://forge.test",
+                data={
+                    "csrf": "incremental-commit-csrf",
+                    "candidate_sha256": hashlib.sha256(candidate).hexdigest(),
+                },
+                follow_redirects=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            "Alle gevonden wijzigingen zijn beschermd en kunnen niet worden gepusht",
+            response.get_data(as_text=True),
+        )
+
     def test_pan_os_no_changes_to_commit_is_reported_as_noop(self):
         def api_response(endpoint, params, ctx):
             if params["type"] == "config" and params.get("action") == "set":
