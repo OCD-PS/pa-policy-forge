@@ -30,6 +30,7 @@ class IncrementalPushCommitTests(unittest.TestCase):
         desired = b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="e2e-address"><ip-netmask>192.0.2.44/32</ip-netmask></entry></address></entry></vsys></entry></devices></config>'
         self.workspace_id = main.store_config_workspace(
             self.profile, "incremental commit test", "candidate.xml", desired, "test",
+            baseline_xml=self.candidate_xml,
         )
         self.extra_workspace_ids = []
         self.client = main.app.test_client()
@@ -123,6 +124,45 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertEqual([child.tag for child in patch_xml], ["description"])
         self.assertEqual(patch_xml.findtext("description"), "Steven description")
         self.assertNotIn("source", config_calls[0]["element"])
+
+    def test_legacy_workspace_without_candidate_baseline_cannot_push_stale_policy_fields(self):
+        stale = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<rulebase><security><rules><entry name="Salto toegang">'
+            b'<description>Forge description</description><source><member>any</member>'
+            b'<member>Old-address-object</member></source></entry></rules></security></rulebase>'
+            b'</entry></vsys></entry></devices></config>'
+        ))
+        workspace_id = main.store_config_workspace(
+            self.profile, "legacy candidate workspace", "candidate.xml", stale, "edit",
+        )
+        self.extra_workspace_ids.append(workspace_id)
+
+        with patch("app.main.fetch_panos_candidate_xml_for_preview") as fetch_candidate:
+            preview = self.client.get(
+                f"/config-workspaces/{workspace_id}/push-preview",
+                base_url="https://forge.test", follow_redirects=True,
+            )
+
+        message = "geen oorspronkelijke candidate-snapshot"
+        self.assertIn(message, preview.get_data(as_text=True))
+        fetch_candidate.assert_not_called()
+
+        with patch("app.main.fetch_panos_candidate_xml") as fetch_candidate, \
+             patch("app.main.panos_api_post") as api_post:
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push",
+                base_url="https://forge.test", follow_redirects=True,
+                data={
+                    "csrf": "incremental-commit-csrf",
+                    "candidate_sha256": "ignored-without-baseline",
+                    "family": '["vsys1","policy:security"]',
+                },
+            )
+
+        self.assertIn(message, response.get_data(as_text=True))
+        fetch_candidate.assert_not_called()
+        api_post.assert_not_called()
 
     def test_conflicting_edit_blocks_push_and_keeps_workspace_draft(self):
         workspace_id, _, _, current = self.create_policy_workspace("colleague description")
@@ -303,10 +343,18 @@ class IncrementalPushCommitTests(unittest.TestCase):
         candidate = main.normalized_config_xml(main.ET.fromstring(
             b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="e2e-address"><ip-netmask>192.0.2.44/32</ip-netmask></entry></address></entry></vsys></entry></devices><mgt-config><users><entry name="admin"><phash>redacted-test-value</phash></entry></users></mgt-config></config>'
         ))
+        desired_root = main.ET.fromstring(candidate)
+        desired_root.remove(desired_root.find("mgt-config"))
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "protected-only test", "candidate.xml", desired, "test",
+            baseline_xml=candidate,
+        )
+        self.extra_workspace_ids.append(workspace_id)
 
         with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), candidate)):
             response = self.client.get(
-                f"/config-workspaces/{self.workspace_id}/push-preview",
+                f"/config-workspaces/{workspace_id}/push-preview",
                 base_url="https://forge.test",
             )
 
@@ -321,10 +369,18 @@ class IncrementalPushCommitTests(unittest.TestCase):
         candidate = main.normalized_config_xml(main.ET.fromstring(
             b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="e2e-address"><ip-netmask>192.0.2.44/32</ip-netmask></entry></address></entry></vsys></entry></devices><mgt-config><users><entry name="admin"><phash>redacted-test-value</phash></entry></users></mgt-config></config>'
         ))
+        desired_root = main.ET.fromstring(candidate)
+        desired_root.remove(desired_root.find("mgt-config"))
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "protected-only test", "candidate.xml", desired, "test",
+            baseline_xml=candidate,
+        )
+        self.extra_workspace_ids.append(workspace_id)
 
         with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), candidate)):
             response = self.client.post(
-                f"/config-workspaces/{self.workspace_id}/push",
+                f"/config-workspaces/{workspace_id}/push",
                 base_url="https://forge.test",
                 data={
                     "csrf": "incremental-commit-csrf",
