@@ -3556,6 +3556,18 @@ def workspace_baseline_config(workspace) -> bytes | None:
     return baseline
 
 
+def require_workspace_baseline(workspace) -> bytes:
+    """Fail closed when an incremental PAN-OS push cannot distinguish stale fields."""
+    baseline = workspace_baseline_config(workspace)
+    if baseline is None:
+        raise OfflineConfigError(
+            "Deze workspace heeft geen oorspronkelijke candidate-snapshot. "
+            "Forge kan daardoor niet veilig onderscheiden welke velden intussen op de firewall zijn gewijzigd. "
+            "Haal de actuele candidate op in een nieuwe workspace en herhaal daarin alleen je bedoelde wijzigingen."
+        )
+    return baseline
+
+
 @lru_cache(maxsize=4)
 def cached_workspace_config(stored_path: str, sha256: str):
     path = safe_workspace_path(CONFIG_WORKSPACES, stored_path)
@@ -5423,16 +5435,13 @@ def config_workspace_push_preview(workspace_id):
             raise OfflineConfigError(f"Deze configuratie lijkt niet afkomstig van het gekozen {label}-profiel")
         workspace_parse_ms = (time.perf_counter() - phase_started) * 1000
         phase_started = time.perf_counter()
+        baseline = require_workspace_baseline(workspace)
         current, candidate_cache_hit = fetch_panos_candidate_xml_for_preview(profile)
         candidate_fetch_ms = (time.perf_counter() - phase_started) * 1000
         phase_started = time.perf_counter()
-        baseline = workspace_baseline_config(workspace)
         merge_conflicts = []
-        rebase_applied = False
-        push_desired = desired
-        if baseline is not None:
-            push_desired, merge_conflicts = merge_panos_candidate_xml(baseline, desired, current)
-            rebase_applied = snapshot_sha256(current) != snapshot_sha256(baseline)
+        push_desired, merge_conflicts = merge_panos_candidate_xml(baseline, desired, current)
+        rebase_applied = snapshot_sha256(current) != snapshot_sha256(baseline)
         changes = [] if merge_conflicts else config_push_delta(current, push_desired)
         delta_ms = (time.perf_counter() - phase_started) * 1000
         families = {}
@@ -5468,7 +5477,7 @@ def config_workspace_push_preview(workspace_id):
             families=families, change_count=len(changes), candidate_sha256=hashlib.sha256(current).hexdigest(),
             latest_commit=latest_commit, selectable_change_count=selectable_change_count,
             merge_conflicts=merge_conflicts, rebase_applied=rebase_applied,
-            merge_enabled=baseline is not None,
+            merge_enabled=True,
         )
     except Exception as exc:
         if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, ssl.SSLCertVerificationError):
@@ -5646,21 +5655,15 @@ def config_workspace_push(workspace_id):
         if desired_snapshot.kind != expected_kind:
             label = "Panorama" if expected_kind == "panorama" else "standalone firewall"
             raise OfflineConfigError(f"Deze configuratie lijkt niet afkomstig van het gekozen {label}-profiel")
+        baseline = require_workspace_baseline(workspace)
         endpoint, key, ctx, current_xml = fetch_panos_candidate_xml(profile)
-        live_fingerprint = hashlib.sha256(current_xml).hexdigest()
-        baseline = workspace_baseline_config(workspace)
-        if baseline is None:
-            if not hmac.compare_digest(live_fingerprint, request.form.get("candidate_sha256", "")):
-                raise RuntimeError("De targetcandidate wijzigde sinds de preview; maak een nieuwe preview")
-            push_desired_xml = workspace_xml
-        else:
-            push_desired_xml, merge_conflicts = merge_panos_candidate_xml(baseline, workspace_xml, current_xml)
-            if merge_conflicts:
-                examples = ", ".join(merge_conflicts[:3])
-                raise RuntimeError(
-                    f"De candidate heeft conflicterende wijzigingen ({examples}); er is niets geschreven. "
-                    "Open de workspace opnieuw en los de conflicten op."
-                )
+        push_desired_xml, merge_conflicts = merge_panos_candidate_xml(baseline, workspace_xml, current_xml)
+        if merge_conflicts:
+            examples = ", ".join(merge_conflicts[:3])
+            raise RuntimeError(
+                f"De candidate heeft conflicterende wijzigingen ({examples}); er is niets geschreven. "
+                "Open de workspace opnieuw en los de conflicten op."
+            )
         changes = config_push_delta(current_xml, push_desired_xml)
         selectable_changes = [item for item in changes if item["family"] != "protected"]
         if not selected:
