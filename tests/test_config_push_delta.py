@@ -30,7 +30,7 @@ class ConfigPushDeltaTests(unittest.TestCase):
         self.assertEqual(payload.attrib["name"], "Pa_Policy_Forge")
         self.assertEqual(payload.findtext("./server/entry/server"), "10.74.80.46")
 
-    def test_vsys_policy_edit_keeps_complete_config_xpath_and_owner(self):
+    def test_vsys_policy_edit_sets_only_changed_field_at_rule_xpath(self):
         current = b"""<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase><security><rules><entry name="Allow"><action>deny</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
         desired = b"""<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase><security><rules><entry name="Allow"><action>allow</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
 
@@ -38,13 +38,31 @@ class ConfigPushDeltaTests(unittest.TestCase):
 
         self.assertEqual(len(changes), 1)
         change = changes[0]
-        self.assertEqual(change["action"], "edit")
+        self.assertEqual(change["action"], "set")
         self.assertEqual(
             change["xpath"],
             "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/rulebase/security/rules/entry[@name='Allow']",
         )
         self.assertEqual(change["scope"], "vsys1")
         self.assertEqual(change["family"], "policy:security")
+        payload = ET.fromstring(f"<patch>{change['element']}</patch>")
+        self.assertEqual([child.tag for child in payload], ["action"])
+        self.assertEqual(payload.findtext("action"), "allow")
+
+    def test_policy_set_fields_are_batched_into_one_api_write(self):
+        current = b"<config><shared><pre-rulebase><security><rules><entry name='Allow'><action>allow</action><disabled>no</disabled></entry></rules></security></pre-rulebase></shared></config>"
+        desired = b"<config><shared><pre-rulebase><security><rules><entry name='Allow'><action>deny</action><disabled>yes</disabled></entry></rules></security></pre-rulebase></shared></config>"
+
+        changes = main.config_push_delta(current, desired)
+
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["action"], "set")
+        self.assertEqual(changes[0]["scope"], "Shared")
+        payload = ET.fromstring(f"<patch>{changes[0]['element']}</patch>")
+        self.assertEqual(
+            [(child.tag, child.text) for child in payload],
+            [("action", "deny"), ("disabled", "yes")],
+        )
 
     def test_disabling_existing_security_rule_is_selectable(self):
         current = b"""<config><devices><entry name=\"localhost.localdomain\"><vsys><entry name=\"vsys2\"><rulebase><security><rules><entry name=\"Allow trusted clients\"><action>allow</action><disabled>no</disabled></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
@@ -53,11 +71,11 @@ class ConfigPushDeltaTests(unittest.TestCase):
         changes = main.config_push_delta(current, desired)
 
         self.assertEqual(len(changes), 1)
-        self.assertEqual(changes[0]["action"], "edit")
+        self.assertEqual(changes[0]["action"], "set")
         self.assertEqual(changes[0]["scope"], "vsys2")
         self.assertEqual(changes[0]["family"], "policy:security")
         self.assertEqual(changes[0]["selection_key"], '["vsys2","policy:security"]')
-        self.assertEqual(ET.fromstring(changes[0]["element"]).findtext("disabled"), "yes")
+        self.assertEqual(ET.fromstring(changes[0]["element"]).text, "yes")
 
     def test_policy_rename_is_selectable_when_pan_os_response_metadata_is_present(self):
         current = b"""<config version=\"12.1.0\" admin=\"admin\" dirtyId=\"14\" time=\"2026/10/23 10:13:50\"><shared><certificate><entry name=\"fw-cert\"><private-key>old-placeholder</private-key></entry></certificate></shared><devices admin=\"admin\" dirtyId=\"14\" time=\"2026/10/23 10:13:50\"><entry name=\"localhost.localdomain\" admin=\"admin\" dirtyId=\"14\" time=\"2026/10/23 10:13:50\"><vsys admin=\"admin\" dirtyId=\"14\" time=\"2026/10/23 10:13:50\"><entry name=\"vsys1\" admin=\"admin\" dirtyId=\"14\" time=\"2026/10/23 10:13:50\"><rulebase><security><rules><entry name=\"Block_US_RU_CN_TO_DMZ-F5\"><action>deny</action></entry></rules></security></rulebase></entry><entry name=\"vsys2\"><rulebase><security><rules><entry name=\"Unchanged\"><action>allow</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""

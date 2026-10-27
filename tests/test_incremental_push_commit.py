@@ -117,10 +117,12 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
         config_calls = [call.args[1] for call in api_post.call_args_list if call.args[1]["type"] == "config"]
         self.assertEqual(len(config_calls), 1)
-        self.assertEqual(config_calls[0]["action"], "edit")
-        element = main.ET.fromstring(config_calls[0]["element"])
-        self.assertEqual(element.findtext("description"), "Steven description")
-        self.assertEqual([item.text for item in element.findall("source/member")], ["RU"])
+        self.assertEqual(config_calls[0]["action"], "set")
+        self.assertTrue(config_calls[0]["xpath"].endswith("/entry[@name='Allow-app']"))
+        patch_xml = main.ET.fromstring(f"<patch>{config_calls[0]['element']}</patch>")
+        self.assertEqual([child.tag for child in patch_xml], ["description"])
+        self.assertEqual(patch_xml.findtext("description"), "Steven description")
+        self.assertNotIn("source", config_calls[0]["element"])
 
     def test_conflicting_edit_blocks_push_and_keeps_workspace_draft(self):
         workspace_id, _, _, current = self.create_policy_workspace("colleague description")
