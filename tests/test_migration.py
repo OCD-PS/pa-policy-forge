@@ -1754,7 +1754,7 @@ allow-web,security,,Trust,Untrust,any,web,ssl,application-default,allow
         with main.db() as conn:
             profile_id = conn.execute(
                 "INSERT INTO profiles(name,target_type,settings_json,created_at,updated_at) VALUES(?,?,?,?,?)",
-                ("PANOS live base test", "panos", json.dumps({"vsys": "vsys1"}), stamp, stamp),
+                ("PANOS live base test", "panos", json.dumps({"vsys": "vsys1", "endpoint": "https://fw.example.invalid"}), stamp, stamp),
             ).lastrowid
             project_id = conn.execute(
                 "INSERT INTO migration_projects(name,target_profile_id,created_at,updated_at) VALUES(?,?,?,?)",

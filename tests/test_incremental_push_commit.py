@@ -31,6 +31,7 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.workspace_id = main.store_config_workspace(
             self.profile, "incremental commit test", "candidate.xml", desired, "test",
         )
+        self.extra_workspace_ids = []
         self.client = main.app.test_client()
         with self.client.session_transaction(base_url="https://forge.test") as login:
             login["user_id"] = 1
@@ -41,13 +42,139 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.selection_key = next(item["selection_key"] for item in delta if item["family"].startswith("object:"))
 
     def tearDown(self):
-        workspace = main.workspace_row(self.workspace_id)
-        if workspace:
-            Path(workspace["config_path"]).unlink(missing_ok=True)
+        for workspace_id in [self.workspace_id, *self.extra_workspace_ids]:
+            workspace = main.workspace_row(workspace_id)
+            if workspace:
+                Path(workspace["config_path"]).unlink(missing_ok=True)
+                if workspace["baseline_config_path"]:
+                    Path(workspace["baseline_config_path"]).unlink(missing_ok=True)
         with main.db() as conn:
-            conn.execute("DELETE FROM config_workspace_commits WHERE workspace_id=?", (self.workspace_id,))
-            conn.execute("DELETE FROM config_workspaces WHERE id=?", (self.workspace_id,))
+            for workspace_id in [self.workspace_id, *self.extra_workspace_ids]:
+                conn.execute("DELETE FROM config_workspace_commits WHERE workspace_id=?", (workspace_id,))
+                conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
             conn.execute("DELETE FROM profiles WHERE id=?", (self.profile_id,))
+
+    def create_policy_workspace(self, description_current="old"):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys2">'
+            b'<rulebase><security><rules><entry name="Allow-app"><description>old</description>'
+            b'<source><member>CN</member><member>RU</member></source></entry></rules></security></rulebase>'
+            b'</entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find(".//rules/entry/description").text = "Steven description"
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "rebase test", "candidate.xml", desired, "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        current_root = main.ET.fromstring(base)
+        current_root.find(".//rules/entry/source").remove(
+            current_root.find(".//rules/entry/source/member")
+        )
+        if description_current != "old":
+            current_root.find(".//rules/entry/description").text = description_current
+        current = main.normalized_config_xml(current_root)
+        return workspace_id, base, desired, current
+
+    def test_rebase_preserves_concurrent_member_deletion_and_pushes_local_description(self):
+        workspace_id, _, _, current = self.create_policy_workspace()
+        self.assertIsNotNone(main.workspace_baseline_config(main.workspace_row(workspace_id)))
+        with patch("app.main.fetch_panos_candidate_xml_for_preview", return_value=(current, False)):
+            preview = self.client.get(
+                f"/config-workspaces/{workspace_id}/push-preview", base_url="https://forge.test",
+            )
+        self.assertEqual(preview.status_code, 200)
+        preview_html = preview.get_data(as_text=True)
+        self.assertIn("Niet-botsende wijzigingen zijn behouden", preview_html)
+        merged, conflicts = main.merge_panos_candidate_xml(
+            main.workspace_baseline_config(main.workspace_row(workspace_id)),
+            main.workspace_config_path(main.workspace_row(workspace_id)).read_bytes(), current,
+        )
+        self.assertEqual(conflicts, [])
+        changes = main.config_push_delta(current, merged)
+        self.assertEqual(len(changes), 1)
+        selection_key = changes[0]["selection_key"]
+
+        def api_response(endpoint, params, ctx):
+            if params["type"] == "config":
+                return '<response status="success" code="20"><result/></response>'
+            if params["type"] == "op":
+                return '<response status="success"><result><job>505</job></result></response>'
+            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), current)), \
+             patch("app.main.panos_api_post", side_effect=api_response) as api_post, \
+             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={
+                    "csrf": "incremental-commit-csrf",
+                    "candidate_sha256": hashlib.sha256(self.candidate_xml).hexdigest(),
+                    "family": selection_key,
+                }, follow_redirects=True,
+            )
+        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
+        config_calls = [call.args[1] for call in api_post.call_args_list if call.args[1]["type"] == "config"]
+        self.assertEqual(len(config_calls), 1)
+        self.assertEqual(config_calls[0]["action"], "edit")
+        element = main.ET.fromstring(config_calls[0]["element"])
+        self.assertEqual(element.findtext("description"), "Steven description")
+        self.assertEqual([item.text for item in element.findall("source/member")], ["RU"])
+
+    def test_conflicting_edit_blocks_push_and_keeps_workspace_draft(self):
+        workspace_id, _, _, current = self.create_policy_workspace("colleague description")
+        with patch("app.main.fetch_panos_candidate_xml_for_preview", return_value=(current, False)):
+            preview = self.client.get(
+                f"/config-workspaces/{workspace_id}/push-preview", base_url="https://forge.test",
+            )
+        self.assertIn("Er zijn conflicterende wijzigingen gevonden", preview.get_data(as_text=True))
+        self.assertNotIn('data-incremental-push', preview.get_data(as_text=True))
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), current)), \
+             patch("app.main.panos_api_post") as api_post:
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "candidate_sha256": "stale", "family": self.selection_key},
+                follow_redirects=True,
+            )
+        self.assertIn("conflicterende wijzigingen", response.get_data(as_text=True))
+        api_post.assert_not_called()
+        self.assertTrue(main.workspace_config_path(main.workspace_row(workspace_id)).is_file())
+
+    def test_competing_policy_member_replacements_block_all_candidate_writes(self):
+        base_root = main.ET.fromstring(
+            b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys2">'
+            b'<rulebase><security><rules><entry name="Allow-app"><source><member>CN</member>'
+            b'</source></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        )
+        base = main.normalized_config_xml(base_root)
+        desired_root = main.ET.fromstring(base)
+        desired_root.find(".//rules/entry/source/member").text = "RU"
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "member conflict", "candidate.xml", desired, "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        current_root = main.ET.fromstring(base)
+        current_root.find(".//rules/entry/source/member").text = "US"
+        current = main.normalized_config_xml(current_root)
+
+        with patch("app.main.fetch_panos_candidate_xml_for_preview", return_value=(current, False)):
+            preview = self.client.get(
+                f"/config-workspaces/{workspace_id}/push-preview", base_url="https://forge.test",
+            )
+        self.assertIn("/source/member-list", preview.get_data(as_text=True))
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), current)), \
+             patch("app.main.panos_api_post") as api_post:
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "candidate_sha256": "stale"},
+                follow_redirects=True,
+            )
+        self.assertIn("conflicterende wijzigingen", response.get_data(as_text=True))
+        api_post.assert_not_called()
 
     def test_commit_is_opt_in_and_status_checks_are_rate_limited(self):
         with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), self.candidate_xml)):
