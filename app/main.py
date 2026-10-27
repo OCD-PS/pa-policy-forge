@@ -4974,8 +4974,9 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes, desired_root=None) ->
             for node in source.iter()
         ):
             family, label = "protected", "Credential or certificate configuration"
+        change_name = element.get("name", "") if element is not None else ""
         changes.append({"action": action, "xpath": xpath, "element": ET.tostring(element, encoding="unicode") if element is not None else "",
-                        "family": family, "label": label, "name": element.get("name", "") if element is not None else xpath.rsplit("/", 1)[-1]})
+                        "family": family, "label": label, "name": change_name or xpath.rsplit("/", 1)[-1]})
 
     def xml_content_signature(element):
         # Ignore indentation-only text between XML elements. ElementTree includes
@@ -5033,14 +5034,33 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes, desired_root=None) ->
         parent_name = parent_path.rsplit("/", 1)[-1].split("[", 1)[0]
         if before.tag == "entry" and parent_name in _PUSH_ENTRY_COLLECTIONS:
             if xml_content_signature(before) != xml_content_signature(after):
-                add("edit", node_path(parent_path, after), after, here_parts, protected_source=before)
+                # Replacing a complete policy entry can undo unrelated edits
+                # made on the firewall after this workspace was pulled. Walk
+                # into the entry so scalar changes become narrow set requests
+                # and repeated-list changes stay confined to their own field.
+                if parent_name in _PUSH_POLICY_NODES or parent_name == "rules":
+                    before_children = {child.tag: child for child in list(before)}
+                    after_children = {child.tag: child for child in list(after)}
+                    for tag in dict.fromkeys((*before_children, *after_children)):
+                        walk(
+                            before_children.get(tag), after_children.get(tag),
+                            node_path(parent_path, after), here_parts,
+                        )
+                else:
+                    add("edit", node_path(parent_path, after), after, here_parts, protected_source=before)
             return
         # PAN-OS API XML and workspace XML use different indentation. Container
         # whitespace is formatting, not a configuration edit; comparing it raw
         # can collapse a multi-VSYS change into one protected /config/devices edit.
         if (before.text or "").strip() != (after.text or "").strip() or before.attrib != after.attrib:
-            # Replacing a repeated-list container by XPath is ambiguous; replace its nearest named entry instead.
-            add("edit", node_path(parent_path, after), after, here_parts)
+            # Keep repeated-list writes scoped to their field container; targeting
+            # the parent rule could affect unrelated attributes and sibling fields.
+            if "rules" in parts and any(part in _PUSH_POLICY_NODES for part in parts):
+                # PAN-OS supports setting individual rule fields at the rule
+                # XPath. This leaves every sibling field untouched.
+                add("set", parent_path, after, here_parts)
+            else:
+                add("edit", node_path(parent_path, after), after, here_parts)
             return
         before_children, after_children = list(before), list(after)
         before_counts, after_counts = {}, {}
@@ -5091,6 +5111,23 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes, desired_root=None) ->
     after_children = {child.tag: child for child in list(after_root)}
     for tag in dict.fromkeys((*before_children.keys(), *after_children.keys())):
         walk(before_children.get(tag), after_children.get(tag), "/config", ("config",))
+    # A set request can carry several sibling fields (or entries) in one XML
+    # fragment. Coalesce compatible writes at the same XPath to avoid one API
+    # round-trip per changed field while retaining narrow edit/delete paths.
+    coalesced = []
+    set_by_path = {}
+    for change in changes:
+        if change["action"] != "set":
+            coalesced.append(change)
+            continue
+        key = (change["xpath"], change["family"], change["label"])
+        existing = set_by_path.get(key)
+        if existing is None:
+            set_by_path[key] = change
+            coalesced.append(change)
+        else:
+            existing["element"] += change["element"]
+    changes = coalesced
     # Keep same-named families separate by owner. A Shared object is a different
     # API write target from an identically named object inside a VSYS.
     for change in changes:
