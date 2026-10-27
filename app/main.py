@@ -70,7 +70,7 @@ from app.offline_config import (
     apply_configuration_changes, apply_object_changes, configuration_inventory,
     create_basic_network_entry, configuration_create_templates, create_configuration_entry,
     configuration_records as scoped_configuration_records,
-    normalized_config_xml, parse_snapshot,
+    merge_config_xml, normalized_config_xml, parse_snapshot,
     object_create_record, policy_create_record,
     object_fingerprint as offline_object_fingerprint,
     policy_fingerprint as offline_policy_fingerprint, render_set_commands,
@@ -428,7 +428,9 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS config_workspaces (
           id INTEGER PRIMARY KEY, profile_id INTEGER NOT NULL, name TEXT NOT NULL,
           source TEXT NOT NULL, original_name TEXT NOT NULL, config_path TEXT NOT NULL,
-          sha256 TEXT NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}',
+          sha256 TEXT NOT NULL, baseline_config_path TEXT NOT NULL DEFAULT '',
+          baseline_sha256 TEXT NOT NULL DEFAULT '', baseline_target_sha256 TEXT NOT NULL DEFAULT '',
+          metadata_json TEXT NOT NULL DEFAULT '{}',
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
           FOREIGN KEY(profile_id) REFERENCES profiles(id)
         );
@@ -533,6 +535,13 @@ def init_db() -> None:
         source_columns = {row[1] for row in conn.execute("PRAGMA table_info(migration_sources)")}
         if "staging_workspace_id" not in source_columns:
             conn.execute("ALTER TABLE migration_sources ADD COLUMN staging_workspace_id INTEGER")
+        workspace_columns = {row[1] for row in conn.execute("PRAGMA table_info(config_workspaces)")}
+        if "baseline_config_path" not in workspace_columns:
+            conn.execute("ALTER TABLE config_workspaces ADD COLUMN baseline_config_path TEXT NOT NULL DEFAULT ''")
+        if "baseline_sha256" not in workspace_columns:
+            conn.execute("ALTER TABLE config_workspaces ADD COLUMN baseline_sha256 TEXT NOT NULL DEFAULT ''")
+        if "baseline_target_sha256" not in workspace_columns:
+            conn.execute("ALTER TABLE config_workspaces ADD COLUMN baseline_target_sha256 TEXT NOT NULL DEFAULT ''")
         initialize_workspace_access(conn)
         monitor_columns = {row[1] for row in conn.execute("PRAGMA table_info(post_deploy_monitors)")}
         if "target_type" not in monitor_columns:
@@ -2697,7 +2706,10 @@ def accessible_workspace_rows(rows):
         return [row for row in rows if workspace_allowed(conn, int(row["id"]), username)]
 
 
-def store_config_workspace(profile, name: str, original_name: str, xml_bytes: bytes, source: str, project_id: int | None = None) -> int:
+def store_config_workspace(
+    profile, name: str, original_name: str, xml_bytes: bytes, source: str,
+    project_id: int | None = None, baseline_workspace=None, baseline_xml: bytes | None = None,
+) -> int:
     expected = "panorama" if profile["target_type"] == "panorama" else "panos"
     root, snapshot = parse_snapshot(xml_bytes, expected_kind=expected)
     normalized = normalized_config_xml(root)
@@ -2705,12 +2717,45 @@ def store_config_workspace(profile, name: str, original_name: str, xml_bytes: by
     path = CONFIG_WORKSPACES / f"{workspace_token}.xml"
     path.write_bytes(normalized)
     path.chmod(0o600)
+    baseline_path = ""
+    baseline_hash = ""
+    baseline_target_hash = ""
+    created_baseline_path = None
+    if baseline_workspace is not None:
+        baseline_path = str(baseline_workspace["baseline_config_path"] or "")
+        baseline_hash = str(baseline_workspace["baseline_sha256"] or "")
+        baseline_target_hash = str(baseline_workspace["baseline_target_sha256"] or "")
+        if bool(baseline_path) != bool(baseline_hash) or bool(baseline_path) != bool(baseline_target_hash):
+            path.unlink(missing_ok=True)
+            raise OfflineConfigError("De oorspronkelijke candidate-snapshot is onvolledig; haal de config opnieuw op")
+        if baseline_path and baseline_hash:
+            checked_path = safe_workspace_path(CONFIG_WORKSPACES, baseline_path)
+            if not checked_path.is_file() or snapshot_sha256(checked_path.read_bytes()) != baseline_hash:
+                path.unlink(missing_ok=True)
+                raise OfflineConfigError("De oorspronkelijke workspaceconfiguratie ontbreekt of is gewijzigd")
+    elif baseline_xml is not None:
+        try:
+            parse_snapshot(baseline_xml, expected_kind=expected)
+            endpoint = validate_panos_endpoint(json.loads(profile["settings_json"] or "{}").get("endpoint", ""))
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
+        normalized_baseline = normalized_config_xml(SafeET.fromstring(baseline_xml))
+        baseline_path_object = CONFIG_WORKSPACES / f"{workspace_token}-baseline.xml"
+        baseline_path_object.write_bytes(normalized_baseline)
+        baseline_path_object.chmod(0o600)
+        baseline_path = str(baseline_path_object)
+        baseline_hash = snapshot_sha256(normalized_baseline)
+        baseline_target_hash = hashlib.sha256(
+            f"{profile['target_type']}\0{endpoint}".encode("utf-8")
+        ).hexdigest()
+        created_baseline_path = baseline_path_object
     timestamp = now()
     try:
         with db() as conn:
             cursor = conn.execute(
-                "INSERT INTO config_workspaces(profile_id,name,source,original_name,config_path,sha256,metadata_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (profile["id"], name[:120], source, original_name[:255], str(path), snapshot_sha256(normalized), json.dumps(snapshot.as_dict()), timestamp, timestamp),
+                "INSERT INTO config_workspaces(profile_id,name,source,original_name,config_path,sha256,baseline_config_path,baseline_sha256,baseline_target_sha256,metadata_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (profile["id"], name[:120], source, original_name[:255], str(path), snapshot_sha256(normalized), baseline_path, baseline_hash, baseline_target_hash, json.dumps(snapshot.as_dict()), timestamp, timestamp),
             )
             workspace_id = int(cursor.lastrowid)
             if project_id is None and has_request_context():
@@ -2719,6 +2764,8 @@ def store_config_workspace(profile, name: str, original_name: str, xml_bytes: by
                 link_workspace_project(conn, workspace_id, int(project_id))
     except Exception:
         path.unlink(missing_ok=True)
+        if created_baseline_path is not None:
+            created_baseline_path.unlink(missing_ok=True)
         raise
     audit("config-workspace-created", f"workspace={workspace_id} profile={profile['name']} source={source} kind={snapshot.kind}")
     return workspace_id
@@ -2808,6 +2855,7 @@ def store_workspace_edit_version(workspace, new_xml: bytes, label: str) -> int:
         workspace["original_name"],
         new_xml,
         workspace_version_source(workspace),
+        baseline_workspace=workspace,
     )
     if not advance_migration_staging_workspace(workspace["id"], new_id):
         advance_migration_output_workspace(workspace["id"], new_id, new_xml)
@@ -3371,7 +3419,8 @@ def create_merged_workspace(
         settings.get("rulebase", "pre"), approved_reuses,
     )
     workspace_id = store_config_workspace(
-        profile, f"{project['name']} · merged {now()}", workspace["original_name"], merged_xml, "migration-merge", project_id=int(project["id"])
+        profile, f"{project['name']} · merged {now()}", workspace["original_name"], merged_xml,
+        "migration-merge", project_id=int(project["id"]), baseline_workspace=workspace,
     )
     set_active_config_workspace(profile["id"], workspace_id)
     return workspace_id, plan
@@ -3480,6 +3529,31 @@ def workspace_config_path(workspace) -> Path:
     if not path.is_file():
         raise FileNotFoundError("Workspace XML ontbreekt")
     return path
+
+
+def workspace_baseline_config(workspace) -> bytes | None:
+    """Read a verified immutable target snapshot used as a three-way merge base."""
+    stored_path = str(workspace["baseline_config_path"] or "")
+    expected_sha256 = str(workspace["baseline_sha256"] or "")
+    if not stored_path and not expected_sha256:
+        return None
+    if not stored_path or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise OfflineConfigError("De oorspronkelijke candidate-snapshot is ongeldig; haal de config opnieuw op")
+    path = safe_workspace_path(CONFIG_WORKSPACES, stored_path)
+    if not path.is_file():
+        raise OfflineConfigError("De oorspronkelijke candidate-snapshot ontbreekt; haal de config opnieuw op")
+    baseline = path.read_bytes()
+    if not hmac.compare_digest(snapshot_sha256(baseline), expected_sha256):
+        raise OfflineConfigError("De oorspronkelijke candidate-snapshot is gewijzigd; haal de config opnieuw op")
+    settings = json.loads(workspace["settings_json"] or "{}")
+    endpoint = validate_panos_endpoint(settings.get("endpoint", ""))
+    target_sha256 = hashlib.sha256(
+        f"{workspace['target_type']}\0{endpoint}".encode("utf-8")
+    ).hexdigest()
+    expected_target_sha256 = str(workspace["baseline_target_sha256"] or "")
+    if not expected_target_sha256 or not hmac.compare_digest(target_sha256, expected_target_sha256):
+        raise OfflineConfigError("Het firewallendpoint is gewijzigd; haal de config opnieuw op")
+    return baseline
 
 
 @lru_cache(maxsize=4)
@@ -4144,7 +4218,7 @@ def config_workspace_policy_bulk_apply(draft_id):
         )
         with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
         if not profile: raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
-        new_id = store_config_workspace(profile, f"{workspace['name']} · bulk edit {now()}", workspace["original_name"], new_xml, workspace_version_source(workspace))
+        new_id = store_config_workspace(profile, f"{workspace['name']} · bulk edit {now()}", workspace["original_name"], new_xml, workspace_version_source(workspace), baseline_workspace=workspace)
         if not advance_migration_staging_workspace(workspace["id"], new_id):
             set_active_config_workspace(workspace["profile_id"], new_id)
         audit("config-workspace-policy-bulk-edited", f"source={workspace['id']} workspace={new_id} scope={draft['scope']} rules={len(draft['changes'])}")
@@ -4185,7 +4259,8 @@ def config_workspace_policy_apply(draft_id):
         if not profile:
             raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
         new_id = store_config_workspace(
-            profile, f"{workspace['name']} · edit {now()}", workspace["original_name"], new_xml, workspace_version_source(workspace),
+            profile, f"{workspace['name']} · edit {now()}", workspace["original_name"], new_xml,
+            workspace_version_source(workspace), baseline_workspace=workspace,
         )
         if not advance_migration_staging_workspace(workspace["id"], new_id):
             set_active_config_workspace(workspace["profile_id"], new_id)
@@ -4363,7 +4438,8 @@ def config_workspace_object_apply(draft_id):
         if not profile:
             raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
         new_id = store_config_workspace(
-            profile, f"{workspace['name']} · object edit {now()}", workspace["original_name"], new_xml, workspace_version_source(workspace),
+            profile, f"{workspace['name']} · object edit {now()}", workspace["original_name"], new_xml,
+            workspace_version_source(workspace), baseline_workspace=workspace,
         )
         if not advance_migration_staging_workspace(workspace["id"], new_id):
             set_active_config_workspace(workspace["profile_id"], new_id)
@@ -4394,7 +4470,7 @@ def _store_workspace_configuration_version(workspace, context: dict, changes: li
         raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
     new_id = store_config_workspace(
         profile, f"{workspace['name']} · {context['view']} edit {now()}",
-        workspace["original_name"], new_xml, workspace_version_source(workspace),
+        workspace["original_name"], new_xml, workspace_version_source(workspace), baseline_workspace=workspace,
     )
     if not advance_migration_staging_workspace(workspace["id"], new_id):
         set_active_config_workspace(workspace["profile_id"], new_id)
@@ -4443,7 +4519,7 @@ def config_workspace_configuration_create_basic(workspace_id):
             raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
         new_id = store_config_workspace(
             profile, f"{workspace['name']} · {context['view']} add {now()}", workspace["original_name"],
-            new_xml, workspace_version_source(workspace),
+            new_xml, workspace_version_source(workspace), baseline_workspace=workspace,
         )
         if not advance_migration_staging_workspace(workspace["id"], new_id):
             advance_migration_output_workspace(workspace["id"], new_id, new_xml)
@@ -4651,6 +4727,7 @@ def config_workspace_pull(profile_id):
             "api-candidate.xml",
             xml_bytes,
             "api",
+            baseline_xml=xml_bytes,
         )
         set_active_config_workspace(profile_id, workspace_id)
         if discovered_vsys_count is None:
@@ -4852,6 +4929,15 @@ def normalize_legacy_server_profile_root(root) -> None:
             legacy_profiles.remove(legacy)
         if not list(legacy_profiles) and not (legacy_profiles.text or "").strip() and not legacy_profiles.attrib:
             scope.remove(legacy_profiles)
+
+
+def merge_panos_candidate_xml(base_xml: bytes, desired_xml: bytes, current_xml: bytes) -> tuple[bytes, list[str]]:
+    """Normalize PAN-OS response metadata and legacy XML aliases before rebasing."""
+    return merge_config_xml(
+        base_xml, desired_xml, current_xml,
+        ignored_attributes=_PANOS_RESPONSE_METADATA_ATTRIBUTES,
+        root_normalizer=normalize_legacy_server_profile_root,
+    )
 
 
 def config_push_delta(base_xml: bytes, desired_xml: bytes, desired_root=None) -> list[dict]:
@@ -5303,7 +5389,14 @@ def config_workspace_push_preview(workspace_id):
         current, candidate_cache_hit = fetch_panos_candidate_xml_for_preview(profile)
         candidate_fetch_ms = (time.perf_counter() - phase_started) * 1000
         phase_started = time.perf_counter()
-        changes = config_push_delta(current, desired, desired_root=desired_root)
+        baseline = workspace_baseline_config(workspace)
+        merge_conflicts = []
+        rebase_applied = False
+        push_desired = desired
+        if baseline is not None:
+            push_desired, merge_conflicts = merge_panos_candidate_xml(baseline, desired, current)
+            rebase_applied = snapshot_sha256(current) != snapshot_sha256(baseline)
+        changes = [] if merge_conflicts else config_push_delta(current, push_desired)
         delta_ms = (time.perf_counter() - phase_started) * 1000
         families = {}
         for item in changes:
@@ -5337,6 +5430,8 @@ def config_workspace_push_preview(workspace_id):
             "config_workspace_push_preview.html", workspace=workspace, profile=profile,
             families=families, change_count=len(changes), candidate_sha256=hashlib.sha256(current).hexdigest(),
             latest_commit=latest_commit, selectable_change_count=selectable_change_count,
+            merge_conflicts=merge_conflicts, rebase_applied=rebase_applied,
+            merge_enabled=baseline is not None,
         )
     except Exception as exc:
         if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, ssl.SSLCertVerificationError):
@@ -5516,9 +5611,20 @@ def config_workspace_push(workspace_id):
             raise OfflineConfigError(f"Deze configuratie lijkt niet afkomstig van het gekozen {label}-profiel")
         endpoint, key, ctx, current_xml = fetch_panos_candidate_xml(profile)
         live_fingerprint = hashlib.sha256(current_xml).hexdigest()
-        if not hmac.compare_digest(live_fingerprint, request.form.get("candidate_sha256", "")):
-            raise RuntimeError("De targetcandidate wijzigde sinds de preview; maak een nieuwe preview")
-        changes = config_push_delta(current_xml, workspace_xml, desired_root=desired_root)
+        baseline = workspace_baseline_config(workspace)
+        if baseline is None:
+            if not hmac.compare_digest(live_fingerprint, request.form.get("candidate_sha256", "")):
+                raise RuntimeError("De targetcandidate wijzigde sinds de preview; maak een nieuwe preview")
+            push_desired_xml = workspace_xml
+        else:
+            push_desired_xml, merge_conflicts = merge_panos_candidate_xml(baseline, workspace_xml, current_xml)
+            if merge_conflicts:
+                examples = ", ".join(merge_conflicts[:3])
+                raise RuntimeError(
+                    f"De candidate heeft conflicterende wijzigingen ({examples}); er is niets geschreven. "
+                    "Open de workspace opnieuw en los de conflicten op."
+                )
+        changes = config_push_delta(current_xml, push_desired_xml)
         selectable_changes = [item for item in changes if item["family"] != "protected"]
         if not selected:
             if changes and not selectable_changes:
@@ -5537,7 +5643,7 @@ def config_workspace_push(workspace_id):
             raise RuntimeError("De selectie bevat geen wijzigingen")
         invalidate_candidate_preview_cache(int(profile["id"]))
         if profile["target_type"] == "panos":
-            analysis = panos_candidate_analysis(workspace_xml)
+            analysis = panos_candidate_analysis(push_desired_xml)
             invalid_zones = analysis.get("unresolved_zone_references", [])
             selected_policy_scopes = {
                 item["scope"] for item in chosen if item["family"].startswith("policy:")
@@ -5691,6 +5797,11 @@ def config_workspace_delete(workspace_id):
         workspace_config_path(workspace).unlink(missing_ok=True)
         with db() as conn:
             conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
+            baseline_path = str(workspace["baseline_config_path"] or "")
+            if baseline_path and not conn.execute(
+                "SELECT 1 FROM config_workspaces WHERE baseline_config_path=? LIMIT 1", (baseline_path,)
+            ).fetchone():
+                safe_workspace_path(CONFIG_WORKSPACES, baseline_path).unlink(missing_ok=True)
         if was_active:
             set_active_config_workspace(workspace["profile_id"], None)
         audit("config-workspace-deleted", f"workspace={workspace_id} profile={workspace['profile_name']}")
@@ -7131,7 +7242,11 @@ def migration_source_profile(project_id):
         if not profile: raise MigrationError("Bronprofiel bestaat niet")
         model,xml_bytes=live_profile_migration_source(profile)
         if xml_bytes is not None and int(profile["id"])==int(project["target_profile_id"]):
-            workspace_id=store_config_workspace(profile,f"Bronconfiguratie - {profile['name']}",f"{profile['name']}-candidate.xml",xml_bytes,"migration-api")
+            workspace_id=store_config_workspace(
+                profile, f"Bronconfiguratie - {profile['name']}",
+                f"{profile['name']}-candidate.xml", xml_bytes, "migration-api",
+                baseline_xml=xml_bytes,
+            )
             with db() as conn:
                 conn.execute("UPDATE migration_projects SET base_workspace_id=?,updated_at=? WHERE id=?",(workspace_id,now(),project_id))
             audit("migration-live-base",f"project={project_id} workspace={workspace_id} profile={profile['name']}")

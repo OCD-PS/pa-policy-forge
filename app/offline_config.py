@@ -7,7 +7,7 @@ import re
 import ipaddress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 import xml.etree.ElementTree as ET
 
 from defusedxml import ElementTree as SafeET
@@ -15,6 +15,177 @@ from defusedxml import ElementTree as SafeET
 
 class OfflineConfigError(ValueError):
     pass
+
+
+def merge_config_xml(
+    base_xml: bytes, desired_xml: bytes, current_xml: bytes,
+    ignored_attributes: Iterable[str] = (),
+    root_normalizer: Callable[[ET.Element], None] | None = None,
+) -> tuple[bytes, list[str]]:
+    """Merge independent edits from a workspace onto a newer PAN-OS XML candidate.
+
+    XML child collections that represent member lists are treated as unordered
+    multisets. Named ``entry`` collections merge by name; policy ``rules`` order
+    is preserved and concurrent order changes fail closed.
+    """
+    base = SafeET.fromstring(base_xml)
+    desired = SafeET.fromstring(desired_xml)
+    current = SafeET.fromstring(current_xml)
+    for root in (base, desired, current):
+        for node in root.iter():
+            for attribute in ignored_attributes:
+                node.attrib.pop(attribute, None)
+        if root_normalizer is not None:
+            root_normalizer(root)
+    conflicts: list[str] = []
+
+    def signature(node):
+        return (
+            node.tag,
+            tuple(sorted(node.attrib.items())),
+            (node.text or "").strip(),
+            tuple(signature(child) for child in list(node)),
+        )
+
+    def conflict(path):
+        if path not in conflicts and len(conflicts) < 20:
+            conflicts.append(path[:240])
+
+    def merge_scalar(base_value, desired_value, current_value, path):
+        if desired_value == base_value:
+            return current_value
+        if current_value == base_value or desired_value == current_value:
+            return desired_value
+        conflict(path)
+        return current_value
+
+    def merge_node(base_node, desired_node, current_node, path):
+        if base_node is None:
+            if desired_node is None:
+                return copy.deepcopy(current_node) if current_node is not None else None
+            if current_node is None or signature(desired_node) == signature(current_node):
+                return copy.deepcopy(desired_node)
+            conflict(path)
+            return copy.deepcopy(current_node)
+        if desired_node is None:
+            if current_node is None or signature(current_node) == signature(base_node):
+                return None
+            conflict(path)
+            return copy.deepcopy(current_node)
+        if current_node is None:
+            if signature(desired_node) == signature(base_node):
+                return None
+            conflict(path)
+            return None
+
+        merged = ET.Element(base_node.tag)
+        attr_keys = set(base_node.attrib) | set(desired_node.attrib) | set(current_node.attrib)
+        for key in sorted(attr_keys):
+            value = merge_scalar(
+                base_node.attrib.get(key), desired_node.attrib.get(key),
+                current_node.attrib.get(key), f"{path}/@{key}",
+            )
+            if value is not None:
+                merged.set(key, value)
+        merged.text = merge_scalar(
+            (base_node.text or "").strip(), (desired_node.text or "").strip(),
+            (current_node.text or "").strip(), path,
+        ) or None
+
+        base_children, desired_children, current_children = (
+            list(base_node), list(desired_node), list(current_node)
+        )
+        all_children = (*base_children, *desired_children, *current_children)
+        if all_children and all(
+            child.tag == "member" and not child.attrib and not list(child) for child in all_children
+        ):
+            def member_values(children):
+                return [(child.text or "").strip() for child in children]
+
+            b_values = member_values(base_children)
+            d_values = member_values(desired_children)
+            c_values = member_values(current_children)
+            if d_values == b_values:
+                chosen = current_children
+            elif c_values == b_values or d_values == c_values:
+                chosen = desired_children
+            else:
+                # PAN-OS member lists commonly mean OR alternatives. Combining
+                # two distinct edits could widen a security rule unexpectedly.
+                conflict(f"{path}/member-list")
+                chosen = current_children
+            for child in chosen:
+                merged.append(copy.deepcopy(child))
+            return merged
+
+        if all_children and all(child.tag == "entry" and child.get("name") for child in all_children):
+            def named_map(children):
+                return {child.get("name"): child for child in children}
+
+            b_map, d_map, c_map = map(named_map, (base_children, desired_children, current_children))
+            merged_map = {}
+            for name in dict.fromkeys((*b_map, *d_map, *c_map)):
+                item = merge_node(
+                    b_map.get(name), d_map.get(name), c_map.get(name),
+                    f"{path}/entry[@name={name}]",
+                )
+                if item is not None:
+                    merged_map[name] = item
+            b_order = [child.get("name") for child in base_children]
+            d_order = [child.get("name") for child in desired_children]
+            c_order = [child.get("name") for child in current_children]
+            if base_node.tag == "rules":
+                order = merge_scalar(b_order, d_order, c_order, f"{path}/order")
+            else:
+                order = c_order + [name for name in d_order if name not in c_map]
+            emitted_names = set()
+            for name in order:
+                if name in merged_map and name not in emitted_names:
+                    merged.append(merged_map[name])
+                    emitted_names.add(name)
+            for name, child in merged_map.items():
+                if name not in emitted_names:
+                    merged.append(child)
+            return merged
+
+        # Singleton child tags (description, action, source, etc.) can merge
+        # recursively. Ambiguous repeated schemas are replaced only when one
+        # side is unchanged; competing edits are surfaced as conflicts.
+        def unique_tag_map(children):
+            tags = [child.tag for child in children]
+            return len(tags) == len(set(tags))
+
+        if all(unique_tag_map(children) for children in (base_children, desired_children, current_children)):
+            b_map = {child.tag: child for child in base_children}
+            d_map = {child.tag: child for child in desired_children}
+            c_map = {child.tag: child for child in current_children}
+            merged_map = {}
+            for tag in dict.fromkeys((*b_map, *d_map, *c_map)):
+                item = merge_node(b_map.get(tag), d_map.get(tag), c_map.get(tag), f"{path}/{tag}")
+                if item is not None:
+                    merged_map[tag] = item
+            tags = [child.tag for child in current_children]
+            tags.extend(tag for tag in merged_map if tag not in tags)
+            for tag in tags:
+                if tag in merged_map:
+                    merged.append(merged_map.pop(tag))
+            for child in merged_map.values():
+                merged.append(child)
+            return merged
+
+        if signature(desired_node) == signature(base_node):
+            return copy.deepcopy(current_node)
+        if signature(current_node) == signature(base_node) or signature(desired_node) == signature(current_node):
+            return copy.deepcopy(desired_node)
+        conflict(path)
+        return copy.deepcopy(current_node)
+
+    merged_root = merge_node(base, desired, current, "/config")
+    if conflicts:
+        return b"", conflicts
+    if merged_root is None:
+        raise OfflineConfigError("De volledige configuratieroot kan niet worden verwijderd")
+    return normalized_config_xml(merged_root), []
 
 
 PANORAMA_TREE = [
