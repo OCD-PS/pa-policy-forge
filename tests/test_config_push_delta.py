@@ -104,6 +104,31 @@ class ConfigPushDeltaTests(unittest.TestCase):
         self.assertEqual(payload.tag, "destination")
         self.assertEqual([member.text for member in payload.findall("member")], ["10.10.102.56"])
 
+    def test_policy_member_fields_replace_lists_for_zones_users_and_groups(self):
+        device_prefix = b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase><security><rules><entry name="Allow">'
+        device_suffix = b'</entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        replacements = {
+            "from": ("any", "Trust"),
+            "to": ("any", "Server"),
+            "source-user": ("any", "DOMAIN\\Firewall-Admins"),
+            "source": ("any", "host-10.10.102.56"),
+            "destination": ("any", "server-group"),
+        }
+
+        for field, (before_value, after_value) in replacements.items():
+            with self.subTest(field=field):
+                current = device_prefix + f'<{field}><member>{before_value}</member></{field}>'.encode() + device_suffix
+                desired = device_prefix + f'<{field}><member>{after_value}</member></{field}>'.encode() + device_suffix
+
+                changes = main.config_push_delta(current, desired)
+
+                self.assertEqual(len(changes), 1)
+                self.assertEqual(changes[0]["action"], "edit")
+                self.assertTrue(changes[0]["xpath"].endswith(f"/entry[@name='Allow']/{field}"))
+                payload = ET.fromstring(changes[0]["element"])
+                self.assertEqual(payload.tag, field)
+                self.assertEqual([member.text for member in payload.findall("member")], [after_value])
+
     def test_policy_set_fields_are_batched_into_one_api_write(self):
         current = b"<config><shared><pre-rulebase><security><rules><entry name='Allow'><action>allow</action><disabled>no</disabled></entry></rules></security></pre-rulebase></shared></config>"
         desired = b"<config><shared><pre-rulebase><security><rules><entry name='Allow'><action>deny</action><disabled>yes</disabled></entry></rules></security></pre-rulebase></shared></config>"

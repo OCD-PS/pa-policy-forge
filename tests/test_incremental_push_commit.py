@@ -125,6 +125,52 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertEqual(patch_xml.findtext("description"), "Steven description")
         self.assertNotIn("source", config_calls[0]["element"])
 
+    def test_rebase_preserves_concurrent_zone_address_and_user_group_additions(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<address/><rulebase><security><rules><entry name="Allow-app"><description>old</description>'
+            b'<from><member>any</member></from><source><member>any</member></source>'
+            b'<destination><member>any</member></destination><source-user><member>any</member></source-user>'
+            b'</entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find(".//rules/entry/description").text = "Forge description"
+        desired = main.normalized_config_xml(desired_root)
+        current_root = main.ET.fromstring(base)
+        address = current_root.find(".//vsys/entry/address")
+        address_entry = main.ET.SubElement(address, "entry", {"name": "host-10.10.102.56"})
+        main.ET.SubElement(address_entry, "ip-netmask").text = "10.10.102.56"
+        rule = current_root.find(".//rules/entry")
+        for field, value in (
+            ("from", "Trust"),
+            ("source", "host-10.10.102.56"),
+            ("destination", "server-group"),
+            ("source-user", "DOMAIN\\Operations"),
+        ):
+            field_node = rule.find(field)
+            field_node.remove(field_node.find("member"))
+            main.ET.SubElement(field_node, "member").text = value
+        current = main.normalized_config_xml(current_root)
+
+        merged, conflicts = main.merge_panos_candidate_xml(base, desired, current)
+
+        self.assertEqual(conflicts, [])
+        merged_root = main.ET.fromstring(merged)
+        merged_rule = merged_root.find(".//rules/entry")
+        self.assertIsNotNone(merged_root.find(".//address/entry[@name='host-10.10.102.56']"))
+        self.assertEqual(merged_rule.findtext("description"), "Forge description")
+        for field, value in (
+            ("from", "Trust"),
+            ("source", "host-10.10.102.56"),
+            ("destination", "server-group"),
+            ("source-user", "DOMAIN\\Operations"),
+        ):
+            self.assertEqual(merged_rule.findtext(f"{field}/member"), value)
+        changes = main.config_push_delta(current, merged)
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["action"], "set")
+        self.assertEqual(main.ET.fromstring(changes[0]["element"]).text.strip(), "Forge description")
+
     def test_legacy_workspace_without_candidate_baseline_cannot_push_stale_policy_fields(self):
         stale = main.normalized_config_xml(main.ET.fromstring(
             b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
