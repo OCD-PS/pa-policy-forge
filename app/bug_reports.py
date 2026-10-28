@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from email.message import EmailMessage
 from email.utils import parseaddr
+from io import BytesIO
 import json
 import os
 import re
@@ -14,6 +15,7 @@ from flask import (
     Blueprint, Response, abort, current_app, flash, redirect, render_template,
     request, session, url_for,
 )
+from PIL import Image, UnidentifiedImageError
 
 MAX_SCREENSHOT_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_REPORTS = 1000
@@ -196,6 +198,8 @@ def create_bug_reports_blueprint(db, fernet, now, audit):
     def submit():
         if not session.get("user_id"):
             abort(401)
+        # Keep multipart parsing on this route close to the screenshot limit.
+        request.max_content_length = MAX_SCREENSHOT_BYTES + 64 * 1024
         reporter_email = request.form.get("email", "").strip()
         description = request.form.get("description", "").strip()
         page_path = request.form.get("page_path", "").strip()
@@ -212,9 +216,18 @@ def create_bug_reports_blueprint(db, fernet, now, audit):
         if screenshot and not (screenshot.startswith(b"\x89PNG\r\n\x1a\n") and len(screenshot) >= 24):
             return {"error": "De screenshot moet een geldige PNG zijn."}, 400
         if screenshot:
-            width = int.from_bytes(screenshot[16:20], "big")
-            height = int.from_bytes(screenshot[20:24], "big")
-            if not width or not height or width > 2400 or height > 1600 or width * height > 3_840_000:
+            try:
+                with Image.open(BytesIO(screenshot)) as image:
+                    width, height = image.size
+                    if image.format != "PNG" or image.n_frames != 1:
+                        return {"error": "Voeg een statische PNG-screenshot toe."}, 400
+                    if not width or not height or width > 2400 or height > 1600 or width * height > 3_840_000:
+                        return {"error": "De screenshotafmetingen zijn ongeldig."}, 400
+                    image.verify()
+                # verify() checks structure; load() also fully decodes pixel data.
+                with Image.open(BytesIO(screenshot)) as image:
+                    image.load()
+            except (Image.DecompressionBombError, UnidentifiedImageError, OSError, ValueError):
                 return {"error": "De screenshotafmetingen zijn ongeldig."}, 400
         timestamp = now()
         private_data = fernet.encrypt(json.dumps({
@@ -270,6 +283,7 @@ def create_bug_reports_blueprint(db, fernet, now, audit):
         response = Response(fernet.decrypt(row["screenshot_blob"]), mimetype="image/png")
         response.headers["Content-Disposition"] = "inline; filename=bug-report.png"
         response.headers["Cache-Control"] = "private, no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
         return response
 
     @bp.post("/admin/bug-reports/<int:report_id>/status")

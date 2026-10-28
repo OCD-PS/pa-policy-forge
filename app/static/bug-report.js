@@ -33,7 +33,7 @@
   dialog.innerHTML = `
     <form method="dialog" class="stack" data-bug-report-form>
       <div class="card-header"><div><h2 id="bug-report-title">Bug melden</h2><p>Controleer de screenshot voor je de melding verstuurt.</p></div><button type="button" class="bug-report-close" data-close>Sluiten</button></div>
-      <div data-preview-wrap><p class="bug-report-status" data-capture-status>Screenshot wordt gemaakt…</p><img class="bug-report-preview" data-preview alt="Voorbeeld van de screenshot"></div>
+      <div data-preview-wrap><p class="bug-report-status" data-capture-status role="status" aria-live="polite">Screenshot wordt gemaakt…</p><img class="bug-report-preview" data-preview alt="Voorbeeld van de screenshot"><button type="button" data-capture-retry hidden>Screenshot opnieuw maken</button><label data-capture-fallback hidden>Automatische opname lukt niet? Voeg een PNG-screenshot toe en controleer die op gevoelige informatie.<input type="file" accept="image/png" data-capture-file></label></div>
       <div class="field"><label for="bug-report-email">Je e-mailadres</label><input id="bug-report-email" name="email" type="email" maxlength="254" autocomplete="email" required></div>
       <div class="field"><label for="bug-report-description">Wat ging er mis?</label><textarea id="bug-report-description" name="description" rows="5" maxlength="5000" required></textarea></div>
       <p class="bug-report-status" data-result role="status" aria-live="polite"></p>
@@ -46,6 +46,9 @@
   const status = dialog.querySelector("[data-capture-status]");
   const result = dialog.querySelector("[data-result]");
   const submit = dialog.querySelector("[data-submit]");
+  const captureRetry = dialog.querySelector("[data-capture-retry]");
+  const captureFallback = dialog.querySelector("[data-capture-fallback]");
+  const captureFile = dialog.querySelector("[data-capture-file]");
   const form = dialog.querySelector("[data-bug-report-form]");
 
   function openBugReport(event) {
@@ -54,29 +57,56 @@
     const dialogHost = owningModal || document.body;
     if (dialog.parentElement !== dialogHost) dialogHost.append(dialog);
     screenshotBlob = null;
+    captureFile.value = "";
+    captureFallback.hidden = true;
     result.textContent = "";
     submit.disabled = true;
     status.textContent = "Screenshot wordt gemaakt…";
     if (previewUrl) URL.revokeObjectURL(previewUrl);
     previewUrl = "";
     dialog.showModal();
+    captureScreenshot();
+  }
+
+  async function captureScreenshot() {
+    captureRetry.hidden = true;
+    screenshotBlob = null;
+    submit.disabled = true;
+    status.textContent = "Screenshot wordt gemaakt…";
     try {
-      captureViewport().then((blob) => {
-        if (!blob || blob.size > 2 * 1024 * 1024) throw new Error("too-large");
-        screenshotBlob = blob;
-        previewUrl = URL.createObjectURL(blob);
-        dialog.querySelector("[data-preview]").src = previewUrl;
-        status.textContent = "Screenshot klaar. Bekende geheime formuliervelden zijn afgeschermd. Andere gevoelige tekst kan zichtbaar zijn; controleer de afbeelding voor verzending.";
-        submit.disabled = false;
-      }).catch(() => {
-        status.textContent = "De screenshot kon niet veilig worden gemaakt. Vernieuw de pagina en probeer opnieuw.";
-      });
-    } catch {
-      status.textContent = "De screenshot kon niet veilig worden gemaakt. Vernieuw de pagina en probeer opnieuw.";
+      const blob = await captureViewport();
+      screenshotBlob = blob;
+      previewUrl = URL.createObjectURL(blob);
+      dialog.querySelector("[data-preview]").src = previewUrl;
+      status.textContent = "Screenshot klaar. Bekende geheime formuliervelden zijn afgeschermd. Andere gevoelige tekst kan zichtbaar zijn; controleer de afbeelding voor verzending.";
+      submit.disabled = false;
+    } catch (error) {
+      status.textContent = error?.message === "too-large"
+        ? "De screenshot blijft te groot. Verklein het browservenster en probeer opnieuw."
+        : "De automatische screenshot is mislukt. Probeer opnieuw; je ingevulde melding blijft staan.";
+      captureRetry.hidden = false;
+      captureFallback.hidden = false;
     }
   }
 
   launcher.addEventListener("click", openBugReport);
+  captureRetry.addEventListener("click", captureScreenshot);
+  captureFile.addEventListener("change", () => {
+    const file = captureFile.files?.[0];
+    if (!file) return;
+    if (file.type !== "image/png" || file.size > 2 * 1024 * 1024) {
+      screenshotBlob = null;
+      submit.disabled = true;
+      status.textContent = "Kies een PNG-bestand van maximaal 2 MB.";
+      return;
+    }
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    screenshotBlob = file;
+    previewUrl = URL.createObjectURL(file);
+    dialog.querySelector("[data-preview]").src = previewUrl;
+    status.textContent = "Screenshot toegevoegd. Controleer de afbeelding op wachtwoorden en andere gevoelige informatie.";
+    submit.disabled = false;
+  });
 
   function syncModalLaunchers() {
     const openDialogs = new Set(
@@ -112,6 +142,28 @@
   function safePageClone() {
     const clonedRoot = document.documentElement.cloneNode(true);
     clonedRoot.querySelectorAll("[data-bug-report-launcher],.bug-report-dialog,script,iframe,object,embed,link[rel~='stylesheet']").forEach((node) => node.remove());
+    clonedRoot.querySelectorAll("[data-bug-report-modal-launcher]").forEach((node) => node.remove());
+    const sourceDialogs = Array.from(document.querySelectorAll("dialog:not(.bug-report-dialog)"));
+    clonedRoot.querySelectorAll("dialog:not(.bug-report-dialog)").forEach((clonedDialog, index) => {
+      const sourceDialog = sourceDialogs[index];
+      if (!sourceDialog?.open) {
+        clonedDialog.remove();
+        return;
+      }
+      // Render the active app modal as ordinary markup in the SVG snapshot.
+      // Modal top-layer state is browser-managed and does not serialize reliably.
+      const snapshotDialog = document.createElement("div");
+      Array.from(clonedDialog.attributes).forEach((attribute) => {
+        if (attribute.name !== "open") snapshotDialog.setAttribute(attribute.name, attribute.value);
+      });
+      const sourceStyle = getComputedStyle(sourceDialog);
+      for (const property of sourceStyle) {
+        snapshotDialog.style.setProperty(property, sourceStyle.getPropertyValue(property));
+      }
+      snapshotDialog.style.setProperty("display", "block");
+      while (clonedDialog.firstChild) snapshotDialog.append(clonedDialog.firstChild);
+      clonedDialog.replaceWith(snapshotDialog);
+    });
     clonedRoot.querySelectorAll("input,textarea,select").forEach((field) => {
       const key = `${field.name || ""} ${field.id || ""} ${field.autocomplete || ""}`.toLowerCase();
       if (field.type === "password" || /password|secret|token|api.?key|credential|private.?key/.test(key)) {
@@ -155,27 +207,39 @@
   async function captureViewport() {
     const width = Math.max(1, Math.min(window.innerWidth, 2400));
     const height = Math.max(1, Math.min(window.innerHeight, 1600));
-    const scale = Math.min(1, 2400 / width, 1600 / height);
+    const initialScale = Math.min(1, 1600 / width, 1000 / height);
     const root = safePageClone();
     const container = document.createElementNS("http://www.w3.org/1999/xhtml", "div");
     container.setAttribute("style", `position:relative;width:${width}px;height:${height}px;overflow:hidden`);
     container.append(root);
     const xhtml = new XMLSerializer().serializeToString(container);
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${Math.round(width * scale)}" height="${Math.round(height * scale)}" viewBox="0 0 ${width} ${height}"><foreignObject width="100%" height="100%">${xhtml}</foreignObject></svg>`;
-    const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }));
-    try {
-      const image = new Image();
-      image.src = url;
-      await image.decode();
-      const canvas = document.createElement("canvas");
-      canvas.width = Math.round(width * scale);
-      canvas.height = Math.round(height * scale);
-      const context = canvas.getContext("2d", { alpha: false });
-      context.drawImage(image, 0, 0, canvas.width, canvas.height);
-      return await new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), "image/png"));
-    } finally {
-      URL.revokeObjectURL(url);
+    let lastError = null;
+    for (const scale of [initialScale, initialScale * 0.8, initialScale * 0.65, initialScale * 0.5]) {
+      const outputWidth = Math.max(1, Math.round(width * scale));
+      const outputHeight = Math.max(1, Math.round(height * scale));
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${outputWidth}" height="${outputHeight}" viewBox="0 0 ${width} ${height}"><foreignObject width="100%" height="100%">${xhtml}</foreignObject></svg>`;
+      const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }));
+      try {
+        const image = new Image();
+        image.src = url;
+        await image.decode();
+        const canvas = document.createElement("canvas");
+        canvas.width = outputWidth;
+        canvas.height = outputHeight;
+        const context = canvas.getContext("2d", { alpha: false });
+        if (!context) throw new Error("canvas-unavailable");
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        const blob = await new Promise((resolve) => canvas.toBlob((value) => resolve(value), "image/png"));
+        if (blob && blob.size <= 2 * 1024 * 1024) return blob;
+        if (!blob) throw new Error("canvas-encode-failed");
+        lastError = new Error("too-large");
+      } catch (error) {
+        lastError = error;
+      } finally {
+        URL.revokeObjectURL(url);
+      }
     }
+    throw lastError || new Error("capture-failed");
   }
 
   dialog.querySelector("[data-close]").addEventListener("click", () => dialog.close());
