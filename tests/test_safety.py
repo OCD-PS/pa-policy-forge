@@ -222,7 +222,10 @@ done'''
     def test_runtime_uses_hash_lock_and_pinned_official_python_image_digest(self):
         dockerfile=(ROOT/"Dockerfile").read_text()
         requirements=(ROOT/"requirements.txt").read_text()
-        self.assertRegex(dockerfile, r"FROM python:3\.14-slim@sha256:[0-9a-f]{64}")
+        self.assertIn(
+            "FROM python:3.14.10-slim@sha256:3cabfd7d7aaf394e6040e79fa1eec6ca1c52b74ed9188650472695d9a9326999",
+            dockerfile,
+        )
         self.assertIn("--require-hashes -r requirements.txt", dockerfile)
         self.assertIn("--hash=sha256:", requirements)
 
