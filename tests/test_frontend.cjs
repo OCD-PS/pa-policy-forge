@@ -257,23 +257,33 @@ test('optional absent boolean fields stay unset until deliberately selected', as
   assert.deepEqual(errors, []); dom.window.close();
 });
 
-test('bug report snapshot uses a data URL so Chromium canvas PNG export stays origin-clean', async () => {
+test('bug report snapshot skips an uncloneable page widget and surfaces app notices above the modal', async () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'app', 'static', 'bug-report.js'), 'utf8');
-  const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
+  const dom = new JSDOM('<!doctype html><html><head></head><body><div class="flash-stack"><div class="flash flash-success" role="status">Syslog is actief</div></div><div id="uncloneable">Widget</div></body></html>', {
     url: 'https://forge.test/', runScripts: 'outside-only', pretendToBeVisual: true,
   });
   const {window} = dom;
   const sources = [];
+  let failImageDecode = false;
   window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
+  window.HTMLDialogElement.prototype.close = function () {
+    this.open = false;
+    this.dispatchEvent(new window.Event('close'));
+  };
   window.URL.createObjectURL = () => 'blob:preview';
   window.URL.revokeObjectURL = () => {};
   window.Image = class {
     set src(value) { sources.push(value); }
-    async decode() {}
+    async decode() {
+      if (failImageDecode) throw new window.DOMException('Invalid image data', 'InvalidStateError');
+    }
   };
   window.HTMLCanvasElement.prototype.getContext = () => ({drawImage() {}});
   window.HTMLCanvasElement.prototype.toBlob = function (callback) {
     callback(new window.Blob(['png'], {type:'image/png'}));
+  };
+  window.document.querySelector('#uncloneable').cloneNode = () => {
+    throw new window.DOMException('Browser-managed state cannot be cloned', 'InvalidStateError');
   };
   const script = window.document.createElement('script');
   script.dataset.csrf = 'test-token';
@@ -285,8 +295,30 @@ test('bug report snapshot uses a data URL so Chromium canvas PNG export stays or
 
   assert.equal(sources.length, 1);
   assert.match(sources[0], /^data:image\/svg\+xml;charset=utf-8,/);
-  assert.match(decodeURIComponent(sources[0].split(',', 2)[1]), /<foreignObject/);
+  const snapshot = decodeURIComponent(sources[0].split(',', 2)[1]);
+  assert.match(snapshot, /<foreignObject/);
+  assert.doesNotMatch(snapshot, /uncloneable|Widget/);
   assert.match(window.document.querySelector('[data-capture-status]').textContent, /Screenshot klaar/);
   assert.equal(window.document.querySelector('[data-submit]').disabled, false);
+  const priorityNotices = window.document.querySelector('[data-priority-notices]');
+  assert.equal(priorityNotices.hidden, false);
+  assert.match(priorityNotices.textContent, /Syslog is actief/);
+
+  window.document.querySelector('.flash').textContent = 'Syslog is hersteld';
+  await new Promise(resolve => window.setTimeout(resolve, 25));
+  assert.match(priorityNotices.textContent, /Syslog is hersteld/);
+
+  window.document.querySelector('[data-close]').click();
+  assert.equal(priorityNotices.hidden, true);
+  await new Promise(resolve => window.setTimeout(resolve, 0));
+  assert.equal(window.document.querySelector('[data-preview]').hasAttribute('src'), false);
+  failImageDecode = true;
+  window.document.querySelector('[data-bug-report-launcher]').click();
+  await new Promise(resolve => window.setTimeout(resolve, 0));
+  assert.equal(window.document.querySelector('[data-preview]').hasAttribute('src'), false);
+  assert.equal(window.document.querySelector('[data-submit]').disabled, true);
+  assert.equal(window.document.querySelector('[data-capture-fallback]').hidden, false);
+  window.document.querySelector('[data-close]').click();
+  await new Promise(resolve => window.setTimeout(resolve, 25));
   dom.window.close();
 });
