@@ -256,3 +256,37 @@ test('optional absent boolean fields stay unset until deliberately selected', as
   assert.deepEqual(JSON.parse(form.querySelector('[data-config-updates]').value), [{path:'enable-user-identification',kind:'boolean',value:'no'}]);
   assert.deepEqual(errors, []); dom.window.close();
 });
+
+test('bug report snapshot uses a data URL so Chromium canvas PNG export stays origin-clean', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'app', 'static', 'bug-report.js'), 'utf8');
+  const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
+    url: 'https://forge.test/', runScripts: 'outside-only', pretendToBeVisual: true,
+  });
+  const {window} = dom;
+  const sources = [];
+  window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
+  window.URL.createObjectURL = () => 'blob:preview';
+  window.URL.revokeObjectURL = () => {};
+  window.Image = class {
+    set src(value) { sources.push(value); }
+    async decode() {}
+  };
+  window.HTMLCanvasElement.prototype.getContext = () => ({drawImage() {}});
+  window.HTMLCanvasElement.prototype.toBlob = function (callback) {
+    callback(new window.Blob(['png'], {type:'image/png'}));
+  };
+  const script = window.document.createElement('script');
+  script.dataset.csrf = 'test-token';
+  window.document.body.append(script);
+  Object.defineProperty(window.document, 'currentScript', {configurable:true, value:script});
+  window.eval(source);
+  window.document.querySelector('[data-bug-report-launcher]').click();
+  await new Promise(resolve => window.setTimeout(resolve, 0));
+
+  assert.equal(sources.length, 1);
+  assert.match(sources[0], /^data:image\/svg\+xml;charset=utf-8,/);
+  assert.match(decodeURIComponent(sources[0].split(',', 2)[1]), /<foreignObject/);
+  assert.match(window.document.querySelector('[data-capture-status]').textContent, /Screenshot klaar/);
+  assert.equal(window.document.querySelector('[data-submit]').disabled, false);
+  dom.window.close();
+});

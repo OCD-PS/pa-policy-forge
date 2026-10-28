@@ -251,42 +251,40 @@
     for (const scale of [initialScale, initialScale * 0.8, initialScale * 0.65, initialScale * 0.5]) {
       const outputWidth = Math.max(1, Math.round(width * scale));
       const outputHeight = Math.max(1, Math.round(height * scale));
-      let url;
+      let imageSource;
       try {
         const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${outputWidth}" height="${outputHeight}" viewBox="0 0 ${width} ${height}"><foreignObject width="100%" height="100%">${xhtml}</foreignObject></svg>`;
-        url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }));
+        // Chromium taints canvas exports from blob-backed SVGs containing
+        // foreignObject. A data URL keeps this local snapshot origin-clean.
+        imageSource = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
       } catch (error) {
         throw captureFailure("svg-serialize", error);
       }
+      const image = new Image();
+      image.src = imageSource;
       try {
-        const image = new Image();
-        image.src = url;
-        try {
-          await image.decode();
-        } catch (error) {
-          throw captureFailure("svg-decode", error);
-        }
-        const canvas = document.createElement("canvas");
-        canvas.width = outputWidth;
-        canvas.height = outputHeight;
-        const context = canvas.getContext("2d", { alpha: false });
-        if (!context) throw captureFailure("canvas-create", new Error("unavailable"));
-        try {
-          context.drawImage(image, 0, 0, canvas.width, canvas.height);
-        } catch (error) {
-          throw captureFailure("canvas-render", error);
-        }
-        let blob;
-        try {
-          blob = await new Promise((resolve) => canvas.toBlob((value) => resolve(value), "image/png"));
-        } catch (error) {
-          throw captureFailure("png-export", error);
-        }
-        if (!blob) throw captureFailure("png-export", new Error("empty result"));
-        if (blob.size <= 2 * 1024 * 1024) return blob;
-      } finally {
-        URL.revokeObjectURL(url);
+        await image.decode();
+      } catch (error) {
+        throw captureFailure("svg-decode", error);
       }
+      const canvas = document.createElement("canvas");
+      canvas.width = outputWidth;
+      canvas.height = outputHeight;
+      const context = canvas.getContext("2d", { alpha: false });
+      if (!context) throw captureFailure("canvas-create", new Error("unavailable"));
+      try {
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      } catch (error) {
+        throw captureFailure("canvas-render", error);
+      }
+      let blob;
+      try {
+        blob = await new Promise((resolve) => canvas.toBlob((value) => resolve(value), "image/png"));
+      } catch (error) {
+        throw captureFailure("png-export", error);
+      }
+      if (!blob) throw captureFailure("png-export", new Error("empty result"));
+      if (blob.size <= 2 * 1024 * 1024) return blob;
     }
     throw captureFailure("too-large", null);
   }
