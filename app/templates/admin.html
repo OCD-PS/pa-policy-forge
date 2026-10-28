@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin & meldingen · PA Policy Forge</title>
+<link rel="icon" href="{{url_for('static',filename='favicon.svg',v=asset_version)}}" type="image/svg+xml">
+<link rel="stylesheet" href="{{url_for('static',filename='app.css',v=asset_version)}}">
+</head>
+<body>
+<main class="content" style="max-width:1200px;margin:32px auto">
+<div class="page-header"><div><p class="eyebrow">PA Policy Forge</p><h1>Admin & bugmeldingen</h1><p class="muted">Alleen beheerders kunnen deze instellingen en meldingen bekijken.</p></div><a class="btn" href="{{url_for('index')}}">Terug naar Policy Forge</a></div>
+{% with messages=get_flashed_messages(with_categories=true) %}{% if messages %}<div class="flash-stack">{% for category,message in messages %}<div class="flash flash-{{category}}"><div class="flash-body">{{message}}</div></div>{% endfor %}</div>{% endif %}{% endwith %}
+<section class="card stack">
+<div><h2>Mailrelay</h2><p class="muted">SMTP over TLS of STARTTLS. De relay wachtwoordwaarde wordt versleuteld opgeslagen en nooit terug getoond. De host moet ook op de server zijn toegestaan in <code>PPF_SMTP_ALLOWED_HOSTS</code>; dit beperkt uitgaande verbindingen tot goedgekeurde relays.</p></div>
+<form method="post" action="{{url_for('bug_reports.save_mail_settings')}}" class="stack">
+<input type="hidden" name="csrf" value="{{csrf_token()}}">
+<div class="form-grid">
+<div class="field"><label for="smtp-host">SMTP-host</label><input id="smtp-host" name="host" value="{{mail.host or ''}}" maxlength="253" autocomplete="off" required></div>
+<div class="field"><label for="smtp-port">Poort</label><select id="smtp-port" name="port">{% for port in [25,465,587,2525] %}<option value="{{port}}" {{'selected' if mail.port|int==port else ''}}>{{port}}</option>{% endfor %}</select></div>
+<div class="field"><label for="smtp-encryption">Beveiliging</label><select id="smtp-encryption" name="encryption"><option value="starttls" {{'selected' if mail.encryption=='starttls' else ''}}>STARTTLS</option><option value="tls" {{'selected' if mail.encryption=='tls' else ''}}>TLS (implicit)</option></select></div>
+<div class="field"><label for="smtp-username">Gebruiker</label><input id="smtp-username" name="username" value="{{mail.username or ''}}" autocomplete="username"></div>
+<div class="field"><label for="smtp-password">Wachtwoord {% if mail.password_configured %}<span class="muted">(ingesteld, leeg laten om te behouden)</span>{% endif %}</label><input id="smtp-password" name="password" type="password" autocomplete="new-password" maxlength="2048"></div>
+<div class="field"><label for="smtp-sender">Afzender</label><input id="smtp-sender" name="sender" value="{{mail.sender}}" maxlength="254" required></div>
+<div class="field"><label for="smtp-test-recipient">Vast testadres</label><input id="smtp-test-recipient" name="test_recipient" type="email" value="{{mail.test_recipient or ''}}" maxlength="254" required></div>
+</div>
+{% if mail.password_configured %}<label class="checkbox"><input type="checkbox" name="clear_password" value="yes"> Opgeslagen relaywachtwoord wissen</label>{% endif %}
+<div class="cluster"><button class="btn btn-primary" type="submit">Relayinstellingen opslaan</button></div>
+</form>
+<form method="post" action="{{url_for('bug_reports.test_mail')}}"><input type="hidden" name="csrf" value="{{csrf_token()}}"><button class="btn" type="submit" {{'disabled' if not mail.host or not mail.test_recipient or not mail.host_allowed else ''}}>Testmail naar vast adres sturen</button>{% if mail.host and not mail.host_allowed %}<span class="muted">Deze host staat niet in de serverallowlist.</span>{% endif %}</form>
+</section>
+<section class="card stack" id="reports">
+<div class="card-header"><div><h2>Bugmeldingen</h2><p class="muted">Nieuwe meldingen komen in deze afgeschermde wachtrij. Meldingen ouder dan 180 dagen worden bij het opstarten of bij een nieuwe melding opgeruimd. Gesloten meldingen kun je hieronder ook zelf verwijderen. Een melding als opgelost markeren betekent dat de fix is uitgerold; dan wordt de melder gemaild.</p><p class="muted">Automatische Codex-agentdoorschakeling is nog niet gekoppeld. Meldingen worden hier niet automatisch als uitvoerbare agentprompt gebruikt.</p></div><span class="badge">{{reports|length}} recent</span></div>
+{% for report in reports %}
+<article class="card stack">
+<div class="card-header"><div><h3>#{{report.id}} · {{report.status}}</h3><p class="muted">{{report.created_at}} · {{report.reporter_email}} · <code>{{report.page_path}}</code></p></div>{% if report.has_screenshot %}<a class="btn btn-small" href="{{url_for('bug_reports.screenshot',report_id=report.id)}}" target="_blank" rel="noopener">Screenshot openen</a>{% endif %}</div>
+<p style="white-space:pre-wrap;overflow-wrap:anywhere">{{report.description}}</p>
+<div class="cluster"><form class="cluster" method="post" action="{{url_for('bug_reports.update_status',report_id=report.id)}}"><input type="hidden" name="csrf" value="{{csrf_token()}}"><label>Status <select name="status">{% for value,label in [('new','Nieuw'),('triaged','Getrieerd'),('in_progress','In behandeling'),('fixed_deployed','Opgelost en uitgerold'),('closed','Gesloten')] %}<option value="{{value}}" {{'selected' if report.status==value else ''}}>{{label}}</option>{% endfor %}</select></label><button class="btn btn-small" type="submit">Status bewaren</button>{% if report.notified_at %}<span class="muted">Melder gemaild op {{report.notified_at}}</span>{% endif %}</form>
+{% if report.status=='closed' %}<form method="post" action="{{url_for('bug_reports.delete_report',report_id=report.id)}}" onsubmit="return confirm('Deze gesloten melding definitief verwijderen?')"><input type="hidden" name="csrf" value="{{csrf_token()}}"><button class="btn btn-small" type="submit">Gesloten melding verwijderen</button></form>{% endif %}</div>
+</article>
+{% else %}<div class="empty-state">Nog geen bugmeldingen.</div>{% endfor %}
+</section>
+</main>
+<script src="{{url_for('static',filename='app.js',v=asset_version)}}"></script>
+</body></html>

@@ -37,6 +37,7 @@ from cryptography.hazmat.primitives import hashes
 from defusedxml import ElementTree as SafeET
 from flask import Flask, Response, flash, has_request_context, redirect, render_template, request, send_file, session, url_for
 
+from app.bug_reports import create_bug_reports_blueprint
 from app.certificates import (
     CERTIFICATE_MAX_BYTES,
     PRIVATE_KEY_MAX_BYTES,
@@ -116,7 +117,7 @@ app = Flask(__name__)
 def build_asset_version() -> str:
     digest = hashlib.sha256()
     static_root = Path(app.static_folder or BASE / "app" / "static")
-    for name in ("app.css", "app.js", "favicon.svg"):
+    for name in ("app.css", "app.js", "bug-report.js", "favicon.svg"):
         path = static_root / name
         if path.is_file():
             digest.update(name.encode())
@@ -391,7 +392,8 @@ def init_db() -> None:
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS users (
           id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL,
-          password_hash TEXT NOT NULL, must_change INTEGER NOT NULL DEFAULT 1
+          password_hash TEXT NOT NULL, must_change INTEGER NOT NULL DEFAULT 1,
+          is_admin INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS profiles (
           id INTEGER PRIMARY KEY, name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
@@ -520,7 +522,21 @@ def init_db() -> None:
           setting_key TEXT PRIMARY KEY, settings_json TEXT NOT NULL DEFAULT '{}',
           secret_blob BLOB NOT NULL DEFAULT '', updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS bug_reports (
+          id INTEGER PRIMARY KEY, reporter_user_id INTEGER NOT NULL, secret_blob BLOB NOT NULL,
+          screenshot_blob BLOB,
+          status TEXT NOT NULL DEFAULT 'new', created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL DEFAULT '', notified_at TEXT NOT NULL DEFAULT '',
+          FOREIGN KEY(reporter_user_id) REFERENCES users(id)
+        );
         """)
+        user_columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+        if "is_admin" not in user_columns:
+            conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
+        # The existing single bootstrap account is the only global administrator.
+        # Other accounts, if provisioned later, remain non-admin unless explicitly promoted.
+        conn.execute("UPDATE users SET is_admin=1 WHERE username='admin'")
+        conn.execute("DELETE FROM bug_reports WHERE created_at<strftime('%Y-%m-%d %H:%M:%S','now','-180 days')")
         project_columns = {row[1] for row in conn.execute("PRAGMA table_info(migration_projects)")}
         if "topology" not in project_columns:
             conn.execute("ALTER TABLE migration_projects ADD COLUMN topology TEXT NOT NULL DEFAULT 'active-passive'")
@@ -556,7 +572,7 @@ def init_db() -> None:
                 raise RuntimeError(
                     "A new installation requires PPF_BOOTSTRAP_PASSWORD with at least 12 non-default characters"
                 )
-            conn.execute("INSERT INTO users(username,password_hash,must_change) VALUES(?,?,1)",
+            conn.execute("INSERT INTO users(username,password_hash,must_change,is_admin) VALUES(?,?,1,1)",
                          ("admin", password_hash(bootstrap_password)))
         conn.execute(
             "UPDATE runs SET status='failed',finished_at=strftime('%Y-%m-%d %H:%M:%S','now'),"
@@ -625,6 +641,9 @@ def audit(action: str, detail: str = "", username: str | None = None) -> None:
                      (now(), username or (session.get("username", "system") if has_request_context() else "system"), action, detail[:1000]))
 
 
+app.register_blueprint(create_bug_reports_blueprint(db, fernet, now, audit))
+
+
 def csrf() -> str:
     if "csrf" not in session:
         session["csrf"] = secrets.token_urlsafe(32)
@@ -641,6 +660,10 @@ def protect_csrf():
     for name, value in (request.view_args or {}).items():
         if name.endswith("_id") and isinstance(value, int) and not 1 <= value <= 2**63 - 1:
             return "Not found", 404
+    if request.method == "POST" and request.path == "/bug-reports":
+        request.max_content_length = 3 * 1024 * 1024
+        if (request.content_length or 0) > request.max_content_length:
+            return "Request too large", 413
     if request.method == "POST" and not hmac.compare_digest(request.form.get("csrf", ""), session.get("csrf", "-")):
         return "Invalid CSRF token", 400
     if session.get("user_id") and session.get("must_change") and request.endpoint not in {
@@ -661,10 +684,34 @@ def security_headers(response):
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; "
         "form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:; connect-src 'self'"
+        "img-src 'self' data: blob:; connect-src 'self'"
     )
     if request.endpoint != "static": response.headers["Cache-Control"] = "no-store"
+    if (
+        session.get("user_id") and not session.get("must_change")
+        and response.status_code == 200
+        and response.mimetype == "text/html"
+    ):
+        csrf_value = html.escape(str(session.get("csrf", "")), quote=True)
+        script = (
+            f'<script src="{url_for("static", filename="bug-report.js", v=ASSET_VERSION)}" '
+            f'data-csrf="{csrf_value}" defer></script>'
+        )
+        body = response.get_data(as_text=True)
+        marker = "</body>"
+        if marker in body:
+            response.set_data(body.replace(marker, script + marker, 1))
     return response
+
+
+@app.context_processor
+def inject_admin_access():
+    user_id = session.get("user_id")
+    if not user_id:
+        return {"is_admin": False}
+    with db() as conn:
+        row = conn.execute("SELECT is_admin FROM users WHERE id=?", (user_id,)).fetchone()
+    return {"is_admin": bool(row and row["is_admin"])}
 
 
 def login_rate_limited(client: str, username: str, record_failure: bool = False) -> bool:
