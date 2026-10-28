@@ -103,6 +103,20 @@ primary address through `PPF_BIND_ADDRESS`. Override `PPF_BIND_ADDRESS` and
 `PPF_TRUSTED_HOSTS` in `/opt/pa-policy-forge/.env` when the appliance uses a
 different management address or additional DNS aliases.
 
+The authenticated **Admin & bugmeldingen** page is available to the bootstrap
+`admin` account. SMTP settings are stored in the application database and the
+relay password is encrypted with the appliance encryption key. Before mail can
+be sent, add the exact approved SMTP hostname to the comma-separated
+`PPF_SMTP_ALLOWED_HOSTS` setting in `/opt/pa-policy-forge/.env` and recreate the
+application container. An empty allowlist disables all SMTP connections. Keep
+backups of `/data` protected as secrets because they contain both the database
+and its encryption key. Bug-report screenshots are reviewed by the reporter
+before upload, encrypted at rest, and limited to 2 MiB each. Reports older than
+180 days are purged at application startup or when a new report arrives. The
+Admin queue is capped at 1,000 reports and 256 MiB of encrypted screenshots;
+closed reports can be deleted to reclaim space. Codex-agent dispatch is not
+integrated, so admins must triage the queue manually.
+
 The installer creates a self-signed certificate for the server IP and starts a dedicated,
 unprivileged HTTP redirect container. If the final FQDN is already known, provide it during
 installation:
