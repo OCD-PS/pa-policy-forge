@@ -48,6 +48,67 @@
   const submit = dialog.querySelector("[data-submit]");
   const form = dialog.querySelector("[data-bug-report-form]");
 
+  function openBugReport(event) {
+    const clickedLauncher = event?.currentTarget || launcher;
+    const owningModal = clickedLauncher.closest("dialog[open]");
+    const dialogHost = owningModal || document.body;
+    if (dialog.parentElement !== dialogHost) dialogHost.append(dialog);
+    screenshotBlob = null;
+    result.textContent = "";
+    submit.disabled = true;
+    status.textContent = "Screenshot wordt gemaakt…";
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    previewUrl = "";
+    dialog.showModal();
+    try {
+      captureViewport().then((blob) => {
+        if (!blob || blob.size > 2 * 1024 * 1024) throw new Error("too-large");
+        screenshotBlob = blob;
+        previewUrl = URL.createObjectURL(blob);
+        dialog.querySelector("[data-preview]").src = previewUrl;
+        status.textContent = "Screenshot klaar. Bekende geheime formuliervelden zijn afgeschermd. Andere gevoelige tekst kan zichtbaar zijn; controleer de afbeelding voor verzending.";
+        submit.disabled = false;
+      }).catch(() => {
+        status.textContent = "De screenshot kon niet veilig worden gemaakt. Vernieuw de pagina en probeer opnieuw.";
+      });
+    } catch {
+      status.textContent = "De screenshot kon niet veilig worden gemaakt. Vernieuw de pagina en probeer opnieuw.";
+    }
+  }
+
+  launcher.addEventListener("click", openBugReport);
+
+  function syncModalLaunchers() {
+    const openDialogs = new Set(
+      Array.from(document.querySelectorAll("dialog[open]"))
+        .filter((openDialog) => openDialog !== dialog)
+    );
+    document.querySelectorAll("[data-bug-report-modal-launcher]").forEach((button) => {
+      if (!openDialogs.has(button.closest("dialog"))) button.remove();
+    });
+    openDialogs.forEach((openDialog) => {
+      if (openDialog.querySelector("[data-bug-report-modal-launcher]")) return;
+      const modalLauncher = launcher.cloneNode(true);
+      modalLauncher.dataset.bugReportModalLauncher = "";
+      modalLauncher.addEventListener("click", openBugReport);
+      openDialog.append(modalLauncher);
+    });
+  }
+
+  // Native modal dialogs enter the browser top layer and make the rest of the
+  // document inert, so z-index alone cannot keep the body launcher clickable.
+  const modalObserver = new MutationObserver((records) => {
+    if (records.some((record) => record.target?.tagName === "DIALOG")) {
+      syncModalLaunchers();
+    }
+  });
+  modalObserver.observe(document.body, {
+    attributes: true,
+    attributeFilter: ["open"],
+    subtree: true,
+  });
+  syncModalLaunchers();
+
   function safePageClone() {
     const clonedRoot = document.documentElement.cloneNode(true);
     clonedRoot.querySelectorAll("[data-bug-report-launcher],.bug-report-dialog,script,iframe,object,embed,link[rel~='stylesheet']").forEach((node) => node.remove());
@@ -116,27 +177,6 @@
       URL.revokeObjectURL(url);
     }
   }
-
-  launcher.addEventListener("click", async () => {
-    screenshotBlob = null;
-    result.textContent = "";
-    submit.disabled = true;
-    status.textContent = "Screenshot wordt gemaakt…";
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    previewUrl = "";
-    dialog.showModal();
-    try {
-      const blob = await captureViewport();
-      if (!blob || blob.size > 2 * 1024 * 1024) throw new Error("too-large");
-      screenshotBlob = blob;
-      previewUrl = URL.createObjectURL(blob);
-      dialog.querySelector("[data-preview]").src = previewUrl;
-      status.textContent = "Screenshot klaar. Bekende geheime formuliervelden zijn afgeschermd. Andere gevoelige tekst kan zichtbaar zijn; controleer de afbeelding voor verzending.";
-      submit.disabled = false;
-    } catch {
-      status.textContent = "De screenshot kon niet veilig worden gemaakt. Vernieuw de pagina en probeer opnieuw.";
-    }
-  });
 
   dialog.querySelector("[data-close]").addEventListener("click", () => dialog.close());
   dialog.addEventListener("click", (event) => {
