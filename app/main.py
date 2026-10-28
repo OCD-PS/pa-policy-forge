@@ -67,7 +67,7 @@ from app.migration import (
     reconcile_model, scm_items, restore_migration_source_topology,
 )
 from app.offline_config import (
-    OBJECT_NODES, POLICY_NODES, PANOS_LOCATION_SECTIONS, OfflineConfigError, available_scopes, available_templates,
+    OBJECT_NODES, POLICY_NODES, PANOS_LOCATION_SECTIONS, REFERENCE_CHECK_OBJECT_TYPES, UNUSED_OBJECT_TYPES, OfflineConfigError, available_scopes, available_templates,
     apply_configuration_changes, apply_object_changes, configuration_inventory,
     create_basic_network_entry, configuration_create_templates, create_configuration_entry,
     configuration_records as scoped_configuration_records,
@@ -76,6 +76,7 @@ from app.offline_config import (
     object_fingerprint as offline_object_fingerprint,
     policy_fingerprint as offline_policy_fingerprint, render_set_commands,
     panos_ui_decorate_record, scoped_server_profiles,
+    object_reference_index,
     replace_policy_in_snapshot, replace_policies_in_snapshot, insert_policy_in_snapshot,
     delete_policies_from_snapshot, move_policies_in_snapshot,
     safe_workspace_path, scoped_objects,
@@ -2239,7 +2240,7 @@ def object_payload_xml(payload: dict) -> str:
     return ET.tostring(entry, encoding="unicode")
 
 
-def write_panos_object_draft(profile, draft: dict) -> None:
+def write_panos_object_draft(profile, draft: dict, on_delete=None) -> None:
     _, endpoint, key, ctx = panos_profile_context(profile)
     object_type = draft["object_type"]; node = PANOS_OBJECT_NODES[object_type]; operation = draft["operation"]
     if operation == "create":
@@ -2258,6 +2259,8 @@ def write_panos_object_draft(profile, draft: dict) -> None:
             item = wrapped["value"]; base = item.get("_scope_xpath") or ("/config/shared" if profile["target_type"] == "panorama" and object_type != "zones" else panos_object_bases(profile, object_type)[0])
             xpath = f"{base}/{node}/entry[@name={policy_api.xpath_literal(item['name'])}]"
             policy_api.require_success(panos_api_post(endpoint, {"type": "config", "action": "delete", "xpath": xpath, "key": key}, ctx), f"delete {object_type}")
+            if on_delete:
+                on_delete()
 
 
 def validate_object_payload(payload: dict, object_type: str, existing: list[dict], own_id: str = "") -> None:
@@ -3723,6 +3726,245 @@ WORKSPACE_EDITABLE_OBJECT_TYPES = set(OBJECT_NODES)
 WORKSPACE_CREATABLE_OBJECT_TYPES = set(OBJECT_NODES)
 
 
+def validate_workspace_object_deletions(xml_bytes: bytes, object_type: str, names: list[str]) -> dict[str, list[str]]:
+    """Fail closed unless the full PAN-OS/Panorama XML proves objects unused."""
+    if object_type not in REFERENCE_CHECK_OBJECT_TYPES:
+        raise OfflineConfigError("Veilig verwijderen is voor dit objecttype niet beschikbaar")
+    try:
+        references = object_reference_index(xml_bytes, object_type, names)
+    except Exception as exc:
+        raise OfflineConfigError("Referentiecontrole van de volledige configuratie is mislukt; niets verwijderd") from exc
+    used = {name: paths for name, paths in references.items() if paths}
+    if used:
+        details = "; ".join(f"{name}: {', '.join(paths[:3])}" for name, paths in list(used.items())[:5])
+        raise OfflineConfigError(f"Niet verwijderd: objecten zijn nog in gebruik ({details})")
+    return references
+
+
+def validate_workspace_configuration_deletions(xml_bytes: bytes, view: str, section: str, records: list[dict]) -> None:
+    """Block certificate removal while its names appear in certificate use sites."""
+    if view != "device" or section != "certificates":
+        return
+    names = [str(item.get("name", "")) for item in records]
+    try:
+        references = object_reference_index(xml_bytes, "certificates", names)
+    except Exception as exc:
+        raise OfflineConfigError("Certificaatreferentiecontrole is mislukt; niets verwijderd") from exc
+    used = {name: paths for name, paths in references.items() if paths}
+    if used:
+        details = "; ".join(f"{name}: {', '.join(paths[:3])}" for name, paths in list(used.items())[:5])
+        raise OfflineConfigError(f"Certificaat in gebruik; niet verwijderd ({details})")
+
+
+def scm_fetch_reference_inventory(endpoint: str, token: str, container: dict[str, str], label: str) -> list[dict]:
+    """Fetch all pages from an SCM reference source, rejecting ambiguous responses."""
+    items = []
+    offset = 0
+    while True:
+        params = {**container, "limit": "200", "offset": str(offset)}
+        if "position" in container:
+            params["position"] = container["position"]
+        response = policy_api.scm_http_request(
+            "GET", endpoint, token, params=params,
+        )
+        if not isinstance(response, (dict, list)):
+            raise RuntimeError(f"SCM-{label}-referentiebron heeft een ongeldig antwoord")
+        if isinstance(response, dict) and (
+            "_errors" in response or not any(key in response for key in ("data", "items", "results", "entry"))
+        ):
+            raise RuntimeError(f"SCM-{label}-referentiebron gaf geen volledige gegevens terug")
+        page = policy_api.response_items(response)
+        items.extend(page)
+        total = response.get("total") if isinstance(response, dict) else None
+        if total is not None:
+            try:
+                expected_total = int(total)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"SCM-{label}-referentiebron gaf een ongeldige paginatelling") from exc
+            if expected_total < 0 or expected_total < len(items):
+                raise RuntimeError(f"SCM-{label}-referentiebron gaf een ongeldige paginatelling")
+            if len(items) >= expected_total:
+                break
+            if not page:
+                raise RuntimeError(f"SCM-{label}-referentiebron eindigde vóór alle resultaten waren opgehaald")
+        elif not page or len(page) < 200:
+            break
+        offset += len(page)
+        if offset > 100_000:
+            raise RuntimeError(f"SCM-{label}-referentiebron overschrijdt de veiligheidslimiet")
+    return items
+
+
+def scm_fetch_setup_inventory(endpoint: str, token: str, label: str) -> list[dict]:
+    """Fetch a complete unscoped SCM setup inventory or fail closed."""
+    return scm_fetch_reference_inventory(endpoint, token, {"pagination": "true"}, label)
+
+
+def scm_object_reference_index(profile, object_type: str, names: list[str]) -> dict[str, list[str]]:
+    """Build a typed reference index from SCM policies and objects.
+
+    Folder objects can be inherited by descendants, so scan the selected folder
+    and every descendant folder. An API or parsing failure blocks deletion.
+    """
+    if object_type not in UNUSED_OBJECT_TYPES:
+        raise ValueError("Veilig verwijderen is voor dit objecttype niet beschikbaar")
+    references = {str(name): [] for name in names if str(name)}
+    if not references:
+        return references
+    scm, token, _, _ = scm_client(profile)
+    if not scm.scm_object_folder or scm.scm_snippet or scm.scm_device:
+        # Snippet/device inheritance requires a full attachment inventory; a
+        # local-only scan is unsafe, so do not assume the selected scope is isolated.
+        raise RuntimeError("SCM-verwijdercontrole kan deze snippet/device-scope niet volledig controleren")
+    root = policy_api.scm_api_root(scm.scm_api_base)
+    folder_endpoint = f"{root}/config/setup/v1/folders"
+    folders = scm_fetch_setup_inventory(folder_endpoint, token, "folder")
+    if any(not str(item.get("name", "")).strip() for item in folders):
+        raise RuntimeError("SCM-folderlijst bevat een item zonder naam")
+
+    folder_by_name = {str(item["name"]).strip(): item for item in folders}
+    target_folders = {scm.scm_object_folder.strip()}
+    if scm.scm_folder.strip():
+        target_folders.add(scm.scm_folder.strip())
+    if not target_folders.issubset(folder_by_name):
+        raise RuntimeError("SCM kan de volledige folder-scope niet vaststellen")
+    relevant_folders = set(target_folders)
+    while True:
+        children = {
+            str(item["name"]).strip()
+            for item in folders
+            if str((item.get("parent") or {}).get("name", "") if isinstance(item.get("parent"), dict) else item.get("parent", "")).strip() in relevant_folders
+        }
+        expanded = relevant_folders | children
+        if expanded == relevant_folders:
+            break
+        relevant_folders = expanded
+
+    # Snippets can attach to folders, devices, and deployments. Scan every
+    # tenant snippet, not just the ones listed on a folder, to cover all attachments.
+    snippets_endpoint = f"{root}/config/setup/v1/snippets"
+    snippets = scm_fetch_setup_inventory(snippets_endpoint, token, "snippet")
+    relevant_snippets = {str(item.get("name", "")).strip() for item in snippets}
+    if any(not name for name in relevant_snippets):
+        raise RuntimeError("SCM-snippetinventaris bevat een item zonder naam")
+
+    # Device-scoped candidate rules can also reference inherited folder objects.
+    devices_endpoint = f"{root}/config/setup/v1/devices"
+    devices = scm_fetch_setup_inventory(devices_endpoint, token, "device")
+    relevant_devices = set()
+    for item in devices:
+        device_name = str(item.get("name", "")).strip()
+        device_folder = str(item.get("folder", "")).strip()
+        if not device_name or not device_folder:
+            raise RuntimeError("SCM-deviceinventaris is onvolledig; referentiecontrole geblokkeerd")
+        if device_folder in relevant_folders:
+            relevant_devices.add(device_name)
+
+    object_kinds = {
+        "addresses": ("address-groups",),
+        "address-groups": ("address-groups",),
+        "services": ("service-groups",),
+        "service-groups": ("service-groups",),
+        "application-groups": ("application-groups",),
+        "tags": tuple(
+            kind for kind, metadata in SCM_OBJECT_TYPES.items()
+            if kind != "applications" and not metadata.get("catalog_only")
+        ),
+    }[object_type]
+    documents = []
+    containers = [policy_api.scm_container(folder=folder) for folder in sorted(relevant_folders)]
+    containers.extend(policy_api.scm_container(snippet=name) for name in sorted(relevant_snippets))
+    containers.extend(policy_api.scm_container(device=name) for name in sorted(relevant_devices))
+    for container in containers:
+        scope_name = next(iter(container.values()))
+        for kind in object_kinds:
+            metadata = SCM_OBJECT_TYPES[kind]
+            service = metadata.get("service") or "objects"
+            endpoint_name = metadata.get("endpoint", kind)
+            endpoint = f"{root}/config/{service}/v1/{endpoint_name}"
+            for item in scm_fetch_reference_inventory(endpoint, token, container, kind):
+                documents.append((f"{scope_name}/{kind}/{item.get('name', 'unnamed')}", item))
+        for policy_kind, (service, endpoint_name, _) in SCM_POLICY_TYPES.items():
+            endpoint = f"{root}/config/{service}/v1/{endpoint_name}"
+            for position in ("pre", "post"):
+                policy_container = {**container, "position": position}
+                policies = scm_fetch_reference_inventory(endpoint, token, policy_container, policy_kind)
+                for policy in policies:
+                    documents.append((f"{scope_name}/{policy_kind}/{position}/{policy.get('name', 'unnamed')}", policy))
+
+    def add_values(values, source: str):
+        if isinstance(values, dict):
+            for key, value in values.items():
+                add_values(value, f"{source}/{key}")
+        elif isinstance(values, list):
+            for value in values:
+                add_values(value, source)
+        elif isinstance(values, str):
+            clean = values.strip()
+            if clean in references:
+                references[clean].append(source[:240])
+            elif object_type == "tags":
+                for name in references:
+                    if re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w.-])", clean):
+                        references[name].append(source[:240])
+
+    for source, document in documents:
+        if object_type in {"addresses", "address-groups"}:
+            for field in ("source", "destination", "static", "members", "source_translation", "destination_translation"):
+                add_values(document.get(field), f"{source}/{field}")
+        elif object_type in {"services", "service-groups"}:
+            for field in ("service", "members"):
+                add_values(document.get(field), f"{source}/{field}")
+        elif object_type == "application-groups":
+            for field in ("application", "members"):
+                add_values(document.get(field), f"{source}/{field}")
+        elif object_type == "tags":
+            def scan_tag_fields(value, field_path):
+                if isinstance(value, dict):
+                    for key, child in value.items():
+                        child_path = f"{field_path}/{key}"
+                        if str(key).casefold() in {"tag", "tags", "filter"}:
+                            add_values(child, child_path)
+                        else:
+                            scan_tag_fields(child, child_path)
+                elif isinstance(value, list):
+                    for child in value:
+                        scan_tag_fields(child, field_path)
+            scan_tag_fields(document, source)
+    return references
+
+
+def validate_scm_object_deletions(profile, object_type: str, names: list[str]) -> dict[str, list[str]]:
+    try:
+        references = scm_object_reference_index(profile, object_type, names)
+    except Exception as exc:
+        raise ValueError("SCM-referentiecontrole is mislukt; niets verwijderd") from exc
+    used = {name: paths for name, paths in references.items() if paths}
+    if used:
+        details = "; ".join(f"{name}: {', '.join(paths[:3])}" for name, paths in list(used.items())[:5])
+        raise ValueError(f"Niet verwijderd: objecten zijn nog in gebruik ({details})")
+    return references
+
+
+def validate_live_object_deletions(profile, object_type: str, names: list[str]) -> dict[str, list[str]]:
+    """Validate deletes against the complete target configuration, not the UI scope."""
+    if profile["target_type"] == "scm":
+        return validate_scm_object_deletions(profile, object_type, names)
+    try:
+        _, _, _, xml_bytes = fetch_panos_candidate_xml(profile)
+    except Exception as exc:
+        raise ValueError("Volledige PAN-OS/Panorama-config kon niet worden gecontroleerd; niets verwijderd") from exc
+    try:
+        references = object_reference_index(xml_bytes, object_type, names)
+    except Exception as exc:
+        raise ValueError("PAN-OS/Panorama-referentiecontrole is mislukt; niets verwijderd") from exc
+    used = {name: paths for name, paths in references.items() if paths}
+    if used:
+        details = "; ".join(f"{name}: {', '.join(paths[:3])}" for name, paths in list(used.items())[:5])
+        raise ValueError(f"Niet verwijderd: objecten zijn nog in gebruik ({details})")
+    return references
+
+
 def workspace_policy_reference_catalog(xml_bytes: bytes, scope: str, parsed, profile) -> tuple[list[dict], dict]:
     parsed_root, snapshot = parsed
     catalog = []
@@ -4444,19 +4686,31 @@ def config_workspace_object_delete_preview(workspace_id):
     try:
         if object_type not in WORKSPACE_EDITABLE_OBJECT_TYPES:
             raise OfflineConfigError("Dit objecttype heeft geen configureerbare candidate-mapping")
+        delete_unused = request.form.get("delete_unused") == "yes"
+        if delete_unused and object_type not in UNUSED_OBJECT_TYPES:
+            raise OfflineConfigError("Ongebruikt verwijderen is niet beschikbaar voor dit objecttype")
         selected_names = list(dict.fromkeys(request.form.getlist("object_id")))
         if not selected_names:
-            raise OfflineConfigError("Selecteer minstens één object")
+            if not delete_unused:
+                raise OfflineConfigError("Selecteer minstens één object")
         xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
         _, existing = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
+        if delete_unused:
+            candidates = [item for item in existing if item["editable"]]
+            references = object_reference_index(xml_bytes, object_type, [item["name"] for item in candidates])
+            selected_names = [item["name"] for item in candidates if not references.get(item["name"])]
+            if not selected_names:
+                raise OfflineConfigError("Geen ongebruikte objecten gevonden in deze scope")
         selected = [item for item in existing if item["name"] in selected_names and item["editable"]]
         if len(selected) != len(selected_names):
             raise OfflineConfigError("Een geselecteerd object is inherited of bestaat niet meer")
+        validate_workspace_object_deletions(xml_bytes, object_type, selected_names)
         changes = [{"operation": "delete", "original_name": item["name"], "fingerprint": offline_object_fingerprint(item)} for item in selected]
         draft_id = secrets.token_urlsafe(24)
         draft = {
             "workspace_id": workspace_id, "scope": scope, "object_type": object_type,
-            "operation": "delete", "objects": selected, "changes": changes, "created_at": now(),
+            "operation": "delete", "delete_unused": delete_unused,
+            "objects": selected, "changes": changes, "created_at": now(),
         }
         if request.form.get("direct_save") == "yes":
             new_xml = apply_object_changes(
@@ -4490,6 +4744,12 @@ def config_workspace_object_apply(draft_id):
         workspace = workspace_row(int(draft["workspace_id"]))
         if not workspace:
             raise OfflineConfigError("De bronworkspace bestaat niet meer")
+        if draft.get("operation") == "delete":
+            source_xml = workspace_config_path(workspace).read_bytes()
+            validate_workspace_object_deletions(
+                source_xml, draft["object_type"],
+                [change["original_name"] for change in draft["changes"]],
+            )
         new_xml = apply_object_changes(
             workspace_config_path(workspace).read_bytes(), draft["scope"],
             draft["object_type"], draft["changes"],
@@ -4686,6 +4946,7 @@ def config_workspace_configuration_delete_preview(workspace_id):
         selected = [item for item in records if item["locator"] in selected_locators and item["is_entry"]]
         if not selected_locators or len(selected) != len(selected_locators):
             raise OfflineConfigError("Selecteer minstens één benoemd configuratie-item")
+        validate_workspace_configuration_deletions(xml_bytes, context["view"], context["section"], selected)
         changes = [{"operation": "delete", "locator": item["locator"], "fingerprint": item["fingerprint"]} for item in selected]
         if request.form.get("direct_save") == "yes":
             direct_context = {**context, "operation": "delete"}
@@ -4715,6 +4976,12 @@ def config_workspace_configuration_apply(draft_id):
         workspace = workspace_row(int(draft["workspace_id"]))
         if not workspace:
             raise OfflineConfigError("De bronworkspace bestaat niet meer")
+        if draft.get("operation") == "delete":
+            source_xml = workspace_config_path(workspace).read_bytes()
+            validate_workspace_configuration_deletions(
+                source_xml, draft.get("view", ""), draft.get("section", ""),
+                draft.get("before_items", []),
+            )
         new_id = _store_workspace_configuration_version(workspace, draft, draft["changes"])
         draft_path.unlink(missing_ok=True)
         flash("Opgeslagen", "success")
@@ -5035,7 +5302,9 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes, desired_root=None) ->
             for node in source.iter()
         ):
             family, label = "protected", "Credential or certificate configuration"
-        change_name = element.get("name", "") if element is not None else ""
+        change_name = element.get("name", "") if element is not None else str(
+            protected_source.get("name", "") if protected_source is not None else ""
+        )
         changes.append({"action": action, "xpath": xpath, "element": ET.tostring(element, encoding="unicode") if element is not None else "",
                         "family": family, "label": label, "name": change_name or xpath.rsplit("/", 1)[-1]})
 
@@ -5762,6 +6031,20 @@ def config_workspace_push(workspace_id):
                 raise RuntimeError(
                     "Candidate bevat zoneverwijzingen die ongeldig zijn voor de geselecteerde VSYS; los die eerst op"
                 )
+        deleted_objects: dict[str, list[str]] = defaultdict(list)
+        object_type_by_node = {node: kind for kind, node in OBJECT_NODES.items()}
+        for change in chosen:
+            if change["action"] != "delete" or not change["family"].startswith("object:"):
+                continue
+            node = change["family"].split(":", 1)[1]
+            object_type = object_type_by_node.get(node)
+            if not object_type or object_type not in REFERENCE_CHECK_OBJECT_TYPES:
+                raise RuntimeError(f"Veilige verwijdercontrole ontbreekt voor configuratietype {node}; niets geschreven")
+            if not change.get("name"):
+                raise RuntimeError(f"Verwijdering van {node} heeft geen herkenbare objectnaam; niets geschreven")
+            deleted_objects[object_type].append(change["name"])
+        for object_type, names in deleted_objects.items():
+            validate_workspace_object_deletions(push_desired_xml, object_type, names)
         for change in chosen:
             params = {"type": "config", "action": change["action"], "xpath": change["xpath"], "key": key}
             if change["action"] in {"set", "edit"}:
@@ -8303,13 +8586,31 @@ def object_delete_preview(profile_id, object_type):
     with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
     if not profile: return "Not found", 404
     try:
+        delete_unused = request.form.get("delete_unused") == "yes"
+        if delete_unused and object_type not in UNUSED_OBJECT_TYPES:
+            raise ValueError("Ongebruikt verwijderen is niet beschikbaar voor dit objecttype")
         selected_ids = set(request.form.getlist("object_id"))
-        if not selected_ids: raise ValueError("Selecteer minstens één object")
         current = fetch_scm_objects(profile, object_type)
+        references = None
+        if not selected_ids and not delete_unused:
+            raise ValueError("Selecteer minstens één object")
+        if delete_unused:
+            references = validate_live_object_deletions(profile, object_type, [str(item.get("name", "")) for item in current])
+            selected_ids = {
+                str(item.get("id", "")) for item in current
+                if item.get("name") and not references.get(str(item["name"]))
+            }
+            if not selected_ids:
+                raise ValueError("Geen ongebruikte objecten gevonden in deze scope")
         selected = [item for item in current if str(item.get("id", "")) in selected_ids]
         if len(selected) != len(selected_ids): raise ValueError("Niet alle geselecteerde objecten bestaan nog. Vernieuw de lijst.")
+        selected_names = [str(item.get("name", "")) for item in selected]
+        if references is None:
+            validate_live_object_deletions(profile, object_type, selected_names)
+        elif any(references.get(name) for name in selected_names):
+            raise ValueError("Een van de geselecteerde objecten wordt inmiddels gebruikt; niets verwijderd")
         draft_id = secrets.token_urlsafe(18)
-        draft = {"profile_id": profile_id, "created_at": now(), "object_type": object_type, "operation": "delete", "objects": [{"value": item, "fingerprint": object_fingerprint(item)} for item in selected]}
+        draft = {"profile_id": profile_id, "created_at": now(), "object_type": object_type, "operation": "delete", "delete_unused": delete_unused, "objects": [{"value": item, "fingerprint": object_fingerprint(item)} for item in selected]}
         path = OBJECT_DRAFTS / f"{draft_id}.json"; path.write_text(json.dumps(draft)); path.chmod(0o600)
         audit("object-delete-preview", f"profile={profile['name']} type={object_type} count={len(selected)}")
         return render_template("object_preview.html", profile=profile, object_type=object_type, object_label=SCM_OBJECT_TYPES[object_type]["label"], delete_objects=selected, operation="delete", draft_id=draft_id)
@@ -8327,6 +8628,8 @@ def object_push(draft_id):
     draft = json.loads(path.read_text())
     with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (draft["profile_id"],)).fetchone()
     if not profile: return "Not found", 404
+    deleted_count = 0
+    delete_progress = [0]
     try:
         object_type = draft["object_type"]
         metadata = SCM_OBJECT_TYPES[object_type]
@@ -8346,9 +8649,27 @@ def object_push(draft_id):
             else:
                 validate_object_payload(draft["payload"], object_type, current, str(before["id"]))
         elif operation == "delete":
+            current_by_id = {str(item.get("id", "")): item for item in current}
+            current_by_name = {str(item.get("name", "")): item for item in current}
+            pending_entries = []
             for entry in draft["objects"]:
-                before = entry["value"]; live = next((item for item in current if str(item.get("id", "")) == str(before.get("id", ""))), None)
-                if not live or object_fingerprint(live) != entry["fingerprint"]: raise RuntimeError(f"Object {before['name']} is intussen gewijzigd; Delete gestopt.")
+                before = entry["value"]
+                live = current_by_id.get(str(before.get("id", "")))
+                if not live:
+                    if str(before.get("name", "")) in current_by_name:
+                        raise RuntimeError(f"Object {before['name']} heeft intussen een andere identiteit; Delete gestopt.")
+                    # A previous multi-delete may have completed before a later API error.
+                    # Treat an already absent object as complete on retry.
+                    continue
+                if object_fingerprint(live) != entry["fingerprint"]:
+                    raise RuntimeError(f"Object {before['name']} is intussen gewijzigd; Delete gestopt.")
+                pending_entries.append(entry)
+            draft = {**draft, "objects": pending_entries}
+            if pending_entries:
+                validate_live_object_deletions(
+                    profile, object_type,
+                    [str(entry["value"].get("name", "")) for entry in pending_entries],
+                )
         else: raise RuntimeError("Onbekende objectbewerking")
         if operation in {"create", "update"} and not metadata.get("generic"):
             validate_object_references(
@@ -8370,15 +8691,23 @@ def object_push(draft_id):
             if operation == "create": policy_api.scm_http_request("POST", f"{root}/{endpoint_name}", token, payload=payload)
             elif operation == "update": policy_api.scm_http_request("PUT", f"{root}/{endpoint_name}/{draft['before']['id']}", token, payload=payload)
             else:
-                for entry in draft["objects"]: policy_api.scm_http_request("DELETE", f"{root}/{endpoint_name}/{entry['value']['id']}", token, params=container)
+                for entry in draft["objects"]:
+                    policy_api.scm_http_request("DELETE", f"{root}/{endpoint_name}/{entry['value']['id']}", token, params=container)
+                    deleted_count += 1
         else:
-            write_panos_object_draft(profile, draft)
+            write_panos_object_draft(
+                profile, draft,
+                on_delete=lambda: delete_progress.__setitem__(0, delete_progress[0] + 1),
+            )
+            deleted_count = delete_progress[0]
         path.unlink()
         count = len(draft.get("objects", [])) or 1
         audit("object-candidate", f"profile={profile['name']} operation={operation} type={object_type} count={count}")
         flash(f"Objectbewerking ({operation}) geschreven naar {profile['target_type'].upper()} candidate.", "success")
     except Exception as exc:
-        flash(f"Object-Push gestopt: {exc}", "error")
+        deleted_count = max(deleted_count, delete_progress[0])
+        partial = f" ({deleted_count} object(en) al verwijderd; herhaal dezelfde preview om verder te gaan)" if deleted_count else ""
+        flash(f"Object-Push gestopt: {exc}{partial}", "error")
     return redirect(url_for("index", policy_profile=profile["id"], policy_view=managed_view(draft["object_type"]), object_type=draft["object_type"]) + "#policy-management")
 
 

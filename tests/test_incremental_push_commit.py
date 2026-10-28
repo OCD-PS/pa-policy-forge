@@ -264,6 +264,45 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertIn("conflicterende wijzigingen", response.get_data(as_text=True))
         api_post.assert_not_called()
 
+    def test_deleted_object_is_rechecked_against_references_added_after_workspace_pull(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<address><entry name="late-reference"><ip-netmask>192.0.2.99/32</ip-netmask></entry></address>'
+            b'</entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find(".//address/entry[@name='late-reference']").clear()
+        desired_root.find(".//address").remove(desired_root.find(".//address/entry"))
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "object delete rebase", "candidate.xml", desired, "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        current_root = main.ET.fromstring(base)
+        rulebase = main.ET.SubElement(current_root.find(".//vsys/entry"), "rulebase")
+        security = main.ET.SubElement(rulebase, "security")
+        rules = main.ET.SubElement(security, "rules")
+        rule = main.ET.SubElement(rules, "entry", {"name": "colleague-rule"})
+        source = main.ET.SubElement(rule, "source")
+        main.ET.SubElement(source, "member").text = "late-reference"
+        current = main.normalized_config_xml(current_root)
+        selected = next(
+            item for item in main.config_push_delta(current, desired)
+            if item["family"] == "object:address" and item["action"] == "delete"
+        )
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), current)), \
+             patch("app.main.panos_api_post") as api_post:
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push",
+                base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": selected["selection_key"]},
+                follow_redirects=True,
+            )
+
+        self.assertIn("objecten zijn nog in gebruik", response.get_data(as_text=True))
+        api_post.assert_not_called()
+
     def test_commit_is_opt_in_and_status_checks_are_rate_limited(self):
         with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), self.candidate_xml)):
             preview = self.client.get(
