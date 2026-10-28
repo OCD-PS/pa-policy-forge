@@ -5078,6 +5078,22 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes, desired_root=None) ->
         before_counts, after_counts = {}, {}
         for child in before_children: before_counts[child.tag] = before_counts.get(child.tag, 0) + 1
         for child in after_children: after_counts[child.tag] = after_counts.get(child.tag, 0) + 1
+        policy_member_list = (
+            "rules" in parts
+            and any(part in _PUSH_POLICY_NODES for part in parts)
+            and before_children
+            and after_children
+            and all(child.tag == "member" for child in (*before_children, *after_children))
+        )
+        if policy_member_list:
+            # PAN-OS `set` appends members at an existing list XPath. Sending a
+            # changed member there can leave an old wildcard such as `any` next
+            # to the new value. Replace this one policy field as a whole so the
+            # API receives the complete desired list and sibling rule fields stay
+            # untouched.
+            if xml_content_signature(before) != xml_content_signature(after):
+                add("edit", node_path(parent_path, after), after, here_parts, protected_source=before)
+            return
         named_entries = bool(before_children or after_children) and all(
             child.tag == "entry" and child.get("name") for child in (*before_children, *after_children)
         )
