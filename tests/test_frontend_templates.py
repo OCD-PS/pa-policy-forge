@@ -54,6 +54,12 @@ class FrontendTemplateTests(unittest.TestCase):
         self.assertIn("+3 meer", long)
         self.assertIn("five", long)
 
+    def test_workspace_editor_omits_multi_vsys_explainer_but_keeps_policy_guidance(self):
+        source = self.environment().loader.get_source(self.environment(), "workspace_editor.html")[0]
+        self.assertNotIn("Multi-VSYS-configuratie", source)
+        self.assertNotIn("PAN-OS valideert elke policy tegen de zones", source)
+        self.assertIn("Klik op een policy om ze te bewerken. Inherited regels openen in hun owning scope.", source)
+
     def test_device_workspace_owns_zone_mapping_and_push_flow(self):
         source = self.environment().loader.get_source(self.environment(), "app.html")[0]
         self.assertIn("Firewall toevoegen", source)
