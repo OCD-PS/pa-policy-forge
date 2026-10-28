@@ -49,6 +49,61 @@ class ConfigPushDeltaTests(unittest.TestCase):
         self.assertEqual([child.tag for child in payload], ["action"])
         self.assertEqual(payload.findtext("action"), "allow")
 
+    def test_policy_any_to_object_replaces_the_complete_source_list(self):
+        current = b"""<config><devices><entry name=\"localhost.localdomain\"><vsys><entry name=\"vsys1\"><rulebase><security><rules><entry name=\"salto toegang\"><source><member>any</member></source><destination><member>any</member></destination><action>allow</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
+        desired = b"""<config><devices><entry name=\"localhost.localdomain\"><vsys><entry name=\"vsys1\"><rulebase><security><rules><entry name=\"salto toegang\"><source><member>CN</member></source><destination><member>any</member></destination><action>allow</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
+
+        changes = main.config_push_delta(current, desired)
+
+        self.assertEqual(len(changes), 1)
+        change = changes[0]
+        self.assertEqual(change["action"], "edit")
+        self.assertEqual(
+            change["xpath"],
+            "/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/rulebase/security/rules/entry[@name='salto toegang']/source",
+        )
+        self.assertEqual(change["scope"], "vsys1")
+        payload = ET.fromstring(change["element"])
+        self.assertEqual(payload.tag, "source")
+        self.assertEqual([member.text for member in payload.findall("member")], ["CN"])
+
+    def test_policy_object_to_any_replaces_the_complete_source_list(self):
+        current = b"""<config><devices><entry name=\"localhost.localdomain\"><vsys><entry name=\"vsys1\"><rulebase><security><rules><entry name=\"salto toegang\"><source><member>CN</member><member>RU</member></source><action>allow</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
+        desired = b"""<config><devices><entry name=\"localhost.localdomain\"><vsys><entry name=\"vsys1\"><rulebase><security><rules><entry name=\"salto toegang\"><source><member>any</member></source><action>allow</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
+
+        changes = main.config_push_delta(current, desired)
+
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["action"], "edit")
+        payload = ET.fromstring(changes[0]["element"])
+        self.assertEqual([member.text for member in payload.findall("member")], ["any"])
+
+    def test_panorama_policy_member_replacement_keeps_device_group_scope(self):
+        current = b"""<config><devices><entry name=\"localhost.localdomain\"><device-group><entry name=\"HQ\"><pre-rulebase><security><rules><entry name=\"Allow\"><source><member>any</member></source><action>allow</action></entry></rules></security></pre-rulebase></entry></device-group></entry></devices></config>"""
+        desired = b"""<config><devices><entry name=\"localhost.localdomain\"><device-group><entry name=\"HQ\"><pre-rulebase><security><rules><entry name=\"Allow\"><source><member>CN</member></source><action>allow</action></entry></rules></security></pre-rulebase></entry></device-group></entry></devices></config>"""
+
+        changes = main.config_push_delta(current, desired)
+
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["action"], "edit")
+        self.assertEqual(changes[0]["scope"], "HQ")
+        self.assertEqual(changes[0]["family"], "policy:security")
+        self.assertEqual(changes[0]["xpath"], "/config/devices/entry[@name='localhost.localdomain']/device-group/entry[@name='HQ']/pre-rulebase/security/rules/entry[@name='Allow']/source")
+
+    def test_shared_policy_member_replacement_keeps_shared_scope(self):
+        current = b"""<config><shared><pre-rulebase><security><rules><entry name=\"Allow\"><destination><member>any</member></destination><action>allow</action></entry></rules></security></pre-rulebase></shared></config>"""
+        desired = b"""<config><shared><pre-rulebase><security><rules><entry name=\"Allow\"><destination><member>10.10.102.56</member></destination><action>allow</action></entry></rules></security></pre-rulebase></shared></config>"""
+
+        changes = main.config_push_delta(current, desired)
+
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["action"], "edit")
+        self.assertEqual(changes[0]["scope"], "Shared")
+        self.assertEqual(changes[0]["family"], "policy:security")
+        payload = ET.fromstring(changes[0]["element"])
+        self.assertEqual(payload.tag, "destination")
+        self.assertEqual([member.text for member in payload.findall("member")], ["10.10.102.56"])
+
     def test_policy_set_fields_are_batched_into_one_api_write(self):
         current = b"<config><shared><pre-rulebase><security><rules><entry name='Allow'><action>allow</action><disabled>no</disabled></entry></rules></security></pre-rulebase></shared></config>"
         desired = b"<config><shared><pre-rulebase><security><rules><entry name='Allow'><action>deny</action><disabled>yes</disabled></entry></rules></security></pre-rulebase></shared></config>"
