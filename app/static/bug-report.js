@@ -10,6 +10,9 @@
     .bug-report-launcher:hover,.bug-report-launcher:focus{background:#ff9833;outline:3px solid #fff}
     .bug-report-dialog{width:min(680px,calc(100vw - 24px));max-height:calc(100vh - 24px);padding:0;border:1px solid #555;border-radius:10px;background:#161616;color:#eee;box-shadow:0 24px 70px #000b}
     .bug-report-dialog::backdrop{background:#000b;backdrop-filter:blur(2px)}.bug-report-dialog form{padding:20px}
+    .bug-report-priority-notices{display:grid;gap:8px;max-height:20vh;overflow:auto}.bug-report-priority-notices[hidden]{display:none}
+    .bug-report-priority-notice{padding:10px 12px;border:1px solid #414141;border-left:4px solid #58a6ff;border-radius:6px;background:#202020;color:#eee}
+    .bug-report-priority-notice.is-success{border-left-color:#35b875}.bug-report-priority-notice.is-warning{border-left-color:#e9a23b}.bug-report-priority-notice.is-error{border-left-color:#e05252}
     .bug-report-dialog .stack{display:grid;gap:14px}.bug-report-dialog .field{display:grid;gap:6px}.bug-report-dialog label{font-weight:700}
     .bug-report-dialog input,.bug-report-dialog textarea{box-sizing:border-box;width:100%;border:1px solid #484848;border-radius:5px;padding:10px;background:#090909;color:#fff;font:inherit}
     .bug-report-preview{display:block;max-width:100%;max-height:35vh;object-fit:contain;border:1px solid #444;border-radius:6px;background:#080808}
@@ -33,6 +36,7 @@
   dialog.innerHTML = `
     <form method="dialog" class="stack" data-bug-report-form>
       <div class="card-header"><div><h2 id="bug-report-title">Bug melden</h2><p>Controleer de screenshot voor je de melding verstuurt.</p></div><button type="button" class="bug-report-close" data-close>Sluiten</button></div>
+      <div class="bug-report-priority-notices" data-priority-notices role="status" aria-live="polite" hidden></div>
       <div data-preview-wrap><p class="bug-report-status" data-capture-status role="status" aria-live="polite">Screenshot wordt gemaakt…</p><img class="bug-report-preview" data-preview alt="Voorbeeld van de screenshot"><button type="button" data-capture-retry hidden>Screenshot opnieuw maken</button><label data-capture-fallback hidden>Automatische opname lukt niet? Voeg een PNG-screenshot toe en controleer die op gevoelige informatie.<input type="file" accept="image/png" data-capture-file></label></div>
       <div class="field"><label for="bug-report-email">Je e-mailadres</label><input id="bug-report-email" name="email" type="email" maxlength="254" autocomplete="email" required></div>
       <div class="field"><label for="bug-report-description">Wat ging er mis?</label><textarea id="bug-report-description" name="description" rows="5" maxlength="5000" required></textarea></div>
@@ -50,6 +54,84 @@
   const captureFallback = dialog.querySelector("[data-capture-fallback]");
   const captureFile = dialog.querySelector("[data-capture-file]");
   const form = dialog.querySelector("[data-bug-report-form]");
+  const preview = dialog.querySelector("[data-preview]");
+  const priorityNotices = dialog.querySelector("[data-priority-notices]");
+  let noticeObserver = null;
+  let noticeRefreshScheduled = false;
+  let noticeSignature = "";
+
+  function readVisibleNotices() {
+    return Array.from(document.querySelectorAll('.flash-stack .flash,.workspace-loading-status,[role="status"],[aria-live="polite"],[aria-live="assertive"]'))
+      .filter((element) => element !== priorityNotices && !dialog.contains(element))
+      .map((element) => {
+        try {
+          if (element.hidden || element.closest("[hidden]")) return null;
+          const style = getComputedStyle(element);
+          if (style.display === "none" || style.visibility === "hidden" || element.checkVisibility?.() === false) return null;
+          const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
+          if (!text) return null;
+          const classes = element.className && typeof element.className === "string" ? element.className : "";
+          const severity = /(?:^|\s)(?:flash-error|flash-danger|error|danger)(?:\s|$)/.test(classes)
+            ? "error"
+            : /(?:^|\s)(?:flash-warning|warning)(?:\s|$)/.test(classes)
+              ? "warning"
+              : /(?:^|\s)flash-success(?:\s|$)/.test(classes) ? "success" : "info";
+          return { text, severity };
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  }
+
+  function refreshPriorityNotices() {
+    noticeRefreshScheduled = false;
+    if (!dialog.open) return;
+    const notices = readVisibleNotices();
+    const signature = JSON.stringify(notices);
+    if (signature === noticeSignature) return;
+    noticeSignature = signature;
+    priorityNotices.replaceChildren(...notices.map(({ text, severity }) => {
+      const notice = document.createElement("div");
+      notice.className = `bug-report-priority-notice${severity === "info" ? "" : ` is-${severity}`}`;
+      notice.textContent = text;
+      return notice;
+    }));
+    priorityNotices.hidden = notices.length === 0;
+  }
+
+  function schedulePriorityNoticeRefresh() {
+    if (noticeRefreshScheduled || !dialog.open) return;
+    noticeRefreshScheduled = true;
+    window.requestAnimationFrame(refreshPriorityNotices);
+  }
+
+  function observePriorityNotices() {
+    refreshPriorityNotices();
+    if (noticeObserver) return;
+    noticeObserver = new MutationObserver(schedulePriorityNoticeRefresh);
+    noticeObserver.observe(document.body, {
+      subtree: true,
+      childList: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["aria-live", "class", "hidden", "role", "style"],
+    });
+  }
+
+  function stopObservingPriorityNotices() {
+    noticeObserver?.disconnect();
+    noticeObserver = null;
+    noticeSignature = "";
+    priorityNotices.replaceChildren();
+    priorityNotices.hidden = true;
+  }
+
+  function clearScreenshotPreview() {
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    previewUrl = "";
+    preview.removeAttribute("src");
+  }
 
   function openBugReport(event) {
     const clickedLauncher = event?.currentTarget || launcher;
@@ -62,13 +144,14 @@
     result.textContent = "";
     submit.disabled = true;
     status.textContent = "Screenshot wordt gemaakt…";
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    previewUrl = "";
+    clearScreenshotPreview();
     dialog.showModal();
+    observePriorityNotices();
     captureScreenshot();
   }
 
   async function captureScreenshot() {
+    clearScreenshotPreview();
     captureRetry.hidden = true;
     screenshotBlob = null;
     submit.disabled = true;
@@ -81,6 +164,7 @@
       status.textContent = "Screenshot klaar. Bekende geheime formuliervelden zijn afgeschermd. Andere gevoelige tekst kan zichtbaar zijn; controleer de afbeelding voor verzending.";
       submit.disabled = false;
     } catch (error) {
+      clearScreenshotPreview();
       status.textContent = error?.captureStage === "too-large"
         ? "De screenshot blijft te groot. Verklein het browservenster en probeer opnieuw."
         : formatCaptureError(error);
@@ -164,12 +248,31 @@
   syncModalLaunchers();
 
   function safePageClone() {
-    const clonedRoot = document.documentElement.cloneNode(true);
-    clonedRoot.querySelectorAll("[data-bug-report-launcher],.bug-report-dialog,script,iframe,object,embed,link[rel~='stylesheet']").forEach((node) => node.remove());
-    clonedRoot.querySelectorAll("[data-bug-report-modal-launcher]").forEach((node) => node.remove());
-    const sourceDialogs = Array.from(document.querySelectorAll("dialog:not(.bug-report-dialog)"));
-    clonedRoot.querySelectorAll("dialog:not(.bug-report-dialog)").forEach((clonedDialog, index) => {
-      const sourceDialog = sourceDialogs[index];
+    const omittedNodes = "[data-bug-report-launcher],.bug-report-dialog,[data-bug-report-modal-launcher],script,iframe,object,embed,link[rel~='stylesheet']";
+    const dialogPairs = [];
+    function cloneNodeSafely(node) {
+      if (node.nodeType === Node.ELEMENT_NODE && node.matches(omittedNodes)) return null;
+      let clone;
+      try {
+        clone = node.cloneNode(false);
+      } catch {
+        // A page widget can have browser-managed state that cannot be cloned.
+        // Skip only that subtree so one unusual control cannot block the report.
+        return null;
+      }
+      if (node.nodeType === Node.ELEMENT_NODE && node.tagName === "DIALOG") {
+        dialogPairs.push({ source: node, clone });
+      }
+      for (const child of Array.from(node.childNodes)) {
+        const childClone = cloneNodeSafely(child);
+        if (!childClone) continue;
+        try { clone.appendChild(childClone); } catch { /* Keep the rest of the page snapshot. */ }
+      }
+      return clone;
+    }
+    const clonedRoot = cloneNodeSafely(document.documentElement);
+    if (!clonedRoot) throw captureFailure("page-copy", new Error("page root could not be copied"));
+    dialogPairs.forEach(({ source: sourceDialog, clone: clonedDialog }) => {
       if (!sourceDialog?.open) {
         clonedDialog.remove();
         return;
@@ -180,29 +283,41 @@
       Array.from(clonedDialog.attributes).forEach((attribute) => {
         if (attribute.name !== "open") snapshotDialog.setAttribute(attribute.name, attribute.value);
       });
-      const sourceStyle = getComputedStyle(sourceDialog);
-      for (const property of sourceStyle) {
-        snapshotDialog.style.setProperty(property, sourceStyle.getPropertyValue(property));
+      try {
+        const sourceStyle = getComputedStyle(sourceDialog);
+        for (const property of sourceStyle) {
+          snapshotDialog.style.setProperty(property, sourceStyle.getPropertyValue(property));
+        }
+      } catch {
+        clonedDialog.remove();
+        return;
       }
       snapshotDialog.style.setProperty("display", "block");
       while (clonedDialog.firstChild) snapshotDialog.append(clonedDialog.firstChild);
       clonedDialog.replaceWith(snapshotDialog);
     });
     clonedRoot.querySelectorAll("input,textarea,select").forEach((field) => {
-      const key = `${field.name || ""} ${field.id || ""} ${field.autocomplete || ""}`.toLowerCase();
-      if (field.type === "password" || /password|secret|token|api.?key|credential|private.?key/.test(key)) {
-        field.value = "[verborgen]";
-        field.setAttribute("value", "[verborgen]");
-        if (field.tagName === "TEXTAREA") field.textContent = "[verborgen]";
-      } else if (field.tagName === "INPUT" && field.type !== "hidden") {
-        if (["checkbox", "radio"].includes(field.type)) field.toggleAttribute("checked", field.checked);
-        else field.setAttribute("value", field.value);
-      } else if (field.tagName === "TEXTAREA") {
-        field.textContent = field.value;
-      } else if (field.tagName === "SELECT") {
-        field.querySelectorAll("option").forEach((option) => option.toggleAttribute("selected", option.selected));
+      try {
+        const key = `${field.name || ""} ${field.id || ""} ${field.autocomplete || ""}`.toLowerCase();
+        if (field.type === "password" || /password|secret|token|api.?key|credential|private.?key/.test(key)) {
+          field.value = "[verborgen]";
+          field.setAttribute("value", "[verborgen]");
+          if (field.tagName === "TEXTAREA") field.textContent = "[verborgen]";
+        } else if (field.tagName === "INPUT" && field.type !== "hidden") {
+          if (["checkbox", "radio"].includes(field.type)) field.toggleAttribute("checked", field.checked);
+          else if (field.type !== "file") field.setAttribute("value", field.value);
+        } else if (field.tagName === "TEXTAREA") {
+          field.textContent = field.value;
+        } else if (field.tagName === "SELECT") {
+          field.querySelectorAll("option").forEach((option) => option.toggleAttribute("selected", option.selected));
+        }
+        if (field.type === "hidden") field.remove();
+      } catch {
+        // Do not fail the entire screenshot on an unusual browser-managed field.
+        field.removeAttribute("value");
+        field.removeAttribute("checked");
+        if (field.tagName === "TEXTAREA") field.textContent = "";
       }
-      if (field.type === "hidden") field.remove();
     });
     clonedRoot.querySelectorAll("img").forEach((image) => {
       try {
@@ -294,8 +409,8 @@
     if (event.target === dialog) dialog.close();
   });
   dialog.addEventListener("close", () => {
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    previewUrl = "";
+    stopObservingPriorityNotices();
+    clearScreenshotPreview();
   });
 
   form.addEventListener("submit", async (event) => {
