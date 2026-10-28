@@ -37,7 +37,7 @@ from cryptography.hazmat.primitives import hashes
 from defusedxml import ElementTree as SafeET
 from flask import Flask, Response, flash, has_request_context, redirect, render_template, request, send_file, session, url_for
 
-from app.bug_reports import create_bug_reports_blueprint
+from app.bug_reports import create_bug_reports_blueprint, prune_bug_reports
 from app.certificates import (
     CERTIFICATE_MAX_BYTES,
     PRIVATE_KEY_MAX_BYTES,
@@ -537,6 +537,7 @@ def init_db() -> None:
         # Other accounts, if provisioned later, remain non-admin unless explicitly promoted.
         conn.execute("UPDATE users SET is_admin=1 WHERE username='admin'")
         conn.execute("DELETE FROM bug_reports WHERE created_at<strftime('%Y-%m-%d %H:%M:%S','now','-180 days')")
+        prune_bug_reports(conn)
         project_columns = {row[1] for row in conn.execute("PRAGMA table_info(migration_projects)")}
         if "topology" not in project_columns:
             conn.execute("ALTER TABLE migration_projects ADD COLUMN topology TEXT NOT NULL DEFAULT 'active-passive'")

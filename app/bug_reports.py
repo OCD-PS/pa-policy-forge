@@ -18,13 +18,42 @@ from flask import (
 from PIL import Image, UnidentifiedImageError
 
 MAX_SCREENSHOT_BYTES = 2 * 1024 * 1024
-MAX_TOTAL_REPORTS = 1000
+MAX_TOTAL_REPORTS = 100
 MAX_SCREENSHOT_STORAGE_BYTES = 256 * 1024 * 1024
 SMTP_TIMEOUT_SECONDS = 12
 SMTP_PORTS = {25, 465, 587, 2525}
 VALID_STATUSES = {"new", "triaged", "in_progress", "fixed_deployed", "closed"}
 EMAIL_RE = re.compile(r"^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$")
 SMTP_HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+
+
+def prune_bug_reports(conn, incoming_screenshot_bytes=0):
+    """Keep the newest reports that fit count and encrypted screenshot limits."""
+    incoming_screenshot_bytes = max(0, int(incoming_screenshot_bytes))
+    if incoming_screenshot_bytes > MAX_SCREENSHOT_STORAGE_BYTES:
+        return 0
+
+    keep_limit = MAX_TOTAL_REPORTS - (1 if incoming_screenshot_bytes else 0)
+    rows = conn.execute(
+        "SELECT id,COALESCE(length(screenshot_blob),0) AS screenshot_bytes "
+        "FROM bug_reports ORDER BY created_at DESC,id DESC"
+    ).fetchall()
+    keep_ids = []
+    keep_bytes = 0
+    for row in rows:
+        screenshot_bytes = int(row["screenshot_bytes"] or 0)
+        if (
+            len(keep_ids) >= keep_limit
+            or keep_bytes + screenshot_bytes + incoming_screenshot_bytes > MAX_SCREENSHOT_STORAGE_BYTES
+        ):
+            break
+        keep_ids.append(int(row["id"]))
+        keep_bytes += screenshot_bytes
+
+    delete_ids = [int(row["id"]) for row in rows[len(keep_ids):]]
+    if delete_ids:
+        conn.executemany("DELETE FROM bug_reports WHERE id=?", ((report_id,) for report_id in delete_ids))
+    return len(delete_ids)
 
 
 def create_bug_reports_blueprint(db, fernet, now, audit):
@@ -117,7 +146,7 @@ def create_bug_reports_blueprint(db, fernet, now, audit):
             reports = conn.execute(
                 "SELECT id,secret_blob,(screenshot_blob IS NOT NULL) AS has_screenshot,"
                 "status,created_at,updated_at,notified_at "
-                "FROM bug_reports ORDER BY id DESC LIMIT 200"
+                "FROM bug_reports ORDER BY id DESC LIMIT ?", (MAX_TOTAL_REPORTS,)
             ).fetchall()
         report_views = []
         for report in reports:
@@ -246,6 +275,7 @@ def create_bug_reports_blueprint(db, fernet, now, audit):
             ).fetchone()[0]
             if recent >= 5:
                 return {"error": "Er zijn te veel meldingen verstuurd. Probeer het later opnieuw."}, 429
+            pruned_reports = prune_bug_reports(conn, len(encrypted_screenshot))
             usage = conn.execute(
                 "SELECT COUNT(*),COALESCE(SUM(length(screenshot_blob)),0) FROM bug_reports"
             ).fetchone()
@@ -257,7 +287,7 @@ def create_bug_reports_blueprint(db, fernet, now, audit):
                 (session["user_id"], private_data, encrypted_screenshot, timestamp, timestamp),
             )
             report_id = int(cursor.lastrowid)
-        audit("bug-report-submitted", f"report_id={report_id}")
+        audit("bug-report-submitted", f"report_id={report_id} pruned={pruned_reports}")
         return {"id": report_id, "message": "Bedankt. Je melding staat veilig in de reviewwachtrij."}, 201
 
     @bp.post("/admin/bug-reports/<int:report_id>/delete")
