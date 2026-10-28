@@ -219,6 +219,162 @@ OBJECT_NODES = {
 }
 
 
+UNUSED_OBJECT_TYPES = frozenset({
+    "addresses", "address-groups", "application-groups", "services",
+    "service-groups", "tags",
+})
+REFERENCE_CHECK_OBJECT_TYPES = UNUSED_OBJECT_TYPES | frozenset({
+    "regions", "applications", "application-filters", "schedules",
+    "security-profile-groups", "log-forwarding", "custom-url-categories",
+    "hip-profiles", "dynamic-user-groups",
+})
+
+
+def object_reference_index(xml_bytes: bytes, object_type: str, names: Iterable[str]) -> dict[str, list[str]]:
+    """Find conservative, typed references to named PAN-OS objects.
+
+    The scan uses the complete configuration root so Shared, every VSYS, and
+    Panorama device groups/templates can protect an object from deletion.
+    Unknown or unparsable configurations must be treated by callers as unsafe.
+    """
+    if object_type not in REFERENCE_CHECK_OBJECT_TYPES | {"certificates"}:
+        raise OfflineConfigError("Voor dit configuratietype is geen referentiecontrole beschikbaar")
+    root = SafeET.fromstring(xml_bytes)
+    wanted = {str(name): [] for name in names if str(name)}
+    if not wanted:
+        return wanted
+
+    parent = {child: node for node in root.iter() for child in node}
+    paths: dict[ET.Element, str] = {root: "/" + root.tag}
+    for node in root.iter():
+        if node not in paths:
+            owner = parent.get(node)
+            if owner is None:
+                paths[node] = "/" + node.tag
+            else:
+                suffix = f"[@name={node.get('name')}]" if node.tag == "entry" and node.get("name") else ""
+                paths[node] = paths[owner] + "/" + node.tag + suffix
+
+    def add(value: str, path: str) -> None:
+        value = value.strip()
+        if value in wanted and path not in wanted[value]:
+            wanted[value].append(path[:240])
+
+    def ancestors(node: ET.Element) -> list[str]:
+        result = []
+        current = node
+        while current is not None:
+            result.append(current.tag)
+            current = parent.get(current)
+        return result
+
+    policy_kinds = set(POLICY_NODES.values())
+    for node in root.iter():
+        chain = ancestors(node)
+        chain_set = set(chain)
+        parent_node = parent.get(node)
+
+        if object_type == "certificates":
+            # The API configuration stores certificate references as named
+            # values in profiles and SSL/TLS settings; also honor PAN-OS's
+            # special Forward Trust / Forward Untrust usage marker.
+            if node.tag in {
+                "certificate", "certificate-name", "ca-certificate", "ca-certificates",
+                "forward-trust-certificate", "forward-untrust-certificate", "root-ca",
+                "ssl-tls-service-profile", "server-certificate",
+            }:
+                add(node.text or "", paths[node])
+            if node.tag == "rsa" and chain_set & {"forward-trust-certificate", "forward-untrust-certificate"}:
+                add(node.text or "", paths[node])
+            if node.tag == "member" and chain_set & {"ca", "certificate", "ca-certificates", "trusted-root-CA", "trusted-root-ca"}:
+                add(node.text or "", paths[node])
+            if node.tag == "entry" and str(node.findtext("./usage", "")).casefold() in {
+                "forward-trust", "forward-untrust", "forward trust", "forward untrust",
+                "forward-trust-certificate", "forward-untrust-certificate",
+            }:
+                add(node.get("name", ""), paths[node] + "/usage")
+            continue
+
+        if object_type in {"addresses", "address-groups", "regions"}:
+            is_policy_reference = (
+                node.tag == "member" and parent_node is not None
+                and parent_node.tag in {"source", "destination"}
+                and "rulebase" in chain_set and bool(chain_set & policy_kinds)
+            )
+            is_group_member = (
+                node.tag == "member" and parent_node is not None and parent_node.tag == "static"
+                and "address-group" in chain_set
+            )
+            is_nat_translation = (
+                node.tag in {"translated-address", "translated-port", "member"}
+                and node.text and bool(chain_set & {"source-translation", "destination-translation"})
+            )
+            if is_policy_reference or is_group_member or is_nat_translation:
+                add(node.text or "", paths[node])
+        elif object_type in {"services", "service-groups"}:
+            is_policy_reference = (
+                node.tag == "member" and parent_node is not None and parent_node.tag == "service"
+                and "rulebase" in chain_set and bool(chain_set & policy_kinds)
+            )
+            is_group_member = (
+                node.tag == "member" and parent_node is not None and parent_node.tag == "members"
+                and "service-group" in chain_set
+            )
+            if is_policy_reference or is_group_member:
+                add(node.text or "", paths[node])
+        elif object_type == "application-groups":
+            is_policy_reference = (
+                node.tag == "member" and parent_node is not None and parent_node.tag == "application"
+                and "rulebase" in chain_set and bool(chain_set & policy_kinds)
+            )
+            is_group_member = (
+                node.tag == "member" and parent_node is not None and parent_node.tag == "members"
+                and "application-group" in chain_set
+            )
+            if is_policy_reference or is_group_member:
+                add(node.text or "", paths[node])
+        elif object_type in {"applications", "application-filters"}:
+            is_policy_reference = (
+                node.tag == "member" and parent_node is not None
+                and parent_node.tag in {"application", "application-filter"}
+                and "rulebase" in chain_set and bool(chain_set & policy_kinds)
+            )
+            is_group_member = (
+                node.tag == "member" and parent_node is not None and parent_node.tag == "members"
+                and "application-group" in chain_set
+            )
+            if is_policy_reference or is_group_member:
+                add(node.text or "", paths[node])
+        elif object_type == "schedules":
+            if node.tag == "schedule" and "rulebase" in chain_set and bool(chain_set & policy_kinds):
+                add(node.text or "", paths[node])
+        elif object_type == "security-profile-groups":
+            if node.tag == "member" and parent_node is not None and parent_node.tag == "group" and "profile-setting" in chain_set:
+                add(node.text or "", paths[node])
+        elif object_type == "log-forwarding":
+            if node.tag == "log-setting" and "rulebase" in chain_set and bool(chain_set & policy_kinds):
+                add(node.text or "", paths[node])
+        elif object_type == "custom-url-categories":
+            if node.tag == "member" and parent_node is not None and parent_node.tag == "category" and "rulebase" in chain_set:
+                add(node.text or "", paths[node])
+        elif object_type == "hip-profiles":
+            if node.tag == "member" and parent_node is not None and parent_node.tag in {"source-hip", "destination-hip"}:
+                add(node.text or "", paths[node])
+        elif object_type == "dynamic-user-groups":
+            if node.tag == "member" and parent_node is not None and parent_node.tag in {"source-user", "destination-user"}:
+                add(node.text or "", paths[node])
+        elif object_type == "tags":
+            if node.tag == "member" and parent_node is not None and parent_node.tag in {"tag", "tags"}:
+                add(node.text or "", paths[node])
+            if node.tag == "filter" and node.text:
+                expression = node.text
+                for name in wanted:
+                    if re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w.-])", expression):
+                        add(name, paths[node])
+
+    return wanted
+
+
 # New generic objects need a real PAN-OS-shaped entry before the field editor can
 # render anything.  These seeds deliberately contain only safe, editable defaults;
 # fields unknown to this application are still preserved when an existing entry is

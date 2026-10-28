@@ -11,7 +11,7 @@ from app.offline_config import (
     delete_policies_from_snapshot, insert_policy_in_snapshot, move_policies_in_snapshot,
     object_create_record, object_fingerprint, policy_create_record, policy_fingerprint, render_set_commands, replace_policy_in_snapshot,
     referenced_template, scoped_objects, scoped_policies,
-    scoped_server_profiles,
+    scoped_server_profiles, object_reference_index,
 )
 
 
@@ -23,6 +23,31 @@ INHERITED = b'''<config version="12.1"><shared><address><entry name="shared-a"><
 
 
 class OfflineConfigTests(unittest.TestCase):
+    def test_reference_index_protects_shared_objects_from_other_vsys(self):
+        source = b'''<config><shared><address><entry name="SharedServer"/></address><service><entry name="tcp-8443"/></service><tag><entry name="Prod"/></tag></shared><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase><security><rules><entry name="allow"><source><member>SharedServer</member></source><service><member>tcp-8443</member></service><tag><member>Prod</member></tag></entry></rules></security></rulebase></entry><entry name="vsys2"><rulebase><nat><rules><entry name="translate"><destination-translation><translated-address>SharedServer</translated-address></destination-translation></entry></rules></nat></rulebase></entry></vsys></entry></devices></config>'''
+        addresses = object_reference_index(source, "addresses", ["SharedServer", "unused"])
+        services = object_reference_index(source, "services", ["tcp-8443"])
+        tags = object_reference_index(source, "tags", ["Prod", "unused"])
+        self.assertTrue(any("vsys1" in path for path in addresses["SharedServer"]))
+        self.assertTrue(any("vsys2" in path for path in addresses["SharedServer"]))
+        self.assertEqual(addresses["unused"], [])
+        self.assertTrue(services["tcp-8443"])
+        self.assertTrue(tags["Prod"])
+        self.assertEqual(tags["unused"], [])
+
+    def test_reference_index_detects_group_members_dynamic_tag_filters_and_cert_use(self):
+        source = b'''<config><shared><address-group><entry name="servers"><static><member>server-a</member></static></entry><entry name="dynamic-servers"><dynamic><filter> 'Prod' </filter></dynamic></entry></address-group><certificate><entry name="proxy-cert"><usage>forward-trust</usage></entry></certificate><ssl-decrypt><entry name="decrypt"><forward-trust-certificate>proxy-cert</forward-trust-certificate></entry></ssl-decrypt></shared></config>'''
+        self.assertTrue(object_reference_index(source, "addresses", ["server-a"])["server-a"])
+        self.assertTrue(object_reference_index(source, "tags", ["Prod"])["Prod"])
+        certificate_uses = object_reference_index(source, "certificates", ["proxy-cert"])["proxy-cert"]
+        self.assertGreaterEqual(len(certificate_uses), 2)
+
+    def test_reference_index_detects_nested_nat_members_and_documented_certificate_fields(self):
+        source = b'''<config><shared><rulebase><nat><rules><entry name="dynamic-nat"><source-translation><dynamic-ip-and-port><translated-address><member>nat-pool</member></translated-address></dynamic-ip-and-port></source-translation></entry></rules></nat></rulebase><ssl-decrypt><trusted-root-CA><member>root-ca</member></trusted-root-CA><forward-trust-certificate><rsa>forward-cert</rsa></forward-trust-certificate></ssl-decrypt></shared></config>'''
+        self.assertTrue(object_reference_index(source, "addresses", ["nat-pool"])["nat-pool"])
+        self.assertTrue(object_reference_index(source, "certificates", ["root-ca"])["root-ca"])
+        self.assertTrue(object_reference_index(source, "certificates", ["forward-cert"])["forward-cert"])
+
     def test_empty_network_containers_are_not_fake_records_and_can_be_bootstrapped(self):
         source = b'<config><devices><entry name="localhost.localdomain"><network><interface><ethernet /></interface></network><vsys><entry name="vsys1"><zone /></entry></vsys></entry></devices></config>'
         _, interfaces = configuration_records(source, "vsys1", "", "network", "interfaces")
