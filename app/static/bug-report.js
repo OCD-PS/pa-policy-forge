@@ -81,12 +81,36 @@
       status.textContent = "Screenshot klaar. Bekende geheime formuliervelden zijn afgeschermd. Andere gevoelige tekst kan zichtbaar zijn; controleer de afbeelding voor verzending.";
       submit.disabled = false;
     } catch (error) {
-      status.textContent = error?.message === "too-large"
+      status.textContent = error?.captureStage === "too-large"
         ? "De screenshot blijft te groot. Verklein het browservenster en probeer opnieuw."
-        : "De automatische screenshot is mislukt. Probeer opnieuw; je ingevulde melding blijft staan.";
+        : formatCaptureError(error);
       captureRetry.hidden = false;
       captureFallback.hidden = false;
     }
+  }
+
+  function formatCaptureError(error) {
+    const stageLabels = {
+      "page-copy": "de pagina kopiëren",
+      "svg-serialize": "de kopie voorbereiden",
+      "svg-decode": "de afbeelding in de browser laden",
+      "canvas-create": "de afbeelding voorbereiden",
+      "canvas-render": "de pagina tekenen",
+      "png-export": "de PNG maken",
+    };
+    const safeErrorNames = new Set([
+      "EncodingError", "InvalidStateError", "NotSupportedError", "OperationError", "SecurityError",
+    ]);
+    const code = safeErrorNames.has(error?.cause?.name) ? error.cause.name : "browserfout";
+    const stage = stageLabels[error?.captureStage] || "de pagina vastleggen";
+    return `Automatische screenshot faalde bij ${stage} (${code}). Probeer opnieuw of voeg een PNG toe; je melding blijft staan.`;
+  }
+
+  function captureFailure(stage, cause) {
+    const error = new Error(stage);
+    error.captureStage = stage;
+    error.cause = cause;
+    return error;
   }
 
   launcher.addEventListener("click", openBugReport);
@@ -208,38 +232,63 @@
     const width = Math.max(1, Math.min(window.innerWidth, 2400));
     const height = Math.max(1, Math.min(window.innerHeight, 1600));
     const initialScale = Math.min(1, 1600 / width, 1000 / height);
-    const root = safePageClone();
-    const container = document.createElementNS("http://www.w3.org/1999/xhtml", "div");
-    container.setAttribute("style", `position:relative;width:${width}px;height:${height}px;overflow:hidden`);
-    container.append(root);
-    const xhtml = new XMLSerializer().serializeToString(container);
-    let lastError = null;
+    let root;
+    try {
+      root = safePageClone();
+    } catch (error) {
+      throw captureFailure("page-copy", error);
+    }
+    let xhtml;
+    try {
+      const container = document.createElementNS("http://www.w3.org/1999/xhtml", "div");
+      container.setAttribute("style", `position:relative;width:${width}px;height:${height}px;overflow:hidden`);
+      container.append(root);
+      xhtml = new XMLSerializer().serializeToString(container);
+    } catch (error) {
+      throw captureFailure("svg-serialize", error);
+    }
+
     for (const scale of [initialScale, initialScale * 0.8, initialScale * 0.65, initialScale * 0.5]) {
       const outputWidth = Math.max(1, Math.round(width * scale));
       const outputHeight = Math.max(1, Math.round(height * scale));
-      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${outputWidth}" height="${outputHeight}" viewBox="0 0 ${width} ${height}"><foreignObject width="100%" height="100%">${xhtml}</foreignObject></svg>`;
-      const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }));
+      let url;
+      try {
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${outputWidth}" height="${outputHeight}" viewBox="0 0 ${width} ${height}"><foreignObject width="100%" height="100%">${xhtml}</foreignObject></svg>`;
+        url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }));
+      } catch (error) {
+        throw captureFailure("svg-serialize", error);
+      }
       try {
         const image = new Image();
         image.src = url;
-        await image.decode();
+        try {
+          await image.decode();
+        } catch (error) {
+          throw captureFailure("svg-decode", error);
+        }
         const canvas = document.createElement("canvas");
         canvas.width = outputWidth;
         canvas.height = outputHeight;
         const context = canvas.getContext("2d", { alpha: false });
-        if (!context) throw new Error("canvas-unavailable");
-        context.drawImage(image, 0, 0, canvas.width, canvas.height);
-        const blob = await new Promise((resolve) => canvas.toBlob((value) => resolve(value), "image/png"));
-        if (blob && blob.size <= 2 * 1024 * 1024) return blob;
-        if (!blob) throw new Error("canvas-encode-failed");
-        lastError = new Error("too-large");
-      } catch (error) {
-        lastError = error;
+        if (!context) throw captureFailure("canvas-create", new Error("unavailable"));
+        try {
+          context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        } catch (error) {
+          throw captureFailure("canvas-render", error);
+        }
+        let blob;
+        try {
+          blob = await new Promise((resolve) => canvas.toBlob((value) => resolve(value), "image/png"));
+        } catch (error) {
+          throw captureFailure("png-export", error);
+        }
+        if (!blob) throw captureFailure("png-export", new Error("empty result"));
+        if (blob.size <= 2 * 1024 * 1024) return blob;
       } finally {
         URL.revokeObjectURL(url);
       }
     }
-    throw lastError || new Error("capture-failed");
+    throw captureFailure("too-large", null);
   }
 
   dialog.querySelector("[data-close]").addEventListener("click", () => dialog.close());
