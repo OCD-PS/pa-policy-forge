@@ -572,8 +572,9 @@ def init_db() -> None:
                 raise RuntimeError(
                     "A new installation requires PPF_BOOTSTRAP_PASSWORD with at least 12 non-default characters"
                 )
-            conn.execute("INSERT INTO users(username,password_hash,must_change,is_admin) VALUES(?,?,1,1)",
+            conn.execute("INSERT INTO users(username,password_hash,must_change) VALUES(?,?,1)",
                          ("admin", password_hash(bootstrap_password)))
+            conn.execute("UPDATE users SET is_admin=1 WHERE username='admin'")
         conn.execute(
             "UPDATE runs SET status='failed',finished_at=strftime('%Y-%m-%d %H:%M:%S','now'),"
             "output=CASE WHEN output='' THEN 'Run onderbroken door een applicatieherstart.' ELSE output END "
