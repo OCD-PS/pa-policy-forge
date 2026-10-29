@@ -1548,6 +1548,37 @@ class TargetAdapterTests(unittest.TestCase):
                 conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
                 conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
 
+    def test_pulled_workspace_reuses_validated_parse_for_snapshot_and_baseline(self):
+        timestamp = main.now()
+        settings = json.dumps({"endpoint": "https://firewall.example.invalid"})
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("preparsed-workspace-test", 1, "", "", "panos", settings, b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        xml = b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"/></vsys></entry></devices></config>'
+        parsed = main.parse_snapshot(xml, expected_kind="panos")
+        try:
+            with patch.object(main, "parse_snapshot", side_effect=AssertionError("unexpected XML reparse")):
+                workspace_id = main.store_config_workspace(
+                    profile, "preparsed", "api-candidate.xml", xml, "api",
+                    baseline_xml=xml, parsed_config=parsed,
+                )
+            workspace = main.workspace_row(workspace_id)
+            baseline = main.workspace_baseline_config(workspace)
+            self.assertEqual(baseline, main.workspace_config_path(workspace).read_bytes())
+        finally:
+            if "workspace_id" in locals():
+                workspace = main.workspace_row(workspace_id)
+                main.workspace_config_path(workspace).unlink(missing_ok=True)
+                pathlib.Path(workspace["baseline_config_path"]).unlink(missing_ok=True)
+                with main.db() as conn:
+                    conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
+            with main.db() as conn:
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
     def test_offline_object_create_preview_and_apply_creates_new_workspace(self):
         timestamp = main.now()
         with main.db() as conn:
