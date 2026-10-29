@@ -77,7 +77,8 @@ from app.offline_config import (
     policy_fingerprint as offline_policy_fingerprint, render_set_commands,
     panos_ui_decorate_record, scoped_server_profiles,
     object_reference_index,
-    duplicate_object_groups, merge_duplicate_object_groups,
+    duplicate_object_groups, duplicate_object_groups_across_panos_scopes,
+    merge_duplicate_object_groups, merge_duplicate_object_groups_to_shared,
     move_panos_scope_entries,
     replace_policy_in_snapshot, replace_policies_in_snapshot, insert_policy_in_snapshot,
     delete_policies_from_snapshot, move_policies_in_snapshot,
@@ -4849,6 +4850,68 @@ def config_workspace_object_merge_preview(workspace_id):
         ))
 
 
+@app.post("/config-workspaces/<int:workspace_id>/objects/merge-shared-preview")
+@login_required
+def config_workspace_object_merge_shared_preview(workspace_id):
+    """Preview functional duplicates across Shared and all standalone VSYS scopes."""
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    scope = request.form.get("scope", "")
+    return_object_type = request.form.get("object_type", "")
+    try:
+        if workspace["target_type"] != "panos":
+            raise OfflineConfigError("Samenvoegen naar Shared vereist standalone PAN-OS")
+        xml_bytes, parsed_root, snapshot = cached_workspace_config(
+            workspace["config_path"], workspace["sha256"],
+        )
+        if snapshot.kind != "panos" or len(snapshot.vsys) < 2:
+            raise OfflineConfigError("Samenvoegen naar Shared vereist standalone PAN-OS met meerdere VSYS")
+        if scope not in available_scopes(snapshot) and scope != "Shared":
+            raise OfflineConfigError("De geselecteerde scope bestaat niet meer")
+
+        groups = []
+        object_types = sorted(MERGEABLE_OBJECT_TYPES)
+        for object_type in object_types:
+            label = SCM_OBJECT_TYPES.get(object_type, {}).get("label", object_type)
+            groups.extend({
+                **group,
+                "object_type": object_type,
+                "object_label": label,
+            } for group in duplicate_object_groups_across_panos_scopes(
+                xml_bytes, object_type, parsed=(parsed_root, snapshot),
+            ))
+        if not groups:
+            flash("Geen inhoudelijk identieke objecten gevonden tussen Shared en verschillende VSYS.", "info")
+            return redirect(url_for(
+                "config_workspace_editor", workspace_id=workspace_id, scope=scope,
+                workspace_view="objects", object_type=return_object_type,
+            ))
+
+        draft_id = secrets.token_urlsafe(24)
+        draft = {
+            "workspace_id": workspace_id, "scope": scope,
+            "object_type": return_object_type or "__all__",
+            "return_object_type": return_object_type,
+            "object_types": object_types,
+            "operation": "merge_to_shared", "groups": groups, "created_at": now(),
+        }
+        draft_path = OBJECT_DRAFTS / f"offline-object-{draft_id}.json"
+        draft_path.write_text(json.dumps(draft))
+        draft_path.chmod(0o600)
+        return render_template(
+            "workspace_object_merge_preview.html", workspace=workspace,
+            draft=draft, draft_id=draft_id,
+            object_label="alle ondersteunde objecten en services tussen scopes",
+        )
+    except Exception as exc:
+        flash(f"Duplicaten niet voorbereid: {exc}", "error")
+        return redirect(url_for(
+            "config_workspace_editor", workspace_id=workspace_id, scope=scope,
+            workspace_view="objects", object_type=return_object_type,
+        ))
+
+
 @app.post("/config-workspaces/<int:workspace_id>/objects/delete-preview")
 @login_required
 def config_workspace_object_delete_preview(workspace_id):
@@ -4918,7 +4981,25 @@ def config_workspace_object_apply(draft_id):
         workspace = workspace_row(int(draft["workspace_id"]))
         if not workspace:
             raise OfflineConfigError("De bronworkspace bestaat niet meer")
-        if draft.get("operation") == "merge":
+        if draft.get("operation") == "merge_to_shared":
+            selections = []
+            for group in draft.get("groups", []):
+                object_type = group.get("object_type", "")
+                if object_type not in MERGEABLE_OBJECT_TYPES:
+                    raise OfflineConfigError("Samenvoegen naar Shared is voor dit objecttype niet veilig ondersteund")
+                candidate_id = request.form.get(f"master_{group.get('id', '')}", "")
+                candidates = [item for item in group.get("objects", []) if item.get("candidate_id") == candidate_id]
+                if len(candidates) != 1:
+                    raise OfflineConfigError("Kies precies één Shared-master per duplicaatgroep")
+                selections.append({
+                    "object_type": object_type,
+                    "objects": group["objects"],
+                    "master": {"scope": candidates[0]["scope"], "name": candidates[0]["name"]},
+                })
+            new_xml, merge_summary = merge_duplicate_object_groups_to_shared(
+                workspace_config_path(workspace).read_bytes(), selections,
+            )
+        elif draft.get("operation") == "merge":
             selections = []
             for group in draft.get("groups", []):
                 object_type = group.get("object_type", draft.get("object_type"))
@@ -4968,9 +5049,10 @@ def config_workspace_object_apply(draft_id):
             f"types={','.join(draft.get('object_types', [draft['object_type']]))} "
             f"operation={draft['operation']}",
         )
-        if draft.get("operation") == "merge":
+        if draft.get("operation") in {"merge", "merge_to_shared"}:
+            destination = " naar Shared" if draft.get("operation") == "merge_to_shared" else ""
             flash(
-                f"{merge_summary['merged']} duplicaatobject(en) samengevoegd in {merge_summary['groups']} groep(en); referenties bijgewerkt.",
+                f"{merge_summary['merged']} duplicaatobject(en){destination} samengevoegd in {merge_summary['groups']} groep(en); referenties bijgewerkt.",
                 "success",
             )
         else:

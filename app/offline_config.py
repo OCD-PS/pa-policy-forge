@@ -441,6 +441,59 @@ def duplicate_object_groups(xml_bytes: bytes, scope: str, object_type: str, pars
     return sorted(groups, key=lambda group: group["objects"][0]["name"].casefold())
 
 
+def duplicate_object_groups_across_panos_scopes(xml_bytes: bytes, object_type: str, parsed=None) -> list[dict]:
+    """Find functional duplicates defined in Shared and multiple standalone VSYS scopes."""
+    if object_type not in MERGEABLE_OBJECT_TYPES:
+        raise OfflineConfigError("Dubbele objecten samenvoegen is niet veilig ondersteund voor dit objecttype")
+    root, snapshot = parsed if parsed is not None else parse_snapshot(xml_bytes)
+    if snapshot.kind != "panos" or len(snapshot.vsys) < 2:
+        raise OfflineConfigError("Scope-overstijgend samenvoegen vereist standalone PAN-OS met meerdere VSYS")
+
+    by_signature: dict[tuple, list[dict]] = {}
+    for scope in ["Shared", *snapshot.vsys]:
+        scope_root = _scope_root(root, snapshot, scope)
+        if scope_root is None:
+            continue
+        collection = scope_root
+        for part in OBJECT_NODES[object_type].split("/"):
+            collection = collection.find(f"./{part}")
+            if collection is None:
+                break
+        if collection is None:
+            continue
+        for entry in collection.findall("./entry"):
+            record = object_record(entry, scope, True, object_type)
+            fingerprint = hashlib.sha256(ET.tostring(entry, encoding="utf-8")).hexdigest()
+            candidate_id = hashlib.sha256(
+                f"{object_type}\0{scope}\0{entry.get('name', '')}\0{fingerprint}".encode()
+            ).hexdigest()[:24]
+            by_signature.setdefault(_merge_object_signature(entry, object_type), []).append({
+                "name": entry.get("name", ""),
+                "owner": scope,
+                "scope": scope,
+                "description": record.get("description") or record.get("comments", ""),
+                "tags": list(record.get("tag", []) or []),
+                "summary": record.get("summary", ""),
+                "fingerprint": fingerprint,
+                "candidate_id": candidate_id,
+            })
+
+    groups = []
+    scope_order = {scope: index for index, scope in enumerate(["Shared", *snapshot.vsys])}
+    for signature, items in by_signature.items():
+        if len(items) < 2 or len({item["scope"] for item in items}) < 2:
+            continue
+        sorted_items = sorted(items, key=lambda item: (scope_order[item["scope"]], item["name"].casefold()))
+        group_id = hashlib.sha256("\0".join(item["candidate_id"] for item in sorted_items).encode()).hexdigest()[:20]
+        groups.append({
+            "id": group_id,
+            "objects": sorted_items,
+            "metadata_differs": len({item["description"] for item in items}) > 1,
+            "tags_differ": len({tuple(sorted(item["tags"])) for item in items}) > 1,
+        })
+    return sorted(groups, key=lambda group: (group["objects"][0]["name"].casefold(), group["id"]))
+
+
 def _find_scoped_object_entry(root: ET.Element, snapshot: ConfigSnapshot, scope: str, object_type: str, name: str) -> ET.Element | None:
     scope_root = _scope_root(root, snapshot, scope)
     if scope_root is None:
@@ -774,6 +827,247 @@ def merge_duplicate_object_groups(
     for collection, entry in selected_entries.values():
         collection.remove(entry)
     return normalized_config_xml(root), {"merged": len(selected_entries), "groups": len(selections)}
+
+
+def merge_duplicate_object_groups_to_shared(
+    xml_bytes: bytes, selections: list[dict],
+) -> tuple[bytes, dict[str, int]]:
+    """Merge identical local/Shared PAN-OS objects into one Shared definition."""
+    root, snapshot = parse_snapshot(xml_bytes)
+    if snapshot.kind != "panos" or len(snapshot.vsys) < 2:
+        raise OfflineConfigError("Scope-overstijgend samenvoegen vereist standalone PAN-OS met meerdere VSYS")
+    if not isinstance(selections, list) or not selections:
+        raise OfflineConfigError("Selecteer minstens één scope-overstijgende duplicaatgroep")
+
+    valid_scopes = {"Shared", *snapshot.vsys}
+    selected_by_key: dict[tuple[str, str, str], tuple[ET.Element, ET.Element]] = {}
+    selected_by_entry: dict[ET.Element, tuple[str, str, str]] = {}
+    merged_groups: list[dict] = []
+    target_signatures: dict[tuple[str, str], tuple] = {}
+
+    def collection_for(scope_name: str, object_type: str, *, create: bool = False) -> ET.Element | None:
+        scope_root = _scope_root(root, snapshot, scope_name)
+        if scope_root is None and create and scope_name == "Shared":
+            scope_root = ET.SubElement(root, "shared")
+        if scope_root is None:
+            return None
+        collection = scope_root
+        for part in OBJECT_NODES[object_type].split("/"):
+            child = collection.find(f"./{part}")
+            if child is None:
+                if not create:
+                    return None
+                child = ET.SubElement(collection, part)
+            collection = child
+        return collection
+
+    for selection in selections:
+        object_type = str(selection.get("object_type", ""))
+        if object_type not in MERGEABLE_OBJECT_TYPES:
+            raise OfflineConfigError("Scope-overstijgend samenvoegen is niet veilig ondersteund voor dit type")
+        raw_objects = selection.get("objects")
+        master = selection.get("master")
+        if not isinstance(raw_objects, list) or len(raw_objects) < 2 or not isinstance(master, dict):
+            raise OfflineConfigError("Een duplicaatgroep bevat geen geldige scope/objectselectie")
+
+        entries: list[tuple[tuple[str, str, str], ET.Element, ET.Element]] = []
+        signatures = set()
+        for item in raw_objects:
+            if not isinstance(item, dict):
+                raise OfflineConfigError("Een duplicaatgroep bevat een ongeldige objectselectie")
+            owner = str(item.get("scope", ""))
+            name = str(item.get("name", ""))
+            key = (object_type, owner, name)
+            if owner not in valid_scopes or not name or key in selected_by_key:
+                raise OfflineConfigError("Duplicaatgroepen overlappen of bevatten een onbekende scope")
+            collection = collection_for(owner, object_type)
+            matches = [entry for entry in collection.findall("./entry") if entry.get("name") == name] if collection is not None else []
+            if len(matches) != 1:
+                raise OfflineConfigError(f"Object {name} in {owner} is intussen gewijzigd of bestaat niet meer")
+            entry = matches[0]
+            fingerprint = hashlib.sha256(ET.tostring(entry, encoding="utf-8")).hexdigest()
+            if not isinstance(item.get("fingerprint"), str) or not hmac.compare_digest(item["fingerprint"], fingerprint):
+                raise OfflineConfigError(f"Object {name} in {owner} is intussen gewijzigd; maak een nieuwe merge-preview")
+            entries.append((key, collection, entry))
+            signatures.add(_merge_object_signature(entry, object_type))
+        if len(signatures) != 1 or len({key[1] for key, _, _ in entries}) < 2:
+            raise OfflineConfigError("De objecten zijn niet langer gelijk of komen niet uit meerdere scopes")
+
+        master_scope = str(master.get("scope", ""))
+        master_name = str(master.get("name", ""))
+        master_key = (object_type, master_scope, master_name)
+        if master_key not in {key for key, _, _ in entries}:
+            raise OfflineConfigError("De gekozen Shared-master hoort niet bij deze duplicaatgroep")
+        target_key = (object_type, master_name)
+        signature = next(iter(signatures))
+        if target_key in target_signatures and target_signatures[target_key] != signature:
+            raise OfflineConfigError(f"Naam {master_name} zou verschillende objecten in Shared samenvoegen")
+        target_signatures[target_key] = signature
+
+        for key, collection, entry in entries:
+            selected_by_key[key] = (collection, entry)
+            selected_by_entry[entry] = key
+        merged_groups.append({
+            "object_type": object_type,
+            "entries": entries,
+            "master_key": master_key,
+            "master_name": master_name,
+            "signature": signature,
+        })
+
+    if not selected_by_key:
+        raise OfflineConfigError("Er zijn geen scope-overstijgende duplicaten geselecteerd")
+
+    # A Shared master cannot be shadowed by a different local definition in any VSYS.
+    for group in merged_groups:
+        object_type, master_name = group["master_key"][0], group["master_name"]
+        for owner in ["Shared", *snapshot.vsys]:
+            collection = collection_for(owner, object_type)
+            matches = [entry for entry in collection.findall("./entry") if entry.get("name") == master_name] if collection is not None else []
+            for entry in matches:
+                key = (object_type, owner, master_name)
+                if key not in selected_by_key:
+                    raise OfflineConfigError(
+                        f"Shared-master {master_name} wordt overschaduwd door een ander object in {owner}; "
+                        "los die naamconflict eerst op",
+                    )
+
+    duplicates_by_entry: dict[ET.Element, tuple[str, str]] = {}
+    for group in merged_groups:
+        object_type = group["object_type"]
+        master_key = group["master_key"]
+        master_entry = selected_by_key[master_key][1]
+        for key, _, entry in group["entries"]:
+            duplicates_by_entry[entry] = (object_type, group["master_name"])
+        if object_type in {"services", "service-groups"}:
+            master_tag = master_entry.find("./tag")
+            seen_tags = {
+                (item.text or "").strip()
+                for item in (master_tag.findall("./member") if master_tag is not None else [])
+            }
+            for _, _, entry in group["entries"]:
+                for tag in entry.findall("./tag/member"):
+                    value = (tag.text or "").strip()
+                    if value and value not in seen_tags:
+                        if master_tag is None:
+                            master_tag = ET.SubElement(master_entry, "tag")
+                        ET.SubElement(master_tag, "member").text = value
+                        seen_tags.add(value)
+
+    parent_map = {child: parent for parent in root.iter() for child in parent}
+    resolution_cache: dict[tuple[str, str, str], ET.Element | None] = {}
+
+    def resolve(scope_name: str, object_type: str, name: str) -> ET.Element | None:
+        cache_key = (scope_name, object_type, name)
+        if cache_key not in resolution_cache:
+            resolution_cache[cache_key] = _resolve_scoped_object_entry(root, snapshot, scope_name, object_type, name)
+        return resolution_cache[cache_key]
+
+    replacements_to_verify: list[tuple[ET.Element, str, str, str]] = []
+    for object_type in {key[0] for key in selected_by_key}:
+        refs, expressions = _typed_object_reference_nodes(root, object_type)
+        replaced_by_parent: dict[ET.Element, set[str]] = {}
+        for node in refs:
+            reference_scope = _reference_scope(node, parent_map, snapshot)
+            value = (node.text or "").strip()
+            if reference_scope is None:
+                if any(key[0] == object_type and key[2] == value for key in selected_by_key):
+                    raise OfflineConfigError(f"Referentie naar object {value} heeft geen herkenbare scope; niets opgeslagen")
+                continue
+            entry = resolve(reference_scope, object_type, value)
+            selected_key = selected_by_entry.get(entry) if entry is not None else None
+            if selected_key is None:
+                continue
+            master_name = duplicates_by_entry[entry][1]
+            node.text = master_name
+            replacements_to_verify.append((node, reference_scope, object_type, master_name))
+            if node in parent_map:
+                replaced_by_parent.setdefault(parent_map[node], set()).add(master_name)
+
+        for node in expressions:
+            reference_scope = _reference_scope(node, parent_map, snapshot)
+            expression = node.text or ""
+            relevant_names = {
+                key[2] for key in selected_by_key if key[0] == object_type
+                and re.search(rf"(?<![\w.-]){re.escape(key[2])}(?![\w.-])", expression)
+            }
+            if reference_scope is None:
+                if relevant_names:
+                    raise OfflineConfigError("Tagfilter met een geselecteerd object heeft geen herkenbare scope; niets opgeslagen")
+                continue
+            for old_name in relevant_names:
+                entry = resolve(reference_scope, object_type, old_name)
+                selected_key = selected_by_entry.get(entry) if entry is not None else None
+                if selected_key is None:
+                    continue
+                master_name = duplicates_by_entry[entry][1]
+                expression = re.sub(
+                    rf"(?<![\w.-]){re.escape(old_name)}(?![\w.-])",
+                    lambda _: master_name,
+                    expression,
+                )
+                # Each expression can mention multiple merged names. Keep the
+                # specific token so verification resolves an object name, not
+                # the complete filter expression.
+                replacements_to_verify.append((node, reference_scope, object_type, master_name))
+            node.text = expression
+
+        for parent, merged_names in replaced_by_parent.items():
+            children = list(parent)
+            if not children or any(child.tag != "member" for child in children):
+                continue
+            seen = set()
+            for child in children:
+                value = (child.text or "").strip()
+                if value in merged_names and value in seen:
+                    parent.remove(child)
+                elif value in merged_names:
+                    seen.add(value)
+
+    # Copy masters only after rewriting references in the source tree. This is
+    # important for nested objects: a copied Shared address-group must inherit
+    # any member rewrites made while merging its referenced address objects.
+    shared_entries: dict[tuple[str, str], ET.Element] = {}
+    for index, group in enumerate(merged_groups):
+        object_type = group["object_type"]
+        master_name = group["master_name"]
+        target_key = (object_type, master_name)
+        master_entry = selected_by_key[group["master_key"]][1]
+        target_entry = copy.deepcopy(master_entry)
+        prior = shared_entries.get(target_key)
+        if prior is not None:
+            if _merge_object_signature(prior, object_type) != group["signature"]:
+                raise OfflineConfigError(f"Naam {master_name} zou verschillende objecten in Shared samenvoegen")
+            # Identical groups with a common target name retain metadata from the
+            # first selected master while unioning service tags.
+            if object_type in {"services", "service-groups"}:
+                tag = prior.find("./tag")
+                seen = {(item.text or "").strip() for item in (tag.findall("./member") if tag is not None else [])}
+                for member in target_entry.findall("./tag/member"):
+                    value = (member.text or "").strip()
+                    if value and value not in seen:
+                        if tag is None:
+                            tag = ET.SubElement(prior, "tag")
+                        ET.SubElement(tag, "member").text = value
+                        seen.add(value)
+        else:
+            shared_entries[target_key] = target_entry
+
+    for collection, entry in selected_by_key.values():
+        collection.remove(entry)
+    for (object_type, _), entry in shared_entries.items():
+        collection = collection_for("Shared", object_type, create=True)
+        if any(item.get("name") == entry.get("name") for item in collection.findall("./entry")):
+            raise OfflineConfigError(f"Object {entry.get('name')} bestaat al in Shared")
+        collection.append(entry)
+
+    for node, reference_scope, object_type, master_name in replacements_to_verify:
+        resolved = _resolve_scoped_object_entry(root, snapshot, reference_scope, object_type, master_name)
+        expected_entry = shared_entries.get((object_type, master_name))
+        if expected_entry is None or resolved is not expected_entry:
+            raise OfflineConfigError("Een verwijzing naar de nieuwe Shared-master wordt lokaal overschaduwd; niets opgeslagen")
+
+    return normalized_config_xml(root), {"merged": len(selected_by_key) - len(merged_groups), "groups": len(merged_groups)}
 
 
 # New generic objects need a real PAN-OS-shaped entry before the field editor can
