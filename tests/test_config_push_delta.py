@@ -275,6 +275,27 @@ class ConfigPushDeltaTests(unittest.TestCase):
 
         self.assertEqual(changes, [])
 
+    def test_predefined_catalog_changes_are_never_pushable(self):
+        current = b"""<config><predefined><application><entry name=\"abbott-poca\"><category>business-systems</category><default><port><member>tcp/443</member></port></default></entry><entry name=\"legacy-app\"><category>old</category></entry></application><history><entry name=\"abbott-poca\"><member>old</member></entry></history></predefined></config>"""
+        desired = b"""<config><predefined><application><entry name=\"abbott-poca\"><category>collaboration</category><default><port><member>tcp/8443</member></port></default></entry><entry name=\"new-app\"><category>new</category></entry></application><history><entry name=\"abbott-poca\"><member>new</member></entry></history></predefined></config>"""
+
+        changes = main.config_push_delta(current, desired)
+
+        self.assertEqual(changes, [])
+
+    def test_predefined_catalog_is_ignored_when_present_on_only_one_side(self):
+        current = b"""<config><predefined><application><entry name=\"abbott-poca\"><category>business-systems</category></entry></application></predefined></config>"""
+        desired = b"<config />"
+
+        changes = main.config_push_delta(current, desired)
+
+        self.assertEqual(changes, [])
+
+        current, desired = desired, current
+        changes = main.config_push_delta(current, desired)
+
+        self.assertEqual(changes, [])
+
     def test_multi_vsys_additions_are_diffed_per_named_entry(self):
         current = b"""<config><devices><entry name=\"localhost.localdomain\"><vsys><entry name=\"vsys1\"><address><entry name=\"Existing1\"><ip-netmask>192.0.2.1/32</ip-netmask></entry></address><rulebase><security><rules><entry name=\"Keep1\"><action>allow</action></entry></rules></security></rulebase></entry><entry name=\"vsys2\"><address><entry name=\"Existing2\"><ip-netmask>192.0.2.2/32</ip-netmask></entry></address><rulebase><security><rules><entry name=\"Keep2\"><action>allow</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
         desired = b"""<config><devices><entry name=\"localhost.localdomain\"><vsys><entry name=\"vsys1\"><address><entry name=\"Existing1\"><ip-netmask>192.0.2.1/32</ip-netmask></entry></address><rulebase><security><rules><entry name=\"Keep1\"><action>allow</action></entry></rules></security></rulebase></entry><entry name=\"vsys2\"><address><entry name=\"Existing2\"><ip-netmask>192.0.2.2/32</ip-netmask></entry><entry name=\"PF_E2E_ADDR\"><ip-netmask>203.0.113.79/32</ip-netmask></entry></address><rulebase><security><rules><entry name=\"Keep2\"><action>allow</action></entry><entry name=\"PF_E2E_RULE\"><action>deny</action><disabled>yes</disabled></entry></rules></security></rulebase></entry></vsys></entry></devices></config>"""
