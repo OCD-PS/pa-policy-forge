@@ -354,6 +354,116 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertEqual({write["action"] for write in writes}, {"set", "delete"})
         self.assertTrue(any("/shared/address" in write["xpath"] for write in writes if write["action"] == "set"))
 
+    def test_moving_referenced_vsys2_destination_object_to_shared_allows_incremental_push(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared/><devices><entry name="localhost.localdomain"><vsys>'
+            b'<entry name="vsys1"><address/></entry><entry name="vsys2">'
+            b'<address><entry name="aaa-first"><ip-netmask>192.0.2.1/32</ip-netmask></entry>'
+            b'<entry name="XIQ-NL-GCP"><ip-netmask>198.51.100.45/32</ip-netmask></entry></address>'
+            b'<rulebase><security><rules><entry name="Explore-Access Points-to-XIQ-RadSec">'
+            b'<destination><member>XIQ-NL-GCP</member></destination></entry></rules></security></rulebase>'
+            b'</entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        local_collection = desired_root.find("./devices/entry/vsys/entry[@name='vsys2']/address")
+        local_entries = list(local_collection)
+        for local_entry in local_entries:
+            local_collection.remove(local_entry)
+        shared_collection = main.ET.SubElement(desired_root.find("./shared"), "address")
+        for local_entry in local_entries:
+            shared_collection.append(local_entry)
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "move vsys2 destination object to Shared", "candidate.xml", desired, "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        changes = main.config_push_delta(base, desired)
+        selected = list(dict.fromkeys(item["selection_key"] for item in changes))
+        shared_addition = next(item for item in changes if item["action"] == "set" and item["scope"] == "Shared")
+        self.assertIn("XIQ-NL-GCP", main.config_push_change_names(shared_addition))
+
+        def api_response(endpoint, params, ctx):
+            if params["type"] == "config":
+                return '<response status="success" code="20"><result/></response>'
+            if params["type"] == "op":
+                return '<response status="success"><result><job>607</job></result></response>'
+            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post", side_effect=api_response) as api_post, \
+             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": selected}, follow_redirects=True,
+            )
+
+        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
+        writes = [call.args[1] for call in api_post.call_args_list if call.args[1]["type"] == "config"]
+        self.assertEqual({write["action"] for write in writes}, {"set", "delete"})
+        self.assertTrue(any("/vsys/entry[@name='vsys2']/address" in write["xpath"] for write in writes if write["action"] == "delete"))
+        self.assertTrue(any("/shared/address" in write["xpath"] for write in writes if write["action"] == "set"))
+
+    def create_existing_shared_object_move_workspace(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address><entry name="XIQ-NL-GCP"><ip-netmask>198.51.100.44/32</ip-netmask>'
+            b'</entry></address></shared><devices><entry name="localhost.localdomain"><vsys>'
+            b'<entry name="vsys1"><address/></entry><entry name="vsys2">'
+            b'<address><entry name="XIQ-NL-GCP"><ip-netmask>198.51.100.45/32</ip-netmask></entry></address>'
+            b'<rulebase><security><rules><entry name="Explore-Access Points-to-XIQ-RadSec">'
+            b'<destination><member>XIQ-NL-GCP</member></destination></entry></rules></security></rulebase>'
+            b'</entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find("./devices/entry/vsys/entry[@name='vsys2']/address").clear()
+        desired_root.find("./shared/address/entry[@name='XIQ-NL-GCP']/ip-netmask").text = "198.51.100.45/32"
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "move existing Shared object", "candidate.xml", desired, "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        changes = main.config_push_delta(base, desired)
+        removal = next(item for item in changes if item["action"] == "delete" and item["family"] == "object:address")
+        shared_edit = next(item for item in changes if item["action"] == "edit" and item["scope"] == "Shared")
+        self.assertEqual(shared_edit["name"], "XIQ-NL-GCP")
+        return workspace_id, base, removal, shared_edit
+
+    def test_shared_edit_is_paired_with_vsys_delete_when_only_one_scope_selected(self):
+        workspace_id, base, removal, _ = self.create_existing_shared_object_move_workspace()
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post") as api_post:
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": removal["selection_key"]},
+                follow_redirects=True,
+            )
+
+        self.assertIn("Verplaatsing van XIQ-NL-GCP vereist zowel de bron- als doelscope", response.get_data(as_text=True))
+        api_post.assert_not_called()
+
+    def test_shared_edit_and_vsys_delete_together_allow_equivalent_move(self):
+        workspace_id, base, removal, shared_edit = self.create_existing_shared_object_move_workspace()
+
+        def api_response(endpoint, params, ctx):
+            if params["type"] == "config":
+                return '<response status="success" code="20"><result/></response>'
+            if params["type"] == "op":
+                return '<response status="success"><result><job>608</job></result></response>'
+            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post", side_effect=api_response) as api_post, \
+             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": [removal["selection_key"], shared_edit["selection_key"]]},
+                follow_redirects=True,
+            )
+
+        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
+        writes = [call.args[1] for call in api_post.call_args_list if call.args[1]["type"] == "config"]
+        self.assertEqual({write["action"] for write in writes}, {"delete", "edit"})
+        self.assertTrue(any(write["xpath"].endswith("/shared/address/entry[@name='XIQ-NL-GCP']") for write in writes if write["action"] == "edit"))
+
     def test_shared_fallback_is_not_accepted_when_its_addition_is_not_selected(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><shared/><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
