@@ -5567,6 +5567,14 @@ def panos_scope_move_plan(
     consumed_deletes: set[int] = set()
     moved_names: set[tuple[str, str]] = set()
     safe_merge_ops: list[dict] = []
+    shared_merge_contexts: dict[str, dict | None] = {}
+    shared_merge_names: dict[str, set[str]] = defaultdict(set)
+    for removal in selected_deletes:
+        node = removal["family"].split(":", 1)[1]
+        object_type = object_type_by_node.get(node)
+        name = str(removal.get("name", ""))
+        if object_type and name:
+            shared_merge_names[object_type].add(name)
 
     def entry_signature(node):
         return (
@@ -5609,6 +5617,71 @@ def panos_scope_move_plan(
             reference_paths[node] = f"{reference_paths[owner]}/{reference_segment}"
         return api_paths, reference_paths, parent
 
+    def shared_merge_context(object_type):
+        """Build full-config indexes once per object type for this push."""
+        if object_type in shared_merge_contexts:
+            return shared_merge_contexts[object_type]
+        try:
+            current_parsed = parse_snapshot(current_xml)
+            desired_parsed = parse_snapshot(desired_xml)
+            current_root, current_snapshot = current_parsed
+            desired_root, desired_snapshot = desired_parsed
+            if current_snapshot.kind not in {"panos", "panorama"} or desired_snapshot.kind != current_snapshot.kind:
+                shared_merge_contexts[object_type] = None
+                return None
+            names = sorted(shared_merge_names.get(object_type, ()))
+            current_references = object_reference_index(
+                current_xml, object_type, names, parsed_root=current_root,
+            )
+            unresolved_references = unresolved_object_reference_index(
+                desired_xml, object_type, names,
+                parsed=desired_parsed, original_parsed=current_parsed,
+            )
+            refs, expressions = _typed_object_reference_nodes(current_root, object_type)
+            refs_by_name: dict[str, list[ET.Element]] = defaultdict(list)
+            for ref in (*refs, *expressions):
+                value = (ref.text or "").strip()
+                if value in current_references:
+                    refs_by_name[value].append(ref)
+            current_api_paths, current_reference_paths, parent = xml_paths(current_root)
+            desired_api_paths, _, _ = xml_paths(desired_root)
+            desired_by_path = {path: node for node, path in desired_api_paths.items()}
+            scope_records: dict[tuple[str, str], list[dict]] = {}
+
+            def records(version, scope):
+                parsed = current_parsed if version == "current" else desired_parsed
+                cache_key = (version, scope)
+                if cache_key not in scope_records:
+                    source_xml = current_xml if version == "current" else desired_xml
+                    _, scope_records[cache_key] = scoped_objects(
+                        source_xml, scope, object_type, parsed=parsed,
+                    )
+                return scope_records[cache_key]
+
+            context = {
+                "current_root": current_root,
+                "current_snapshot": current_snapshot,
+                "desired_root": desired_root,
+                "desired_snapshot": desired_snapshot,
+                "current_references": current_references,
+                "unresolved_references": unresolved_references,
+                "refs_by_name": refs_by_name,
+                "current_api_paths": current_api_paths,
+                "current_reference_paths": current_reference_paths,
+                "desired_api_paths": desired_api_paths,
+                "desired_by_path": desired_by_path,
+                "parent": parent,
+                "records": records,
+                "used_names": {
+                    node.get("name", "") for node in current_root.iter("entry") if node.get("name")
+                },
+            }
+            shared_merge_contexts[object_type] = context
+            return context
+        except (OfflineConfigError, KeyError, TypeError, ValueError, ET.ParseError):
+            shared_merge_contexts[object_type] = None
+            return None
+
     def existing_shared_merge(removal, object_type):
         """Plan a same-name local-to-Shared collapse without deleting live refs.
 
@@ -5631,12 +5704,13 @@ def panos_scope_move_plan(
         }:
             return None
         try:
-            current_root, current_snapshot = parse_snapshot(current_xml)
-            desired_root, desired_snapshot = parse_snapshot(desired_xml)
-            if current_snapshot.kind not in {"panos", "panorama"}:
+            context = shared_merge_context(object_type)
+            if context is None:
                 return None
-            if desired_snapshot.kind != current_snapshot.kind:
-                return None
+            current_root = context["current_root"]
+            current_snapshot = context["current_snapshot"]
+            desired_root = context["desired_root"]
+            desired_snapshot = context["desired_snapshot"]
             valid_scopes = (
                 set(current_snapshot.vsys)
                 if current_snapshot.kind == "panos"
@@ -5649,10 +5723,10 @@ def panos_scope_move_plan(
             )
             if source_scope not in valid_scopes or source_scope not in desired_scopes:
                 return None
-            _, source_records = scoped_objects(current_xml, source_scope, object_type)
-            _, shared_records = scoped_objects(current_xml, "Shared", object_type)
-            _, desired_source_records = scoped_objects(desired_xml, source_scope, object_type)
-            _, desired_shared_records = scoped_objects(desired_xml, "Shared", object_type)
+            source_records = context["records"]("current", source_scope)
+            shared_records = context["records"]("current", "Shared")
+            desired_source_records = context["records"]("desired", source_scope)
+            desired_shared_records = context["records"]("desired", "Shared")
             source = next((item for item in source_records if item.get("owner") == source_scope and item.get("name") == name), None)
             shared = next((item for item in shared_records if item.get("owner") == "Shared" and item.get("name") == name), None)
             desired_source = next((item for item in desired_source_records if item.get("owner") == source_scope and item.get("name") == name), None)
@@ -5673,13 +5747,15 @@ def panos_scope_move_plan(
             if current_source_entry is None:
                 return None
 
-            reference_inventory = object_reference_index(current_xml, object_type, [name]).get(name, [])
-            refs, expressions = _typed_object_reference_nodes(current_root, object_type)
-            all_paths, reference_paths, parent = xml_paths(current_root)
+            reference_inventory = context["current_references"].get(name, [])
+            refs_by_name = context["refs_by_name"]
+            all_paths = context["current_api_paths"]
+            reference_paths = context["current_reference_paths"]
+            parent = context["parent"]
             recognized_paths = set()
             source_fields = {}
             source_reference_scopes = set()
-            for ref in [*refs, *expressions]:
+            for ref in refs_by_name.get(name, []):
                 value = ref.text or ""
                 if ref is not None and value.strip() == name:
                     ref_path = reference_paths.get(ref)
@@ -5722,24 +5798,18 @@ def panos_scope_move_plan(
                     desired_root, desired_snapshot, scope, object_type, name,
                 ) is not desired_shared_entry:
                     return None
-            unresolved = unresolved_object_reference_index(
-                desired_xml, object_type, [name], original_xml_bytes=current_xml,
-            ).get(name, [])
+            unresolved = context["unresolved_references"].get(name, [])
             if unresolved:
                 return None
 
             # Fail closed if the merge would also change any reference field.
-            desired_paths, _, _ = xml_paths(desired_root)
-            desired_by_path = {path: node for node, path in desired_paths.items()}
+            desired_by_path = context["desired_by_path"]
             for field_path, field in source_fields.items():
                 desired_field = desired_by_path.get(field_path)
                 if desired_field is None or ET.tostring(desired_field) != ET.tostring(field):
                     return None
 
-            used_names = {
-                node.get("name", "") for node in current_root.iter("entry")
-                if node.get("name")
-            }
+            used_names = context["used_names"]
             temporary_name = f"PF_TMP_{secrets.token_hex(8)}"
             while temporary_name in used_names:
                 temporary_name = f"PF_TMP_{secrets.token_hex(8)}"
@@ -5962,6 +6032,7 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes, desired_root=None) ->
                 node.attrib.pop(attribute, None)
     normalize_legacy_server_profile_root(after_root)
     changes = []
+    signature_cache: dict[ET.Element, tuple] = {}
 
     def node_key(node, ordinal):
         if node.tag == "entry" and node.get("name") is not None:
@@ -5992,12 +6063,17 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes, desired_root=None) ->
         # Ignore indentation-only text between XML elements. ElementTree includes
         # an element's tail in tostring(), so appending a sibling can otherwise
         # make the preceding unchanged PAN-OS entry look edited.
-        return (
+        cached = signature_cache.get(element)
+        if cached is not None:
+            return cached
+        value = (
             element.tag,
             tuple(sorted(element.attrib.items())),
             (element.text or "").strip(),
             tuple(xml_content_signature(child) for child in list(element)),
         )
+        signature_cache[element] = value
+        return value
 
     def is_admin_role_ui_metadata(xpath):
         # PAN-OS returns UI permission catalogs beneath admin-role entries with
@@ -6681,7 +6757,24 @@ def config_workspace_push(workspace_id):
     applied_changes = 0
     commit_record_id = None
     commit_requested = request.form.get("commit_after_push") == "yes"
+    push_started = time.perf_counter()
+    push_trace = {
+        "phase": "initialize", "phase_started": push_started, "phase_ms": {},
+        "api_write_count": 0, "api_write_ms": 0.0, "desired_bytes": 0,
+        "candidate_bytes": 0, "delta_count": 0,
+    }
+
+    def start_push_phase(name):
+        phase_now = time.perf_counter()
+        previous = push_trace.get("phase")
+        if previous:
+            elapsed = max(0.0, phase_now - push_trace["phase_started"])
+            push_trace["phase_ms"][previous] = push_trace["phase_ms"].get(previous, 0.0) + elapsed * 1000
+        push_trace["phase"] = name
+        push_trace["phase_started"] = phase_now
+
     try:
+        start_push_phase("load_workspace")
         with db() as conn:
             profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
         if not profile or profile["target_type"] not in {"panorama", "panos"}:
@@ -6695,7 +6788,11 @@ def config_workspace_push(workspace_id):
             label = "Panorama" if expected_kind == "panorama" else "standalone firewall"
             raise OfflineConfigError(f"Deze configuratie lijkt niet afkomstig van het gekozen {label}-profiel")
         baseline = require_workspace_baseline(workspace)
+        push_trace["desired_bytes"] = len(workspace_xml)
+        start_push_phase("fetch_candidate")
         endpoint, key, ctx, current_xml = fetch_panos_candidate_xml(profile)
+        push_trace["candidate_bytes"] = len(current_xml)
+        start_push_phase("three_way_merge")
         push_desired_xml, merge_conflicts = merge_panos_candidate_xml(baseline, workspace_xml, current_xml)
         if merge_conflicts:
             examples = ", ".join(merge_conflicts[:3])
@@ -6703,7 +6800,9 @@ def config_workspace_push(workspace_id):
                 f"De candidate heeft conflicterende wijzigingen ({examples}); er is niets geschreven. "
                 "Open de workspace opnieuw en los de conflicten op."
             )
+        start_push_phase("build_delta")
         changes = config_push_delta(current_xml, push_desired_xml)
+        push_trace["delta_count"] = len(changes)
         selectable_changes = [item for item in changes if item["family"] != "protected"]
         if not selected:
             if changes and not selectable_changes:
@@ -6715,6 +6814,7 @@ def config_workspace_push(workspace_id):
         available = {item["selection_key"] for item in changes}
         if not selected.issubset(available):
             raise RuntimeError("De geselecteerde scope/familie hoort niet bij deze candidatepreview")
+        start_push_phase("plan_and_dependency_checks")
         scope_move_targets = defaultdict(list)
         for target_change in changes:
             # A same-name object may already exist in Shared. Updating that
@@ -6792,6 +6892,7 @@ def config_workspace_push(workspace_id):
             validate_workspace_object_deletions(
                 push_desired_xml, object_type, names,
             )
+        start_push_phase("api_writes")
         for change in write_plan:
             params = {"type": "config", "action": change["action"], "xpath": change["xpath"], "key": key}
             if change["action"] in {"set", "edit", "multi-move", "multi-config"}:
@@ -6806,7 +6907,12 @@ def config_workspace_push(workspace_id):
                 params["where"] = change["where"]
                 if change.get("dst"):
                     params["dst"] = change["dst"]
-            response = panos_api_post(endpoint, params, ctx)
+            api_write_started = time.perf_counter()
+            try:
+                response = panos_api_post(endpoint, params, ctx)
+            finally:
+                push_trace["api_write_count"] += 1
+                push_trace["api_write_ms"] += (time.perf_counter() - api_write_started) * 1000
             action_label = f"{change['action']} {change['label']} {change['name']}"
             response_root = policy_api.require_success(response, action_label)
             if change["action"] == "multi-config":
@@ -6823,6 +6929,7 @@ def config_workspace_push(workspace_id):
                 applied_changes += int(change.get("operation_count", 1))
             else:
                 applied_changes += 1
+        start_push_phase("candidate_validation")
         validation_root = policy_api.require_success(
             panos_api_post(endpoint, {"type": "op", "cmd": "<validate><full></full></validate>", "key": key}, ctx),
             "PAN-OS candidatevalidatie starten",
@@ -6840,6 +6947,7 @@ def config_workspace_push(workspace_id):
             message = "; ".join(details[-8:]) or "PAN-OS meldde een ongeldige candidate"
             flash(f"Candidate geladen maar validatie mislukt; er is niet gecommit: {message}", "error")
         elif commit_requested:
+            start_push_phase("commit_submission")
             commit_record_id = None
             endpoint_hash = hashlib.sha256(endpoint.encode("utf-8")).hexdigest()
             with db() as conn:
@@ -6922,10 +7030,26 @@ def config_workspace_push(workspace_id):
                 )
         else:
             flash(f"{len(chosen)} wijzigingen uit {len(selected)} configuratiefamilie(s) naar de candidate geschreven en gevalideerd; niet gecommit.", "success")
+        start_push_phase("complete")
+        app.logger.info(
+            "Incremental push timing workspace_id=%s desired_bytes=%s candidate_bytes=%s "
+            "delta_count=%s api_write_count=%s api_write_ms=%.1f phase_ms=%s total_ms=%.1f",
+            workspace_id, push_trace["desired_bytes"], push_trace["candidate_bytes"],
+            push_trace["delta_count"], push_trace["api_write_count"], push_trace["api_write_ms"],
+            {name: round(value, 1) for name, value in push_trace["phase_ms"].items()},
+            (time.perf_counter() - push_started) * 1000,
+        )
     except Exception as exc:
         app.logger.exception(
-            "Incremental push failed for workspace=%s after %s write(s)",
-            workspace_id, applied_changes,
+            "Incremental push failed for workspace=%s phase=%s phase_ms=%.1f total_ms=%.1f "
+            "after %s applied change(s); api_write_count=%s api_write_ms=%.1f "
+            "desired_bytes=%s candidate_bytes=%s delta_count=%s completed_phase_ms=%s",
+            workspace_id, push_trace["phase"],
+            (time.perf_counter() - push_trace["phase_started"]) * 1000,
+            (time.perf_counter() - push_started) * 1000,
+            applied_changes, push_trace["api_write_count"], push_trace["api_write_ms"],
+            push_trace["desired_bytes"], push_trace["candidate_bytes"], push_trace["delta_count"],
+            {name: round(value, 1) for name, value in push_trace["phase_ms"].items()},
         )
         state = (
             f"{applied_changes} wijziging(en) staan al in de candidate; niet gecommit"

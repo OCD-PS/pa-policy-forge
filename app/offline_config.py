@@ -39,14 +39,20 @@ def merge_config_xml(
         if root_normalizer is not None:
             root_normalizer(root)
     conflicts: list[str] = []
+    signature_cache: dict[ET.Element, tuple] = {}
 
     def signature(node):
-        return (
+        cached = signature_cache.get(node)
+        if cached is not None:
+            return cached
+        value = (
             node.tag,
             tuple(sorted(node.attrib.items())),
             (node.text or "").strip(),
             tuple(signature(child) for child in list(node)),
         )
+        signature_cache[node] = value
+        return value
 
     def conflict(path):
         if path not in conflicts and len(conflicts) < 20:
@@ -233,7 +239,9 @@ REFERENCE_CHECK_OBJECT_TYPES = UNUSED_OBJECT_TYPES | frozenset({
 MERGEABLE_OBJECT_TYPES = REFERENCE_CHECK_OBJECT_TYPES
 
 
-def object_reference_index(xml_bytes: bytes, object_type: str, names: Iterable[str]) -> dict[str, list[str]]:
+def object_reference_index(
+    xml_bytes: bytes, object_type: str, names: Iterable[str], *, parsed_root: ET.Element | None = None,
+) -> dict[str, list[str]]:
     """Find conservative, typed references to named PAN-OS objects.
 
     The scan uses the complete configuration root so Shared, every VSYS, and
@@ -242,7 +250,7 @@ def object_reference_index(xml_bytes: bytes, object_type: str, names: Iterable[s
     """
     if object_type not in REFERENCE_CHECK_OBJECT_TYPES | {"certificates"}:
         raise OfflineConfigError("Voor dit configuratietype is geen referentiecontrole beschikbaar")
-    root = SafeET.fromstring(xml_bytes)
+    root = parsed_root if parsed_root is not None else SafeET.fromstring(xml_bytes)
     wanted = {str(name): [] for name in names if str(name)}
     if not wanted:
         return wanted
@@ -381,6 +389,8 @@ def object_reference_index(xml_bytes: bytes, object_type: str, names: Iterable[s
 
 def unresolved_object_reference_index(
     xml_bytes: bytes, object_type: str, names: Iterable[str], *, original_xml_bytes: bytes | None = None,
+    parsed: tuple[ET.Element, ConfigSnapshot] | None = None,
+    original_parsed: tuple[ET.Element, ConfigSnapshot] | None = None,
 ) -> dict[str, list[str]]:
     """Return references whose effective object is missing or changed.
 
@@ -392,13 +402,16 @@ def unresolved_object_reference_index(
     same-name but behaviorally different Shared object cannot silently change
     policy semantics. Keep untyped/unknown references fail-closed.
     """
-    all_references = object_reference_index(xml_bytes, object_type, names)
+    root = parsed[0] if parsed is not None else None
+    all_references = object_reference_index(xml_bytes, object_type, names, parsed_root=root)
     wanted = {name for name, paths in all_references.items() if paths}
     if not wanted:
         return all_references
-    root, snapshot = parse_snapshot(xml_bytes)
+    root, snapshot = parsed if parsed is not None else parse_snapshot(xml_bytes)
     original_root, original_snapshot = (
-        parse_snapshot(original_xml_bytes) if original_xml_bytes is not None else (root, snapshot)
+        original_parsed if original_parsed is not None else (
+            parse_snapshot(original_xml_bytes) if original_xml_bytes is not None else (root, snapshot)
+        )
     )
     references, _ = _typed_object_reference_nodes(root, object_type)
     parent = {child: node for node in root.iter() for child in node}
