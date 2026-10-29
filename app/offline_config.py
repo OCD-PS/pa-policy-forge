@@ -454,6 +454,50 @@ def _find_scoped_object_entry(root: ET.Element, snapshot: ConfigSnapshot, scope:
     return matches[0] if len(matches) == 1 else None
 
 
+def _reference_scope(node: ET.Element, parent: dict[ET.Element, ET.Element], snapshot: ConfigSnapshot) -> str | None:
+    """Return the VSYS/device-group that owns a reference, or Shared."""
+    current = node
+    while current is not None:
+        owner = parent.get(current)
+        if current.tag == "shared":
+            return "Shared"
+        if current.tag == "entry" and owner is not None and owner.tag in {"vsys", "device-group"}:
+            return current.get("name")
+        current = owner
+    return None
+
+
+def _object_resolution_chain(snapshot: ConfigSnapshot, scope: str) -> list[str]:
+    if scope == "Shared":
+        return ["Shared"]
+    if snapshot.kind == "panorama":
+        return _scope_chain(snapshot, scope)
+    return ["Shared", scope]
+
+
+def _resolve_scoped_object_entry(
+    root: ET.Element, snapshot: ConfigSnapshot, scope: str, object_type: str, name: str,
+) -> ET.Element | None:
+    """Resolve a name using Shared/VSYS or Panorama device-group inheritance."""
+    for candidate_scope in reversed(_object_resolution_chain(snapshot, scope)):
+        scope_root = _scope_root(root, snapshot, candidate_scope)
+        if scope_root is None:
+            continue
+        collection = scope_root
+        for part in OBJECT_NODES[object_type].split("/"):
+            collection = collection.find(f"./{part}")
+            if collection is None:
+                break
+        if collection is None:
+            continue
+        matches = [entry for entry in collection.findall("./entry") if entry.get("name") == name]
+        if len(matches) > 1:
+            raise OfflineConfigError(f"Object {name} komt dubbel voor in scope {candidate_scope}")
+        if matches:
+            return matches[0]
+    return None
+
+
 def _typed_object_reference_nodes(root: ET.Element, object_type: str) -> tuple[list[ET.Element], list[ET.Element]]:
     """Return recognized reference nodes and tag-filter expressions for a type."""
     if object_type not in MERGEABLE_OBJECT_TYPES:
@@ -547,9 +591,10 @@ def merge_duplicate_object_groups(
 
     duplicates_by_type: dict[str, dict[str, str]] = {}
     selected_entries: dict[tuple[str, str], tuple[ET.Element, ET.Element]] = {}
+    selected_entry_by_name: dict[tuple[str, str], ET.Element] = {}
+    selected_master_entries: dict[tuple[str, str], ET.Element] = {}
     selected_names_by_type: dict[str, set[str]] = {}
     collections: dict[str, ET.Element] = {}
-    definitions_by_type: dict[str, dict[str, list[ET.Element]]] = {}
 
     for selection in selections:
         object_type = str(selection.get("object_type", ""))
@@ -563,10 +608,6 @@ def merge_duplicate_object_groups(
                 if collection is None:
                     raise OfflineConfigError("De objectcollectie bestaat niet meer")
             collections[object_type] = collection
-            definitions: dict[str, list[ET.Element]] = {}
-            for candidate in root.findall(f".//{OBJECT_NODES[object_type]}/entry"):
-                definitions.setdefault(candidate.get("name", ""), []).append(candidate)
-            definitions_by_type[object_type] = definitions
 
         names = list(dict.fromkeys(str(value) for value in selection.get("names", []) if str(value)))
         master_name = str(selection.get("master", ""))
@@ -586,9 +627,6 @@ def merge_duplicate_object_groups(
             actual_fingerprint = hashlib.sha256(ET.tostring(matches[0], encoding="utf-8")).hexdigest()
             if not isinstance(expected_fingerprint, str) or not hmac.compare_digest(expected_fingerprint, actual_fingerprint):
                 raise OfflineConfigError(f"Object {name} is intussen gewijzigd; maak een nieuwe merge-preview")
-            definitions = definitions_by_type[object_type].get(name, [])
-            if len(definitions) != 1 or definitions[0] is not entries[name]:
-                raise OfflineConfigError(f"Objectnaam {name} komt in meerdere scopes voor; samenvoegen is ambigu")
         signatures = {_merge_object_signature(entry, object_type) for entry in entries.values()}
         if len(signatures) != 1:
             raise OfflineConfigError("De objecten zijn niet langer functioneel identiek; niets samengevoegd")
@@ -600,6 +638,8 @@ def merge_duplicate_object_groups(
                 raise OfflineConfigError("Duplicaatgroepen overlappen; maak een nieuwe preview")
             duplicates[name] = master_name
             selected_entries[(object_type, name)] = (collection, entry)
+            selected_entry_by_name[(object_type, name)] = entry
+        selected_master_entries[(object_type, master_name)] = entries[master_name]
         if object_type in {"services", "service-groups"}:
             # Tags on services are organizational metadata. Retain the union
             # instead of dropping tags when aliases are removed.
@@ -625,21 +665,63 @@ def merge_duplicate_object_groups(
         raise OfflineConfigError("Er zijn geen duplicaten geselecteerd")
 
     parent_map = {child: parent for parent in root.iter() for child in parent}
+    resolution_cache: dict[tuple[str, str, str], ET.Element | None] = {}
+
+    def resolve_reference(scope_name: str, object_type: str, name: str) -> ET.Element | None:
+        key = (scope_name, object_type, name)
+        if key not in resolution_cache:
+            resolution_cache[key] = _resolve_scoped_object_entry(root, snapshot, scope_name, object_type, name)
+        return resolution_cache[key]
+
     for object_type, duplicates in duplicates_by_type.items():
-        # A name may be referenced outside this family through a PAN-OS feature
-        # not modeled by the typed index; fail closed if known references remain.
+        # Resolve each reference in its own VSYS/device-group chain. Identical
+        # names in other scopes can refer to different objects and must survive.
         refs, expressions = _typed_object_reference_nodes(root, object_type)
         replaced_by_parent: dict[ET.Element, set[str]] = {}
         for node in refs:
             value = (node.text or "").strip()
-            if value in duplicates:
-                master_name = duplicates[value]
-                node.text = master_name
-                if node in parent_map:
-                    replaced_by_parent.setdefault(parent_map[node], set()).add(master_name)
+            selected_entry = selected_entry_by_name.get((object_type, value))
+            if selected_entry is None:
+                continue
+            reference_scope = _reference_scope(node, parent_map, snapshot)
+            if reference_scope is None:
+                raise OfflineConfigError(
+                    f"Referentie naar object {value} heeft geen herkenbare scope; niets opgeslagen",
+                )
+            if resolve_reference(reference_scope, object_type, value) is not selected_entry:
+                continue
+            master_name = duplicates[value]
+            expected_master = selected_master_entries[(object_type, master_name)]
+            if resolve_reference(reference_scope, object_type, master_name) is not expected_master:
+                raise OfflineConfigError(
+                    f"Object {master_name} wordt in scope {reference_scope} overschaduwd; "
+                    "de verwijzing kan niet veilig worden omgezet",
+                )
+            node.text = master_name
+            if node in parent_map:
+                replaced_by_parent.setdefault(parent_map[node], set()).add(master_name)
         for node in expressions:
             expression = node.text or ""
+            reference_scope = _reference_scope(node, parent_map, snapshot)
+            if reference_scope is None:
+                if any(
+                    re.search(rf"(?<![\w.-]){re.escape(old_name)}(?![\w.-])", expression)
+                    for old_name in duplicates
+                ):
+                    raise OfflineConfigError(
+                        "Tagfilter met een geselecteerd object heeft geen herkenbare scope; niets opgeslagen",
+                    )
+                continue
             for old_name, new_name in duplicates.items():
+                selected_entry = selected_entry_by_name[(object_type, old_name)]
+                if resolve_reference(reference_scope, object_type, old_name) is not selected_entry:
+                    continue
+                expected_master = selected_master_entries[(object_type, new_name)]
+                if resolve_reference(reference_scope, object_type, new_name) is not expected_master:
+                    raise OfflineConfigError(
+                        f"Object {new_name} wordt in scope {reference_scope} overschaduwd; "
+                        "de verwijzing kan niet veilig worden omgezet",
+                    )
                 expression = re.sub(
                     rf"(?<![\w.-]){re.escape(old_name)}(?![\w.-])",
                     lambda _: new_name,
@@ -660,11 +742,34 @@ def merge_duplicate_object_groups(
                 elif value in merged_names:
                     seen.add(value)
 
-    updated_xml = normalized_config_xml(root)
     for object_type, duplicates in duplicates_by_type.items():
-        remaining = object_reference_index(updated_xml, object_type, duplicates)
-        if any(remaining.values()):
-            raise OfflineConfigError("Niet alle referenties konden veilig worden bijgewerkt; niets opgeslagen")
+        refs, expressions = _typed_object_reference_nodes(root, object_type)
+        for node in refs:
+            value = (node.text or "").strip()
+            selected_entry = selected_entry_by_name.get((object_type, value))
+            reference_scope = _reference_scope(node, parent_map, snapshot)
+            if selected_entry is not None:
+                if reference_scope is None:
+                    raise OfflineConfigError("Een objectreferentie heeft geen herkenbare scope; niets opgeslagen")
+                if resolve_reference(reference_scope, object_type, value) is selected_entry:
+                    raise OfflineConfigError("Niet alle scopegebonden referenties konden veilig worden bijgewerkt; niets opgeslagen")
+        for node in expressions:
+            expression = node.text or ""
+            reference_scope = _reference_scope(node, parent_map, snapshot)
+            if reference_scope is None:
+                if any(
+                    re.search(rf"(?<![\w.-]){re.escape(old_name)}(?![\w.-])", expression)
+                    for old_name in duplicates
+                ):
+                    raise OfflineConfigError("Een tagfilter heeft geen herkenbare scope; niets opgeslagen")
+                continue
+            if any(
+                re.search(rf"(?<![\w.-]){re.escape(old_name)}(?![\w.-])", expression)
+                and resolve_reference(reference_scope, object_type, old_name)
+                is selected_entry_by_name[(object_type, old_name)]
+                for old_name in duplicates
+            ):
+                raise OfflineConfigError("Niet alle scopegebonden referenties konden veilig worden bijgewerkt; niets opgeslagen")
 
     for collection, entry in selected_entries.values():
         collection.remove(entry)
