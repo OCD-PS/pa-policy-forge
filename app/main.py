@@ -5799,6 +5799,24 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes, desired_root=None) ->
     ))
 
 
+def config_push_change_names(change: dict) -> list[str]:
+    """Return every named entry carried by a coalesced config API write."""
+    names = []
+    element = str(change.get("element", ""))
+    if element:
+        try:
+            fragment = SafeET.fromstring(f"<fragment>{element}</fragment>")
+        except Exception as exc:
+            raise OfflineConfigError("Een gebundelde API-wijziging bevat ongeldige XML; niets geschreven") from exc
+        entries = list(fragment.findall("./entry"))
+        if fragment.tag == "entry":
+            entries = [fragment]
+        names.extend(entry.get("name", "") for entry in entries if entry.get("name"))
+    if not names and change.get("name"):
+        names.append(str(change["name"]))
+    return list(dict.fromkeys(names))
+
+
 def fetch_panos_candidate_xml(profile) -> tuple[str, str, object, bytes]:
     _, endpoint, key, ctx = panos_profile_context(profile)
     root = policy_api.require_success(
@@ -6319,7 +6337,8 @@ def config_workspace_push(workspace_id):
         scope_move_additions = defaultdict(list)
         for addition in changes:
             if addition["action"] == "set" and addition["family"].startswith(("object:", "policy:")):
-                scope_move_additions[(addition["family"], addition["name"])].append(addition)
+                for name in config_push_change_names(addition):
+                    scope_move_additions[(addition["family"], name)].append(addition)
         scope_move_pairs = []
         for removal in changes:
             if removal["action"] != "delete" or not removal["family"].startswith(("object:", "policy:")):
@@ -6382,12 +6401,12 @@ def config_workspace_push(workspace_id):
                 )[1]
             }
             selected_shared = {
-                item["name"] for item in chosen
+                name for item in chosen for name in config_push_change_names(item)
                 if item["family"] == f"object:{node}" and item["scope"] == "Shared"
                 and item["action"] in {"set", "edit"}
             }
             selected_shared_deletions = {
-                item["name"] for item in chosen
+                name for item in chosen for name in config_push_change_names(item)
                 if item["family"] == f"object:{node}" and item["scope"] == "Shared"
                 and item["action"] == "delete"
             }
