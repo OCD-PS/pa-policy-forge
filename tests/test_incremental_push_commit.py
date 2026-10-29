@@ -889,6 +889,50 @@ class IncrementalPushCommitTests(unittest.TestCase):
                 current, desired, {"addresses": ["Google"]}, set(),
             )
 
+    def test_static_route_destination_reference_without_shared_address_blocks_delete(self):
+        current = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address><entry name="Route-Object">'
+            b'<ip-netmask>10.10.120.100/32</ip-netmask></entry></address></shared>'
+            b'<devices><entry name="localhost.localdomain"><network><virtual-router>'
+            b'<entry name="default"><routing-table><ip><static-route><entry name="route">'
+            b'<destination>Route-Object</destination></entry></static-route></ip></routing-table>'
+            b'</entry></virtual-router></network><vsys><entry name="vsys1"/><entry name="vsys2"/>'
+            b'</vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(current)
+        desired_root.find("./shared/address").clear()
+        desired = main.normalized_config_xml(desired_root)
+
+        with self.assertRaisesRegex(main.OfflineConfigError, "static-route/entry"):
+            main.validate_incremental_object_deletions(
+                current, desired, {"addresses": ["Route-Object"]}, set(),
+            )
+
+    def test_same_name_vsys_merge_satisfies_global_static_route_reference(self):
+        current = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><devices><entry name="localhost.localdomain"><network><virtual-router>'
+            b'<entry name="default"><routing-table><ip><static-route><entry name="route">'
+            b'<destination>Route-Object</destination></entry></static-route></ip></routing-table>'
+            b'</entry></virtual-router></network><vsys><entry name="vsys1"><address><entry name="Route-Object">'
+            b'<ip-netmask>10.10.120.100/32</ip-netmask></entry></address></entry>'
+            b'<entry name="vsys2"><address><entry name="Route-Object"><ip-netmask>'
+            b'10.10.120.100/32</ip-netmask></entry></address></entry></vsys></entry></devices></config>'
+        ))
+        group = next(
+            item for item in main.duplicate_object_groups_across_panos_scopes(current, "addresses")
+            if {obj["scope"] for obj in item["objects"]} == {"vsys1", "vsys2"}
+        )
+        desired, _ = main.merge_duplicate_object_groups_to_shared(current, [{
+            "object_type": "addresses", "objects": group["objects"],
+            "master": {"scope": "vsys1", "name": "Route-Object"},
+        }])
+        delta = main.config_push_delta(current, desired)
+        selected_families = {item["selection_key"] for item in delta}
+
+        main.validate_incremental_object_deletions(
+            current, desired, {"addresses": ["Route-Object"]}, selected_families,
+        )
+
     def test_same_name_shared_merge_stops_on_nested_transaction_error(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><shared><address><entry name="same-object"><ip-netmask>192.0.2.10/32</ip-netmask>'

@@ -352,9 +352,12 @@ def object_reference_indexes(
                 if (
                     object_type == "addresses"
                     and node.tag == "destination"
-                    and _has_path_monitor_address_reference(node, parent)
+                    and (
+                        _has_path_monitor_address_reference(node, parent)
+                        or _has_static_route_address_reference(node, parent)
+                    )
                 ):
-                    # PAN-OS path-monitor destinations reference address objects
+                    # PAN-OS virtual-router destinations reference address objects
                     # outside a VSYS, so include them in dependency inventories.
                     add(object_type, node.text or "", node)
                 if node.tag == "member" and owner_tag in {"source", "destination"}:
@@ -494,12 +497,12 @@ def unresolved_object_reference_indexes(
                 if (node.text or "").strip() != name:
                     continue
                 scope = _reference_scope(node, parent, snapshot)
-                global_path_monitor_ref = _is_panos_path_monitor_address_reference(
+                global_address_ref = _is_panos_global_address_reference(
                     node, parent, snapshot, object_type,
                 )
-                if scope is None and not global_path_monitor_ref:
+                if scope is None and not global_address_ref:
                     continue
-                resolution_scope = "Shared" if global_path_monitor_ref else scope
+                resolution_scope = "Shared" if global_address_ref else scope
                 if allowed_reference_scopes is not None and resolution_scope not in allowed_reference_scopes:
                     continue
                 try:
@@ -514,6 +517,11 @@ def unresolved_object_reference_indexes(
                     continue
                 if resolved is not None and (
                     not had_original_reference
+                    # Device-level PAN-OS route references have no VSYS scope.
+                    # If a local duplicate is promoted into Shared, a reference
+                    # that was previously dangling now resolves to that Shared
+                    # object; there is no prior effective object to preserve.
+                    or (global_address_ref and original_resolved is None)
                     or (
                         original_resolved is not None
                         and _merge_object_signature(resolved, object_type)
@@ -679,6 +687,20 @@ def _is_panos_path_monitor_address_reference(
     return snapshot.kind == "panos" and object_type == "addresses" and _has_path_monitor_address_reference(node, parent)
 
 
+def _is_panos_global_address_reference(
+    node: ET.Element, parent: dict[ET.Element, ET.Element], snapshot: ConfigSnapshot, object_type: str,
+) -> bool:
+    """Identify exact device-level PAN-OS address references resolved from Shared."""
+    return (
+        snapshot.kind == "panos"
+        and object_type == "addresses"
+        and (
+            _has_path_monitor_address_reference(node, parent)
+            or _has_static_route_address_reference(node, parent)
+        )
+    )
+
+
 def _has_path_monitor_address_reference(
     node: ET.Element, parent: dict[ET.Element, ET.Element],
 ) -> bool:
@@ -698,6 +720,39 @@ def _has_path_monitor_address_reference(
     if path_nodes[11].get("name") != "localhost.localdomain":
         return False
     return all(path_nodes[index].get("name") for index in (1, 4, 8))
+
+
+def _has_static_route_address_reference(
+    node: ET.Element, parent: dict[ET.Element, ET.Element],
+) -> bool:
+    """Match an IPv4/IPv6 virtual-router static-route destination exactly."""
+    route_entry = parent.get(node)
+    route_list = parent.get(route_entry) if route_entry is not None else None
+    if node.tag != "destination" or route_entry is None or route_entry.tag != "entry":
+        return False
+    if route_list is None or route_list.tag != "static-route":
+        return False
+    current = node
+    path_nodes: list[ET.Element] = []
+    while current is not None and len(path_nodes) < 10:
+        path_nodes.append(current)
+        current = parent.get(current)
+    if len(path_nodes) != 10:
+        return False
+    tags = [item.tag for item in path_nodes]
+    if tags not in (
+        ["destination", "entry", "static-route", "ip", "routing-table", "entry", "virtual-router", "network", "entry", "devices"],
+        ["destination", "entry", "static-route", "ipv6", "routing-table", "entry", "virtual-router", "network", "entry", "devices"],
+    ):
+        return False
+    config = parent.get(path_nodes[-1])
+    if config is None or config.tag != "config":
+        return False
+    if parent.get(config) is not None:
+        return False
+    if path_nodes[8].get("name") != "localhost.localdomain":
+        return False
+    return all(path_nodes[index].get("name") for index in (1, 5))
 
 
 def _object_resolution_chain(snapshot: ConfigSnapshot, scope: str) -> list[str]:
@@ -770,7 +825,10 @@ def _typed_object_reference_nodes(root: ET.Element, object_type: str) -> tuple[l
             )
             if (
                 object_type == "addresses" and node.tag == "destination"
-                and _has_path_monitor_address_reference(node, parent)
+                and (
+                    _has_path_monitor_address_reference(node, parent)
+                    or _has_static_route_address_reference(node, parent)
+                )
             ):
                 is_reference = True
             if node.tag in {"translated-address", "translated-port"} and node.text and chain & {"source-translation", "destination-translation"}:
@@ -1155,17 +1213,37 @@ def merge_duplicate_object_groups_to_shared(
         for node in refs:
             reference_scope = _reference_scope(node, parent_map, snapshot)
             value = (node.text or "").strip()
-            global_path_monitor_ref = _is_panos_path_monitor_address_reference(
+            global_address_ref = _is_panos_global_address_reference(
                 node, parent_map, snapshot, object_type,
             )
-            if reference_scope is None and not global_path_monitor_ref:
+            if reference_scope is None and not global_address_ref:
                 if any(key[0] == object_type and key[2] == value for key in selected_by_key):
                     raise OfflineConfigError(f"Referentie naar object {value} heeft geen herkenbare scope; niets opgeslagen")
                 continue
-            # PAN-OS virtual-router path-monitor destinations live under the
-            # device tree but resolve globally against Shared address objects.
-            resolution_scope = "Shared" if global_path_monitor_ref else reference_scope
+            # PAN-OS virtual-router destinations live under the device tree
+            # but resolve globally against Shared address objects.
+            resolution_scope = "Shared" if global_address_ref else reference_scope
             entry = resolve(resolution_scope, object_type, value)
+            if entry is None and global_address_ref:
+                # A global route may contain the name of an address that exists
+                # only in a VSYS. If that exact object is part of this merge,
+                # rewrite it to the chosen Shared master instead of leaving a
+                # dangling device-level reference behind.
+                candidates = [
+                    candidate for candidate, key in selected_by_entry.items()
+                    if key[0] == object_type and key[2] == value
+                ]
+                candidate_masters = {
+                    duplicates_by_entry[candidate][1]
+                    for candidate in candidates
+                    if candidate in duplicates_by_entry
+                }
+                if len(candidate_masters) > 1:
+                    raise OfflineConfigError(
+                        f"Globale routeverwijzing naar {value} is ambigu; niets opgeslagen",
+                    )
+                if candidates:
+                    entry = candidates[0]
             selected_key = selected_by_entry.get(entry) if entry is not None else None
             if selected_key is None:
                 continue
