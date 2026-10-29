@@ -12,6 +12,7 @@ from app.offline_config import (
     object_create_record, object_fingerprint, policy_create_record, policy_fingerprint, render_set_commands, replace_policy_in_snapshot,
     referenced_template, scoped_objects, scoped_policies,
     scoped_server_profiles, object_reference_index, duplicate_object_groups, merge_duplicate_objects,
+    merge_duplicate_object_groups,
 )
 
 
@@ -58,6 +59,30 @@ class OfflineConfigTests(unittest.TestCase):
         )
         self.assertEqual(summary, {"merged": 2, "groups": 1})
         self.assertEqual(object_reference_index(merged, "services", ["TCP443", "443_tcp"]), {"TCP443": [], "443_tcp": []})
+
+    def test_batch_duplicate_merge_updates_multiple_object_families_atomically(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="server-a"><ip-netmask>192.0.2.10</ip-netmask></entry><entry name="server-b"><ip-netmask>192.0.2.10</ip-netmask></entry></address><service><entry name="tcp443"><protocol><tcp><port>443</port></tcp></protocol></entry><entry name="https-alt"><protocol><tcp><port>443</port></tcp></protocol></entry></service><rulebase><security><rules><entry name="allow"><source><member>server-b</member></source><service><member>https-alt</member></service></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'''
+        selections = []
+        for object_type, master in (("addresses", "server-a"), ("services", "tcp443")):
+            group = duplicate_object_groups(source, "vsys1", object_type)[0]
+            names = [item["name"] for item in group["objects"]]
+            selections.append({
+                "object_type": object_type,
+                "names": names,
+                "master": master,
+                "fingerprints": {item["name"]: item["fingerprint"] for item in group["objects"]},
+            })
+
+        merged, summary = merge_duplicate_object_groups(source, "vsys1", selections)
+
+        root, _ = parse_snapshot(merged)
+        self.assertEqual(root.findtext(".//rules/entry/source/member"), "server-a")
+        self.assertEqual(root.findtext(".//rules/entry/service/member"), "tcp443")
+        _, addresses = scoped_objects(merged, "vsys1", "addresses")
+        _, services = scoped_objects(merged, "vsys1", "services")
+        self.assertEqual([item["name"] for item in addresses], ["server-a"])
+        self.assertEqual([item["name"] for item in services], ["tcp443"])
+        self.assertEqual(summary, {"merged": 2, "groups": 2})
 
     def test_duplicate_objects_with_different_tags_are_not_grouped(self):
         source = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="server-a"><ip-netmask>10.0.0.1</ip-netmask><tag><member>Production</member></tag></entry><entry name="server-b"><ip-netmask>10.0.0.1</ip-netmask><tag><member>Test</member></tag></entry></address></entry></vsys></entry></devices></config>'''

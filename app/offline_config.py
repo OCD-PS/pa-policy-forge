@@ -406,11 +406,11 @@ def _merge_object_signature(entry: ET.Element, object_type: str) -> tuple:
     return canonical(entry, root=True)
 
 
-def duplicate_object_groups(xml_bytes: bytes, scope: str, object_type: str) -> list[dict]:
+def duplicate_object_groups(xml_bytes: bytes, scope: str, object_type: str, parsed=None) -> list[dict]:
     """Return exact functional duplicate groups in one editable object scope."""
     if object_type not in MERGEABLE_OBJECT_TYPES:
         raise OfflineConfigError("Dubbele objecten samenvoegen is niet veilig ondersteund voor dit type")
-    root, snapshot = parse_snapshot(xml_bytes)
+    root, snapshot = parsed if parsed is not None else parse_snapshot(xml_bytes)
     _, records = scoped_objects(xml_bytes, scope, object_type, parsed=(root, snapshot))
     candidates = [record for record in records if record.get("editable")]
     by_signature: dict[tuple, list[dict]] = {}
@@ -530,31 +530,49 @@ def _typed_object_reference_nodes(root: ET.Element, object_type: str) -> tuple[l
 def merge_duplicate_objects(
     xml_bytes: bytes, scope: str, object_type: str, selections: list[dict],
 ) -> tuple[bytes, dict[str, int]]:
-    """Rewrite typed references and remove duplicates after one master is chosen per group."""
-    if object_type not in MERGEABLE_OBJECT_TYPES:
-        raise OfflineConfigError("Dubbele objecten samenvoegen is niet veilig ondersteund voor dit type")
+    """Merge selected duplicate groups from one typed object collection."""
+    return merge_duplicate_object_groups(xml_bytes, scope, [
+        {**selection, "object_type": object_type} for selection in selections
+    ])
+
+
+def merge_duplicate_object_groups(
+    xml_bytes: bytes, scope: str, selections: list[dict],
+) -> tuple[bytes, dict[str, int]]:
+    """Apply duplicate groups from multiple object types in one validated edit."""
     root, snapshot = parse_snapshot(xml_bytes)
     scope_root = _scope_root(root, snapshot, scope)
     if scope_root is None:
         raise OfflineConfigError("De geselecteerde scope bestaat niet meer")
-    collection = scope_root
-    for part in OBJECT_NODES[object_type].split("/"):
-        collection = collection.find(f"./{part}")
-        if collection is None:
-            raise OfflineConfigError("De objectcollectie bestaat niet meer")
 
-    duplicates: dict[str, str] = {}
-    selected_entries: dict[str, ET.Element] = {}
-    selected_names_seen: set[str] = set()
-    all_definitions: dict[str, list[ET.Element]] = {}
-    for candidate in root.findall(f".//{OBJECT_NODES[object_type]}/entry"):
-        all_definitions.setdefault(candidate.get("name", ""), []).append(candidate)
+    duplicates_by_type: dict[str, dict[str, str]] = {}
+    selected_entries: dict[tuple[str, str], tuple[ET.Element, ET.Element]] = {}
+    selected_names_by_type: dict[str, set[str]] = {}
+    collections: dict[str, ET.Element] = {}
+    definitions_by_type: dict[str, dict[str, list[ET.Element]]] = {}
 
     for selection in selections:
+        object_type = str(selection.get("object_type", ""))
+        if object_type not in MERGEABLE_OBJECT_TYPES:
+            raise OfflineConfigError("Dubbele objecten samenvoegen is niet veilig ondersteund voor dit type")
+        collection = collections.get(object_type)
+        if collection is None:
+            collection = scope_root
+            for part in OBJECT_NODES[object_type].split("/"):
+                collection = collection.find(f"./{part}")
+                if collection is None:
+                    raise OfflineConfigError("De objectcollectie bestaat niet meer")
+            collections[object_type] = collection
+            definitions: dict[str, list[ET.Element]] = {}
+            for candidate in root.findall(f".//{OBJECT_NODES[object_type]}/entry"):
+                definitions.setdefault(candidate.get("name", ""), []).append(candidate)
+            definitions_by_type[object_type] = definitions
+
         names = list(dict.fromkeys(str(value) for value in selection.get("names", []) if str(value)))
         master_name = str(selection.get("master", ""))
         if len(names) < 2 or master_name not in names:
             raise OfflineConfigError("Kies precies één masterobject per duplicaatgroep")
+        selected_names_seen = selected_names_by_type.setdefault(object_type, set())
         if selected_names_seen.intersection(names):
             raise OfflineConfigError("Duplicaatgroepen overlappen; maak een nieuwe preview")
         selected_names_seen.update(names)
@@ -568,19 +586,20 @@ def merge_duplicate_objects(
             actual_fingerprint = hashlib.sha256(ET.tostring(matches[0], encoding="utf-8")).hexdigest()
             if not isinstance(expected_fingerprint, str) or not hmac.compare_digest(expected_fingerprint, actual_fingerprint):
                 raise OfflineConfigError(f"Object {name} is intussen gewijzigd; maak een nieuwe merge-preview")
-            definitions = all_definitions.get(name, [])
+            definitions = definitions_by_type[object_type].get(name, [])
             if len(definitions) != 1 or definitions[0] is not entries[name]:
                 raise OfflineConfigError(f"Objectnaam {name} komt in meerdere scopes voor; samenvoegen is ambigu")
         signatures = {_merge_object_signature(entry, object_type) for entry in entries.values()}
         if len(signatures) != 1:
             raise OfflineConfigError("De objecten zijn niet langer functioneel identiek; niets samengevoegd")
+        duplicates = duplicates_by_type.setdefault(object_type, {})
         for name, entry in entries.items():
             if name == master_name:
                 continue
             if name in duplicates or master_name in duplicates:
                 raise OfflineConfigError("Duplicaatgroepen overlappen; maak een nieuwe preview")
             duplicates[name] = master_name
-            selected_entries[name] = entry
+            selected_entries[(object_type, name)] = (collection, entry)
         if object_type in {"services", "service-groups"}:
             # Tags on services are organizational metadata. Retain the union
             # instead of dropping tags when aliases are removed.
@@ -602,55 +621,54 @@ def merge_duplicate_objects(
                         seen_tags.add(value)
         if master_name in duplicates:
             raise OfflineConfigError("Een gekozen master staat ook als duplicaat in een andere groep")
-        master = entries[master_name]
-    if not duplicates:
+    if not selected_entries:
         raise OfflineConfigError("Er zijn geen duplicaten geselecteerd")
 
-    # A name may be referenced outside this object family through a PAN-OS
-    # feature not modeled by the index. Refuse the operation if the full
-    # configuration index cannot prove all known references were rewritten.
-    refs, expressions = _typed_object_reference_nodes(root, object_type)
-    replaced_by_parent: dict[ET.Element, set[str]] = {}
     parent_map = {child: parent for parent in root.iter() for child in parent}
-    for node in refs:
-        value = (node.text or "").strip()
-        if value in duplicates:
-            master_name = duplicates[value]
-            node.text = master_name
-            if node in parent_map:
-                replaced_by_parent.setdefault(parent_map[node], set()).add(master_name)
-    for node in expressions:
-        expression = node.text or ""
-        for old_name, new_name in duplicates.items():
-            expression = re.sub(
-                rf"(?<![\w.-]){re.escape(old_name)}(?![\w.-])",
-                lambda _: new_name,
-                expression,
-            )
-        node.text = expression
+    for object_type, duplicates in duplicates_by_type.items():
+        # A name may be referenced outside this family through a PAN-OS feature
+        # not modeled by the typed index; fail closed if known references remain.
+        refs, expressions = _typed_object_reference_nodes(root, object_type)
+        replaced_by_parent: dict[ET.Element, set[str]] = {}
+        for node in refs:
+            value = (node.text or "").strip()
+            if value in duplicates:
+                master_name = duplicates[value]
+                node.text = master_name
+                if node in parent_map:
+                    replaced_by_parent.setdefault(parent_map[node], set()).add(master_name)
+        for node in expressions:
+            expression = node.text or ""
+            for old_name, new_name in duplicates.items():
+                expression = re.sub(
+                    rf"(?<![\w.-]){re.escape(old_name)}(?![\w.-])",
+                    lambda _: new_name,
+                    expression,
+                )
+            node.text = expression
 
-    # Deduplicate reference lists after replacements so no member is written
-    # twice when both the old and master names were already present.
-    for parent, merged_names in replaced_by_parent.items():
-        children = list(parent)
-        if not children or any(child.tag != "member" for child in children):
-            continue
-        seen = set()
-        for child in children:
-            value = (child.text or "").strip()
-            if value in merged_names and value in seen:
-                parent.remove(child)
-            else:
-                if value in merged_names:
+        # Replacements can duplicate members when both names were referenced.
+        for parent, merged_names in replaced_by_parent.items():
+            children = list(parent)
+            if not children or any(child.tag != "member" for child in children):
+                continue
+            seen = set()
+            for child in children:
+                value = (child.text or "").strip()
+                if value in merged_names and value in seen:
+                    parent.remove(child)
+                elif value in merged_names:
                     seen.add(value)
 
-    remaining = object_reference_index(normalized_config_xml(root), object_type, duplicates)
-    if any(remaining.values()):
-        raise OfflineConfigError("Niet alle referenties konden veilig worden bijgewerkt; niets opgeslagen")
+    updated_xml = normalized_config_xml(root)
+    for object_type, duplicates in duplicates_by_type.items():
+        remaining = object_reference_index(updated_xml, object_type, duplicates)
+        if any(remaining.values()):
+            raise OfflineConfigError("Niet alle referenties konden veilig worden bijgewerkt; niets opgeslagen")
 
-    for old_name, entry in selected_entries.items():
+    for collection, entry in selected_entries.values():
         collection.remove(entry)
-    return normalized_config_xml(root), {"merged": len(duplicates), "groups": len(selections)}
+    return normalized_config_xml(root), {"merged": len(selected_entries), "groups": len(selections)}
 
 
 # New generic objects need a real PAN-OS-shaped entry before the field editor can

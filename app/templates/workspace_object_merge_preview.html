@@ -19,7 +19,7 @@
   <div class="card stack">
     <div class="callout">
       <strong>{{draft.groups|length}} duplicaatgroep(en) gevonden</strong><br>
-      Alleen dezelfde instellingen komen in een groep. Description en comments van de gekozen master blijven behouden. Bij services worden tags samengevoegd.
+      Alleen dezelfde instellingen komen in een groep. Description en comments van de gekozen master blijven behouden. Bij services worden tags samengevoegd. De scan omvat objecttypen met een volledige, getypeerde referentiecontrole.
     </div>
     <form method="post" action="{{url_for('config_workspace_object_apply',draft_id=draft_id)}}" class="stack">
       <input type="hidden" name="csrf" value="{{csrf_token()}}">
@@ -27,7 +27,7 @@
       <section class="card stack workspace-merge-group">
         <div class="card-header">
           <div>
-            <h2>Groep {{loop.index}}</h2>
+            <h2>{{group.object_label}} · Groep {{loop.index}}</h2>
             <p class="muted">{{group.objects|length}} objecten met dezelfde functionele configuratie</p>
           </div>
         </div>

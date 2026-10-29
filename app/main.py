@@ -77,7 +77,7 @@ from app.offline_config import (
     policy_fingerprint as offline_policy_fingerprint, render_set_commands,
     panos_ui_decorate_record, scoped_server_profiles,
     object_reference_index,
-    duplicate_object_groups, merge_duplicate_objects,
+    duplicate_object_groups, merge_duplicate_object_groups,
     move_panos_scope_entries,
     replace_policy_in_snapshot, replace_policies_in_snapshot, insert_policy_in_snapshot,
     delete_policies_from_snapshot, move_policies_in_snapshot,
@@ -4256,7 +4256,13 @@ def config_workspace_editor(workspace_id):
             object_query=object_query, object_page=object_page,
             object_page_count=object_page_count, object_total=object_total,
             workspace_object_page_size=WORKSPACE_OBJECT_PAGE_SIZE,
-            workspace_mergeable_object_types=MERGEABLE_OBJECT_TYPES,
+            # Duplicate merging rewrites PAN-OS XML references; SCM uses a
+            # different API model and must not expose this XML-only action.
+            workspace_mergeable_object_types=(
+                MERGEABLE_OBJECT_TYPES
+                if workspace_profile["target_type"] in {"panos", "panorama"}
+                else ()
+            ),
             workspace_object_catalog=workspace_object_catalog,
             workspace_object_create_template=workspace_object_create_template,
             workspace_policy_catalog=workspace_policy_catalog,
@@ -4782,25 +4788,45 @@ def config_workspace_object_merge_preview(workspace_id):
     if not workspace:
         return "Not found", 404
     scope = request.form.get("scope", "")
-    object_type = request.form.get("object_type", "")
+    return_object_type = request.form.get("object_type", "")
+    merge_all_types = request.form.get("merge_all_types") == "yes"
+    object_type = "__all__" if merge_all_types else return_object_type
     try:
-        if object_type not in MERGEABLE_OBJECT_TYPES:
+        if workspace["target_type"] not in {"panos", "panorama"}:
+            raise OfflineConfigError("Duplicaten samenvoegen is alleen beschikbaar voor PAN-OS- en Panorama-XML")
+        if not merge_all_types and object_type not in MERGEABLE_OBJECT_TYPES:
             raise OfflineConfigError("Samenvoegen is voor dit objecttype niet veilig beschikbaar")
         xml_bytes, parsed_root, snapshot = cached_workspace_config(
             workspace["config_path"], workspace["sha256"],
         )
         if scope not in available_scopes(snapshot) and not (scope == "Shared" and snapshot.kind == "panos"):
             raise OfflineConfigError("De geselecteerde scope bestaat niet meer")
-        groups = duplicate_object_groups(xml_bytes, scope, object_type)
+        object_types = sorted(MERGEABLE_OBJECT_TYPES) if merge_all_types else [object_type]
+        groups = []
+        for candidate_type in object_types:
+            label = SCM_OBJECT_TYPES.get(candidate_type, {}).get("label", candidate_type)
+            candidate_groups = duplicate_object_groups(
+                xml_bytes, scope, candidate_type, parsed=(parsed_root, snapshot),
+            )
+            groups.extend({
+                **group,
+                "object_type": candidate_type,
+                "object_label": label,
+            } for group in candidate_groups)
         if not groups:
-            flash("Geen functioneel identieke objecten gevonden in deze scope.", "info")
+            flash(
+                f"Geen functioneel identieke objecten gevonden in {len(object_types)} ondersteunde object- en servicetypen binnen {scope}.",
+                "info",
+            )
             return redirect(url_for(
                 "config_workspace_editor", workspace_id=workspace_id, scope=scope,
-                workspace_view="objects", object_type=object_type,
+                workspace_view="objects", object_type=return_object_type,
             ))
         draft_id = secrets.token_urlsafe(24)
         draft = {
             "workspace_id": workspace_id, "scope": scope, "object_type": object_type,
+            "return_object_type": return_object_type,
+            "object_types": object_types,
             "operation": "merge", "groups": groups, "created_at": now(),
         }
         draft_path = OBJECT_DRAFTS / f"offline-object-{draft_id}.json"
@@ -4809,13 +4835,17 @@ def config_workspace_object_merge_preview(workspace_id):
         return render_template(
             "workspace_object_merge_preview.html", workspace=workspace,
             draft=draft, draft_id=draft_id,
-            object_label=SCM_OBJECT_TYPES.get(object_type, {}).get("label", object_type),
+            object_label=(
+                "alle ondersteunde objecten en services"
+                if merge_all_types
+                else SCM_OBJECT_TYPES.get(object_type, {}).get("label", object_type)
+            ),
         )
     except Exception as exc:
         flash(f"Duplicaten niet voorbereid: {exc}", "error")
         return redirect(url_for(
             "config_workspace_editor", workspace_id=workspace_id, scope=scope,
-            workspace_view="objects", object_type=object_type,
+            workspace_view="objects", object_type=return_object_type,
         ))
 
 
@@ -4889,22 +4919,23 @@ def config_workspace_object_apply(draft_id):
         if not workspace:
             raise OfflineConfigError("De bronworkspace bestaat niet meer")
         if draft.get("operation") == "merge":
-            if draft.get("object_type") not in MERGEABLE_OBJECT_TYPES:
-                raise OfflineConfigError("Samenvoegen is voor dit objecttype niet veilig beschikbaar")
             selections = []
             for group in draft.get("groups", []):
+                object_type = group.get("object_type", draft.get("object_type"))
+                if object_type not in MERGEABLE_OBJECT_TYPES:
+                    raise OfflineConfigError("Samenvoegen is voor dit objecttype niet veilig ondersteund")
                 names = [item["name"] for item in group.get("objects", [])]
                 master = request.form.get(f"master_{group.get('id', '')}", "")
                 if master not in names:
                     raise OfflineConfigError("Kies precies één masterobject per duplicaatgroep")
                 selections.append({
+                    "object_type": object_type,
                     "names": names,
                     "master": master,
                     "fingerprints": {item["name"]: item["fingerprint"] for item in group["objects"]},
                 })
-            new_xml, merge_summary = merge_duplicate_objects(
-                workspace_config_path(workspace).read_bytes(), draft["scope"],
-                draft["object_type"], selections,
+            new_xml, merge_summary = merge_duplicate_object_groups(
+                workspace_config_path(workspace).read_bytes(), draft["scope"], selections,
             )
         elif draft.get("operation") == "delete":
             source_xml = workspace_config_path(workspace).read_bytes()
@@ -4931,7 +4962,12 @@ def config_workspace_object_apply(draft_id):
         if not advance_migration_staging_workspace(workspace["id"], new_id):
             set_active_config_workspace(workspace["profile_id"], new_id)
         draft_path.unlink(missing_ok=True)
-        audit("config-workspace-object-edited", f"source={workspace['id']} workspace={new_id} scope={draft['scope']} type={draft['object_type']} operation={draft['operation']}")
+        audit(
+            "config-workspace-object-edited",
+            f"source={workspace['id']} workspace={new_id} scope={draft['scope']} "
+            f"types={','.join(draft.get('object_types', [draft['object_type']]))} "
+            f"operation={draft['operation']}",
+        )
         if draft.get("operation") == "merge":
             flash(
                 f"{merge_summary['merged']} duplicaatobject(en) samengevoegd in {merge_summary['groups']} groep(en); referenties bijgewerkt.",
@@ -4939,7 +4975,11 @@ def config_workspace_object_apply(draft_id):
             )
         else:
             flash("Opgeslagen", "success")
-        return redirect(url_for("config_workspace_editor", workspace_id=new_id, scope=draft["scope"], workspace_view="objects", object_type=draft["object_type"]))
+        return redirect(url_for(
+            "config_workspace_editor", workspace_id=new_id, scope=draft["scope"],
+            workspace_view="objects",
+            object_type=draft.get("return_object_type", draft["object_type"]),
+        ))
     except Exception as exc:
         flash(f"Objectwijziging niet bewaard: {exc}", "error")
         workspace_id = json.loads(draft_path.read_text()).get("workspace_id") if draft_path.is_file() else None
