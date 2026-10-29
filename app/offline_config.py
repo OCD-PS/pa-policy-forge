@@ -242,149 +242,159 @@ MERGEABLE_OBJECT_TYPES = REFERENCE_CHECK_OBJECT_TYPES
 def object_reference_index(
     xml_bytes: bytes, object_type: str, names: Iterable[str], *, parsed_root: ET.Element | None = None,
 ) -> dict[str, list[str]]:
-    """Find conservative, typed references to named PAN-OS objects.
+    """Find conservative typed references to named PAN-OS objects."""
+    return object_reference_indexes(
+        xml_bytes, {object_type: names}, parsed_root=parsed_root,
+    )[object_type]
 
-    The scan uses the complete configuration root so Shared, every VSYS, and
-    Panorama device groups/templates can protect an object from deletion.
-    Unknown or unparsable configurations must be treated by callers as unsafe.
+
+def object_reference_indexes(
+    xml_bytes: bytes, names_by_type: dict[str, Iterable[str]], *, parsed_root: ET.Element | None = None,
+) -> dict[str, dict[str, list[str]]]:
+    """Index several object types in one full-config walk.
+
+    Incremental pushes can delete many object types at once. Building XML
+    paths and ancestor chains separately for every type made dependency checks
+    scale poorly with large PAN-OS/Panorama configurations. This keeps the
+    complete, fail-closed reference inventory while sharing that work.
     """
-    if object_type not in REFERENCE_CHECK_OBJECT_TYPES | {"certificates"}:
+    supported_types = REFERENCE_CHECK_OBJECT_TYPES | {"certificates"}
+    if any(object_type not in supported_types for object_type in names_by_type):
         raise OfflineConfigError("Voor dit configuratietype is geen referentiecontrole beschikbaar")
-    root = parsed_root if parsed_root is not None else SafeET.fromstring(xml_bytes)
-    wanted = {str(name): [] for name in names if str(name)}
-    if not wanted:
-        return wanted
+    wanted_by_type = {
+        object_type: {str(name): [] for name in names if str(name)}
+        for object_type, names in names_by_type.items()
+    }
+    if not any(wanted_by_type.values()):
+        return wanted_by_type
 
+    root = parsed_root if parsed_root is not None else SafeET.fromstring(xml_bytes)
     parent = {child: node for node in root.iter() for child in node}
     paths: dict[ET.Element, str] = {root: "/" + root.tag}
-    for node in root.iter():
-        if node not in paths:
-            owner = parent.get(node)
-            if owner is None:
-                paths[node] = "/" + node.tag
-            else:
-                suffix = f"[@name={node.get('name')}]" if node.tag == "entry" and node.get("name") else ""
-                paths[node] = paths[owner] + "/" + node.tag + suffix
 
-    def add(value: str, path: str) -> None:
-        value = value.strip()
-        if value in wanted and path not in wanted[value]:
-            wanted[value].append(path[:240])
-
-    def ancestors(node: ET.Element) -> list[str]:
-        result = []
+    def path_for(node: ET.Element) -> str:
+        pending = []
         current = node
-        while current is not None:
-            result.append(current.tag)
+        while current not in paths:
+            pending.append(current)
             current = parent.get(current)
-        return result
+            if current is None:
+                break
+        path = paths.get(current, "")
+        for item in reversed(pending):
+            suffix = f"[@name={item.get('name')}]" if item.tag == "entry" and item.get("name") else ""
+            path = f"{path}/{item.tag}{suffix}"
+            paths[item] = path
+        return paths.get(node, path)
+
+    def add(object_type: str, value: str, node: ET.Element, suffix: str = "") -> None:
+        value = value.strip()
+        wanted = wanted_by_type[object_type]
+        if value in wanted:
+            path = path_for(node) + suffix
+            if path not in wanted[value]:
+                wanted[value].append(path[:240])
 
     policy_kinds = set(POLICY_NODES.values())
     rulebase_scopes = {"rulebase", "pre-rulebase", "post-rulebase"}
+    certificate_value_tags = {
+        "certificate", "certificate-name", "ca-certificate", "ca-certificates",
+        "forward-trust-certificate", "forward-untrust-certificate", "root-ca",
+        "ssl-tls-service-profile", "server-certificate",
+    }
+    candidate_tags = {
+        "member", "translated-address", "translated-port", "schedule", "log-setting", "filter",
+    }
+    if "certificates" in wanted_by_type:
+        candidate_tags.update({"rsa", "entry", *certificate_value_tags})
+
     for node in root.iter():
-        chain = ancestors(node)
-        chain_set = set(chain)
-        parent_node = parent.get(node)
-
-        if object_type == "certificates":
-            # The API configuration stores certificate references as named
-            # values in profiles and SSL/TLS settings; also honor PAN-OS's
-            # special Forward Trust / Forward Untrust usage marker.
-            if node.tag in {
-                "certificate", "certificate-name", "ca-certificate", "ca-certificates",
-                "forward-trust-certificate", "forward-untrust-certificate", "root-ca",
-                "ssl-tls-service-profile", "server-certificate",
-            }:
-                add(node.text or "", paths[node])
-            if node.tag == "rsa" and chain_set & {"forward-trust-certificate", "forward-untrust-certificate"}:
-                add(node.text or "", paths[node])
-            if node.tag == "member" and chain_set & {"ca", "certificate", "ca-certificates", "trusted-root-CA", "trusted-root-ca"}:
-                add(node.text or "", paths[node])
-            if node.tag == "entry" and str(node.findtext("./usage", "")).casefold() in {
-                "forward-trust", "forward-untrust", "forward trust", "forward untrust",
-                "forward-trust-certificate", "forward-untrust-certificate",
-            }:
-                add(node.get("name", ""), paths[node] + "/usage")
+        if node.tag not in candidate_tags:
             continue
+        parent_node = parent.get(node)
+        owner_tag = parent_node.tag if parent_node is not None else ""
+        chain_set: set[str] | None = None
 
-        if object_type in {"addresses", "address-groups", "regions"}:
-            is_policy_reference = (
-                node.tag == "member" and parent_node is not None
-                and parent_node.tag in {"source", "destination"}
-                and chain_set & rulebase_scopes and bool(chain_set & policy_kinds)
-            )
-            is_group_member = (
-                node.tag == "member" and parent_node is not None and parent_node.tag == "static"
-                and "address-group" in chain_set
-            )
-            is_nat_translation = (
-                node.tag in {"translated-address", "translated-port", "member"}
-                and node.text and bool(chain_set & {"source-translation", "destination-translation"})
-            )
-            if is_policy_reference or is_group_member or is_nat_translation:
-                add(node.text or "", paths[node])
-        elif object_type in {"services", "service-groups"}:
-            is_policy_reference = (
-                node.tag == "member" and parent_node is not None and parent_node.tag == "service"
-                and chain_set & rulebase_scopes and bool(chain_set & policy_kinds)
-            )
-            is_group_member = (
-                node.tag == "member" and parent_node is not None and parent_node.tag == "members"
-                and "service-group" in chain_set
-            )
-            if is_policy_reference or is_group_member:
-                add(node.text or "", paths[node])
-        elif object_type == "application-groups":
-            is_policy_reference = (
-                node.tag == "member" and parent_node is not None and parent_node.tag == "application"
-                and chain_set & rulebase_scopes and bool(chain_set & policy_kinds)
-            )
-            is_group_member = (
-                node.tag == "member" and parent_node is not None and parent_node.tag == "members"
-                and "application-group" in chain_set
-            )
-            if is_policy_reference or is_group_member:
-                add(node.text or "", paths[node])
-        elif object_type in {"applications", "application-filters"}:
-            is_policy_reference = (
-                node.tag == "member" and parent_node is not None
-                and parent_node.tag in {"application", "application-filter"}
-                and chain_set & rulebase_scopes and bool(chain_set & policy_kinds)
-            )
-            is_group_member = (
-                node.tag == "member" and parent_node is not None and parent_node.tag == "members"
-                and "application-group" in chain_set
-            )
-            if is_policy_reference or is_group_member:
-                add(node.text or "", paths[node])
-        elif object_type == "schedules":
-            if node.tag == "schedule" and chain_set & rulebase_scopes and bool(chain_set & policy_kinds):
-                add(node.text or "", paths[node])
-        elif object_type == "security-profile-groups":
-            if node.tag == "member" and parent_node is not None and parent_node.tag == "group" and "profile-setting" in chain_set:
-                add(node.text or "", paths[node])
-        elif object_type == "log-forwarding":
-            if node.tag == "log-setting" and chain_set & rulebase_scopes and bool(chain_set & policy_kinds):
-                add(node.text or "", paths[node])
-        elif object_type == "custom-url-categories":
-            if node.tag == "member" and parent_node is not None and parent_node.tag == "category" and chain_set & rulebase_scopes:
-                add(node.text or "", paths[node])
-        elif object_type == "hip-profiles":
-            if node.tag == "member" and parent_node is not None and parent_node.tag in {"source-hip", "destination-hip"}:
-                add(node.text or "", paths[node])
-        elif object_type == "dynamic-user-groups":
-            if node.tag == "member" and parent_node is not None and parent_node.tag in {"source-user", "destination-user"}:
-                add(node.text or "", paths[node])
-        elif object_type == "tags":
-            if node.tag == "member" and parent_node is not None and parent_node.tag in {"tag", "tags"}:
-                add(node.text or "", paths[node])
-            if node.tag == "filter" and node.text and chain_set & {"address-group", "dynamic-user-group"}:
-                expression = node.text
-                for name in wanted:
-                    if re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w.-])", expression):
-                        add(name, paths[node])
+        def ancestors() -> set[str]:
+            nonlocal chain_set
+            if chain_set is None:
+                chain_set = set()
+                current = node
+                while current is not None:
+                    chain_set.add(current.tag)
+                    current = parent.get(current)
+            return chain_set
 
-    return wanted
+        for object_type, wanted in wanted_by_type.items():
+            if not wanted:
+                continue
+            if object_type == "certificates":
+                if node.tag in certificate_value_tags:
+                    add(object_type, node.text or "", node)
+                if node.tag == "rsa" and ancestors() & {"forward-trust-certificate", "forward-untrust-certificate"}:
+                    add(object_type, node.text or "", node)
+                if node.tag == "member" and ancestors() & {"ca", "certificate", "ca-certificates", "trusted-root-CA", "trusted-root-ca"}:
+                    add(object_type, node.text or "", node)
+                if node.tag == "entry" and str(node.findtext("./usage", "")).casefold() in {
+                    "forward-trust", "forward-untrust", "forward trust", "forward untrust",
+                    "forward-trust-certificate", "forward-untrust-certificate",
+                }:
+                    add(object_type, node.get("name", ""), node, "/usage")
+            elif object_type in {"addresses", "address-groups", "regions"}:
+                if node.tag == "member" and owner_tag in {"source", "destination"}:
+                    if ancestors() & rulebase_scopes and ancestors() & policy_kinds:
+                        add(object_type, node.text or "", node)
+                if node.tag == "member" and owner_tag == "static" and "address-group" in ancestors():
+                    add(object_type, node.text or "", node)
+                if node.tag in {"translated-address", "translated-port", "member"} and node.text:
+                    if ancestors() & {"source-translation", "destination-translation"}:
+                        add(object_type, node.text, node)
+            elif object_type in {"services", "service-groups"}:
+                if node.tag == "member" and owner_tag == "service":
+                    if ancestors() & rulebase_scopes and ancestors() & policy_kinds:
+                        add(object_type, node.text or "", node)
+                if node.tag == "member" and owner_tag == "members" and "service-group" in ancestors():
+                    add(object_type, node.text or "", node)
+            elif object_type == "application-groups":
+                if node.tag == "member" and owner_tag == "application":
+                    if ancestors() & rulebase_scopes and ancestors() & policy_kinds:
+                        add(object_type, node.text or "", node)
+                if node.tag == "member" and owner_tag == "members" and "application-group" in ancestors():
+                    add(object_type, node.text or "", node)
+            elif object_type in {"applications", "application-filters"}:
+                if node.tag == "member" and owner_tag in {"application", "application-filter"}:
+                    if ancestors() & rulebase_scopes and ancestors() & policy_kinds:
+                        add(object_type, node.text or "", node)
+                if node.tag == "member" and owner_tag == "members" and "application-group" in ancestors():
+                    add(object_type, node.text or "", node)
+            elif object_type == "schedules":
+                if node.tag == "schedule" and ancestors() & rulebase_scopes and ancestors() & policy_kinds:
+                    add(object_type, node.text or "", node)
+            elif object_type == "security-profile-groups":
+                if node.tag == "member" and owner_tag == "group" and "profile-setting" in ancestors():
+                    add(object_type, node.text or "", node)
+            elif object_type == "log-forwarding":
+                if node.tag == "log-setting" and ancestors() & rulebase_scopes and ancestors() & policy_kinds:
+                    add(object_type, node.text or "", node)
+            elif object_type == "custom-url-categories":
+                if node.tag == "member" and owner_tag == "category" and ancestors() & rulebase_scopes:
+                    add(object_type, node.text or "", node)
+            elif object_type == "hip-profiles":
+                if node.tag == "member" and owner_tag in {"source-hip", "destination-hip"}:
+                    add(object_type, node.text or "", node)
+            elif object_type == "dynamic-user-groups":
+                if node.tag == "member" and owner_tag in {"source-user", "destination-user"}:
+                    add(object_type, node.text or "", node)
+            elif object_type == "tags":
+                if node.tag == "member" and owner_tag in {"tag", "tags"}:
+                    add(object_type, node.text or "", node)
+                if node.tag == "filter" and node.text and ancestors() & {"address-group", "dynamic-user-group"}:
+                    expression = node.text
+                    for name in wanted:
+                        if re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w.-])", expression):
+                            add(object_type, name, node)
+
+    return wanted_by_type
 
 
 def unresolved_object_reference_index(

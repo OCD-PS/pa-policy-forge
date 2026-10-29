@@ -76,7 +76,7 @@ from app.offline_config import (
     object_fingerprint as offline_object_fingerprint,
     policy_fingerprint as offline_policy_fingerprint, render_set_commands,
     panos_ui_decorate_record, scoped_object_names, scoped_object_page, scoped_server_profiles,
-    object_reference_index,
+    object_reference_index, object_reference_indexes,
     _merge_object_signature, _reference_scope, _resolve_scoped_object_entry,
     _typed_object_reference_nodes,
     duplicate_object_groups, duplicate_object_groups_across_panos_scopes,
@@ -3794,6 +3794,55 @@ def validate_selected_deletion_dependencies(
         )
 
 
+def validate_incremental_object_deletions(
+    current_xml: bytes, desired_xml: bytes, deleted_objects: dict[str, list[str]],
+    selected_families: set[str],
+) -> None:
+    """Validate all selected object deletions with one scan per XML snapshot."""
+    names_by_type = {
+        object_type: list(dict.fromkeys(str(name) for name in names if str(name)))
+        for object_type, names in deleted_objects.items()
+        if names
+    }
+    if not names_by_type:
+        return
+    current_indexes = object_reference_indexes(current_xml, names_by_type)
+    desired_indexes = object_reference_indexes(desired_xml, names_by_type)
+
+    missing = []
+    for object_type, names in names_by_type.items():
+        current_refs = current_indexes[object_type]
+        desired_refs = desired_indexes[object_type]
+        for name in names:
+            for path in sorted(set(current_refs.get(name, ())) - set(desired_refs.get(name, ()))):
+                family, label = config_push_family(tuple(path.strip("/").split("/")))
+                selection_key = json.dumps(
+                    [config_push_scope(path), family], ensure_ascii=False, separators=(",", ":")
+                )
+                if selection_key not in selected_families:
+                    missing.append((name, label, path))
+    if missing:
+        details = "; ".join(
+            f"{name}: selecteer {label}"
+            for name, label, _path in missing[:5]
+        )
+        raise OfflineConfigError(
+            f"Verwijderen vereist ook geselecteerde wijzigingen die de verwijzingen verwijderen ({details})"
+        )
+
+    used = []
+    for object_type, names in names_by_type.items():
+        references = desired_indexes[object_type]
+        used.extend(
+            (name, references[name]) for name in names if references.get(name)
+        )
+    if used:
+        details = "; ".join(
+            f"{name}: {', '.join(paths[:3])}" for name, paths in used[:5]
+        )
+        raise OfflineConfigError(f"Niet verwijderd: objecten zijn nog in gebruik ({details})")
+
+
 def validate_workspace_configuration_deletions(xml_bytes: bytes, view: str, section: str, records: list[dict]) -> None:
     """Block certificate removal while its names appear in certificate use sites."""
     if view != "device" or section != "certificates":
@@ -5600,6 +5649,11 @@ def panos_scope_move_plan(
         name = str(removal.get("name", ""))
         if object_type and name:
             shared_merge_names[object_type].add(name)
+    parsed_snapshots_cache = None
+    parsed_snapshots_attempted = False
+    shared_reference_indexes_cache = None
+    xml_paths_cache: dict[int, tuple[dict, dict, dict]] = {}
+    used_names_cache: set[str] | None = None
 
     def entry_signature(node):
         return (
@@ -5642,22 +5696,56 @@ def panos_scope_move_plan(
             reference_paths[node] = f"{reference_paths[owner]}/{reference_segment}"
         return api_paths, reference_paths, parent
 
+    def parsed_snapshots():
+        nonlocal parsed_snapshots_cache, parsed_snapshots_attempted
+        if parsed_snapshots_attempted:
+            return parsed_snapshots_cache
+        parsed_snapshots_attempted = True
+        try:
+            parsed_snapshots_cache = (parse_snapshot(current_xml), parse_snapshot(desired_xml))
+        except (OfflineConfigError, KeyError, TypeError, ValueError, ET.ParseError):
+            parsed_snapshots_cache = None
+        return parsed_snapshots_cache
+
+    def cached_xml_paths(root):
+        key = id(root)
+        if key not in xml_paths_cache:
+            xml_paths_cache[key] = xml_paths(root)
+        return xml_paths_cache[key]
+
+    def shared_reference_indexes(current_root):
+        nonlocal shared_reference_indexes_cache
+        if shared_reference_indexes_cache is None:
+            shared_reference_indexes_cache = object_reference_indexes(
+                current_xml, shared_merge_names, parsed_root=current_root,
+            )
+        return shared_reference_indexes_cache
+
+    def used_names(current_root):
+        nonlocal used_names_cache
+        if used_names_cache is None:
+            used_names_cache = {
+                node.get("name", "") for node in current_root.iter("entry") if node.get("name")
+            }
+        return used_names_cache
+
     def shared_merge_context(object_type):
-        """Build full-config indexes once per object type for this push."""
+        """Build shared move indexes once per push, reusing parsed XML roots."""
         if object_type in shared_merge_contexts:
             return shared_merge_contexts[object_type]
         try:
-            current_parsed = parse_snapshot(current_xml)
-            desired_parsed = parse_snapshot(desired_xml)
+            parsed_pair = parsed_snapshots()
+            if parsed_pair is None:
+                shared_merge_contexts[object_type] = None
+                return None
+            current_parsed, desired_parsed = parsed_pair
             current_root, current_snapshot = current_parsed
             desired_root, desired_snapshot = desired_parsed
             if current_snapshot.kind not in {"panos", "panorama"} or desired_snapshot.kind != current_snapshot.kind:
                 shared_merge_contexts[object_type] = None
                 return None
             names = sorted(shared_merge_names.get(object_type, ()))
-            current_references = object_reference_index(
-                current_xml, object_type, names, parsed_root=current_root,
-            )
+            current_references = shared_reference_indexes(current_root).get(object_type, {})
             unresolved_references = unresolved_object_reference_index(
                 desired_xml, object_type, names,
                 parsed=desired_parsed, original_parsed=current_parsed,
@@ -5668,8 +5756,8 @@ def panos_scope_move_plan(
                 value = (ref.text or "").strip()
                 if value in current_references:
                     refs_by_name[value].append(ref)
-            current_api_paths, current_reference_paths, parent = xml_paths(current_root)
-            desired_api_paths, _, _ = xml_paths(desired_root)
+            current_api_paths, current_reference_paths, parent = cached_xml_paths(current_root)
+            desired_api_paths, _, _ = cached_xml_paths(desired_root)
             desired_by_path = {path: node for node, path in desired_api_paths.items()}
             scope_records: dict[tuple[str, str], list[dict]] = {}
 
@@ -5697,9 +5785,7 @@ def panos_scope_move_plan(
                 "desired_by_path": desired_by_path,
                 "parent": parent,
                 "records": records,
-                "used_names": {
-                    node.get("name", "") for node in current_root.iter("entry") if node.get("name")
-                },
+                "used_names": used_names(current_root),
             }
             shared_merge_contexts[object_type] = context
             return context
@@ -6905,18 +6991,13 @@ def config_workspace_push(workspace_id):
                 raise RuntimeError(f"Verwijdering van {node} heeft geen herkenbare objectnaam; niets geschreven")
             if (object_type, change["name"]) not in native_moved_names:
                 deleted_objects[object_type].append(change["name"])
-        for object_type, names in deleted_objects.items():
-            # PAN-OS rejects deleting a local entry while any rule still
-            # references it, even if a same-named Shared entry would inherit
-            # after the delete. Validate the exact merged candidate strictly
-            # before the first API write; otherwise earlier writes can leave a
-            # partial candidate before PAN-OS returns code 10 on the delete.
-            validate_selected_deletion_dependencies(
-                current_xml, push_desired_xml, object_type, names, selected,
-            )
-            validate_workspace_object_deletions(
-                push_desired_xml, object_type, names,
-            )
+        # PAN-OS rejects deleting an object that remains referenced, even when
+        # a same-named Shared entry would inherit afterward. Validate every
+        # family against the merged candidate before the first API write, but
+        # scan each XML snapshot only once for all deleted object types.
+        validate_incremental_object_deletions(
+            current_xml, push_desired_xml, deleted_objects, selected,
+        )
         start_push_phase("api_writes")
         for change in write_plan:
             params = {"type": "config", "action": change["action"], "xpath": change["xpath"], "key": key}
