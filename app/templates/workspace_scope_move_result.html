@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Scope-verplaatsing · PA Policy Forge</title>
+  <link rel="stylesheet" href="{{url_for('static',filename='app.css',v=asset_version)}}">
+</head>
+<body>
+<main class="content">
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <p class="eyebrow">{{workspace.profile_name}} · PAN-OS</p>
+        <h1>Scope-verplaatsing</h1>
+        <p class="muted">{{item_type|replace('-', ' ')|title}} · {{source_scope}} → {{target_scope}}</p>
+      </div>
+      <a class="btn btn-primary" href="{{return_url}}">Terug naar workspace</a>
+    </div>
+    <p>{{moved|length}} verplaatst; {{failed|length}} overgeslagen.</p>
+    {% if moved %}
+    <details><summary>Verplaatst ({{moved|length}})</summary><ul>{% for item in moved %}<li>{{item.name}}</li>{% endfor %}</ul></details>
+    {% endif %}
+    {% if failed %}
+    <dialog open class="bulk-dialog">
+      <div class="push-dialog-brand">OCD</div>
+      <div class="bulk-dialog-body">
+        <div class="card-header"><div><h2>Niet alles kon worden verplaatst</h2><p class="muted">{% if moved %}De geslaagde items staan in een nieuwe workspaceversie; de overgeslagen items bleven in de bron staan.{% else %}Er zijn geen items verplaatst; alle wijzigingen bleven ongewijzigd.{% endif %}</p></div></div>
+        <ul>{% for item in failed %}<li><strong>{{item.name}}</strong>: {{item.reason}}</li>{% endfor %}</ul>
+        <div class="cluster bulk-dialog-actions"><a class="btn btn-primary" href="{{return_url}}">Sluiten</a></div>
+      </div>
+    </dialog>
+    {% else %}
+      <p class="flash success">{% if moved %}Alle geselecteerde items zijn verplaatst.{% else %}Er waren geen verplaatsingsfouten, maar er zijn ook geen items geselecteerd om te verplaatsen.{% endif %}</p>
+    {% endif %}
+  </section>
+</main>
+</body>
+</html>

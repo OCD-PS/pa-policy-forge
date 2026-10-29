@@ -782,8 +782,9 @@
     var rows = all("[data-object-row]");
     var checkboxes = all("[data-object-select]");
     var countNode = document.querySelector("[data-object-selected-count]");
-    var deleteButton = document.querySelector("[data-object-delete]");
-    function updateCount() { var count = checkboxes.filter(function (item) { return item.checked; }).length; if (countNode) countNode.textContent = count; if (deleteButton) deleteButton.disabled = !count; }
+    var deleteButtons = all("[data-object-delete]");
+    var deleteButton = deleteButtons[0] || null;
+    function updateCount() { var count = checkboxes.filter(function (item) { return item.checked; }).length; if (countNode) countNode.textContent = count; deleteButtons.forEach(function (button) { button.disabled = !count; }); }
     checkboxes.forEach(function (checkbox) { checkbox.addEventListener("change", updateCount); });
     var master = document.querySelector("[data-object-select-visible]");
     if (master) master.addEventListener("change", function () { rows.forEach(function (row) { var checkbox = row.querySelector("[data-object-select]"); if (checkbox && !row.hidden) checkbox.checked = master.checked; }); updateCount(); });

@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Dubbele objecten samenvoegen · PA Policy Forge</title>
+  <link rel="icon" href="{{url_for('static',filename='favicon.svg',v=asset_version)}}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{url_for('static',filename='app.css',v=asset_version)}}">
+</head>
+<body>
+<main class="content" style="margin:auto">
+  <div class="page-header">
+    <div>
+      <p class="eyebrow">{{workspace.name}} · {{draft.scope}}</p>
+      <h1>Dubbele {{object_label}} samenvoegen</h1>
+      <p class="muted">Kies per groep precies één master. Policy- en objectreferenties worden naar de master omgezet; daarna verwijdert de nieuwe workspaceversie de duplicaten.</p>
+    </div>
+  </div>
+  <div class="card stack">
+    <div class="callout">
+      <strong>{{draft.groups|length}} duplicaatgroep(en) gevonden</strong><br>
+      Alleen dezelfde instellingen komen in een groep. Description en comments van de gekozen master blijven behouden. Bij services worden tags samengevoegd.
+    </div>
+    <form method="post" action="{{url_for('config_workspace_object_apply',draft_id=draft_id)}}" class="stack">
+      <input type="hidden" name="csrf" value="{{csrf_token()}}">
+      {% for group in draft.groups %}
+      <section class="card stack workspace-merge-group">
+        <div class="card-header">
+          <div>
+            <h2>Groep {{loop.index}}</h2>
+            <p class="muted">{{group.objects|length}} objecten met dezelfde functionele configuratie</p>
+          </div>
+        </div>
+        {% if group.metadata_differs %}
+        <div class="callout"><strong>Descriptions verschillen.</strong> De description van de gekozen master blijft behouden.</div>
+        {% endif %}
+        {% if group.tags_differ %}
+        <div class="callout"><strong>Tags verschillen.</strong> De geselecteerde service-master behoudt de tags van alle services in deze groep.</div>
+        {% endif %}
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Master</th><th>Naam</th><th>Owner</th><th>Waarde / werking</th><th>Description / comments</th><th>Tags</th></tr></thead>
+            <tbody>
+            {% for item in group.objects %}
+            <tr>
+              <td><input class="workspace-merge-radio" type="radio" name="master_{{group.id}}" value="{{item.name}}" required aria-label="Gebruik {{item.name}} als master"></td>
+              <td><strong>{{item.name}}</strong></td>
+              <td>{{item.owner}}</td>
+              <td>{{item.summary or '—'}}</td>
+              <td>{{item.description or '—'}}</td>
+              <td>{{item.tags|join(', ') or '—'}}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      {% endfor %}
+      <div class="cluster" style="justify-content:flex-end">
+        <a class="btn" href="{{url_for('config_workspace_editor',workspace_id=workspace.id,scope=draft.scope,workspace_view='objects',object_type=draft.object_type)}}">Annuleren</a>
+        <button class="btn btn-primary" type="submit">Bewaar samengevoegde workspaceversie</button>
+      </div>
+    </form>
+  </div>
+</main>
+</body>
+</html>
