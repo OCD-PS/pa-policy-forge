@@ -5639,6 +5639,11 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes, desired_root=None) ->
 
     def walk(before, after, parent_path, parts):
         node = after if after is not None else before
+        # PAN-OS exposes its system-owned predefined catalog in candidate XML,
+        # but these entries are immutable through the configuration API. A
+        # device/version-specific catalog difference must never become a write.
+        if node is not None and (node.tag == "predefined" or "predefined" in parts):
+            return
         if node is not None and is_admin_role_ui_metadata(node_path(parent_path, node)):
             return
         if before is None or after is None:
