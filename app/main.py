@@ -5545,6 +5545,143 @@ def config_push_scope(xpath: str) -> str:
     return "Global"
 
 
+def panos_scope_move_plan(current_xml: bytes, chosen: list[dict], object_type_by_node: dict[str, str]) -> tuple[list[dict], set[tuple[str, str]]]:
+    """Use PAN-OS multi-move for objects relocated between scopes.
+
+    A set-then-delete sequence fails when policies still reference a local
+    object. PAN-OS's native multi-move preserves those references while it
+    relocates the entry. Use it only when the destination collection has no
+    same-name entry. If the desired object differs, edit the relocated entry
+    afterward; name collisions keep the guarded path.
+    """
+    selected_sets = [item for item in chosen if item["action"] == "set" and item["family"].startswith("object:")]
+    selected_deletes = [item for item in chosen if item["action"] == "delete" and item["family"].startswith("object:")]
+    source_records_cache: dict[tuple[str, str], dict[str, str]] = {}
+    target_entries_cache: dict[int, dict[str, object]] = {}
+    moves_by_target: dict[int, list[dict]] = defaultdict(list)
+    consumed_deletes: set[int] = set()
+    moved_names: set[tuple[str, str]] = set()
+
+    def entry_signature(node):
+        return (
+            node.tag,
+            tuple(sorted((key, value) for key, value in node.attrib.items()
+                         if key not in _PANOS_RESPONSE_METADATA_ATTRIBUTES)),
+            (node.text or "").strip(),
+            tuple(entry_signature(child) for child in list(node)),
+        )
+
+    def target_entries(change):
+        cache_key = id(change)
+        if cache_key not in target_entries_cache:
+            try:
+                wrapper = SafeET.fromstring(f"<fragment>{change.get('element', '')}</fragment>")
+            except Exception as exc:
+                raise OfflineConfigError("Objectverplaatsing bevat ongeldige XML; niets geschreven") from exc
+            target_entries_cache[cache_key] = {node.get("name", ""): node for node in wrapper.findall("./entry")}
+        return target_entries_cache[cache_key]
+
+    def supports_native_scope(xpath):
+        return "/shared/" in xpath or bool(re.search(r"/(?:vsys|device-group)/entry\[@name=", xpath))
+
+    removal_counts = defaultdict(int)
+    for item in selected_deletes:
+        removal_counts[(item["family"], item.get("name", ""))] += 1
+
+    for removal in selected_deletes:
+        node = removal["family"].split(":", 1)[1]
+        object_type = object_type_by_node.get(node)
+        if not object_type or object_type not in PANOS_SCOPE_MOVE_OBJECT_TYPES:
+            continue
+        name = str(removal.get("name", ""))
+        if not name or removal_counts[(removal["family"], name)] != 1:
+            continue
+        targets = [
+            item for item in selected_sets
+            if item["family"] == removal["family"] and item["scope"] != removal["scope"]
+            and name in config_push_change_names(item)
+        ]
+        if len(targets) != 1:
+            continue
+        target = targets[0]
+        target_entry = target_entries(target).get(name)
+        if target_entry is None:
+            continue
+        source_xpath = removal["xpath"]
+        source_collection_end = source_xpath.rfind("/entry[@name=")
+        if source_collection_end <= 0:
+            continue
+        source_collection = source_xpath[:source_collection_end]
+        if not supports_native_scope(source_collection) or not supports_native_scope(target["xpath"]):
+            continue
+        source_key = (removal["scope"], object_type)
+        if source_key not in source_records_cache:
+            try:
+                _, records = scoped_objects(current_xml, removal["scope"], object_type)
+            except Exception as exc:
+                raise OfflineConfigError("Bronconfiguratie van objectverplaatsing is onleesbaar; niets geschreven") from exc
+            source_records_cache[source_key] = {
+                item["name"]: item["_xml"] for item in records if item.get("owner") == removal["scope"]
+            }
+        source_xml = source_records_cache[source_key].get(name)
+        if not source_xml:
+            continue
+        try:
+            source_entry = SafeET.fromstring(source_xml)
+        except Exception as exc:
+            raise OfflineConfigError("Bronobject van verplaatsing is onleesbaar; niets geschreven") from exc
+        selected_list = ET.Element("selected-list")
+        source = ET.SubElement(selected_list, "source", {"xpath": source_collection})
+        ET.SubElement(source, "member").text = name
+        all_errors = ET.Element("all-errors")
+        all_errors.text = "no"
+        # PAN-OS expects all-errors as a sibling of selected-list in the
+        # multi-move element fragment, as shown in its XML API examples.
+        move_element = (
+            ET.tostring(selected_list, encoding="unicode")
+            + ET.tostring(all_errors, encoding="unicode")
+        )
+        moves_by_target[id(target)].append({
+            "action": "multi-move", "xpath": target["xpath"],
+            "element": move_element,
+            "family": removal["family"], "label": target["label"], "name": name,
+            "scope": target["scope"],
+        })
+        if entry_signature(source_entry) != entry_signature(target_entry):
+            # Moving preserves references; editing afterward applies the
+            # desired contents without falling back to a reference-breaking delete.
+            destination_entry_xpath = (
+                f"{target['xpath']}/entry[@name={policy_api.xpath_literal(name)}]"
+            )
+            moves_by_target[id(target)].append({
+                "action": "edit", "xpath": destination_entry_xpath,
+                "element": ET.tostring(target_entry, encoding="unicode"),
+                "family": removal["family"], "label": target["label"], "name": name,
+                "scope": target["scope"],
+            })
+        consumed_deletes.add(id(removal))
+        moved_names.add((object_type, name))
+
+    write_plan = []
+    for change in chosen:
+        move_ops = moves_by_target.get(id(change), [])
+        if move_ops:
+            write_plan.extend(move_ops)
+            moved = {item["name"] for item in move_ops if item["action"] == "multi-move"}
+            residual = [
+                node for name, node in target_entries(change).items() if name not in moved
+            ]
+            if residual:
+                residual_change = dict(change)
+                residual_change["element"] = "".join(ET.tostring(node, encoding="unicode") for node in residual)
+                residual_change["name"] = ", ".join(node.get("name", "") for node in residual)
+                write_plan.append(residual_change)
+            continue
+        if id(change) not in consumed_deletes:
+            write_plan.append(change)
+    return write_plan, moved_names
+
+
 def normalize_legacy_server_profile_paths(xml_bytes: bytes) -> bytes:
     """Move legacy workspace server profiles under PAN-OS log-settings paths."""
     root = SafeET.fromstring(xml_bytes)
@@ -6301,7 +6438,7 @@ def config_workspace_commit_status_api(workspace_id: int, commit_id: int):
 
 def concise_incremental_push_error(exc: Exception) -> str:
     message = str(exc)
-    api_error = re.search(r"(?P<context>(?:set|edit|delete) .*?) failed: status='(?P<status>[^']+)' code='(?P<code>[^']+)' msg=", message)
+    api_error = re.search(r"(?P<context>(?:set|edit|delete|multi-move) .*?) failed: status='(?P<status>[^']+)' code='(?P<code>[^']+)' msg=", message)
     if api_error:
         code = api_error.group("code")
         if code == "13":
@@ -6399,6 +6536,10 @@ def config_workspace_push(workspace_id):
             raise RuntimeError("Management-, administrator- en credentialinstellingen zijn beschermd tegen workspace-push")
         if not chosen:
             raise RuntimeError("De selectie bevat geen wijzigingen")
+        object_type_by_node = {node: kind for kind, node in OBJECT_NODES.items()}
+        write_plan, native_moved_names = panos_scope_move_plan(
+            current_xml, chosen, object_type_by_node,
+        )
         invalidate_candidate_preview_cache(int(profile["id"]))
         if profile["target_type"] == "panos":
             analysis = panos_candidate_analysis(push_desired_xml)
@@ -6416,7 +6557,6 @@ def config_workspace_push(workspace_id):
                     "Candidate bevat zoneverwijzingen die ongeldig zijn voor de geselecteerde VSYS; los die eerst op"
                 )
         deleted_objects: dict[str, list[str]] = defaultdict(list)
-        object_type_by_node = {node: kind for kind, node in OBJECT_NODES.items()}
         for change in chosen:
             if change["action"] != "delete" or not change["family"].startswith("object:"):
                 continue
@@ -6426,7 +6566,8 @@ def config_workspace_push(workspace_id):
                 raise RuntimeError(f"Veilige verwijdercontrole ontbreekt voor configuratietype {node}; niets geschreven")
             if not change.get("name"):
                 raise RuntimeError(f"Verwijdering van {node} heeft geen herkenbare objectnaam; niets geschreven")
-            deleted_objects[object_type].append(change["name"])
+            if (object_type, change["name"]) not in native_moved_names:
+                deleted_objects[object_type].append(change["name"])
         for object_type, names in deleted_objects.items():
             # PAN-OS rejects deleting a local entry while any rule still
             # references it, even if a same-named Shared entry would inherit
@@ -6439,9 +6580,9 @@ def config_workspace_push(workspace_id):
             validate_workspace_object_deletions(
                 push_desired_xml, object_type, names,
             )
-        for change in chosen:
+        for change in write_plan:
             params = {"type": "config", "action": change["action"], "xpath": change["xpath"], "key": key}
-            if change["action"] in {"set", "edit"}:
+            if change["action"] in {"set", "edit", "multi-move"}:
                 params["element"] = change["element"]
             if change["action"] == "move":
                 params["where"] = change["where"]

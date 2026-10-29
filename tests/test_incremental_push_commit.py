@@ -345,7 +345,7 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertIn("selecteer Security policies", message)
         api_post.assert_not_called()
 
-    def test_moving_referenced_vsys_object_to_shared_is_blocked_before_any_write(self):
+    def test_native_multi_move_preserves_references_when_moving_vsys_object_to_shared(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><shared/><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
             b'<address><entry name="A_first"><ip-netmask>192.0.2.1/32</ip-netmask></entry>'
@@ -376,18 +376,64 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertEqual(shared_addition["name"], "A_first")
         self.assertIn("0_NAC_10_10_130_0_24", main.config_push_change_names(shared_addition))
 
+        def api_response(endpoint, params, ctx):
+            if params["type"] == "config":
+                return '<response status="success" code="20"><result/></response>'
+            if params["type"] == "op":
+                return '<response status="success"><result><job>606</job></result></response>'
+            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
+
         with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
-             patch("app.main.panos_api_post") as api_post:
+             patch("app.main.panos_api_post", side_effect=api_response) as api_post, \
+             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
             response = self.client.post(
                 f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
                 data={"csrf": "incremental-commit-csrf", "family": selected}, follow_redirects=True,
             )
 
-        self.assertIn("objecten zijn nog in gebruik", response.get_data(as_text=True))
-        self.assertIn("Migrated sites to Untrust", response.get_data(as_text=True))
-        api_post.assert_not_called()
+        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
+        config_calls = [call.args[1] for call in api_post.call_args_list if call.args[1]["type"] == "config"]
+        self.assertEqual(len(config_calls), 2)
+        self.assertEqual({call["action"] for call in config_calls}, {"multi-move"})
+        moved_names = {
+            node.text for call in config_calls
+            for node in main.ET.fromstring(f"<fragment>{call['element']}</fragment>").findall("./selected-list/source/member")
+        }
+        self.assertEqual(moved_names, {"A_first", "0_NAC_10_10_130_0_24"})
+        for call in config_calls:
+            fragment = main.ET.fromstring(f"<fragment>{call['element']}</fragment>")
+            self.assertEqual(fragment.findtext("./all-errors"), "no")
 
-    def test_moving_referenced_vsys2_destination_object_to_shared_is_blocked_before_any_write(self):
+    def test_native_move_then_edit_handles_changed_object_without_delete(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared/><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<address><entry name="move-me"><ip-netmask>192.0.2.1/32</ip-netmask></entry></address>'
+            b'<rulebase><security><rules><entry name="uses-move-me"><source><member>move-me</member>'
+            b'</source></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        local = desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/address")
+        entry = local.find("./entry[@name='move-me']")
+        local.remove(entry)
+        entry.find("./ip-netmask").text = "192.0.2.2/32"
+        main.ET.SubElement(desired_root.find("./shared"), "address").append(entry)
+        desired = main.normalized_config_xml(desired_root)
+        chosen = main.config_push_delta(base, desired)
+
+        plan, moved = main.panos_scope_move_plan(
+            base, chosen, {node: kind for kind, node in main.OBJECT_NODES.items()},
+        )
+
+        self.assertEqual([item["action"] for item in plan], ["multi-move", "edit"])
+        self.assertEqual(moved, {("addresses", "move-me")})
+        self.assertTrue(plan[1]["xpath"].endswith("/address/entry[@name='move-me']"))
+        self.assertIn("192.0.2.2/32", plan[1]["element"])
+        self.assertEqual(
+            main.ET.fromstring(f"<fragment>{plan[0]['element']}</fragment>").findtext("./all-errors"),
+            "no",
+        )
+
+    def test_native_multi_move_preserves_vsys2_policy_references_to_shared(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><shared/><devices><entry name="localhost.localdomain"><vsys>'
             b'<entry name="vsys1"><address/></entry><entry name="vsys2">'
@@ -415,18 +461,31 @@ class IncrementalPushCommitTests(unittest.TestCase):
         shared_addition = next(item for item in changes if item["action"] == "set" and item["scope"] == "Shared")
         self.assertIn("XIQ-NL-GCP", main.config_push_change_names(shared_addition))
 
+        def api_response(endpoint, params, ctx):
+            if params["type"] == "config":
+                return '<response status="success" code="20"><result/></response>'
+            if params["type"] == "op":
+                return '<response status="success"><result><job>607</job></result></response>'
+            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
+
         with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
-             patch("app.main.panos_api_post") as api_post:
+             patch("app.main.panos_api_post", side_effect=api_response) as api_post, \
+             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
             response = self.client.post(
                 f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
                 data={"csrf": "incremental-commit-csrf", "family": selected}, follow_redirects=True,
             )
 
-        self.assertIn("objecten zijn nog in gebruik", response.get_data(as_text=True))
-        self.assertIn("Explore-Access Points-to-XIQ-RadSec", response.get_data(as_text=True))
-        api_post.assert_not_called()
+        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
+        config_calls = [call.args[1] for call in api_post.call_args_list if call.args[1]["type"] == "config"]
+        self.assertEqual(len(config_calls), 2)
+        self.assertEqual({call["action"] for call in config_calls}, {"multi-move"})
+        self.assertIn("XIQ-NL-GCP", {
+            node.text for call in config_calls
+            for node in main.ET.fromstring(f"<fragment>{call['element']}</fragment>").findall("./selected-list/source/member")
+        })
 
-    def test_move_to_shared_with_live_reference_and_new_reference_is_blocked(self):
+    def test_native_multi_move_can_add_new_reference_in_another_vsys(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><shared/><devices><entry name="localhost.localdomain"><vsys>'
             b'<entry name="vsys1"><address><entry name="XIQ-NL-GCP">'
@@ -455,16 +514,28 @@ class IncrementalPushCommitTests(unittest.TestCase):
             item["selection_key"] for item in main.config_push_delta(base, desired)
         ))
 
+        def api_response(endpoint, params, ctx):
+            if params["type"] == "config":
+                return '<response status="success" code="20"><result/></response>'
+            if params["type"] == "op":
+                return '<response status="success"><result><job>609</job></result></response>'
+            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
+
         with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
-             patch("app.main.panos_api_post") as api_post:
+             patch("app.main.panos_api_post", side_effect=api_response) as api_post, \
+             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
             response = self.client.post(
                 f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
                 data={"csrf": "incremental-commit-csrf", "family": selected}, follow_redirects=True,
             )
 
-        self.assertIn("objecten zijn nog in gebruik", response.get_data(as_text=True))
-        self.assertIn("Existing XIQ rule", response.get_data(as_text=True))
-        api_post.assert_not_called()
+        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
+        config_calls = [call.args[1] for call in api_post.call_args_list if call.args[1]["type"] == "config"]
+        self.assertEqual({call["action"] for call in config_calls}, {"multi-move", "set"})
+        move_call = next(call for call in config_calls if call["action"] == "multi-move")
+        self.assertIn("XIQ-NL-GCP", [
+            node.text for node in main.ET.fromstring(f"<fragment>{move_call['element']}</fragment>").findall("./selected-list/source/member")
+        ])
 
     def create_existing_shared_object_move_workspace(self):
         base = main.normalized_config_xml(main.ET.fromstring(
