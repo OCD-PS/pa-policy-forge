@@ -84,6 +84,7 @@ from app.offline_config import (
     delete_policies_from_snapshot, move_policies_in_snapshot,
     safe_workspace_path, scoped_objects,
     scoped_policies, snapshot_sha256, referenced_template,
+    unresolved_object_reference_index,
 )
 
 BASE = Path(__file__).resolve().parent.parent
@@ -3729,12 +3730,23 @@ WORKSPACE_EDITABLE_OBJECT_TYPES = set(OBJECT_NODES)
 WORKSPACE_CREATABLE_OBJECT_TYPES = set(OBJECT_NODES)
 
 
-def validate_workspace_object_deletions(xml_bytes: bytes, object_type: str, names: list[str]) -> dict[str, list[str]]:
+def validate_workspace_object_deletions(
+    xml_bytes: bytes, object_type: str, names: list[str], *, scope_resolvable_names: set[str] | None = None,
+    original_xml_bytes: bytes | None = None,
+) -> dict[str, list[str]]:
     """Fail closed unless the full PAN-OS/Panorama XML proves objects unused."""
     if object_type not in REFERENCE_CHECK_OBJECT_TYPES:
         raise OfflineConfigError("Veilig verwijderen is voor dit objecttype niet beschikbaar")
     try:
         references = object_reference_index(xml_bytes, object_type, names)
+        scope_resolvable_names = set(scope_resolvable_names or ()) & set(names)
+        if scope_resolvable_names:
+            scoped_references = unresolved_object_reference_index(
+                xml_bytes, object_type, sorted(scope_resolvable_names),
+                original_xml_bytes=original_xml_bytes,
+            )
+            for name in scope_resolvable_names:
+                references[name] = scoped_references.get(name, [])
     except Exception as exc:
         raise OfflineConfigError("Referentiecontrole van de volledige configuratie is mislukt; niets verwijderd") from exc
     used = {name: paths for name, paths in references.items() if paths}
@@ -6361,7 +6373,35 @@ def config_workspace_push(workspace_id):
                 raise RuntimeError(f"Verwijdering van {node} heeft geen herkenbare objectnaam; niets geschreven")
             deleted_objects[object_type].append(change["name"])
         for object_type, names in deleted_objects.items():
-            validate_workspace_object_deletions(push_desired_xml, object_type, names)
+            node = OBJECT_NODES[object_type]
+            scope_resolvable_names = set()
+            current_root, current_snapshot = parse_snapshot(current_xml, expected_kind=expected_kind)
+            current_shared = {
+                item["name"] for item in scoped_objects(
+                    current_xml, "Shared", object_type, parsed=(current_root, current_snapshot),
+                )[1]
+            }
+            selected_shared = {
+                item["name"] for item in chosen
+                if item["family"] == f"object:{node}" and item["scope"] == "Shared"
+                and item["action"] in {"set", "edit"}
+            }
+            selected_shared_deletions = {
+                item["name"] for item in chosen
+                if item["family"] == f"object:{node}" and item["scope"] == "Shared"
+                and item["action"] == "delete"
+            }
+            for name in names:
+                # A same-name Shared definition preserves references from the
+                # source VSYS after the local copy is removed. Only allow the
+                # scope-aware check when that Shared entry already exists on
+                # the target or its write is part of this selected push.
+                if (name in current_shared and name not in selected_shared_deletions) or name in selected_shared:
+                    scope_resolvable_names.add(name)
+            validate_workspace_object_deletions(
+                push_desired_xml, object_type, names,
+                scope_resolvable_names=scope_resolvable_names, original_xml_bytes=current_xml,
+            )
         for change in chosen:
             params = {"type": "config", "action": change["action"], "xpath": change["xpath"], "key": key}
             if change["action"] in {"set", "edit"}:
