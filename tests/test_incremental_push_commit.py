@@ -421,7 +421,7 @@ class IncrementalPushCommitTests(unittest.TestCase):
         chosen = main.config_push_delta(base, desired)
 
         plan, moved = main.panos_scope_move_plan(
-            base, chosen, {node: kind for kind, node in main.OBJECT_NODES.items()},
+            base, desired, chosen, {node: kind for kind, node in main.OBJECT_NODES.items()},
         )
 
         self.assertEqual([item["action"] for item in plan], ["multi-move", "edit"])
@@ -597,6 +597,150 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertIn("objecten zijn nog in gebruik", message)
         self.assertIn("Explore-Access Points-to-XIQ-RadSec", message)
         api_post.assert_not_called()
+
+    def test_same_name_shared_merge_rehomes_local_references_before_delete(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address><entry name="0_NAC_10_10_130_0_24">'
+            b'<ip-netmask>10.10.130.0/24</ip-netmask></entry></address></shared>'
+            b'<devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<address><entry name="0_NAC_10_10_130_0_24"><ip-netmask>10.10.130.0/24</ip-netmask>'
+            b'</entry></address><rulebase><security><rules><entry name="Migrated sites to Untrust">'
+            b'<source><member>0_NAC_10_10_130_0_24</member></source>'
+            b'</entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/address").clear()
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "merge same-name object into Shared", "candidate.xml", desired, "api",
+            baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        deletion = next(item for item in main.config_push_delta(base, desired) if item["action"] == "delete")
+        requests = []
+
+        def api_response(endpoint, params, ctx):
+            requests.append(dict(params))
+            if params["type"] == "config":
+                if params["action"] == "multi-config":
+                    return (
+                        '<response status="success" code="20"><result>'
+                        '<response status="success" code="20" id="1"/>'
+                        '<response status="success" code="20" id="2"/>'
+                        '<response status="success" code="20" id="3"/>'
+                        '</result></response>'
+                    )
+                return '<response status="success" code="20"><result/></response>'
+            if params["type"] == "op":
+                return '<response status="success"><result><job>610</job></result></response>'
+            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post", side_effect=api_response), \
+             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": deletion["selection_key"]},
+                follow_redirects=True,
+            )
+
+        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
+        config_calls = [item for item in requests if item["type"] == "config"]
+        self.assertEqual(len(config_calls), 1)
+        self.assertEqual(config_calls[0]["action"], "multi-config")
+        self.assertEqual(config_calls[0]["strict-transactional"], "no")
+        transaction = main.ET.fromstring(config_calls[0]["element"])
+        self.assertEqual([item.tag for item in transaction], ["rename", "edit", "delete"])
+        self.assertTrue(transaction[0].get("newname").startswith("PF_TMP_"))
+        self.assertTrue(transaction[0].get("xpath").endswith("/entry[@name='0_NAC_10_10_130_0_24']"))
+        self.assertTrue(transaction[1].get("xpath").endswith("/source"))
+        self.assertIn("0_NAC_10_10_130_0_24", main.ET.tostring(transaction[1], encoding="unicode"))
+        self.assertIn("PF_TMP_", transaction[2].get("xpath"))
+
+    def test_same_name_shared_merge_stops_on_nested_transaction_error(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address><entry name="same-object"><ip-netmask>192.0.2.10/32</ip-netmask>'
+            b'</entry></address></shared><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<address><entry name="same-object"><ip-netmask>192.0.2.10/32</ip-netmask></entry></address>'
+            b'<rulebase><security><rules><entry name="allow"><source><member>same-object</member></source>'
+            b'</entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/address").clear()
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "transaction error rolls back Shared merge", "candidate.xml", desired, "api",
+            baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        deletion = next(item for item in main.config_push_delta(base, desired) if item["action"] == "delete")
+        requests = []
+
+        def api_response(endpoint, params, ctx):
+            requests.append(dict(params))
+            return (
+                '<response status="success" code="20">'
+                '<response status="error" code="10"><msg>Object is still referenced</msg></response>'
+                '</response>'
+            )
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post", side_effect=api_response), \
+             patch("app.main.wait_panos_job") as wait_job:
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": deletion["selection_key"]},
+                follow_redirects=True,
+            )
+
+        message = response.get_data(as_text=True)
+        self.assertIn("Shared object merge", message)
+        self.assertIn("kan dit object niet verwijderen zolang er verwijzingen naar bestaan", message)
+        self.assertEqual([item.get("action") for item in requests], ["multi-config"])
+        wait_job.assert_not_called()
+
+    def test_same_name_shared_merge_supports_panorama_device_group_scope(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address><entry name="same-object"><ip-netmask>192.0.2.10/32</ip-netmask>'
+            b'</entry></address></shared><devices><entry name="localhost.localdomain"><device-group>'
+            b'<entry name="DG-A"><address><entry name="same-object"><ip-netmask>192.0.2.10/32</ip-netmask>'
+            b'</entry></address><pre-rulebase><security><rules><entry name="allow"><source>'
+            b'<member>same-object</member></source></entry></rules></security></pre-rulebase>'
+            b'</entry></device-group></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find("./devices/entry/device-group/entry[@name='DG-A']/address").clear()
+        desired = main.normalized_config_xml(desired_root)
+        deletion = next(item for item in main.config_push_delta(base, desired) if item["action"] == "delete")
+
+        plan, moved = main.panos_scope_move_plan(
+            base, desired, [deletion], {node: kind for kind, node in main.OBJECT_NODES.items()},
+        )
+
+        self.assertEqual([item["action"] for item in plan], ["multi-config"])
+        self.assertEqual(moved, {("addresses", "same-object")})
+
+    def test_same_name_shared_merge_blocks_panorama_parent_scope_shadow(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address><entry name="same-object"><ip-netmask>192.0.2.10/32</ip-netmask>'
+            b'</entry></address></shared><devices><entry name="localhost.localdomain"><device-group>'
+            b'<entry name="DG-P"><address><entry name="same-object"><ip-netmask>198.51.100.10/32</ip-netmask>'
+            b'</entry></address></entry><entry name="DG-A"><parent-dg>DG-P</parent-dg><address>'
+            b'<entry name="same-object"><ip-netmask>192.0.2.10/32</ip-netmask></entry></address>'
+            b'<pre-rulebase><security><rules><entry name="allow"><source><member>same-object</member>'
+            b'</source></entry></rules></security></pre-rulebase></entry></device-group></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find("./devices/entry/device-group/entry[@name='DG-A']/address").clear()
+        desired = main.normalized_config_xml(desired_root)
+        deletion = next(item for item in main.config_push_delta(base, desired) if item["action"] == "delete")
+
+        plan, moved = main.panos_scope_move_plan(
+            base, desired, [deletion], {node: kind for kind, node in main.OBJECT_NODES.items()},
+        )
+
+        self.assertEqual([item["action"] for item in plan], ["delete"])
+        self.assertEqual(moved, set())
 
     def test_shared_fallback_is_not_accepted_when_its_addition_is_not_selected(self):
         base = main.normalized_config_xml(main.ET.fromstring(
