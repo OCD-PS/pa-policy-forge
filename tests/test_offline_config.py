@@ -101,6 +101,52 @@ class OfflineConfigTests(unittest.TestCase):
         self.assertEqual(root.findtext("./devices/entry/vsys/entry[@name='vsys2']/rulebase/nat/rules/entry/destination-translation/translated-address"), "PublicServer")
         self.assertEqual(summary, {"merged": 2, "groups": 1})
 
+    def test_cross_scope_merge_to_shared_resolves_global_path_monitor_reference(self):
+        source = b'''<config><shared><address>
+        <entry name="8.8.8.8"><ip-netmask>8.8.8.8/32</ip-netmask></entry>
+        </address></shared><devices><entry name="localhost.localdomain"><network><virtual-router>
+        <entry name="VR1"><routing-table><ip><static-route><entry name="default">
+        <path-monitor><monitor-destinations><entry name="dns-monitor"><destination>8.8.8.8</destination></entry></monitor-destinations></path-monitor>
+        </entry></static-route></ip></routing-table></entry></virtual-router></network>
+        <vsys><entry name="vsys1"><address>
+        <entry name="8.8.8.8"><ip-netmask>8.8.8.8/32</ip-netmask></entry>
+        </address></entry><entry name="vsys2"/></vsys></entry></devices></config>'''
+        group = next(
+            item for item in duplicate_object_groups_across_panos_scopes(source, "addresses")
+            if {obj["scope"] for obj in item["objects"]} == {"Shared", "vsys1"}
+            and {obj["name"] for obj in item["objects"]} == {"8.8.8.8"}
+        )
+
+        merged, summary = merge_duplicate_object_groups_to_shared(source, [{
+            "object_type": "addresses", "objects": group["objects"],
+            "master": {"scope": "Shared", "name": "8.8.8.8"},
+        }])
+
+        root, _ = parse_snapshot(merged)
+        self.assertEqual(len(root.findall("./shared/address/entry[@name='8.8.8.8']")), 1)
+        self.assertIsNone(root.find("./devices/entry/vsys/entry[@name='vsys1']/address/entry[@name='8.8.8.8']"))
+        self.assertEqual(
+            root.findtext("./devices/entry/network/virtual-router/entry/routing-table/ip/static-route/entry/path-monitor/monitor-destinations/entry/destination"),
+            "8.8.8.8",
+        )
+        self.assertEqual(summary, {"merged": 1, "groups": 1})
+
+        unscoped = source.replace(
+            b"</devices></config>",
+            b"</devices><rulebase><security><rules><entry name='unscoped'><source>"
+            b"<member>8.8.8.8</member></source></entry></rules></security></rulebase></config>",
+        )
+        unscoped_group = next(
+            item for item in duplicate_object_groups_across_panos_scopes(unscoped, "addresses")
+            if {obj["scope"] for obj in item["objects"]} == {"Shared", "vsys1"}
+            and {obj["name"] for obj in item["objects"]} == {"8.8.8.8"}
+        )
+        with self.assertRaisesRegex(OfflineConfigError, "geen herkenbare scope"):
+            merge_duplicate_object_groups_to_shared(unscoped, [{
+                "object_type": "addresses", "objects": unscoped_group["objects"],
+                "master": {"scope": "Shared", "name": "8.8.8.8"},
+            }])
+
     def test_cross_scope_merge_can_select_vsys_master_and_rewrites_shared_references(self):
         source = b'''<config><shared><address><entry name="old-shared"><ip-netmask>192.0.2.11</ip-netmask></entry></address>
         <address-group><entry name="Consumers"><static><member>old-shared</member></static></entry></address-group></shared>

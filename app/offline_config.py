@@ -1155,17 +1155,23 @@ def merge_duplicate_object_groups_to_shared(
         for node in refs:
             reference_scope = _reference_scope(node, parent_map, snapshot)
             value = (node.text or "").strip()
-            if reference_scope is None:
+            global_path_monitor_ref = _is_panos_path_monitor_address_reference(
+                node, parent_map, snapshot, object_type,
+            )
+            if reference_scope is None and not global_path_monitor_ref:
                 if any(key[0] == object_type and key[2] == value for key in selected_by_key):
                     raise OfflineConfigError(f"Referentie naar object {value} heeft geen herkenbare scope; niets opgeslagen")
                 continue
-            entry = resolve(reference_scope, object_type, value)
+            # PAN-OS virtual-router path-monitor destinations live under the
+            # device tree but resolve globally against Shared address objects.
+            resolution_scope = "Shared" if global_path_monitor_ref else reference_scope
+            entry = resolve(resolution_scope, object_type, value)
             selected_key = selected_by_entry.get(entry) if entry is not None else None
             if selected_key is None:
                 continue
             master_name = duplicates_by_entry[entry][1]
             node.text = master_name
-            replacements_to_verify.append((node, reference_scope, object_type, master_name))
+            replacements_to_verify.append((node, resolution_scope, object_type, master_name))
             if node in parent_map:
                 replaced_by_parent.setdefault(parent_map[node], set()).add(master_name)
 
