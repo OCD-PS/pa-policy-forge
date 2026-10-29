@@ -720,6 +720,38 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertEqual([item["action"] for item in plan], ["multi-config"])
         self.assertEqual(moved, {("addresses", "same-object")})
 
+    def test_multiple_shared_merges_parse_each_config_once_per_object_type(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address>'
+            b'<entry name="object-a"><ip-netmask>192.0.2.10/32</ip-netmask></entry>'
+            b'<entry name="object-b"><ip-netmask>192.0.2.20/32</ip-netmask></entry>'
+            b'</address></shared><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<address><entry name="object-a"><ip-netmask>192.0.2.10/32</ip-netmask></entry>'
+            b'<entry name="object-b"><ip-netmask>192.0.2.20/32</ip-netmask></entry></address>'
+            b'<rulebase><security><rules><entry name="allow-a"><source><member>object-a</member>'
+            b'</source></entry><entry name="allow-b"><source><member>object-b</member></source>'
+            b'</entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        local_addresses = desired_root.find("./devices/entry/vsys/entry/address")
+        for local_entry in list(local_addresses):
+            local_addresses.remove(local_entry)
+        desired = main.normalized_config_xml(desired_root)
+        deletions = [
+            item for item in main.config_push_delta(base, desired)
+            if item["action"] == "delete" and item["family"] == "object:address"
+        ]
+
+        with patch("app.main.parse_snapshot", wraps=main.parse_snapshot) as parse_config:
+            plan, moved = main.panos_scope_move_plan(
+                base, desired, deletions,
+                {node: kind for kind, node in main.OBJECT_NODES.items()},
+            )
+
+        self.assertEqual([item["action"] for item in plan], ["multi-config"])
+        self.assertEqual(moved, {("addresses", "object-a"), ("addresses", "object-b")})
+        self.assertEqual(parse_config.call_count, 2)
+
     def test_same_name_shared_merge_blocks_panorama_parent_scope_shadow(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><shared><address><entry name="same-object"><ip-netmask>192.0.2.10/32</ip-netmask>'
