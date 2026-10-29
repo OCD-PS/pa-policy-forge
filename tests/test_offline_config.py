@@ -147,6 +147,33 @@ class OfflineConfigTests(unittest.TestCase):
                 "master": {"scope": "Shared", "name": "8.8.8.8"},
             }])
 
+    def test_cross_scope_merge_to_shared_rewrites_static_route_destination(self):
+        source = b'''<config><shared><address>
+        <entry name="Shared-Server"><ip-netmask>10.10.120.100/32</ip-netmask></entry>
+        </address></shared><devices><entry name="localhost.localdomain"><network><virtual-router>
+        <entry name="default"><routing-table><ip><static-route><entry name="Publilink_ftp_Social_Security">
+        <destination>Local-Server</destination></entry></static-route></ip></routing-table></entry>
+        </virtual-router></network><vsys><entry name="vsys1"><address>
+        <entry name="Local-Server"><ip-netmask>10.10.120.100/32</ip-netmask></entry>
+        </address></entry><entry name="vsys2"/></vsys></entry></devices></config>'''
+        group = next(
+            item for item in duplicate_object_groups_across_panos_scopes(source, "addresses")
+            if {obj["scope"] for obj in item["objects"]} == {"Shared", "vsys1"}
+        )
+
+        merged, summary = merge_duplicate_object_groups_to_shared(source, [{
+            "object_type": "addresses", "objects": group["objects"],
+            "master": {"scope": "Shared", "name": "Shared-Server"},
+        }])
+
+        root, _ = parse_snapshot(merged)
+        self.assertIsNone(root.find("./devices/entry/vsys/entry[@name='vsys1']/address/entry[@name='Local-Server']"))
+        self.assertEqual(
+            root.findtext("./devices/entry/network/virtual-router/entry/routing-table/ip/static-route/entry/destination"),
+            "Shared-Server",
+        )
+        self.assertEqual(summary, {"merged": 1, "groups": 1})
+
     def test_cross_scope_merge_can_select_vsys_master_and_rewrites_shared_references(self):
         source = b'''<config><shared><address><entry name="old-shared"><ip-netmask>192.0.2.11</ip-netmask></entry></address>
         <address-group><entry name="Consumers"><static><member>old-shared</member></static></entry></address-group></shared>
@@ -403,6 +430,29 @@ class OfflineConfigTests(unittest.TestCase):
         self.assertEqual(object_reference_index(wrong_device, "addresses", ["Google"])["Google"], [])
         unnamed_route = source.replace(b'<entry name="default_route">', b"<entry>")
         self.assertEqual(object_reference_index(unnamed_route, "addresses", ["Google"])["Google"], [])
+
+    def test_reference_index_includes_panos_static_route_address_object_destinations(self):
+        source = b'''<config><shared><address><entry name="Route-Object"><ip-netmask>10.10.120.100/32</ip-netmask></entry></address></shared>
+        <devices><entry name="localhost.localdomain"><network><virtual-router><entry name="default"><routing-table>
+        <ip><static-route><entry name="route"><destination>Route-Object</destination></entry></static-route></ip>
+        </routing-table></entry></virtual-router></network><vsys><entry name="vsys1"/><entry name="vsys2"/></vsys>
+        </entry></devices></config>'''
+
+        references = object_reference_index(source, "addresses", ["Route-Object"])
+
+        self.assertEqual(references["Route-Object"], [
+            "/config/devices/entry[@name=localhost.localdomain]/network/virtual-router/entry[@name=default]/routing-table/ip/static-route/entry[@name=route]/destination",
+        ])
+        wrong_device = source.replace(b"localhost.localdomain", b"other-device")
+        self.assertEqual(object_reference_index(wrong_device, "addresses", ["Route-Object"])["Route-Object"], [])
+        unnamed_route = source.replace(b'<entry name="route">', b"<entry>")
+        self.assertEqual(object_reference_index(unnamed_route, "addresses", ["Route-Object"])["Route-Object"], [])
+        malformed = source.replace(b"routing-table", b"route-table")
+        self.assertEqual(object_reference_index(malformed, "addresses", ["Route-Object"])["Route-Object"], [])
+        nested_config = source.replace(
+            b"<config>", b"<config><template><entry name='T'><config>", 1,
+        ).replace(b"</config>", b"</config></entry></template></config>")
+        self.assertEqual(object_reference_index(nested_config, "addresses", ["Route-Object"])["Route-Object"], [])
 
     def test_reference_index_detects_group_members_dynamic_tag_filters_and_cert_use(self):
         source = b'''<config><shared><address-group><entry name="servers"><static><member>server-a</member></static></entry><entry name="dynamic-servers"><dynamic><filter> 'Prod' </filter></dynamic></entry></address-group><certificate><entry name="proxy-cert"><usage>forward-trust</usage></entry></certificate><ssl-decrypt><entry name="decrypt"><forward-trust-certificate>proxy-cert</forward-trust-certificate></entry></ssl-decrypt></shared></config>'''
