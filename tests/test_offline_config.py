@@ -14,7 +14,7 @@ from app.offline_config import (
     referenced_template, scoped_objects, scoped_object_names, scoped_object_page, scoped_policies,
     scoped_server_profiles, object_reference_index, duplicate_object_groups, merge_duplicate_objects,
     merge_duplicate_object_groups, duplicate_object_groups_across_panos_scopes,
-    merge_duplicate_object_groups_to_shared,
+    merge_duplicate_object_groups_to_shared, object_reference_indexes,
 )
 
 
@@ -354,6 +354,38 @@ class OfflineConfigTests(unittest.TestCase):
         self.assertTrue(object_reference_index(source, "addresses", ["nat-pool"])["nat-pool"])
         self.assertTrue(object_reference_index(source, "certificates", ["root-ca"])["root-ca"])
         self.assertTrue(object_reference_index(source, "certificates", ["forward-cert"])["forward-cert"])
+
+    def test_multi_type_reference_index_covers_shared_groups_and_vsys_policies(self):
+        source = b'''<config><shared><address><entry name="10.10.120.100"/></address><address-group><entry name="Servers_HTTP_HTTPS"><static><member>10.10.120.100</member><member>10.10.120.102</member></static></entry></address-group><service-group><entry name="web"><members><member>tcp443</member></members></entry></service-group></shared><devices><entry name="localhost.localdomain"><vsys><entry name="vsys2"><rulebase><security><rules><entry name="allow"><service><member>tcp443</member></service></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'''
+
+        references = object_reference_indexes(source, {
+            "addresses": ["10.10.120.100", "10.10.120.102", "unused"],
+            "services": ["tcp443", "unused-service"],
+        })
+
+        self.assertEqual(
+            references["addresses"]["10.10.120.100"],
+            ["/config/shared/address-group/entry[@name=Servers_HTTP_HTTPS]/static/member"],
+        )
+        self.assertEqual(
+            references["addresses"]["10.10.120.102"],
+            ["/config/shared/address-group/entry[@name=Servers_HTTP_HTTPS]/static/member"],
+        )
+        self.assertEqual(references["addresses"]["unused"], [])
+        self.assertEqual(len(references["services"]["tcp443"]), 2)
+        self.assertEqual(references["services"]["unused-service"], [])
+
+    def test_multi_type_reference_index_covers_panorama_shared_and_device_groups(self):
+        source = b'''<config><shared><address-group><entry name="SharedServers"><static><member>server-a</member></static></entry></address-group></shared><devices><entry name="localhost.localdomain"><device-group><entry name="Parent"><address-group><entry name="ParentServers"><static><member>server-a</member></static></entry></address-group><pre-rulebase><security><rules><entry name="allow"><destination><member>server-a</member></destination></entry></rules></security></pre-rulebase></entry><entry name="Child"><parent-dg>Parent</parent-dg><post-rulebase><nat><rules><entry name="translate"><destination-translation><translated-address>server-a</translated-address></destination-translation></entry></rules></nat></post-rulebase></entry></device-group><template><entry name="Branch"><address-group><entry name="TemplateServers"><static><member>server-a</member></static></entry></address-group></entry></template></entry></devices></config>'''
+
+        references = object_reference_indexes(source, {"addresses": ["server-a"]})
+
+        paths = references["addresses"]["server-a"]
+        self.assertTrue(any("/config/shared/address-group/" in path for path in paths))
+        self.assertTrue(any("/device-group/entry[@name=Parent]/address-group/" in path for path in paths))
+        self.assertTrue(any("/device-group/entry[@name=Parent]/pre-rulebase/" in path for path in paths))
+        self.assertTrue(any("/device-group/entry[@name=Child]/post-rulebase/" in path for path in paths))
+        self.assertTrue(any("/template/entry[@name=Branch]/address-group/" in path for path in paths))
 
     def test_empty_network_containers_are_not_fake_records_and_can_be_bootstrapped(self):
         source = b'<config><devices><entry name="localhost.localdomain"><network><interface><ethernet /></interface></network><vsys><entry name="vsys1"><zone /></entry></vsys></entry></devices></config>'
