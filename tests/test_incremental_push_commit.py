@@ -805,6 +805,90 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertTrue(all(item.get("newname", "").startswith("PF_TMP_") for item in transaction.findall("rename")))
         self.assertEqual(sum(item.tag == "edit" for item in transaction), 2)
 
+    def test_same_name_shared_address_merge_restores_device_path_monitor_reference(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address><entry name="Google"><ip-netmask>8.8.8.8/32</ip-netmask>'
+            b'</entry></address></shared><devices><entry name="localhost.localdomain">'
+            b'<network><virtual-router><entry name="VR_Telenet_Archief"><routing-table><ip>'
+            b'<static-route><entry name="default_route"><path-monitor><enable>yes</enable>'
+            b'<monitor-destinations><entry name="Google"><enable>yes</enable>'
+            b'<destination>Google</destination></entry></monitor-destinations></path-monitor>'
+            b'</entry></static-route></ip></routing-table></entry></virtual-router></network>'
+            b'<vsys><entry name="vsys1"><address><entry name="Google">'
+            b'<ip-netmask>8.8.8.8/32</ip-netmask></entry></address>'
+            b'<rulebase><security><rules><entry name="allow-google"><destination>'
+            b'<member>Google</member></destination></entry></rules></security></rulebase>'
+            b'</entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/address").clear()
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "merge same-name address referenced by path monitor", "candidate.xml",
+            desired, "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        deletion = next(
+            item for item in main.config_push_delta(base, desired)
+            if item["action"] == "delete" and item["family"] == "object:address"
+        )
+        requests = []
+
+        def api_response(endpoint, params, ctx):
+            requests.append(dict(params))
+            if params["type"] == "config" and params["action"] == "multi-config":
+                nested = "".join(
+                    f'<response status="success" code="20" id="{index}"/>'
+                    for index in range(1, 5)
+                )
+                return f'<response status="success" code="20"><result>{nested}</result></response>'
+            if params["type"] == "config":
+                return '<response status="success" code="20"><result/></response>'
+            if params["type"] == "op":
+                return '<response status="success"><result><job>612</job></result></response>'
+            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post", side_effect=api_response), \
+             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": deletion["selection_key"]},
+                follow_redirects=True,
+            )
+
+        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
+        self.assertFalse(any(item["type"] == "commit" for item in requests))
+        config_call = next(item for item in requests if item["type"] == "config")
+        transaction = main.ET.fromstring(config_call["element"])
+        self.assertEqual([item.tag for item in transaction], ["rename", "edit", "edit", "delete"])
+        edit_paths = [item.get("xpath") for item in transaction.findall("edit")]
+        self.assertTrue(any(
+            path.endswith("/rulebase/security/rules/entry[@name='allow-google']/destination")
+            for path in edit_paths
+        ))
+        self.assertTrue(any("/monitor-destinations/entry[@name='Google']/destination" in path for path in edit_paths))
+
+    def test_path_monitor_reference_without_shared_address_blocks_delete(self):
+        current = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><devices><entry name="localhost.localdomain"><network>'
+            b'<virtual-router><entry name="VR_Telenet_Archief"><routing-table><ip>'
+            b'<static-route><entry name="default_route"><path-monitor><monitor-destinations>'
+            b'<entry name="Google"><destination>Google</destination></entry>'
+            b'</monitor-destinations></path-monitor></entry></static-route></ip></routing-table>'
+            b'</entry></virtual-router></network><vsys><entry name="vsys1"><address>'
+            b'<entry name="Google"><ip-netmask>8.8.8.8/32</ip-netmask></entry>'
+            b'</address></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(current)
+        desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/address").clear()
+        desired = main.normalized_config_xml(desired_root)
+
+        with self.assertRaisesRegex(main.OfflineConfigError, "path-monitor/monitor-destinations"):
+            main.validate_incremental_object_deletions(
+                current, desired, {"addresses": ["Google"]}, set(),
+            )
+
     def test_same_name_shared_merge_stops_on_nested_transaction_error(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><shared><address><entry name="same-object"><ip-netmask>192.0.2.10/32</ip-netmask>'

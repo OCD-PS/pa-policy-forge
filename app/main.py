@@ -78,6 +78,7 @@ from app.offline_config import (
     panos_ui_decorate_record, scoped_object_names, scoped_object_page, scoped_server_profiles,
     object_reference_index, object_reference_indexes,
     _merge_object_signature, _reference_scope, _resolve_scoped_object_entry,
+    _is_panos_path_monitor_address_reference,
     _typed_object_reference_nodes,
     duplicate_object_groups, duplicate_object_groups_across_panos_scopes,
     merge_duplicate_object_groups, merge_duplicate_object_groups_to_shared,
@@ -5901,15 +5902,19 @@ def panos_scope_move_plan(
                 if value.strip() != name:
                     continue
                 scope = _reference_scope(ref, parent, current_snapshot)
-                if scope != source_scope:
+                device_path_monitor_reference = _is_panos_path_monitor_address_reference(
+                    ref, parent, current_snapshot, object_type,
+                )
+                if scope != source_scope and not (scope is None and device_path_monitor_reference):
                     continue
-                try:
-                    resolved = _resolve_scoped_object_entry(current_root, current_snapshot, scope, object_type, name)
-                except OfflineConfigError:
-                    return None
-                if resolved is not current_source_entry:
-                    continue
-                source_reference_scopes.add(scope)
+                if not device_path_monitor_reference:
+                    try:
+                        resolved = _resolve_scoped_object_entry(current_root, current_snapshot, scope, object_type, name)
+                    except OfflineConfigError:
+                        return None
+                    if resolved is not current_source_entry:
+                        continue
+                    source_reference_scopes.add(scope)
                 field = ref if ref.tag != "member" else parent.get(ref)
                 if field is None:
                     return None
