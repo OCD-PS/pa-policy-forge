@@ -1644,8 +1644,17 @@ class TargetAdapterTests(unittest.TestCase):
             selections = {}
             for section in re.findall(rb'<section class="card stack workspace-merge-group">(.*?)</section>', preview.data, re.S):
                 title = re.search(rb'<h2>(.*?)</h2>', section, re.S).group(1).decode()
-                group_id = re.search(rb'name="master_([a-f0-9]+)"', section).group(1).decode()
-                selections[f"master_{group_id}"] = "server-a" if title.startswith("Addresses") else "https-alt"
+                checked = re.search(
+                    rb'<input[^>]*type="radio"[^>]*name="master_([a-f0-9]+)"[^>]*value="([^"]+)"[^>]*checked',
+                    section,
+                )
+                self.assertIsNotNone(checked, f"The first master should be selected in {title}")
+                group_id, master = checked.groups()
+                selections[f"master_{group_id.decode()}"] = master.decode()
+                if title.startswith("Addresses"):
+                    self.assertEqual(master.decode(), "server-a")
+                elif title.startswith("Services"):
+                    self.assertEqual(master.decode(), "https-alt")
             applied = client.post(
                 action, data={"csrf": "merge-csrf", **selections},
                 base_url="https://forge.test",

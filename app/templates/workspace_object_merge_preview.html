@@ -43,7 +43,7 @@
             <tbody>
             {% for item in group.objects %}
             <tr>
-              <td><input class="workspace-merge-radio" type="radio" name="master_{{group.id}}" value="{{item.name}}" required aria-label="Gebruik {{item.name}} als master"></td>
+              <td><input class="workspace-merge-radio" type="radio" name="master_{{group.id}}" value="{{item.name}}" {{'checked' if loop.first else ''}} required aria-label="Gebruik {{item.name}} als master"></td>
               <td><strong>{{item.name}}</strong></td>
               <td>{{item.owner}}</td>
               <td>{{item.summary or '—'}}</td>
