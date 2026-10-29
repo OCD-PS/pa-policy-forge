@@ -6306,8 +6306,8 @@ def config_workspace_push(workspace_id):
         if not profile or profile["target_type"] not in {"panorama", "panos"}:
             raise RuntimeError("Dit target ondersteunt geen PAN-OS XML candidate-writes")
         selected = set(request.form.getlist("family"))
-        if len(selected) > 200:
-            raise RuntimeError("Selecteer maximaal 200 configuratiefamilies")
+        if len(selected) > 5000:
+            raise RuntimeError("De pushselectie bevat te veel configuratiefamilies")
         expected_kind = "panorama" if profile["target_type"] == "panorama" else "panos"
         workspace_xml, desired_root, desired_snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
         if desired_snapshot.kind != expected_kind:
@@ -6334,22 +6334,26 @@ def config_workspace_push(workspace_id):
         available = {item["selection_key"] for item in changes}
         if not selected.issubset(available):
             raise RuntimeError("De geselecteerde scope/familie hoort niet bij deze candidatepreview")
-        scope_move_additions = defaultdict(list)
-        for addition in changes:
-            if addition["action"] == "set" and addition["family"].startswith(("object:", "policy:")):
-                for name in config_push_change_names(addition):
-                    scope_move_additions[(addition["family"], name)].append(addition)
+        scope_move_targets = defaultdict(list)
+        for target_change in changes:
+            # A same-name object may already exist in Shared. Updating that
+            # entry is an `edit`, so pair it with the VSYS deletion just like a
+            # new Shared `set`; otherwise a partial selection falls through to
+            # the generic in-use guard and obscures the missing scope selection.
+            if target_change["action"] in {"set", "edit"} and target_change["family"].startswith(("object:", "policy:")):
+                for name in config_push_change_names(target_change):
+                    scope_move_targets[(target_change["family"], name)].append(target_change)
         scope_move_pairs = []
         for removal in changes:
             if removal["action"] != "delete" or not removal["family"].startswith(("object:", "policy:")):
                 continue
             counterparts = [
-                addition for addition in scope_move_additions.get((removal["family"], removal["name"]), [])
-                if addition["scope"] != removal["scope"]
+                target_change for target_change in scope_move_targets.get((removal["family"], removal["name"]), [])
+                if target_change["scope"] != removal["scope"]
             ]
             if any(
-                (removal["selection_key"] in selected) != (addition["selection_key"] in selected)
-                for addition in counterparts
+                (removal["selection_key"] in selected) != (target_change["selection_key"] in selected)
+                for target_change in counterparts
             ):
                 scope_move_pairs.append(removal["name"])
         if scope_move_pairs:

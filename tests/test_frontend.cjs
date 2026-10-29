@@ -105,6 +105,29 @@ test('hidden editor fields remain hidden despite layout display rules', async ()
   dom.window.close();
 });
 
+test('incremental push select-all selects every available family and tracks partial selection', async () => {
+  const {dom, document, window, errors} = await page(`<form data-incremental-push>
+    <input type="checkbox" data-push-select-all>
+    <input type="checkbox" name="family" data-push-family value="shared-objects">
+    <input type="checkbox" name="family" data-push-family value="vsys-policies">
+    <input type="checkbox" name="family" value="protected" disabled>
+    <button type="submit"></button><input type="checkbox" data-commit-after-push>
+    <div data-incremental-push-progress hidden></div></form>`);
+  const selectAll = document.querySelector('[data-push-select-all]');
+  const families = [...document.querySelectorAll('[data-push-family]')];
+  selectAll.click();
+  assert.deepEqual(families.map(input => input.checked), [true, true]);
+  assert.equal(document.querySelector('[value="protected"]').checked, false, 'protected settings are excluded from select-all');
+  assert.equal(selectAll.checked, true);
+  families[0].click();
+  assert.equal(selectAll.checked, false);
+  assert.equal(selectAll.indeterminate, true);
+  families[1].click();
+  assert.equal(selectAll.checked, false);
+  assert.equal(selectAll.indeterminate, false);
+  assert.deepEqual(errors, []); dom.window.close();
+});
+
 test('offline policy picker rows support multiple selections like object groups', async () => {
   const {dom, document, errors} = await page(`<dialog data-offline-policy-dialog><form action="/config-workspaces/1/policies/preview">
     <div data-offline-policy-field="source"><input data-offline-policy-input value=""><div data-offline-policy-values></div><input readonly data-offline-policy-entry data-offline-policy-kinds="addresses"><button type="button" data-offline-policy-add>+</button></div>

@@ -1093,10 +1093,26 @@
     });
   }
 
-  function setupIncrementalPushProgress() {
+  function setupIncrementalPushControls() {
     all("form[data-incremental-push]").forEach(function (form) {
       var button = form.querySelector('button[type="submit"]');
       var commitOption = form.querySelector("[data-commit-after-push]");
+      var selectAll = form.querySelector("[data-push-select-all]");
+      var familyChecks = all("[data-push-family]", form);
+      function updateSelectionState() {
+        if (!selectAll) return;
+        var selectedCount = familyChecks.filter(function (checkbox) { return checkbox.checked; }).length;
+        selectAll.checked = familyChecks.length > 0 && selectedCount === familyChecks.length;
+        selectAll.indeterminate = selectedCount > 0 && selectedCount < familyChecks.length;
+      }
+      if (selectAll) selectAll.addEventListener("change", function () {
+        familyChecks.forEach(function (checkbox) { checkbox.checked = selectAll.checked; });
+        updateSelectionState();
+      });
+      familyChecks.forEach(function (checkbox) {
+        checkbox.addEventListener("change", updateSelectionState);
+      });
+      updateSelectionState();
       function updateButtonLabel() {
         if (button) button.textContent = commitOption && commitOption.checked
           ? "Geselecteerde families schrijven en committen"
@@ -1481,7 +1497,7 @@
     runSetup("offline-policy", setupOfflinePolicyTabs);
     runSetup("configuration-editor", setupWorkspaceConfigurationEditor);
     runSetup("pull-progress", setupConfigPullProgress);
-    runSetup("incremental-push-progress", setupIncrementalPushProgress);
+    runSetup("incremental-push-controls", setupIncrementalPushControls);
     runSetup("workspace-commit-status", setupCommitStatusPolling);
     runSetup("workspace-objects", setupWorkspaceObjects);
     runSetup("workspace-context", setupWorkspaceContextLoading);
