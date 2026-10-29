@@ -1680,6 +1680,72 @@ class TargetAdapterTests(unittest.TestCase):
                 conn.execute("DELETE FROM config_workspaces WHERE profile_id=?", (profile_id,))
                 conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
 
+    def test_multivsys_merge_to_shared_preview_and_apply_rewrites_refs(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("offline-panos-shared-merge", 1, "", "", "panos", "{}", b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        xml = b'''<config><shared><address><entry name="server-shared"><ip-netmask>192.0.2.20</ip-netmask></entry></address>
+        <address-group><entry name="Consumers"><static><member>server-shared</member></static></entry></address-group></shared>
+        <devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="server-local"><ip-netmask>192.0.2.20</ip-netmask></entry></address>
+        <rulebase><security><rules><entry name="allow"><source><member>server-local</member></source></entry></rules></security></rulebase></entry><entry name="vsys2"/></vsys></entry></devices></config>'''
+        workspace_id = main.store_config_workspace(profile, "objects", "config.xml", xml, "upload")
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1
+            login["username"] = "test"
+            login["must_change"] = False
+            login["csrf"] = "merge-shared-csrf"
+        try:
+            editor = client.get(
+                f"/config-workspaces/{workspace_id}/edit?scope=vsys1&workspace_view=objects&object_type=addresses",
+                base_url="https://forge.test",
+            )
+            self.assertEqual(editor.status_code, 200)
+            self.assertIn(b"Duplicaten uit Shared/VSYS samenvoegen naar Shared", editor.data)
+            preview = client.post(
+                f"/config-workspaces/{workspace_id}/objects/merge-shared-preview",
+                data={"csrf": "merge-shared-csrf", "scope": "vsys1", "object_type": "addresses"},
+                base_url="https://forge.test",
+            )
+            self.assertEqual(preview.status_code, 200)
+            self.assertIn("Shared", preview.data.decode())
+            section = re.search(rb'<section class="card stack workspace-merge-group">(.*?)</section>', preview.data, re.S).group(1)
+            checked = re.search(rb'<input[^>]*type="radio"[^>]*name="master_([a-f0-9]+)"[^>]*value="([^"]+)"[^>]*checked', section)
+            self.assertIsNotNone(checked)
+            group_id, selected_candidate = (value.decode() for value in checked.groups())
+            draft_id = re.search(rb'/config-workspaces/object-drafts/([^"/]+)/apply', preview.data).group(1).decode()
+            draft_path = main.OBJECT_DRAFTS / f"offline-object-{draft_id}.json"
+            draft = __import__("json").loads(draft_path.read_text())
+            shared_candidate = next(item for item in draft["groups"][0]["objects"] if item["scope"] == "Shared")
+            self.assertEqual(selected_candidate, shared_candidate["candidate_id"])
+            parser = NavigationTargets(); parser.feed(preview.data.decode())
+            action = next(item for item in parser.actions if "/config-workspaces/object-drafts/" in item)
+            applied = client.post(
+                action, data={"csrf": "merge-shared-csrf", f"master_{group_id}": selected_candidate},
+                base_url="https://forge.test",
+            )
+            self.assertEqual(applied.status_code, 302)
+            with main.db() as conn:
+                latest = conn.execute("SELECT * FROM config_workspaces WHERE profile_id=? ORDER BY id DESC LIMIT 1", (profile_id,)).fetchone()
+            merged_xml = main.workspace_config_path(latest).read_bytes()
+            root, _ = main.parse_snapshot(merged_xml)
+            self.assertEqual(len(root.findall("./shared/address/entry")), 1)
+            self.assertEqual(root.findtext("./shared/address-group/entry/static/member"), "server-shared")
+            self.assertEqual(root.findtext("./devices/entry/vsys/entry[@name='vsys1']/rulebase/security/rules/entry/source/member"), "server-shared")
+        finally:
+            with main.db() as conn:
+                workspaces = conn.execute("SELECT * FROM config_workspaces WHERE profile_id=?", (profile_id,)).fetchall()
+            for item in workspaces:
+                main.workspace_config_path(item).unlink(missing_ok=True)
+            with main.db() as conn:
+                conn.execute("DELETE FROM config_workspaces WHERE profile_id=?", (profile_id,))
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
     def test_panorama_duplicate_merge_preview_uses_device_group_scope(self):
         timestamp = main.now()
         with main.db() as conn:

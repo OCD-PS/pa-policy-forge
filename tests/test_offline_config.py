@@ -12,7 +12,8 @@ from app.offline_config import (
     object_create_record, object_fingerprint, policy_create_record, policy_fingerprint, render_set_commands, replace_policy_in_snapshot,
     referenced_template, scoped_objects, scoped_policies,
     scoped_server_profiles, object_reference_index, duplicate_object_groups, merge_duplicate_objects,
-    merge_duplicate_object_groups,
+    merge_duplicate_object_groups, duplicate_object_groups_across_panos_scopes,
+    merge_duplicate_object_groups_to_shared,
 )
 
 
@@ -24,6 +25,79 @@ INHERITED = b'''<config version="12.1"><shared><address><entry name="shared-a"><
 
 
 class OfflineConfigTests(unittest.TestCase):
+    def test_cross_scope_merge_to_shared_preserves_shared_group_refs_and_rewrites_vsys(self):
+        source = b'''<config><shared><address>
+        <entry name="PublicServer"><ip-netmask>192.0.2.10</ip-netmask></entry>
+        </address><address-group><entry name="Publilink_Group"><static><member>PublicServer</member></static></entry></address-group>
+        </shared><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address>
+        <entry name="PublicServer-vsys1"><ip-netmask>192.0.2.10</ip-netmask></entry>
+        </address><rulebase><security><rules><entry name="allow"><source><member>PublicServer-vsys1</member></source></entry></rules></security></rulebase></entry>
+        <entry name="vsys2"><address><entry name="PublicServer-vsys2"><ip-netmask>192.0.2.10</ip-netmask></entry></address>
+        <rulebase><nat><rules><entry name="translate"><destination-translation><translated-address>PublicServer-vsys2</translated-address></destination-translation></entry></rules></nat></rulebase></entry>
+        </vsys></entry></devices></config>'''
+        groups = duplicate_object_groups_across_panos_scopes(source, "addresses")
+        group = next(item for item in groups if {obj["name"] for obj in item["objects"]} == {
+            "PublicServer", "PublicServer-vsys1", "PublicServer-vsys2",
+        })
+        self.assertEqual(group["objects"][0]["scope"], "Shared")
+        selected = [{"object_type": "addresses", "objects": group["objects"],
+                     "master": {"scope": "Shared", "name": "PublicServer"}}]
+
+        merged, summary = merge_duplicate_object_groups_to_shared(source, selected)
+
+        root, _ = parse_snapshot(merged)
+        self.assertEqual(root.findall("./shared/address/entry"), [root.find("./shared/address/entry[@name='PublicServer']")])
+        self.assertEqual(root.findtext("./shared/address-group/entry/static/member"), "PublicServer")
+        self.assertEqual(root.findtext("./devices/entry/vsys/entry[@name='vsys1']/rulebase/security/rules/entry/source/member"), "PublicServer")
+        self.assertEqual(root.findtext("./devices/entry/vsys/entry[@name='vsys2']/rulebase/nat/rules/entry/destination-translation/translated-address"), "PublicServer")
+        self.assertEqual(summary, {"merged": 2, "groups": 1})
+
+    def test_cross_scope_merge_can_select_vsys_master_and_rewrites_shared_references(self):
+        source = b'''<config><shared><address><entry name="old-shared"><ip-netmask>192.0.2.11</ip-netmask></entry></address>
+        <address-group><entry name="Consumers"><static><member>old-shared</member></static></entry></address-group></shared>
+        <devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="new-master"><ip-netmask>192.0.2.11</ip-netmask></entry></address></entry><entry name="vsys2"/></vsys></entry></devices></config>'''
+        group = duplicate_object_groups_across_panos_scopes(source, "addresses")[0]
+        selected = [{"object_type": "addresses", "objects": group["objects"],
+                     "master": {"scope": "vsys1", "name": "new-master"}}]
+        merged, _ = merge_duplicate_object_groups_to_shared(source, selected)
+        root, _ = parse_snapshot(merged)
+        self.assertIsNotNone(root.find("./shared/address/entry[@name='new-master']"))
+        self.assertIsNone(root.find("./shared/address/entry[@name='old-shared']"))
+        self.assertEqual(root.findtext("./shared/address-group/entry/static/member"), "new-master")
+        self.assertIsNone(root.find("./devices/entry/vsys/entry[@name='vsys1']/address/entry"))
+
+    def test_cross_scope_service_merge_unions_tags_on_shared_master(self):
+        source = b'''<config><shared><service><entry name="https"><protocol><tcp><port>443</port></tcp></protocol><tag><member>Blue</member></tag></entry></service></shared>
+        <devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><service><entry name="web-443"><protocol><tcp><port>443</port></tcp></protocol><tag><member>Green</member></tag></entry></service>
+        <rulebase><security><rules><entry name="allow"><service><member>web-443</member></service></entry></rules></security></rulebase></entry><entry name="vsys2"/></vsys></entry></devices></config>'''
+        group = duplicate_object_groups_across_panos_scopes(source, "services")[0]
+        merged, _ = merge_duplicate_object_groups_to_shared(source, [{
+            "object_type": "services", "objects": group["objects"],
+            "master": {"scope": "Shared", "name": "https"},
+        }])
+        root, _ = parse_snapshot(merged)
+        self.assertEqual(
+            [node.text for node in root.findall("./shared/service/entry/tag/member")],
+            ["Blue", "Green"],
+        )
+        self.assertEqual(root.findtext("./devices/entry/vsys/entry[@name='vsys1']/rulebase/security/rules/entry/service/member"), "https")
+
+    def test_cross_scope_merge_rejects_unselected_local_shadow_and_stale_selection(self):
+        source = b'''<config><shared><service><entry name="https"><protocol><tcp><port>443</port></tcp></protocol></entry></service></shared>
+        <devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><service><entry name="web-443"><protocol><tcp><port>443</port></tcp></protocol></entry></service></entry>
+        <entry name="vsys2"><service><entry name="https"><protocol><tcp><port>8443</port></tcp></protocol></entry></service></entry></vsys></entry></devices></config>'''
+        group = duplicate_object_groups_across_panos_scopes(source, "services")[0]
+        selection = {"object_type": "services", "objects": group["objects"],
+                     "master": {"scope": "Shared", "name": "https"}}
+        with self.assertRaisesRegex(OfflineConfigError, "overschaduwd"):
+            merge_duplicate_object_groups_to_shared(source, [selection])
+        stale = {**selection, "objects": [{**item, "fingerprint": "0" * 64} for item in group["objects"]]}
+        with self.assertRaisesRegex(OfflineConfigError, "gewijzigd"):
+            merge_duplicate_object_groups_to_shared(
+                source.replace(b'<entry name="https"><protocol><tcp><port>8443', b'<entry name="https"><protocol><tcp><port>443'),
+                [stale],
+            )
+
     def test_duplicate_services_rewrite_references_and_deduplicate_members(self):
         source = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><service>
         <entry name="TCP443"><protocol><tcp><port>443</port></tcp></protocol><description>Primary</description><tag><member>Blue</member></tag></entry>
