@@ -742,6 +742,69 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertIn("0_NAC_10_10_130_0_24", main.ET.tostring(transaction[1], encoding="unicode"))
         self.assertIn("PF_TMP_", transaction[2].get("xpath"))
 
+    def test_same_name_shared_service_merge_handles_multiple_vsys_deletes(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><service><entry name="RadSec"><protocol><tcp><port>2083</port>'
+            b'</tcp></protocol></entry></service></shared><devices><entry name="localhost.localdomain">'
+            b'<vsys><entry name="vsys1"><service><entry name="RadSec"><protocol><tcp><port>2083</port>'
+            b'</tcp></protocol></entry></service><rulebase><security><rules><entry name="rule-vsys1">'
+            b'<service><member>RadSec</member></service></entry></rules></security></rulebase></entry>'
+            b'<entry name="vsys2"><service><entry name="RadSec"><protocol><tcp><port>2083</port>'
+            b'</tcp></protocol></entry></service><rulebase><security><rules><entry name="rule-vsys2">'
+            b'<service><member>RadSec</member></service></entry></rules></security></rulebase></entry>'
+            b'</vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        for scope in ("vsys1", "vsys2"):
+            desired_root.find(f"./devices/entry/vsys/entry[@name='{scope}']/service").clear()
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "merge same-name RadSec services into Shared", "candidate.xml", desired,
+            "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        deletions = [
+            item for item in main.config_push_delta(base, desired)
+            if item["action"] == "delete" and item["family"] == "object:service"
+        ]
+        self.assertEqual({item["scope"] for item in deletions}, {"vsys1", "vsys2"})
+        requests = []
+
+        def api_response(endpoint, params, ctx):
+            requests.append(dict(params))
+            if params["type"] == "config":
+                if params["action"] == "multi-config":
+                    nested = "".join(
+                        f'<response status="success" code="20" id="{index}"/>'
+                        for index in range(1, 7)
+                    )
+                    return f'<response status="success" code="20"><result>{nested}</result></response>'
+                return '<response status="success" code="20"><result/></response>'
+            if params["type"] == "op":
+                return '<response status="success"><result><job>611</job></result></response>'
+            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post", side_effect=api_response), \
+             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={
+                    "csrf": "incremental-commit-csrf",
+                    "family": [item["selection_key"] for item in deletions],
+                }, follow_redirects=True,
+            )
+
+        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
+        self.assertFalse(any(item["type"] == "commit" for item in requests))
+        config_calls = [item for item in requests if item["type"] == "config"]
+        self.assertEqual(len(config_calls), 1)
+        self.assertEqual(config_calls[0]["action"], "multi-config")
+        transaction = main.ET.fromstring(config_calls[0]["element"])
+        self.assertEqual([item.tag for item in transaction], ["rename", "edit", "delete"] * 2)
+        self.assertTrue(all(item.get("newname", "").startswith("PF_TMP_") for item in transaction.findall("rename")))
+        self.assertEqual(sum(item.tag == "edit" for item in transaction), 2)
+
     def test_same_name_shared_merge_stops_on_nested_transaction_error(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><shared><address><entry name="same-object"><ip-netmask>192.0.2.10/32</ip-netmask>'
