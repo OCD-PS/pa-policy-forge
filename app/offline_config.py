@@ -2124,6 +2124,79 @@ def scoped_objects(xml_bytes: bytes, scope: str, object_type: str, parsed=None) 
     return snapshot, records
 
 
+def scoped_object_names(xml_bytes: bytes, scope: str, object_type: str, parsed=None) -> tuple[ConfigSnapshot, list[str]]:
+    """Return scoped object names without building full editor records.
+
+    Reference pickers only need names. Avoid flattening descriptions, nested
+    members, and editable fields for every object when rendering a policy page.
+    """
+    root, snapshot = parsed if parsed is not None else parse_snapshot(xml_bytes)
+    node = OBJECT_NODES.get(object_type)
+    if not node:
+        raise OfflineConfigError(f"Onbekend objecttype: {object_type}")
+    chain = _scope_chain(snapshot, scope) if snapshot.kind == "panorama" else (
+        ["Shared"] if scope == "Shared" else (["Shared", scope] if root.find("./shared") is not None else [scope])
+    )
+    names = []
+    for owner in chain:
+        scope_root = _scope_root(root, snapshot, owner)
+        if scope_root is None:
+            continue
+        names.extend(
+            entry.get("name", "")
+            for entry in scope_root.findall(f"./{node}/entry")
+            if entry.get("name")
+        )
+    return snapshot, names
+
+
+def scoped_object_page(
+    xml_bytes: bytes,
+    scope: str,
+    object_type: str,
+    requested_page: int,
+    page_size: int,
+    *,
+    parsed=None,
+    editable_first: bool = False,
+    selected_name: str = "",
+) -> tuple[ConfigSnapshot, int, int, int, list[dict]]:
+    """Build editor records only for the requested page of an unfiltered list."""
+    root, snapshot = parsed if parsed is not None else parse_snapshot(xml_bytes)
+    node = OBJECT_NODES.get(object_type)
+    if not node:
+        raise OfflineConfigError(f"Onbekend objecttype: {object_type}")
+    chain = _scope_chain(snapshot, scope) if snapshot.kind == "panorama" else (
+        ["Shared"] if scope == "Shared" else (["Shared", scope] if root.find("./shared") is not None else [scope])
+    )
+    entries = []
+    for owner in chain:
+        scope_root = _scope_root(root, snapshot, owner)
+        if scope_root is None:
+            continue
+        entries.extend(
+            (entry, owner, owner == scope)
+            for entry in scope_root.findall(f"./{node}/entry")
+        )
+    if editable_first:
+        entries.sort(key=lambda item: not item[2])
+
+    total = len(entries)
+    page_count = max(1, (total + page_size - 1) // page_size)
+    selected_index = next(
+        (index for index, (entry, _, _) in enumerate(entries) if entry.get("name") == selected_name),
+        None,
+    ) if selected_name else None
+    page = selected_index // page_size + 1 if selected_index is not None else requested_page
+    page = min(max(1, page), page_count)
+    offset = (page - 1) * page_size
+    records = [
+        object_record(entry, owner, editable, object_type)
+        for entry, owner, editable in entries[offset:offset + page_size]
+    ]
+    return snapshot, total, page_count, page, records
+
+
 PANOS_SCOPE_MOVE_OBJECT_TYPES = frozenset({
     "addresses", "address-groups", "regions", "dynamic-user-groups",
     "applications", "application-groups", "application-filters",

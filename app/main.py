@@ -75,7 +75,7 @@ from app.offline_config import (
     object_create_record, policy_create_record,
     object_fingerprint as offline_object_fingerprint,
     policy_fingerprint as offline_policy_fingerprint, render_set_commands,
-    panos_ui_decorate_record, scoped_server_profiles,
+    panos_ui_decorate_record, scoped_object_names, scoped_object_page, scoped_server_profiles,
     object_reference_index,
     _merge_object_signature, _reference_scope, _resolve_scoped_object_entry,
     _typed_object_reference_nodes,
@@ -2767,9 +2767,15 @@ def accessible_workspace_rows(rows):
 def store_config_workspace(
     profile, name: str, original_name: str, xml_bytes: bytes, source: str,
     project_id: int | None = None, baseline_workspace=None, baseline_xml: bytes | None = None,
+    parsed_config=None,
 ) -> int:
     expected = "panorama" if profile["target_type"] == "panorama" else "panos"
-    root, snapshot = parse_snapshot(xml_bytes, expected_kind=expected)
+    if parsed_config is None:
+        root, snapshot = parse_snapshot(xml_bytes, expected_kind=expected)
+    else:
+        root, snapshot = parsed_config
+        if snapshot.kind != expected:
+            raise OfflineConfigError("Deze configuratie lijkt niet afkomstig van het gekozen platform")
     normalized = normalized_config_xml(root)
     workspace_token = secrets.token_hex(16)
     path = CONFIG_WORKSPACES / f"{workspace_token}.xml"
@@ -2793,12 +2799,17 @@ def store_config_workspace(
                 raise OfflineConfigError("De oorspronkelijke workspaceconfiguratie ontbreekt of is gewijzigd")
     elif baseline_xml is not None:
         try:
-            parse_snapshot(baseline_xml, expected_kind=expected)
+            same_snapshot = baseline_xml == xml_bytes
+            if same_snapshot and parsed_config is not None:
+                if snapshot.kind != expected:
+                    raise OfflineConfigError("De oorspronkelijke config hoort niet bij het gekozen platform")
+            else:
+                parse_snapshot(baseline_xml, expected_kind=expected)
             endpoint = validate_panos_endpoint(json.loads(profile["settings_json"] or "{}").get("endpoint", ""))
         except Exception:
             path.unlink(missing_ok=True)
             raise
-        normalized_baseline = normalized_config_xml(SafeET.fromstring(baseline_xml))
+        normalized_baseline = normalized if same_snapshot else normalized_config_xml(SafeET.fromstring(baseline_xml))
         baseline_path_object = CONFIG_WORKSPACES / f"{workspace_token}-baseline.xml"
         baseline_path_object.write_bytes(normalized_baseline)
         baseline_path_object.chmod(0o600)
@@ -4016,12 +4027,12 @@ def workspace_policy_reference_catalog(xml_bytes: bytes, scope: str, parsed, pro
         "services", "service-groups", "tags", "regions", "hip-profiles", "custom-url-categories", "schedules",
         "security-profile-groups", "log-forwarding",
     ):
-        _, catalog_objects = scoped_objects(xml_bytes, scope, catalog_type, parsed=parsed)
-        for item in catalog_objects:
-            key = (item["name"], catalog_type)
+        _, object_names = scoped_object_names(xml_bytes, scope, catalog_type, parsed=parsed)
+        for name in object_names:
+            key = (name, catalog_type)
             if key not in seen:
                 seen.add(key)
-                catalog.append({"name": item["name"], "kind": catalog_type})
+                catalog.append({"name": name, "kind": catalog_type})
     for code in sorted(PANOS_GEO_REGION_CODES):
         key = (code, "regions")
         if key not in seen:
@@ -4055,12 +4066,12 @@ def workspace_object_reference_catalog(xml_bytes: bytes, scope: str, object_type
     catalog = []
     seen = set()
     for related_type in related_types:
-        _, related_objects = scoped_objects(xml_bytes, scope, related_type, parsed=parsed)
-        for item in related_objects:
-            key = (item["name"], related_type)
+        _, object_names = scoped_object_names(xml_bytes, scope, related_type, parsed=parsed)
+        for name in object_names:
+            key = (name, related_type)
             if key not in seen:
                 seen.add(key)
-                catalog.append({"name": item["name"], "kind": related_type})
+                catalog.append({"name": name, "kind": related_type})
     if object_type == "application-groups":
         for item in cached_application_catalog(profile)["items"]:
             key = (item["name"], "applications")
@@ -4073,12 +4084,12 @@ def workspace_object_reference_catalog(xml_bytes: bytes, scope: str, object_type
             if key not in seen:
                 seen.add(key)
                 catalog.append(item)
-        _, tags = scoped_objects(xml_bytes, scope, "tags", parsed=parsed)
-        for item in tags:
-            key = (item["name"], "tags")
+        _, tag_names = scoped_object_names(xml_bytes, scope, "tags", parsed=parsed)
+        for name in tag_names:
+            key = (name, "tags")
             if key not in seen:
                 seen.add(key)
-                catalog.append({"name": item["name"], "kind": "tags"})
+                catalog.append({"name": name, "kind": "tags"})
         _, log_profiles = scoped_objects(xml_bytes, scope, "log-forwarding", parsed=parsed)
         for profile_item in log_profiles:
             for match in profile_item.get("match_list", []) or []:
@@ -4227,10 +4238,10 @@ def config_workspace_editor(workspace_id):
             )
             workspace_policy_catalog = extend_policy_catalog_with_current(workspace_policy_catalog, all_policies)
         elif workspace_view == "objects":
-            _, all_objects = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
-            if snapshot.kind == "panos" and len(snapshot.vsys) > 1:
-                all_objects.sort(key=lambda item: not item["editable"])
             if object_query:
+                _, all_objects = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
+                if snapshot.kind == "panos" and len(snapshot.vsys) > 1:
+                    all_objects.sort(key=lambda item: not item["editable"])
                 needle = object_query.casefold()
                 all_objects = [
                     item for item in all_objects
@@ -4240,18 +4251,29 @@ def config_workspace_editor(workspace_id):
                         str(item.get("description", "")), str(item.get("comments", "")),
                     ]).casefold()
                 ]
-            object_total = len(all_objects)
-            object_page_count = max(1, (object_total + WORKSPACE_OBJECT_PAGE_SIZE - 1) // WORKSPACE_OBJECT_PAGE_SIZE)
-            if edit_object_name:
-                edit_index = next(
-                    (index for index, item in enumerate(all_objects) if item.get("name") == edit_object_name),
-                    None,
+                object_total = len(all_objects)
+                object_page_count = max(1, (object_total + WORKSPACE_OBJECT_PAGE_SIZE - 1) // WORKSPACE_OBJECT_PAGE_SIZE)
+                if edit_object_name:
+                    edit_index = next(
+                        (index for index, item in enumerate(all_objects) if item.get("name") == edit_object_name),
+                        None,
+                    )
+                    if edit_index is not None:
+                        object_page = edit_index // WORKSPACE_OBJECT_PAGE_SIZE + 1
+                object_page = min(object_page, object_page_count)
+                offset = (object_page - 1) * WORKSPACE_OBJECT_PAGE_SIZE
+                objects = all_objects[offset:offset + WORKSPACE_OBJECT_PAGE_SIZE]
+            else:
+                _, object_total, object_page_count, object_page, objects = scoped_object_page(
+                    xml_bytes,
+                    scope,
+                    object_type,
+                    object_page,
+                    WORKSPACE_OBJECT_PAGE_SIZE,
+                    parsed=(parsed_root, snapshot),
+                    editable_first=snapshot.kind == "panos" and len(snapshot.vsys) > 1,
+                    selected_name=edit_object_name,
                 )
-                if edit_index is not None:
-                    object_page = edit_index // WORKSPACE_OBJECT_PAGE_SIZE + 1
-            object_page = min(object_page, object_page_count)
-            offset = (object_page - 1) * WORKSPACE_OBJECT_PAGE_SIZE
-            objects = all_objects[offset:offset + WORKSPACE_OBJECT_PAGE_SIZE]
             workspace_object_create_template = object_create_record(object_type, scope)
             workspace_object_catalog = workspace_object_reference_catalog(
                 xml_bytes, scope, object_type, (parsed_root, snapshot), workspace_profile
@@ -5374,10 +5396,12 @@ def config_workspace_pull(profile_id):
         if config is None:
             raise RuntimeError("API-antwoord bevat geen volledige configuratie")
         xml_bytes = normalized_config_xml(config)
+        expected_kind = "panorama" if profile["target_type"] == "panorama" else "panos"
+        parsed_config = parse_snapshot(xml_bytes, expected_kind=expected_kind)
         discovered_vsys_count = None
         expected_vsys_count = None
         if profile["target_type"] == "panos":
-            _, snapshot = parse_snapshot(xml_bytes, expected_kind="panos")
+            _, snapshot = parsed_config
             discovered_vsys_count = len(available_scopes(snapshot))
             saved_settings = profile_settings(profile)
             if saved_settings.get("vsys_mode") == "multi":
@@ -5389,6 +5413,7 @@ def config_workspace_pull(profile_id):
             xml_bytes,
             "api",
             baseline_xml=xml_bytes,
+            parsed_config=parsed_config,
         )
         set_active_config_workspace(profile_id, workspace_id)
         if discovered_vsys_count is None:

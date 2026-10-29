@@ -1,6 +1,7 @@
 import pathlib
 import sys
 import unittest
+from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -9,8 +10,8 @@ from app.offline_config import (
     OfflineConfigError, apply_configuration_changes, apply_object_changes, available_scopes, available_templates,
     configuration_inventory, configuration_records, create_basic_network_entry, parse_snapshot,
     delete_policies_from_snapshot, insert_policy_in_snapshot, move_policies_in_snapshot,
-    object_create_record, object_fingerprint, policy_create_record, policy_fingerprint, render_set_commands, replace_policy_in_snapshot,
-    referenced_template, scoped_objects, scoped_policies,
+    object_create_record, object_fingerprint, object_record, policy_create_record, policy_fingerprint, render_set_commands, replace_policy_in_snapshot,
+    referenced_template, scoped_objects, scoped_object_names, scoped_object_page, scoped_policies,
     scoped_server_profiles, object_reference_index, duplicate_object_groups, merge_duplicate_objects,
     merge_duplicate_object_groups, duplicate_object_groups_across_panos_scopes,
     merge_duplicate_object_groups_to_shared,
@@ -25,6 +26,54 @@ INHERITED = b'''<config version="12.1"><shared><address><entry name="shared-a"><
 
 
 class OfflineConfigTests(unittest.TestCase):
+    def test_scoped_object_names_match_editor_records_for_shared_and_inherited_scopes(self):
+        for xml, scope, object_type in (
+            (b'''<config><shared><address><entry name="shared-a"><ip-netmask>192.0.2.1/32</ip-netmask></entry></address></shared><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="local-a"><ip-netmask>192.0.2.2/32</ip-netmask></entry></address></entry></vsys></entry></devices></config>''', "vsys1", "addresses"),
+            (PANORAMA, "Child", "addresses"),
+        ):
+            parsed = parse_snapshot(xml)
+            _, records = scoped_objects(xml, scope, object_type, parsed=parsed)
+            _, names = scoped_object_names(xml, scope, object_type, parsed=parsed)
+            self.assertEqual(names, [record["name"] for record in records])
+
+    def test_unfiltered_object_page_builds_only_visible_records_and_keeps_shared_last(self):
+        xml = b'''<config><shared><address>
+        <entry name="shared-a"><ip-netmask>192.0.2.1/32</ip-netmask></entry>
+        <entry name="shared-b"><ip-netmask>192.0.2.2/32</ip-netmask></entry>
+        </address></shared><devices><entry name="localhost.localdomain"><vsys>
+        <entry name="vsys1"><address>
+        <entry name="local-a"><ip-netmask>192.0.2.3/32</ip-netmask></entry>
+        <entry name="local-b"><ip-netmask>192.0.2.4/32</ip-netmask></entry>
+        </address></entry><entry name="vsys2"/></vsys></entry></devices></config>'''
+        parsed = parse_snapshot(xml)
+        with patch("app.offline_config.object_record", wraps=object_record) as build_record:
+            _, total, page_count, page, records = scoped_object_page(
+                xml, "vsys1", "addresses", 1, 1,
+                parsed=parsed, editable_first=True,
+            )
+            self.assertEqual((total, page_count, page), (4, 4, 1))
+            self.assertEqual([item["name"] for item in records], ["local-a"])
+            self.assertEqual(build_record.call_count, 1)
+
+        _, total, page_count, page, records = scoped_object_page(
+            xml, "vsys1", "addresses", 1, 1,
+            parsed=parsed, editable_first=True, selected_name="shared-b",
+        )
+        self.assertEqual((total, page_count, page), (4, 4, 4))
+        self.assertEqual([item["name"] for item in records], ["shared-b"])
+
+        panorama = parse_snapshot(PANORAMA, expected_kind="panorama")
+        _, total, page_count, page, records = scoped_object_page(
+            PANORAMA, "Child", "addresses", 99, 1, parsed=panorama,
+        )
+        self.assertEqual((total, page_count, page), (2, 2, 2))
+        self.assertEqual([item["name"] for item in records], ["child-a"])
+        _, _, _, page, records = scoped_object_page(
+            PANORAMA, "Child", "addresses", 1, 1,
+            parsed=panorama, selected_name="child-a",
+        )
+        self.assertEqual((page, [item["name"] for item in records]), (2, ["child-a"]))
+
     def test_cross_scope_merge_to_shared_preserves_shared_group_refs_and_rewrites_vsys(self):
         source = b'''<config><shared><address>
         <entry name="PublicServer"><ip-netmask>192.0.2.10</ip-netmask></entry>
