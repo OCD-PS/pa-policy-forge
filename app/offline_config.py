@@ -403,6 +403,31 @@ def unresolved_object_reference_index(
     references, _ = _typed_object_reference_nodes(root, object_type)
     parent = {child: node for node in root.iter() for child in node}
     paths: dict[ET.Element, str] = {root: "/" + root.tag}
+
+    def reference_paths(source_root: ET.Element, source_references: list[ET.Element]) -> set[tuple[str, str]]:
+        source_parent = {child: node for node in source_root.iter() for child in node}
+        source_paths: dict[ET.Element, str] = {source_root: "/" + source_root.tag}
+
+        def path_for(node: ET.Element) -> str:
+            if node in source_paths:
+                return source_paths[node]
+            owner = source_parent.get(node)
+            if owner is None:
+                source_paths[node] = "/" + node.tag
+            else:
+                suffix = f"[@name={node.get('name')}]" if node.tag == "entry" and node.get("name") else ""
+                source_paths[node] = path_for(owner) + "/" + node.tag + suffix
+            return source_paths[node]
+
+        return {
+            (path_for(node), (node.text or "").strip())
+            for node in source_references
+            if (node.text or "").strip() in wanted
+        }
+
+    original_references, _ = _typed_object_reference_nodes(original_root, object_type)
+    original_reference_paths = reference_paths(original_root, original_references)
+
     for node in root.iter():
         if node in paths:
             continue
@@ -423,16 +448,24 @@ def unresolved_object_reference_index(
             continue
         try:
             resolved = _resolve_scoped_object_entry(root, snapshot, scope, object_type, name)
-            original_resolved = _resolve_scoped_object_entry(
-                original_root, original_snapshot, scope, object_type, name,
+            # A newly-added policy reference has no prior object resolution to
+            # compare. Validate that its desired Shared/VSYS object resolves,
+            # then compare behavior only when this same reference existed before.
+            had_original_reference = (paths[node], name) in original_reference_paths
+            original_resolved = (
+                _resolve_scoped_object_entry(original_root, original_snapshot, scope, object_type, name)
+                if had_original_reference else None
             )
         except OfflineConfigError:
             # Duplicate/ambiguous ownership is not proof of safety.
             continue
-        if (
-            resolved is not None and original_resolved is not None
-            and _merge_object_signature(resolved, object_type)
-            == _merge_object_signature(original_resolved, object_type)
+        if resolved is not None and (
+            not had_original_reference
+            or (
+                original_resolved is not None
+                and _merge_object_signature(resolved, object_type)
+                == _merge_object_signature(original_resolved, object_type)
+            )
         ):
             resolved_paths[name].add(paths[node][:240])
 
