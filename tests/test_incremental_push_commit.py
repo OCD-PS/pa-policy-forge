@@ -306,16 +306,20 @@ class IncrementalPushCommitTests(unittest.TestCase):
     def test_moving_referenced_vsys_object_to_shared_allows_selected_incremental_push(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><shared/><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
-            b'<address><entry name="0_NAC_10_10_130_0_24"><ip-netmask>10.10.130.0/24</ip-netmask>'
+            b'<address><entry name="A_first"><ip-netmask>192.0.2.1/32</ip-netmask></entry>'
+            b'<entry name="0_NAC_10_10_130_0_24"><ip-netmask>10.10.130.0/24</ip-netmask>'
             b'</entry></address><rulebase><security><rules><entry name="Migrated sites to Untrust">'
             b'<source><member>0_NAC_10_10_130_0_24</member></source></entry></rules></security></rulebase>'
             b'</entry></vsys></entry></devices></config>'
         ))
         desired_root = main.ET.fromstring(base)
-        local_entry = desired_root.find("./devices/entry/vsys/entry/address/entry")
-        desired_root.find("./devices/entry/vsys/entry/address").remove(local_entry)
+        local_collection = desired_root.find("./devices/entry/vsys/entry/address")
+        for local_entry in list(local_collection):
+            local_collection.remove(local_entry)
         shared = desired_root.find("./shared")
         address = main.ET.SubElement(shared, "address")
+        first_shared_entry = main.ET.SubElement(address, "entry", {"name": "A_first"})
+        main.ET.SubElement(first_shared_entry, "ip-netmask").text = "192.0.2.1/32"
         shared_entry = main.ET.SubElement(address, "entry", {"name": "0_NAC_10_10_130_0_24"})
         main.ET.SubElement(shared_entry, "ip-netmask").text = "10.10.130.0/24"
         desired = main.normalized_config_xml(desired_root)
@@ -326,6 +330,9 @@ class IncrementalPushCommitTests(unittest.TestCase):
         changes = main.config_push_delta(base, desired)
         selected = list(dict.fromkeys(item["selection_key"] for item in changes))
         self.assertEqual({item["action"] for item in changes}, {"set", "delete"})
+        shared_addition = next(item for item in changes if item["action"] == "set" and item["scope"] == "Shared")
+        self.assertEqual(shared_addition["name"], "A_first")
+        self.assertIn("0_NAC_10_10_130_0_24", main.config_push_change_names(shared_addition))
 
         def api_response(endpoint, params, ctx):
             if params["type"] == "config":
@@ -350,14 +357,19 @@ class IncrementalPushCommitTests(unittest.TestCase):
     def test_shared_fallback_is_not_accepted_when_its_addition_is_not_selected(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><shared/><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
-            b'<address><entry name="same-name"><ip-netmask>192.0.2.8/32</ip-netmask></entry></address>'
+            b'<address><entry name="aaa-first"><ip-netmask>192.0.2.9/32</ip-netmask></entry>'
+            b'<entry name="same-name"><ip-netmask>192.0.2.8/32</ip-netmask></entry></address>'
+            b'<rulebase><security><rules><entry name="allow"><destination><member>same-name</member>'
+            b'</destination></entry></rules></security></rulebase>'
             b'</entry></vsys></entry></devices></config>'
         ))
         desired_root = main.ET.fromstring(base)
-        desired_root.find("./devices/entry/vsys/entry/address").remove(
-            desired_root.find("./devices/entry/vsys/entry/address/entry")
-        )
+        local_collection = desired_root.find("./devices/entry/vsys/entry/address")
+        for local_entry in list(local_collection):
+            local_collection.remove(local_entry)
         shared_address = main.ET.SubElement(desired_root.find("./shared"), "address")
+        first_entry = main.ET.SubElement(shared_address, "entry", {"name": "aaa-first"})
+        main.ET.SubElement(first_entry, "ip-netmask").text = "192.0.2.9/32"
         entry = main.ET.SubElement(shared_address, "entry", {"name": "same-name"})
         main.ET.SubElement(entry, "ip-netmask").text = "192.0.2.8/32"
         desired = main.normalized_config_xml(desired_root)
