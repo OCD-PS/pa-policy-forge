@@ -250,6 +250,7 @@ def object_reference_index(
 
 def object_reference_indexes(
     xml_bytes: bytes, names_by_type: dict[str, Iterable[str]], *, parsed_root: ET.Element | None = None,
+    reference_nodes: dict[str, dict[str, list[tuple[str, ET.Element]]]] | None = None,
 ) -> dict[str, dict[str, list[str]]]:
     """Index several object types in one full-config walk.
 
@@ -265,6 +266,8 @@ def object_reference_indexes(
         object_type: {str(name): [] for name in names if str(name)}
         for object_type, names in names_by_type.items()
     }
+    if reference_nodes is not None:
+        reference_nodes.update({object_type: {name: [] for name in wanted} for object_type, wanted in wanted_by_type.items()})
     if not any(wanted_by_type.values()):
         return wanted_by_type
 
@@ -293,7 +296,10 @@ def object_reference_indexes(
         if value in wanted:
             path = path_for(node) + suffix
             if path not in wanted[value]:
-                wanted[value].append(path[:240])
+                short_path = path[:240]
+                wanted[value].append(short_path)
+                if reference_nodes is not None:
+                    reference_nodes[object_type][value].append((short_path, node))
 
     policy_kinds = set(POLICY_NODES.values())
     rulebase_scopes = {"rulebase", "pre-rulebase", "post-rulebase"}
@@ -402,6 +408,28 @@ def unresolved_object_reference_index(
     parsed: tuple[ET.Element, ConfigSnapshot] | None = None,
     original_parsed: tuple[ET.Element, ConfigSnapshot] | None = None,
 ) -> dict[str, list[str]]:
+    """Single-type wrapper for the batched scope-aware reference resolver."""
+    return unresolved_object_reference_indexes(
+        xml_bytes,
+        {object_type: names},
+        original_xml_bytes=original_xml_bytes,
+        parsed=parsed,
+        original_parsed=original_parsed,
+    )[object_type]
+
+
+def unresolved_object_reference_indexes(
+    xml_bytes: bytes,
+    names_by_type: dict[str, Iterable[str]],
+    *,
+    original_xml_bytes: bytes | None = None,
+    parsed: tuple[ET.Element, ConfigSnapshot] | None = None,
+    original_parsed: tuple[ET.Element, ConfigSnapshot] | None = None,
+    indexed_references: dict[str, dict[str, list[str]]] | None = None,
+    indexed_reference_nodes: dict[str, dict[str, list[tuple[str, ET.Element]]]] | None = None,
+    original_indexed_reference_nodes: dict[str, dict[str, list[tuple[str, ET.Element]]]] | None = None,
+    allowed_reference_scopes: set[str] | None = None,
+) -> dict[str, dict[str, list[str]]]:
     """Return references whose effective object is missing or changed.
 
     ``object_reference_index`` intentionally reports every typed name match,
@@ -411,90 +439,79 @@ def unresolved_object_reference_index(
     through inheritance. Compare against the original target too, so a
     same-name but behaviorally different Shared object cannot silently change
     policy semantics. Keep untyped/unknown references fail-closed.
+
+    Optional precomputed indexes let incremental pushes share their full-config
+    scan between dependency selection and this scope-aware safety check.
     """
-    root = parsed[0] if parsed is not None else None
-    all_references = object_reference_index(xml_bytes, object_type, names, parsed_root=root)
-    wanted = {name for name, paths in all_references.items() if paths}
-    if not wanted:
-        return all_references
     root, snapshot = parsed if parsed is not None else parse_snapshot(xml_bytes)
-    original_root, original_snapshot = (
-        original_parsed if original_parsed is not None else (
-            parse_snapshot(original_xml_bytes) if original_xml_bytes is not None else (root, snapshot)
+    if indexed_references is None or indexed_reference_nodes is None:
+        indexed_reference_nodes = {}
+        indexed_references = object_reference_indexes(
+            xml_bytes, names_by_type, parsed_root=root, reference_nodes=indexed_reference_nodes,
         )
-    )
-    references, _ = _typed_object_reference_nodes(root, object_type)
+    if original_xml_bytes is None:
+        original_root, original_snapshot = root, snapshot
+        original_indexed_reference_nodes = indexed_reference_nodes
+    else:
+        original_root, original_snapshot = (
+            original_parsed if original_parsed is not None else parse_snapshot(original_xml_bytes)
+        )
+        if original_indexed_reference_nodes is None:
+            original_indexed_reference_nodes = {}
+            object_reference_indexes(
+                original_xml_bytes,
+                names_by_type,
+                parsed_root=original_root,
+                reference_nodes=original_indexed_reference_nodes,
+            )
+
     parent = {child: node for node in root.iter() for child in node}
-    paths: dict[ET.Element, str] = {root: "/" + root.tag}
-
-    def reference_paths(source_root: ET.Element, source_references: list[ET.Element]) -> set[tuple[str, str]]:
-        source_parent = {child: node for node in source_root.iter() for child in node}
-        source_paths: dict[ET.Element, str] = {source_root: "/" + source_root.tag}
-
-        def path_for(node: ET.Element) -> str:
-            if node in source_paths:
-                return source_paths[node]
-            owner = source_parent.get(node)
-            if owner is None:
-                source_paths[node] = "/" + node.tag
-            else:
-                suffix = f"[@name={node.get('name')}]" if node.tag == "entry" and node.get("name") else ""
-                source_paths[node] = path_for(owner) + "/" + node.tag + suffix
-            return source_paths[node]
-
-        return {
-            (path_for(node), (node.text or "").strip())
-            for node in source_references
-            if (node.text or "").strip() in wanted
+    resolved_paths: dict[str, dict[str, set[str]]] = {
+        object_type: {name: set() for name in references}
+        for object_type, references in indexed_references.items()
+    }
+    for object_type, references in indexed_references.items():
+        old_nodes_by_name = original_indexed_reference_nodes.get(object_type, {})
+        old_paths_by_name = {
+            name: {path for path, _node in nodes}
+            for name, nodes in old_nodes_by_name.items()
         }
-
-    original_references, _ = _typed_object_reference_nodes(original_root, object_type)
-    original_reference_paths = reference_paths(original_root, original_references)
-
-    for node in root.iter():
-        if node in paths:
-            continue
-        owner = parent.get(node)
-        if owner is None:
-            paths[node] = "/" + node.tag
-        else:
-            suffix = f"[@name={node.get('name')}]" if node.tag == "entry" and node.get("name") else ""
-            paths[node] = paths[owner] + "/" + node.tag + suffix
-
-    resolved_paths: dict[str, set[str]] = {name: set() for name in wanted}
-    for node in references:
-        name = (node.text or "").strip()
-        if name not in wanted:
-            continue
-        scope = _reference_scope(node, parent, snapshot)
-        if scope is None:
-            continue
-        try:
-            resolved = _resolve_scoped_object_entry(root, snapshot, scope, object_type, name)
-            # A newly-added policy reference has no prior object resolution to
-            # compare. Validate that its desired Shared/VSYS object resolves,
-            # then compare behavior only when this same reference existed before.
-            had_original_reference = (paths[node], name) in original_reference_paths
-            original_resolved = (
-                _resolve_scoped_object_entry(original_root, original_snapshot, scope, object_type, name)
-                if had_original_reference else None
-            )
-        except OfflineConfigError:
-            # Duplicate/ambiguous ownership is not proof of safety.
-            continue
-        if resolved is not None and (
-            not had_original_reference
-            or (
-                original_resolved is not None
-                and _merge_object_signature(resolved, object_type)
-                == _merge_object_signature(original_resolved, object_type)
-            )
-        ):
-            resolved_paths[name].add(paths[node][:240])
+        for name, nodes in indexed_reference_nodes.get(object_type, {}).items():
+            for path, node in nodes:
+                # Tag filters are expressions rather than exact object-name
+                # references. Keep them fail-closed until the expression can
+                # be safely interpreted.
+                if (node.text or "").strip() != name:
+                    continue
+                scope = _reference_scope(node, parent, snapshot)
+                if scope is None or (allowed_reference_scopes is not None and scope not in allowed_reference_scopes):
+                    continue
+                try:
+                    resolved = _resolve_scoped_object_entry(root, snapshot, scope, object_type, name)
+                    had_original_reference = path in old_paths_by_name.get(name, set())
+                    original_resolved = (
+                        _resolve_scoped_object_entry(original_root, original_snapshot, scope, object_type, name)
+                        if had_original_reference else None
+                    )
+                except OfflineConfigError:
+                    # Duplicate/ambiguous ownership is not proof of safety.
+                    continue
+                if resolved is not None and (
+                    not had_original_reference
+                    or (
+                        original_resolved is not None
+                        and _merge_object_signature(resolved, object_type)
+                        == _merge_object_signature(original_resolved, object_type)
+                    )
+                ):
+                    resolved_paths[object_type][name].add(path)
 
     return {
-        name: [path for path in paths if path not in resolved_paths.get(name, set())]
-        for name, paths in all_references.items()
+        object_type: {
+            name: [path for path in paths if path not in resolved_paths.get(object_type, {}).get(name, set())]
+            for name, paths in references.items()
+        }
+        for object_type, references in indexed_references.items()
     }
 
 

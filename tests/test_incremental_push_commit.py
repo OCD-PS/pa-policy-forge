@@ -347,6 +347,56 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertIn("10.10.120.100", message)
         api_post.assert_not_called()
 
+    def test_delete_vsys_duplicate_keeps_shared_group_reference(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address><entry name="10.10.120.100"><ip-netmask>10.10.120.100/32</ip-netmask>'
+            b'</entry><entry name="10.10.120.102"><ip-netmask>10.10.120.102/32</ip-netmask></entry></address>'
+            b'<address-group><entry name="Servers_HTTP_HTTPS"><static><member>10.10.120.100</member>'
+            b'<member>10.10.120.102</member></static></entry></address-group></shared>'
+            b'<devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<address><entry name="10.10.120.100"><ip-netmask>10.10.120.100/32</ip-netmask>'
+            b'</entry><entry name="10.10.120.102"><ip-netmask>10.10.120.102/32</ip-netmask>'
+            b'</entry></address></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/address").clear()
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "delete VSYS duplicate with Shared references", "candidate.xml", desired,
+            "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        deletion = next(
+            item for item in main.config_push_delta(base, desired)
+            if item["action"] == "delete" and item["family"] == "object:address"
+        )
+
+        def api_response(endpoint, params, ctx):
+            if params["type"] == "config":
+                return '<response status="success" code="20"><result/></response>'
+            if params["type"] == "op":
+                return '<response status="success"><result><job>611</job></result></response>'
+            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post", side_effect=api_response) as api_post, \
+             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": deletion["selection_key"]},
+                follow_redirects=True,
+            )
+
+        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
+        config_calls = [call.args[1] for call in api_post.call_args_list if call.args[1]["type"] == "config"]
+        self.assertEqual(len(config_calls), 2)
+        self.assertEqual({call["action"] for call in config_calls}, {"delete"})
+        deleted_names = {
+            name for name in ("10.10.120.100", "10.10.120.102")
+            if any(name in call["xpath"] for call in config_calls)
+        }
+        self.assertEqual(deleted_names, {"10.10.120.100", "10.10.120.102"})
+
     def test_delete_with_reference_removal_requires_policy_family_selection(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'

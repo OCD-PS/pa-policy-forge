@@ -86,7 +86,7 @@ from app.offline_config import (
     delete_policies_from_snapshot, move_policies_in_snapshot,
     safe_workspace_path, scoped_objects,
     scoped_policies, snapshot_sha256, referenced_template,
-    unresolved_object_reference_index,
+    unresolved_object_reference_index, unresolved_object_reference_indexes,
 )
 
 BASE = Path(__file__).resolve().parent.parent
@@ -3806,8 +3806,16 @@ def validate_incremental_object_deletions(
     }
     if not names_by_type:
         return
-    current_indexes = object_reference_indexes(current_xml, names_by_type)
-    desired_indexes = object_reference_indexes(desired_xml, names_by_type)
+    current_parsed = parse_snapshot(current_xml)
+    desired_parsed = parse_snapshot(desired_xml)
+    current_reference_nodes = {}
+    desired_reference_nodes = {}
+    current_indexes = object_reference_indexes(
+        current_xml, names_by_type, parsed_root=current_parsed[0], reference_nodes=current_reference_nodes,
+    )
+    desired_indexes = object_reference_indexes(
+        desired_xml, names_by_type, parsed_root=desired_parsed[0], reference_nodes=desired_reference_nodes,
+    )
 
     missing = []
     for object_type, names in names_by_type.items():
@@ -3830,12 +3838,30 @@ def validate_incremental_object_deletions(
             f"Verwijderen vereist ook geselecteerde wijzigingen die de verwijzingen verwijderen ({details})"
         )
 
-    used = []
-    for object_type, names in names_by_type.items():
-        references = desired_indexes[object_type]
-        used.extend(
-            (name, references[name]) for name in names if references.get(name)
-        )
+    # A raw name match is not enough to prove that a delete is unsafe:
+    # PAN-OS resolves VSYS references through Shared when the local duplicate
+    # is gone. Resolve in scope and compare against the current candidate,
+    # reusing the full-config indexes built above to avoid rescanning XML.
+    unresolved_references = unresolved_object_reference_indexes(
+        desired_xml,
+        names_by_type,
+        original_xml_bytes=current_xml,
+        parsed=desired_parsed,
+        original_parsed=current_parsed,
+        indexed_references=desired_indexes,
+        indexed_reference_nodes=desired_reference_nodes,
+        original_indexed_reference_nodes=current_reference_nodes,
+        # A Shared-owned reference cannot point at the VSYS-local duplicate.
+        # Other scopes remain fail-closed here; inheritance alone is not
+        # treated as proof that their references are safe to leave untouched.
+        allowed_reference_scopes={"Shared"},
+    )
+    used = [
+        (name, unresolved_references[object_type][name])
+        for object_type, names in names_by_type.items()
+        for name in names
+        if unresolved_references[object_type].get(name)
+    ]
     if used:
         details = "; ".join(
             f"{name}: {', '.join(paths[:3])}" for name, paths in used[:5]
@@ -6991,10 +7017,9 @@ def config_workspace_push(workspace_id):
                 raise RuntimeError(f"Verwijdering van {node} heeft geen herkenbare objectnaam; niets geschreven")
             if (object_type, change["name"]) not in native_moved_names:
                 deleted_objects[object_type].append(change["name"])
-        # PAN-OS rejects deleting an object that remains referenced, even when
-        # a same-named Shared entry would inherit afterward. Validate every
-        # family against the merged candidate before the first API write, but
-        # scan each XML snapshot only once for all deleted object types.
+        # PAN-OS rejects deletes that leave references unresolved after scope
+        # inheritance is applied. Validate every family before the first API
+        # write; the reference indexes are shared across all deleted types.
         validate_incremental_object_deletions(
             current_xml, push_desired_xml, deleted_objects, selected,
         )
