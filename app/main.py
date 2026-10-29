@@ -3756,6 +3756,31 @@ def validate_workspace_object_deletions(
     return references
 
 
+def validate_selected_deletion_dependencies(
+    current_xml: bytes, desired_xml: bytes, object_type: str, names: list[str], selected_families: set[str],
+) -> None:
+    """Require the push selection to include edits that release deleted objects."""
+    current_refs = object_reference_index(current_xml, object_type, names)
+    desired_refs = object_reference_index(desired_xml, object_type, names)
+    missing = []
+    for name in names:
+        for path in sorted(set(current_refs.get(name, ())) - set(desired_refs.get(name, ()))):
+            family, label = config_push_family(tuple(path.strip("/").split("/")))
+            selection_key = json.dumps(
+                [config_push_scope(path), family], ensure_ascii=False, separators=(",", ":")
+            )
+            if selection_key not in selected_families:
+                missing.append((name, label, path))
+    if missing:
+        details = "; ".join(
+            f"{name}: selecteer {label}"
+            for name, label, _path in missing[:5]
+        )
+        raise OfflineConfigError(
+            f"Verwijderen vereist ook geselecteerde wijzigingen die de verwijzingen verwijderen ({details})"
+        )
+
+
 def validate_workspace_configuration_deletions(xml_bytes: bytes, view: str, section: str, records: list[dict]) -> None:
     """Block certificate removal while its names appear in certificate use sites."""
     if view != "device" or section != "certificates":
@@ -6281,6 +6306,8 @@ def concise_incremental_push_error(exc: Exception) -> str:
         code = api_error.group("code")
         if code == "13":
             reason = "PAN-OS herkent dit configuratiepad niet"
+        elif code == "10":
+            reason = "PAN-OS kan dit object niet verwijderen zolang er verwijzingen naar bestaan"
         elif code == "16" or api_error.group("status").casefold() == "unauth":
             reason = "PAN-OS weigert de API-aanroep"
         else:
@@ -6401,34 +6428,16 @@ def config_workspace_push(workspace_id):
                 raise RuntimeError(f"Verwijdering van {node} heeft geen herkenbare objectnaam; niets geschreven")
             deleted_objects[object_type].append(change["name"])
         for object_type, names in deleted_objects.items():
-            node = OBJECT_NODES[object_type]
-            scope_resolvable_names = set()
-            current_root, current_snapshot = parse_snapshot(current_xml, expected_kind=expected_kind)
-            current_shared = {
-                item["name"] for item in scoped_objects(
-                    current_xml, "Shared", object_type, parsed=(current_root, current_snapshot),
-                )[1]
-            }
-            selected_shared = {
-                name for item in chosen for name in config_push_change_names(item)
-                if item["family"] == f"object:{node}" and item["scope"] == "Shared"
-                and item["action"] in {"set", "edit"}
-            }
-            selected_shared_deletions = {
-                name for item in chosen for name in config_push_change_names(item)
-                if item["family"] == f"object:{node}" and item["scope"] == "Shared"
-                and item["action"] == "delete"
-            }
-            for name in names:
-                # A same-name Shared definition preserves references from the
-                # source VSYS after the local copy is removed. Only allow the
-                # scope-aware check when that Shared entry already exists on
-                # the target or its write is part of this selected push.
-                if (name in current_shared and name not in selected_shared_deletions) or name in selected_shared:
-                    scope_resolvable_names.add(name)
+            # PAN-OS rejects deleting a local entry while any rule still
+            # references it, even if a same-named Shared entry would inherit
+            # after the delete. Validate the exact merged candidate strictly
+            # before the first API write; otherwise earlier writes can leave a
+            # partial candidate before PAN-OS returns code 10 on the delete.
+            validate_selected_deletion_dependencies(
+                current_xml, push_desired_xml, object_type, names, selected,
+            )
             validate_workspace_object_deletions(
                 push_desired_xml, object_type, names,
-                scope_resolvable_names=scope_resolvable_names, original_xml_bytes=current_xml,
             )
         for change in chosen:
             params = {"type": "config", "action": change["action"], "xpath": change["xpath"], "key": key}
