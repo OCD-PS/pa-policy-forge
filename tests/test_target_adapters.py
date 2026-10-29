@@ -1610,7 +1610,7 @@ class TargetAdapterTests(unittest.TestCase):
             )
             profile_id = cursor.lastrowid
             profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
-        xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><service><entry name="TCP443"><protocol><tcp><port>443</port></tcp></protocol></entry><entry name="https-alt"><protocol><tcp><port>443</port></tcp></protocol></entry></service><service-group><entry name="web"><members><member>TCP443</member><member>https-alt</member></members></entry></service-group><rulebase><security><rules><entry name="allow"><service><member>TCP443</member></service></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'''
+        xml = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="server-a"><ip-netmask>192.0.2.10</ip-netmask></entry><entry name="server-b"><ip-netmask>192.0.2.10</ip-netmask></entry></address><service><entry name="TCP443"><protocol><tcp><port>443</port></tcp></protocol></entry><entry name="https-alt"><protocol><tcp><port>443</port></tcp></protocol></entry></service><service-group><entry name="web"><members><member>TCP443</member><member>https-alt</member></members></entry></service-group><rulebase><security><rules><entry name="allow"><service><member>TCP443</member></service></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'''
         workspace_id = main.store_config_workspace(profile, "objects", "config.xml", xml, "upload")
         client = main.app.test_client()
         with client.session_transaction(base_url="https://forge.test") as login:
@@ -1619,18 +1619,35 @@ class TargetAdapterTests(unittest.TestCase):
             login["must_change"] = False
             login["csrf"] = "merge-csrf"
         try:
+            editor = client.get(
+                f"/config-workspaces/{workspace_id}/edit?scope=vsys1&workspace_view=objects&object_type=services",
+                base_url="https://forge.test",
+            )
+            self.assertEqual(editor.status_code, 200)
+            self.assertRegex(
+                editor.data.decode(),
+                r'<button[^>]*formaction="[^"]*/objects/merge-preview"[^>]*name="merge_all_types"[^>]*value="yes"',
+            )
             preview = client.post(
                 f"/config-workspaces/{workspace_id}/objects/merge-preview",
-                data={"csrf": "merge-csrf", "scope": "vsys1", "object_type": "services"},
+                data={"csrf": "merge-csrf", "scope": "vsys1", "object_type": "services", "merge_all_types": "yes"},
                 base_url="https://forge.test",
             )
             self.assertEqual(preview.status_code, 200)
+            self.assertIn(b"alle ondersteunde objecten en services", preview.data)
+            preview_text = preview.data.decode()
+            self.assertIn("Addresses · Groep", preview_text)
+            self.assertIn("Services · Groep", preview_text)
             self.assertIn(b"name=\"master_", preview.data)
             parser = NavigationTargets(); parser.feed(preview.data.decode())
             action = next(item for item in parser.actions if "/config-workspaces/object-drafts/" in item)
-            group_id = re.search(rb'name="master_([a-f0-9]+)"', preview.data).group(1).decode()
+            selections = {}
+            for section in re.findall(rb'<section class="card stack workspace-merge-group">(.*?)</section>', preview.data, re.S):
+                title = re.search(rb'<h2>(.*?)</h2>', section, re.S).group(1).decode()
+                group_id = re.search(rb'name="master_([a-f0-9]+)"', section).group(1).decode()
+                selections[f"master_{group_id}"] = "server-a" if title.startswith("Addresses") else "https-alt"
             applied = client.post(
-                action, data={"csrf": "merge-csrf", f"master_{group_id}": "https-alt"},
+                action, data={"csrf": "merge-csrf", **selections},
                 base_url="https://forge.test",
             )
             self.assertEqual(applied.status_code, 302)
@@ -1638,11 +1655,68 @@ class TargetAdapterTests(unittest.TestCase):
                 latest = conn.execute("SELECT * FROM config_workspaces WHERE profile_id=? ORDER BY id DESC LIMIT 1", (profile_id,)).fetchone()
             self.assertNotEqual(latest["id"], workspace_id)
             merged_xml = main.workspace_config_path(latest).read_bytes()
+            _, addresses = main.scoped_objects(merged_xml, "vsys1", "addresses")
             _, services = main.scoped_objects(merged_xml, "vsys1", "services")
+            self.assertEqual([item["name"] for item in addresses], ["server-a"])
             self.assertEqual([item["name"] for item in services], ["https-alt"])
             root, _ = main.parse_snapshot(merged_xml)
             self.assertEqual(root.findtext(".//service-group/entry/members/member"), "https-alt")
             self.assertEqual(root.findtext(".//rules/entry/service/member"), "https-alt")
+        finally:
+            with main.db() as conn:
+                workspaces = conn.execute("SELECT * FROM config_workspaces WHERE profile_id=?", (profile_id,)).fetchall()
+            for item in workspaces:
+                main.workspace_config_path(item).unlink(missing_ok=True)
+            with main.db() as conn:
+                conn.execute("DELETE FROM config_workspaces WHERE profile_id=?", (profile_id,))
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
+    def test_panorama_duplicate_merge_preview_uses_device_group_scope(self):
+        timestamp = main.now()
+        with main.db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO profiles(name,enabled,serial,source_ip,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("offline-panorama-merge", 1, "", "", "panorama", "{}", b"", timestamp, timestamp),
+            )
+            profile_id = cursor.lastrowid
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        xml = b'''<config><devices><entry name="localhost.localdomain"><device-group><entry name="Branches"><service><entry name="tcp443"><protocol><tcp><port>443</port></tcp></protocol></entry><entry name="https-alt"><protocol><tcp><port>443</port></tcp></protocol></entry></service><pre-rulebase><security><rules><entry name="allow"><service><member>tcp443</member><member>https-alt</member></service></entry></rules></security></pre-rulebase></entry></device-group></entry></devices></config>'''
+        workspace_id = main.store_config_workspace(profile, "objects", "config.xml", xml, "upload")
+        client = main.app.test_client()
+        with client.session_transaction(base_url="https://forge.test") as login:
+            login["user_id"] = 1
+            login["username"] = "test"
+            login["must_change"] = False
+            login["csrf"] = "panorama-merge-csrf"
+        try:
+            preview = client.post(
+                f"/config-workspaces/{workspace_id}/objects/merge-preview",
+                data={
+                    "csrf": "panorama-merge-csrf", "scope": "Branches",
+                    "object_type": "services", "merge_all_types": "yes",
+                },
+                base_url="https://forge.test",
+            )
+            self.assertEqual(preview.status_code, 200)
+            self.assertIn("Services · Groep", preview.data.decode())
+            parser = NavigationTargets(); parser.feed(preview.data.decode())
+            action = next(item for item in parser.actions if "/config-workspaces/object-drafts/" in item)
+            group_id = re.search(rb'name="master_([a-f0-9]+)"', preview.data).group(1).decode()
+            applied = client.post(
+                action, data={"csrf": "panorama-merge-csrf", f"master_{group_id}": "https-alt"},
+                base_url="https://forge.test",
+            )
+            self.assertEqual(applied.status_code, 302)
+            with main.db() as conn:
+                latest = conn.execute("SELECT * FROM config_workspaces WHERE profile_id=? ORDER BY id DESC LIMIT 1", (profile_id,)).fetchone()
+            merged_xml = main.workspace_config_path(latest).read_bytes()
+            _, services = main.scoped_objects(merged_xml, "Branches", "services")
+            self.assertEqual([item["name"] for item in services], ["https-alt"])
+            root, _ = main.parse_snapshot(merged_xml)
+            self.assertEqual(
+                [member.text for member in root.findall(".//pre-rulebase/security/rules/entry/service/member")],
+                ["https-alt"],
+            )
         finally:
             with main.db() as conn:
                 workspaces = conn.execute("SELECT * FROM config_workspaces WHERE profile_id=?", (profile_id,)).fetchall()
