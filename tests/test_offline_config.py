@@ -342,6 +342,22 @@ class OfflineConfigTests(unittest.TestCase):
         self.assertTrue(tags["Prod"])
         self.assertEqual(tags["unused"], [])
 
+    def test_reference_index_includes_panos_virtual_router_path_monitor_destinations(self):
+        source = b'''<config><shared><address><entry name="Google"><ip-netmask>8.8.8.8/32</ip-netmask></entry></address></shared><devices><entry name="localhost.localdomain"><network><virtual-router><entry name="VR_Telenet_Archief"><routing-table><ip><static-route><entry name="default_route"><path-monitor><enable>yes</enable><monitor-destinations><entry name="Google"><enable>yes</enable><destination>Google</destination></entry></monitor-destinations></path-monitor></entry></static-route></ip></routing-table></entry></virtual-router></network></entry></devices></config>'''
+
+        references = object_reference_index(source, "addresses", ["Google"])
+
+        self.assertEqual(
+            references["Google"],
+            ["/config/devices/entry[@name=localhost.localdomain]/network/virtual-router/entry[@name=VR_Telenet_Archief]/routing-table/ip/static-route/entry[@name=default_route]/path-monitor/monitor-destinations/entry[@name=Google]/destination"],
+        )
+        malformed = b'''<config><devices><entry name="localhost.localdomain"><network><path-monitor><virtual-router><entry name="VR_Telenet_Archief"><routing-table><ip><static-route><entry name="default_route"><monitor-destinations><entry name="Google"><destination>Google</destination></entry></monitor-destinations></entry></static-route></ip></routing-table></entry></virtual-router></path-monitor></network></entry></devices></config>'''
+        self.assertEqual(object_reference_index(malformed, "addresses", ["Google"])["Google"], [])
+        wrong_device = source.replace(b"localhost.localdomain", b"other-device")
+        self.assertEqual(object_reference_index(wrong_device, "addresses", ["Google"])["Google"], [])
+        unnamed_route = source.replace(b'<entry name="default_route">', b"<entry>")
+        self.assertEqual(object_reference_index(unnamed_route, "addresses", ["Google"])["Google"], [])
+
     def test_reference_index_detects_group_members_dynamic_tag_filters_and_cert_use(self):
         source = b'''<config><shared><address-group><entry name="servers"><static><member>server-a</member></static></entry><entry name="dynamic-servers"><dynamic><filter> 'Prod' </filter></dynamic></entry></address-group><certificate><entry name="proxy-cert"><usage>forward-trust</usage></entry></certificate><ssl-decrypt><entry name="decrypt"><forward-trust-certificate>proxy-cert</forward-trust-certificate></entry></ssl-decrypt></shared></config>'''
         self.assertTrue(object_reference_index(source, "addresses", ["server-a"])["server-a"])

@@ -311,6 +311,8 @@ def object_reference_indexes(
     candidate_tags = {
         "member", "translated-address", "translated-port", "schedule", "log-setting", "filter",
     }
+    if "addresses" in wanted_by_type:
+        candidate_tags.add("destination")
     if "certificates" in wanted_by_type:
         candidate_tags.update({"rsa", "entry", *certificate_value_tags})
 
@@ -347,6 +349,14 @@ def object_reference_indexes(
                 }:
                     add(object_type, node.get("name", ""), node, "/usage")
             elif object_type in {"addresses", "address-groups", "regions"}:
+                if (
+                    object_type == "addresses"
+                    and node.tag == "destination"
+                    and _has_path_monitor_address_reference(node, parent)
+                ):
+                    # PAN-OS path-monitor destinations reference address objects
+                    # outside a VSYS, so include them in dependency inventories.
+                    add(object_type, node.text or "", node)
                 if node.tag == "member" and owner_tag in {"source", "destination"}:
                     if ancestors() & rulebase_scopes and ancestors() & policy_kinds:
                         add(object_type, node.text or "", node)
@@ -484,13 +494,19 @@ def unresolved_object_reference_indexes(
                 if (node.text or "").strip() != name:
                     continue
                 scope = _reference_scope(node, parent, snapshot)
-                if scope is None or (allowed_reference_scopes is not None and scope not in allowed_reference_scopes):
+                global_path_monitor_ref = _is_panos_path_monitor_address_reference(
+                    node, parent, snapshot, object_type,
+                )
+                if scope is None and not global_path_monitor_ref:
+                    continue
+                resolution_scope = "Shared" if global_path_monitor_ref else scope
+                if allowed_reference_scopes is not None and resolution_scope not in allowed_reference_scopes:
                     continue
                 try:
-                    resolved = _resolve_scoped_object_entry(root, snapshot, scope, object_type, name)
+                    resolved = _resolve_scoped_object_entry(root, snapshot, resolution_scope, object_type, name)
                     had_original_reference = path in old_paths_by_name.get(name, set())
                     original_resolved = (
-                        _resolve_scoped_object_entry(original_root, original_snapshot, scope, object_type, name)
+                        _resolve_scoped_object_entry(original_root, original_snapshot, resolution_scope, object_type, name)
                         if had_original_reference else None
                     )
                 except OfflineConfigError:
@@ -656,6 +672,34 @@ def _reference_scope(node: ET.Element, parent: dict[ET.Element, ET.Element], sna
     return None
 
 
+def _is_panos_path_monitor_address_reference(
+    node: ET.Element, parent: dict[ET.Element, ET.Element], snapshot: ConfigSnapshot, object_type: str,
+) -> bool:
+    """Identify a global PAN-OS path-monitor destination that resolves in Shared."""
+    return snapshot.kind == "panos" and object_type == "addresses" and _has_path_monitor_address_reference(node, parent)
+
+
+def _has_path_monitor_address_reference(
+    node: ET.Element, parent: dict[ET.Element, ET.Element],
+) -> bool:
+    """Match the ordered PAN-OS static-route path-monitor XML path exactly."""
+    expected_path = [
+        "destination", "entry", "monitor-destinations", "path-monitor", "entry",
+        "static-route", "ip", "routing-table", "entry", "virtual-router", "network",
+        "entry", "devices", "config",
+    ]
+    current = node
+    path_nodes = []
+    while current is not None and len(path_nodes) < len(expected_path):
+        path_nodes.append(current)
+        current = parent.get(current)
+    if [item.tag for item in path_nodes] != expected_path:
+        return False
+    if path_nodes[11].get("name") != "localhost.localdomain":
+        return False
+    return all(path_nodes[index].get("name") for index in (1, 4, 8))
+
+
 def _object_resolution_chain(snapshot: ConfigSnapshot, scope: str) -> list[str]:
     if scope == "Shared":
         return ["Shared"]
@@ -700,7 +744,7 @@ def _typed_object_reference_nodes(root: ET.Element, object_type: str) -> tuple[l
         owner = parent.get(node)
         if node.tag != "member" and not (object_type == "schedules" and node.tag == "schedule") and not (
             object_type in {"addresses", "address-groups", "regions"}
-            and node.tag in {"translated-address", "translated-port"}
+            and node.tag in {"translated-address", "translated-port", "destination"}
         ):
             if object_type == "tags" and node.tag == "filter" and node.text:
                 chain = set()
@@ -724,6 +768,11 @@ def _typed_object_reference_nodes(root: ET.Element, object_type: str) -> tuple[l
                      or (owner.tag == "static" and "address-group" in chain)
                      or ("source-translation" in chain or "destination-translation" in chain))
             )
+            if (
+                object_type == "addresses" and node.tag == "destination"
+                and _has_path_monitor_address_reference(node, parent)
+            ):
+                is_reference = True
             if node.tag in {"translated-address", "translated-port"} and node.text and chain & {"source-translation", "destination-translation"}:
                 members.append(node)
         elif object_type in {"services", "service-groups"}:
