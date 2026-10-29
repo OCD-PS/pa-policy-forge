@@ -379,6 +379,69 @@ def object_reference_index(xml_bytes: bytes, object_type: str, names: Iterable[s
     return wanted
 
 
+def unresolved_object_reference_index(
+    xml_bytes: bytes, object_type: str, names: Iterable[str], *, original_xml_bytes: bytes | None = None,
+) -> dict[str, list[str]]:
+    """Return references whose effective object is missing or changed.
+
+    ``object_reference_index`` intentionally reports every typed name match,
+    which is useful for conservative deletion workflows. Incremental pushes
+    need one extra distinction: a VSYS reference remains valid after its local
+    definition is moved to Shared, because PAN-OS resolves that same reference
+    through inheritance. Compare against the original target too, so a
+    same-name but behaviorally different Shared object cannot silently change
+    policy semantics. Keep untyped/unknown references fail-closed.
+    """
+    all_references = object_reference_index(xml_bytes, object_type, names)
+    wanted = {name for name, paths in all_references.items() if paths}
+    if not wanted:
+        return all_references
+    root, snapshot = parse_snapshot(xml_bytes)
+    original_root, original_snapshot = (
+        parse_snapshot(original_xml_bytes) if original_xml_bytes is not None else (root, snapshot)
+    )
+    references, _ = _typed_object_reference_nodes(root, object_type)
+    parent = {child: node for node in root.iter() for child in node}
+    paths: dict[ET.Element, str] = {root: "/" + root.tag}
+    for node in root.iter():
+        if node in paths:
+            continue
+        owner = parent.get(node)
+        if owner is None:
+            paths[node] = "/" + node.tag
+        else:
+            suffix = f"[@name={node.get('name')}]" if node.tag == "entry" and node.get("name") else ""
+            paths[node] = paths[owner] + "/" + node.tag + suffix
+
+    resolved_paths: dict[str, set[str]] = {name: set() for name in wanted}
+    for node in references:
+        name = (node.text or "").strip()
+        if name not in wanted:
+            continue
+        scope = _reference_scope(node, parent, snapshot)
+        if scope is None:
+            continue
+        try:
+            resolved = _resolve_scoped_object_entry(root, snapshot, scope, object_type, name)
+            original_resolved = _resolve_scoped_object_entry(
+                original_root, original_snapshot, scope, object_type, name,
+            )
+        except OfflineConfigError:
+            # Duplicate/ambiguous ownership is not proof of safety.
+            continue
+        if (
+            resolved is not None and original_resolved is not None
+            and _merge_object_signature(resolved, object_type)
+            == _merge_object_signature(original_resolved, object_type)
+        ):
+            resolved_paths[name].add(paths[node][:240])
+
+    return {
+        name: [path for path in paths if path not in resolved_paths.get(name, set())]
+        for name, paths in all_references.items()
+    }
+
+
 def _merge_object_signature(entry: ET.Element, object_type: str) -> tuple:
     """Compare behavior-bearing XML; service tags are preserved as metadata."""
     ignored_nodes = {"description", "comments"}

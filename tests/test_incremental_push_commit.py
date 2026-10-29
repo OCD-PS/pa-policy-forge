@@ -303,6 +303,117 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertIn("objecten zijn nog in gebruik", response.get_data(as_text=True))
         api_post.assert_not_called()
 
+    def test_moving_referenced_vsys_object_to_shared_allows_selected_incremental_push(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared/><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<address><entry name="0_NAC_10_10_130_0_24"><ip-netmask>10.10.130.0/24</ip-netmask>'
+            b'</entry></address><rulebase><security><rules><entry name="Migrated sites to Untrust">'
+            b'<source><member>0_NAC_10_10_130_0_24</member></source></entry></rules></security></rulebase>'
+            b'</entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        local_entry = desired_root.find("./devices/entry/vsys/entry/address/entry")
+        desired_root.find("./devices/entry/vsys/entry/address").remove(local_entry)
+        shared = desired_root.find("./shared")
+        address = main.ET.SubElement(shared, "address")
+        shared_entry = main.ET.SubElement(address, "entry", {"name": "0_NAC_10_10_130_0_24"})
+        main.ET.SubElement(shared_entry, "ip-netmask").text = "10.10.130.0/24"
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "merge object into Shared", "candidate.xml", desired, "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        changes = main.config_push_delta(base, desired)
+        selected = list(dict.fromkeys(item["selection_key"] for item in changes))
+        self.assertEqual({item["action"] for item in changes}, {"set", "delete"})
+
+        def api_response(endpoint, params, ctx):
+            if params["type"] == "config":
+                return '<response status="success" code="20"><result/></response>'
+            if params["type"] == "op":
+                return '<response status="success"><result><job>606</job></result></response>'
+            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post", side_effect=api_response) as api_post, \
+             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": selected}, follow_redirects=True,
+            )
+
+        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
+        writes = [call.args[1] for call in api_post.call_args_list if call.args[1]["type"] == "config"]
+        self.assertEqual({write["action"] for write in writes}, {"set", "delete"})
+        self.assertTrue(any("/shared/address" in write["xpath"] for write in writes if write["action"] == "set"))
+
+    def test_shared_fallback_is_not_accepted_when_its_addition_is_not_selected(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared/><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<address><entry name="same-name"><ip-netmask>192.0.2.8/32</ip-netmask></entry></address>'
+            b'</entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find("./devices/entry/vsys/entry/address").remove(
+            desired_root.find("./devices/entry/vsys/entry/address/entry")
+        )
+        shared_address = main.ET.SubElement(desired_root.find("./shared"), "address")
+        entry = main.ET.SubElement(shared_address, "entry", {"name": "same-name"})
+        main.ET.SubElement(entry, "ip-netmask").text = "192.0.2.8/32"
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "incomplete Shared move", "candidate.xml", desired, "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        removal = next(
+            item for item in main.config_push_delta(base, desired)
+            if item["action"] == "delete" and item["family"] == "object:address"
+        )
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post") as api_post:
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": removal["selection_key"]},
+                follow_redirects=True,
+            )
+
+        self.assertIn("vereist zowel de bron- als doelscope", response.get_data(as_text=True))
+        api_post.assert_not_called()
+
+    def test_shared_fallback_with_different_object_behavior_still_blocks_deletion(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address><entry name="same-name"><ip-netmask>192.0.2.10/32</ip-netmask>'
+            b'</entry></address></shared><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<address><entry name="same-name"><ip-netmask>192.0.2.8/32</ip-netmask></entry></address>'
+            b'<rulebase><security><rules><entry name="allow"><source><member>same-name</member>'
+            b'</source></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find("./devices/entry/vsys/entry/address").remove(
+            desired_root.find("./devices/entry/vsys/entry/address/entry")
+        )
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "unsafe different Shared fallback", "candidate.xml", desired, "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        removal = next(
+            item for item in main.config_push_delta(base, desired)
+            if item["action"] == "delete" and item["family"] == "object:address"
+        )
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post") as api_post:
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": removal["selection_key"]},
+                follow_redirects=True,
+            )
+
+        self.assertIn("objecten zijn nog in gebruik", response.get_data(as_text=True))
+        api_post.assert_not_called()
+
     def test_commit_is_opt_in_and_status_checks_are_rate_limited(self):
         with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), self.candidate_xml)):
             preview = self.client.get(
