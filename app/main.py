@@ -77,6 +77,8 @@ from app.offline_config import (
     policy_fingerprint as offline_policy_fingerprint, render_set_commands,
     panos_ui_decorate_record, scoped_server_profiles,
     object_reference_index,
+    _merge_object_signature, _reference_scope, _resolve_scoped_object_entry,
+    _typed_object_reference_nodes,
     duplicate_object_groups, duplicate_object_groups_across_panos_scopes,
     merge_duplicate_object_groups, merge_duplicate_object_groups_to_shared,
     move_panos_scope_entries,
@@ -5545,7 +5547,10 @@ def config_push_scope(xpath: str) -> str:
     return "Global"
 
 
-def panos_scope_move_plan(current_xml: bytes, chosen: list[dict], object_type_by_node: dict[str, str]) -> tuple[list[dict], set[tuple[str, str]]]:
+def panos_scope_move_plan(
+    current_xml: bytes, desired_xml: bytes, chosen: list[dict],
+    object_type_by_node: dict[str, str],
+) -> tuple[list[dict], set[tuple[str, str]]]:
     """Use PAN-OS multi-move for objects relocated between scopes.
 
     A set-then-delete sequence fails when policies still reference a local
@@ -5561,6 +5566,7 @@ def panos_scope_move_plan(current_xml: bytes, chosen: list[dict], object_type_by
     moves_by_target: dict[int, list[dict]] = defaultdict(list)
     consumed_deletes: set[int] = set()
     moved_names: set[tuple[str, str]] = set()
+    safe_merge_ops: list[dict] = []
 
     def entry_signature(node):
         return (
@@ -5580,6 +5586,183 @@ def panos_scope_move_plan(current_xml: bytes, chosen: list[dict], object_type_by
                 raise OfflineConfigError("Objectverplaatsing bevat ongeldige XML; niets geschreven") from exc
             target_entries_cache[cache_key] = {node.get("name", ""): node for node in wrapper.findall("./entry")}
         return target_entries_cache[cache_key]
+
+    def xml_paths(root):
+        """Index unambiguous PAN-OS element paths for narrow temporary edits."""
+        parent = {child: node for node in root.iter() for child in node}
+        api_paths = {root: "/config"}
+        reference_paths = {root: "/config"}
+        for node in root.iter():
+            if node is root:
+                continue
+            owner = parent.get(node)
+            if owner is None:
+                continue
+            segment = node.tag
+            reference_segment = node.tag
+            if node.tag == "entry" and node.get("name") is not None:
+                segment += f"[@name={policy_api.xpath_literal(node.get('name', ''))}]"
+                # object_reference_index stores a compact, unquoted identity
+                # path. Keep that representation separate from API-safe XPath.
+                reference_segment += f"[@name={node.get('name', '')}]"
+            api_paths[node] = f"{api_paths[owner]}/{segment}"
+            reference_paths[node] = f"{reference_paths[owner]}/{reference_segment}"
+        return api_paths, reference_paths, parent
+
+    def existing_shared_merge(removal, object_type):
+        """Plan a same-name local-to-Shared collapse without deleting live refs.
+
+        When Shared already owns an equivalent object, PAN-OS cannot multi-move
+        the local entry into that occupied name. Rename the local entry to a
+        short-lived unique name, point its unchanged reference fields back at
+        the equivalent Shared object, then delete the now-unused temporary
+        entry. The final candidate keeps the original reference names.
+        """
+        name = str(removal.get("name", ""))
+        source_scope = str(removal.get("scope", ""))
+        if not name or source_scope == "Shared":
+            return None
+        # These definitions contain references to other scoped objects. Their
+        # identical XML can resolve to different effective members after a
+        # move to Shared, so keep the ordinary dependency guard in charge.
+        if object_type in {
+            "address-groups", "application-groups", "service-groups",
+            "dynamic-user-groups", "security-profile-groups",
+        }:
+            return None
+        try:
+            current_root, current_snapshot = parse_snapshot(current_xml)
+            desired_root, desired_snapshot = parse_snapshot(desired_xml)
+            if current_snapshot.kind not in {"panos", "panorama"}:
+                return None
+            if desired_snapshot.kind != current_snapshot.kind:
+                return None
+            valid_scopes = (
+                set(current_snapshot.vsys)
+                if current_snapshot.kind == "panos"
+                else {item["name"] for item in current_snapshot.device_groups}
+            )
+            desired_scopes = (
+                set(desired_snapshot.vsys)
+                if desired_snapshot.kind == "panos"
+                else {item["name"] for item in desired_snapshot.device_groups}
+            )
+            if source_scope not in valid_scopes or source_scope not in desired_scopes:
+                return None
+            _, source_records = scoped_objects(current_xml, source_scope, object_type)
+            _, shared_records = scoped_objects(current_xml, "Shared", object_type)
+            _, desired_source_records = scoped_objects(desired_xml, source_scope, object_type)
+            _, desired_shared_records = scoped_objects(desired_xml, "Shared", object_type)
+            source = next((item for item in source_records if item.get("owner") == source_scope and item.get("name") == name), None)
+            shared = next((item for item in shared_records if item.get("owner") == "Shared" and item.get("name") == name), None)
+            desired_source = next((item for item in desired_source_records if item.get("owner") == source_scope and item.get("name") == name), None)
+            desired_shared = next((item for item in desired_shared_records if item.get("owner") == "Shared" and item.get("name") == name), None)
+            if not source or not shared or desired_source or not desired_shared:
+                return None
+            source_entry = SafeET.fromstring(source["_xml"])
+            shared_entry = SafeET.fromstring(shared["_xml"])
+            desired_shared_entry = SafeET.fromstring(desired_shared["_xml"])
+            source_signature = _merge_object_signature(source_entry, object_type)
+            if source_signature != _merge_object_signature(shared_entry, object_type):
+                return None
+            if source_signature != _merge_object_signature(desired_shared_entry, object_type):
+                return None
+            current_source_entry = _resolve_scoped_object_entry(
+                current_root, current_snapshot, source_scope, object_type, name,
+            )
+            if current_source_entry is None:
+                return None
+
+            reference_inventory = object_reference_index(current_xml, object_type, [name]).get(name, [])
+            refs, expressions = _typed_object_reference_nodes(current_root, object_type)
+            all_paths, reference_paths, parent = xml_paths(current_root)
+            recognized_paths = set()
+            source_fields = {}
+            source_reference_scopes = set()
+            for ref in [*refs, *expressions]:
+                value = ref.text or ""
+                if ref is not None and value.strip() == name:
+                    ref_path = reference_paths.get(ref)
+                    if ref_path:
+                        recognized_paths.add(ref_path[:240])
+                if value.strip() != name:
+                    continue
+                scope = _reference_scope(ref, parent, current_snapshot)
+                if scope != source_scope:
+                    continue
+                try:
+                    resolved = _resolve_scoped_object_entry(current_root, current_snapshot, scope, object_type, name)
+                except OfflineConfigError:
+                    return None
+                if resolved is not current_source_entry:
+                    continue
+                source_reference_scopes.add(scope)
+                field = ref if ref.tag != "member" else parent.get(ref)
+                if field is None:
+                    return None
+                field_path = all_paths.get(field)
+                if not field_path:
+                    return None
+                source_fields[field_path] = copy.deepcopy(field)
+
+            if not reference_inventory or not source_fields:
+                return None
+            if set(reference_inventory) != recognized_paths:
+                return None
+            desired_shared_entry = _resolve_scoped_object_entry(
+                desired_root, desired_snapshot, "Shared", object_type, name,
+            )
+            if desired_shared_entry is None:
+                return None
+            # Panorama resolves device-group references through parent groups
+            # before Shared. Confirm every affected reference still resolves
+            # to the intended Shared entry after the local definition leaves.
+            for scope in source_reference_scopes:
+                if _resolve_scoped_object_entry(
+                    desired_root, desired_snapshot, scope, object_type, name,
+                ) is not desired_shared_entry:
+                    return None
+            unresolved = unresolved_object_reference_index(
+                desired_xml, object_type, [name], original_xml_bytes=current_xml,
+            ).get(name, [])
+            if unresolved:
+                return None
+
+            # Fail closed if the merge would also change any reference field.
+            desired_paths, _, _ = xml_paths(desired_root)
+            desired_by_path = {path: node for node, path in desired_paths.items()}
+            for field_path, field in source_fields.items():
+                desired_field = desired_by_path.get(field_path)
+                if desired_field is None or ET.tostring(desired_field) != ET.tostring(field):
+                    return None
+
+            used_names = {
+                node.get("name", "") for node in current_root.iter("entry")
+                if node.get("name")
+            }
+            temporary_name = f"PF_TMP_{secrets.token_hex(8)}"
+            while temporary_name in used_names:
+                temporary_name = f"PF_TMP_{secrets.token_hex(8)}"
+            source_collection = removal["xpath"].rsplit("/entry[@name=", 1)[0]
+            temporary_xpath = f"{source_collection}/entry[@name={policy_api.xpath_literal(temporary_name)}]"
+            label = removal["label"]
+            ops = [{
+                "action": "rename", "xpath": removal["xpath"], "newname": temporary_name,
+                "family": removal["family"], "label": label, "name": name,
+            }]
+            for field_path, field in source_fields.items():
+                ops.append({
+                    "action": "edit", "xpath": field_path,
+                    "element": ET.tostring(field, encoding="unicode"),
+                    "family": removal["family"], "label": label, "name": name,
+                })
+            ops.append({
+                "action": "delete", "xpath": temporary_xpath, "element": "",
+                "family": removal["family"], "label": label, "name": name,
+            })
+            return ops
+        except (OfflineConfigError, KeyError, TypeError, ValueError, ET.ParseError):
+            return None
 
     def supports_native_scope(xpath):
         return "/shared/" in xpath or bool(re.search(r"/(?:vsys|device-group)/entry\[@name=", xpath))
@@ -5601,6 +5784,13 @@ def panos_scope_move_plan(current_xml: bytes, chosen: list[dict], object_type_by
             if item["family"] == removal["family"] and item["scope"] != removal["scope"]
             and name in config_push_change_names(item)
         ]
+        if not targets:
+            merge_ops = existing_shared_merge(removal, object_type)
+            if merge_ops:
+                safe_merge_ops.extend(merge_ops)
+                consumed_deletes.add(id(removal))
+                moved_names.add((object_type, name))
+                continue
         if len(targets) != 1:
             continue
         target = targets[0]
@@ -5662,7 +5852,29 @@ def panos_scope_move_plan(current_xml: bytes, chosen: list[dict], object_type_by
         consumed_deletes.add(id(removal))
         moved_names.add((object_type, name))
 
+    # Apply each same-name Shared merge as one transactional XML API request.
+    # PAN-OS rolls the batch back if one step fails, so a transient rename can
+    # never strand the candidate between the rename and reference repair.
     write_plan = []
+    if safe_merge_ops:
+        transaction = ET.Element("multi-config")
+        for change in safe_merge_ops:
+            attributes = {"xpath": change["xpath"]}
+            if change.get("newname"):
+                attributes["newname"] = change["newname"]
+            action = ET.SubElement(transaction, change["action"], attributes)
+            if change.get("element"):
+                try:
+                    element = SafeET.fromstring(f"<fragment>{change['element']}</fragment>")
+                except Exception as exc:
+                    raise OfflineConfigError("Shared-merge bevat ongeldige XML; niets geschreven") from exc
+                action.extend(copy.deepcopy(list(element)))
+        write_plan.append({
+            "action": "multi-config", "xpath": "/config", "element": ET.tostring(transaction, encoding="unicode"),
+            "family": safe_merge_ops[0]["family"], "label": "Shared object merge",
+            "name": ", ".join(dict.fromkeys(change["name"] for change in safe_merge_ops)),
+            "operation_count": len(safe_merge_ops),
+        })
     for change in chosen:
         move_ops = moves_by_target.get(id(change), [])
         if move_ops:
@@ -6438,7 +6650,7 @@ def config_workspace_commit_status_api(workspace_id: int, commit_id: int):
 
 def concise_incremental_push_error(exc: Exception) -> str:
     message = str(exc)
-    api_error = re.search(r"(?P<context>(?:set|edit|delete|multi-move) .*?) failed: status='(?P<status>[^']+)' code='(?P<code>[^']+)' msg=", message)
+    api_error = re.search(r"(?P<context>(?:set|edit|delete|rename|multi-move|multi-config) .*?) failed: status='(?P<status>[^']+)' code='(?P<code>[^']+)' msg=", message)
     if api_error:
         code = api_error.group("code")
         if code == "13":
@@ -6538,7 +6750,7 @@ def config_workspace_push(workspace_id):
             raise RuntimeError("De selectie bevat geen wijzigingen")
         object_type_by_node = {node: kind for kind, node in OBJECT_NODES.items()}
         write_plan, native_moved_names = panos_scope_move_plan(
-            current_xml, chosen, object_type_by_node,
+            current_xml, push_desired_xml, chosen, object_type_by_node,
         )
         invalidate_candidate_preview_cache(int(profile["id"]))
         if profile["target_type"] == "panos":
@@ -6582,17 +6794,35 @@ def config_workspace_push(workspace_id):
             )
         for change in write_plan:
             params = {"type": "config", "action": change["action"], "xpath": change["xpath"], "key": key}
-            if change["action"] in {"set", "edit", "multi-move"}:
+            if change["action"] in {"set", "edit", "multi-move", "multi-config"}:
                 params["element"] = change["element"]
+            if change["action"] == "multi-config":
+                # Keep the batch transactional without rolling back other
+                # pending candidate changes owned by this administrator.
+                params["strict-transactional"] = "no"
+            if change["action"] == "rename":
+                params["newname"] = change["newname"]
             if change["action"] == "move":
                 params["where"] = change["where"]
                 if change.get("dst"):
                     params["dst"] = change["dst"]
-            policy_api.require_success(
-                panos_api_post(endpoint, params, ctx),
-                f"{change['action']} {change['label']} {change['name']}",
-            )
-            applied_changes += 1
+            response = panos_api_post(endpoint, params, ctx)
+            action_label = f"{change['action']} {change['label']} {change['name']}"
+            response_root = policy_api.require_success(response, action_label)
+            if change["action"] == "multi-config":
+                failures = [
+                    item for item in response_root.iter("response")
+                    if item is not response_root and item.get("status") != "success"
+                ]
+                if failures:
+                    detail = " ".join(" ".join(node.itertext()).strip() for node in failures)
+                    code = next((item.get("code", "") for item in failures if item.get("code")), "")
+                    raise RuntimeError(
+                        f"multi-config {change['label']} failed: status='error' code='{code}' msg={detail[:180]}"
+                    )
+                applied_changes += int(change.get("operation_count", 1))
+            else:
+                applied_changes += 1
         validation_root = policy_api.require_success(
             panos_api_post(endpoint, {"type": "op", "cmd": "<validate><full></full></validate>", "key": key}, ctx),
             "PAN-OS candidatevalidatie starten",
