@@ -55,6 +55,15 @@ class IncrementalPushCommitTests(unittest.TestCase):
                 conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
             conn.execute("DELETE FROM profiles WHERE id=?", (self.profile_id,))
 
+    def test_pan_os_reference_count_error_has_actionable_short_message(self):
+        message = main.concise_incremental_push_error(RuntimeError(
+            "delete Addresses host-a failed: status='error' code='10' msg=references remain"
+        ))
+        self.assertEqual(
+            message,
+            "delete Addresses host-a: PAN-OS kan dit object niet verwijderen zolang er verwijzingen naar bestaan (code 10)",
+        )
+
     def create_policy_workspace(self, description_current="old"):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys2">'
@@ -303,7 +312,40 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertIn("objecten zijn nog in gebruik", response.get_data(as_text=True))
         api_post.assert_not_called()
 
-    def test_moving_referenced_vsys_object_to_shared_allows_selected_incremental_push(self):
+    def test_delete_with_reference_removal_requires_policy_family_selection(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<address><entry name="delete-me"><ip-netmask>192.0.2.99/32</ip-netmask></entry></address>'
+            b'<rulebase><security><rules><entry name="allow-delete-me"><source><member>delete-me</member>'
+            b'</source></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find(".//address/entry[@name='delete-me']").clear()
+        desired_root.find(".//address").remove(desired_root.find(".//address/entry"))
+        desired_root.find(".//rules").clear()
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "delete with dependent reference change", "candidate.xml", desired,
+            "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        changes = main.config_push_delta(base, desired)
+        object_delete = next(item for item in changes if item["family"] == "object:address")
+        self.assertTrue(any(item["family"] == "policy:security" for item in changes))
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post") as api_post:
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": object_delete["selection_key"]},
+                follow_redirects=True,
+            )
+
+        message = response.get_data(as_text=True)
+        self.assertIn("selecteer Security policies", message)
+        api_post.assert_not_called()
+
+    def test_moving_referenced_vsys_object_to_shared_is_blocked_before_any_write(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><shared/><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
             b'<address><entry name="A_first"><ip-netmask>192.0.2.1/32</ip-netmask></entry>'
@@ -334,27 +376,18 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertEqual(shared_addition["name"], "A_first")
         self.assertIn("0_NAC_10_10_130_0_24", main.config_push_change_names(shared_addition))
 
-        def api_response(endpoint, params, ctx):
-            if params["type"] == "config":
-                return '<response status="success" code="20"><result/></response>'
-            if params["type"] == "op":
-                return '<response status="success"><result><job>606</job></result></response>'
-            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
-
         with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
-             patch("app.main.panos_api_post", side_effect=api_response) as api_post, \
-             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
+             patch("app.main.panos_api_post") as api_post:
             response = self.client.post(
                 f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
                 data={"csrf": "incremental-commit-csrf", "family": selected}, follow_redirects=True,
             )
 
-        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
-        writes = [call.args[1] for call in api_post.call_args_list if call.args[1]["type"] == "config"]
-        self.assertEqual({write["action"] for write in writes}, {"set", "delete"})
-        self.assertTrue(any("/shared/address" in write["xpath"] for write in writes if write["action"] == "set"))
+        self.assertIn("objecten zijn nog in gebruik", response.get_data(as_text=True))
+        self.assertIn("Migrated sites to Untrust", response.get_data(as_text=True))
+        api_post.assert_not_called()
 
-    def test_moving_referenced_vsys2_destination_object_to_shared_allows_incremental_push(self):
+    def test_moving_referenced_vsys2_destination_object_to_shared_is_blocked_before_any_write(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><shared/><devices><entry name="localhost.localdomain"><vsys>'
             b'<entry name="vsys1"><address/></entry><entry name="vsys2">'
@@ -382,28 +415,18 @@ class IncrementalPushCommitTests(unittest.TestCase):
         shared_addition = next(item for item in changes if item["action"] == "set" and item["scope"] == "Shared")
         self.assertIn("XIQ-NL-GCP", main.config_push_change_names(shared_addition))
 
-        def api_response(endpoint, params, ctx):
-            if params["type"] == "config":
-                return '<response status="success" code="20"><result/></response>'
-            if params["type"] == "op":
-                return '<response status="success"><result><job>607</job></result></response>'
-            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
-
         with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
-             patch("app.main.panos_api_post", side_effect=api_response) as api_post, \
-             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
+             patch("app.main.panos_api_post") as api_post:
             response = self.client.post(
                 f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
                 data={"csrf": "incremental-commit-csrf", "family": selected}, follow_redirects=True,
             )
 
-        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
-        writes = [call.args[1] for call in api_post.call_args_list if call.args[1]["type"] == "config"]
-        self.assertEqual({write["action"] for write in writes}, {"set", "delete"})
-        self.assertTrue(any("/vsys/entry[@name='vsys2']/address" in write["xpath"] for write in writes if write["action"] == "delete"))
-        self.assertTrue(any("/shared/address" in write["xpath"] for write in writes if write["action"] == "set"))
+        self.assertIn("objecten zijn nog in gebruik", response.get_data(as_text=True))
+        self.assertIn("Explore-Access Points-to-XIQ-RadSec", response.get_data(as_text=True))
+        api_post.assert_not_called()
 
-    def test_move_to_shared_allows_new_reference_in_another_vsys(self):
+    def test_move_to_shared_with_live_reference_and_new_reference_is_blocked(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><shared/><devices><entry name="localhost.localdomain"><vsys>'
             b'<entry name="vsys1"><address><entry name="XIQ-NL-GCP">'
@@ -432,28 +455,16 @@ class IncrementalPushCommitTests(unittest.TestCase):
             item["selection_key"] for item in main.config_push_delta(base, desired)
         ))
 
-        def api_response(endpoint, params, ctx):
-            if params["type"] == "config":
-                return '<response status="success" code="20"><result/></response>'
-            if params["type"] == "op":
-                return '<response status="success"><result><job>609</job></result></response>'
-            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
-
         with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
-             patch("app.main.panos_api_post", side_effect=api_response) as api_post, \
-             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
+             patch("app.main.panos_api_post") as api_post:
             response = self.client.post(
                 f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
                 data={"csrf": "incremental-commit-csrf", "family": selected}, follow_redirects=True,
             )
 
-        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
-        writes = [call.args[1] for call in api_post.call_args_list if call.args[1]["type"] == "config"]
-        self.assertTrue(any("/shared/address" in write["xpath"] for write in writes if write["action"] == "set"))
-        self.assertTrue(any(
-            "Explore-Access Points-to-XIQ-RadSec" in write.get("element", "")
-            for write in writes if write["action"] == "set"
-        ))
+        self.assertIn("objecten zijn nog in gebruik", response.get_data(as_text=True))
+        self.assertIn("Existing XIQ rule", response.get_data(as_text=True))
+        api_post.assert_not_called()
 
     def create_existing_shared_object_move_workspace(self):
         base = main.normalized_config_xml(main.ET.fromstring(
@@ -492,7 +503,7 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertIn("Verplaatsing van XIQ-NL-GCP vereist zowel de bron- als doelscope", response.get_data(as_text=True))
         api_post.assert_not_called()
 
-    def test_shared_edit_and_vsys_delete_together_allow_equivalent_move(self):
+    def test_shared_move_with_live_policy_reference_is_blocked_before_any_write(self):
         workspace_id, base, removal, shared_edit = self.create_existing_shared_object_move_workspace()
 
         def api_response(endpoint, params, ctx):
@@ -511,10 +522,10 @@ class IncrementalPushCommitTests(unittest.TestCase):
                 follow_redirects=True,
             )
 
-        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
-        writes = [call.args[1] for call in api_post.call_args_list if call.args[1]["type"] == "config"]
-        self.assertEqual({write["action"] for write in writes}, {"delete", "edit"})
-        self.assertTrue(any(write["xpath"].endswith("/shared/address/entry[@name='XIQ-NL-GCP']") for write in writes if write["action"] == "edit"))
+        message = response.get_data(as_text=True)
+        self.assertIn("objecten zijn nog in gebruik", message)
+        self.assertIn("Explore-Access Points-to-XIQ-RadSec", message)
+        api_post.assert_not_called()
 
     def test_shared_fallback_is_not_accepted_when_its_addition_is_not_selected(self):
         base = main.normalized_config_xml(main.ET.fromstring(
