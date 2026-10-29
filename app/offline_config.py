@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import copy
 import shlex
 import re
@@ -229,6 +230,8 @@ REFERENCE_CHECK_OBJECT_TYPES = UNUSED_OBJECT_TYPES | frozenset({
     "hip-profiles", "dynamic-user-groups",
 })
 
+MERGEABLE_OBJECT_TYPES = REFERENCE_CHECK_OBJECT_TYPES
+
 
 def object_reference_index(xml_bytes: bytes, object_type: str, names: Iterable[str]) -> dict[str, list[str]]:
     """Find conservative, typed references to named PAN-OS objects.
@@ -269,6 +272,7 @@ def object_reference_index(xml_bytes: bytes, object_type: str, names: Iterable[s
         return result
 
     policy_kinds = set(POLICY_NODES.values())
+    rulebase_scopes = {"rulebase", "pre-rulebase", "post-rulebase"}
     for node in root.iter():
         chain = ancestors(node)
         chain_set = set(chain)
@@ -299,7 +303,7 @@ def object_reference_index(xml_bytes: bytes, object_type: str, names: Iterable[s
             is_policy_reference = (
                 node.tag == "member" and parent_node is not None
                 and parent_node.tag in {"source", "destination"}
-                and "rulebase" in chain_set and bool(chain_set & policy_kinds)
+                and chain_set & rulebase_scopes and bool(chain_set & policy_kinds)
             )
             is_group_member = (
                 node.tag == "member" and parent_node is not None and parent_node.tag == "static"
@@ -314,7 +318,7 @@ def object_reference_index(xml_bytes: bytes, object_type: str, names: Iterable[s
         elif object_type in {"services", "service-groups"}:
             is_policy_reference = (
                 node.tag == "member" and parent_node is not None and parent_node.tag == "service"
-                and "rulebase" in chain_set and bool(chain_set & policy_kinds)
+                and chain_set & rulebase_scopes and bool(chain_set & policy_kinds)
             )
             is_group_member = (
                 node.tag == "member" and parent_node is not None and parent_node.tag == "members"
@@ -325,7 +329,7 @@ def object_reference_index(xml_bytes: bytes, object_type: str, names: Iterable[s
         elif object_type == "application-groups":
             is_policy_reference = (
                 node.tag == "member" and parent_node is not None and parent_node.tag == "application"
-                and "rulebase" in chain_set and bool(chain_set & policy_kinds)
+                and chain_set & rulebase_scopes and bool(chain_set & policy_kinds)
             )
             is_group_member = (
                 node.tag == "member" and parent_node is not None and parent_node.tag == "members"
@@ -337,7 +341,7 @@ def object_reference_index(xml_bytes: bytes, object_type: str, names: Iterable[s
             is_policy_reference = (
                 node.tag == "member" and parent_node is not None
                 and parent_node.tag in {"application", "application-filter"}
-                and "rulebase" in chain_set and bool(chain_set & policy_kinds)
+                and chain_set & rulebase_scopes and bool(chain_set & policy_kinds)
             )
             is_group_member = (
                 node.tag == "member" and parent_node is not None and parent_node.tag == "members"
@@ -346,16 +350,16 @@ def object_reference_index(xml_bytes: bytes, object_type: str, names: Iterable[s
             if is_policy_reference or is_group_member:
                 add(node.text or "", paths[node])
         elif object_type == "schedules":
-            if node.tag == "schedule" and "rulebase" in chain_set and bool(chain_set & policy_kinds):
+            if node.tag == "schedule" and chain_set & rulebase_scopes and bool(chain_set & policy_kinds):
                 add(node.text or "", paths[node])
         elif object_type == "security-profile-groups":
             if node.tag == "member" and parent_node is not None and parent_node.tag == "group" and "profile-setting" in chain_set:
                 add(node.text or "", paths[node])
         elif object_type == "log-forwarding":
-            if node.tag == "log-setting" and "rulebase" in chain_set and bool(chain_set & policy_kinds):
+            if node.tag == "log-setting" and chain_set & rulebase_scopes and bool(chain_set & policy_kinds):
                 add(node.text or "", paths[node])
         elif object_type == "custom-url-categories":
-            if node.tag == "member" and parent_node is not None and parent_node.tag == "category" and "rulebase" in chain_set:
+            if node.tag == "member" and parent_node is not None and parent_node.tag == "category" and chain_set & rulebase_scopes:
                 add(node.text or "", paths[node])
         elif object_type == "hip-profiles":
             if node.tag == "member" and parent_node is not None and parent_node.tag in {"source-hip", "destination-hip"}:
@@ -366,13 +370,287 @@ def object_reference_index(xml_bytes: bytes, object_type: str, names: Iterable[s
         elif object_type == "tags":
             if node.tag == "member" and parent_node is not None and parent_node.tag in {"tag", "tags"}:
                 add(node.text or "", paths[node])
-            if node.tag == "filter" and node.text:
+            if node.tag == "filter" and node.text and chain_set & {"address-group", "dynamic-user-group"}:
                 expression = node.text
                 for name in wanted:
                     if re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w.-])", expression):
                         add(name, paths[node])
 
     return wanted
+
+
+def _merge_object_signature(entry: ET.Element, object_type: str) -> tuple:
+    """Compare behavior-bearing XML; service tags are preserved as metadata."""
+    ignored_nodes = {"description", "comments"}
+    if object_type in {"services", "service-groups"}:
+        ignored_nodes.update({"tag", "tags"})
+
+    def canonical(node: ET.Element, *, root: bool = False, parent_tag: str = "") -> tuple | None:
+        if (
+            object_type == "services" and node.tag == "source-port"
+            and parent_tag in {"tcp", "udp"} and (node.text or "").strip() == "0-65535"
+        ):
+            # PAN-OS documents source-port as optional and accepts 0-65535;
+            # this explicit range is the same unrestricted source-port value.
+            return None
+        children = tuple(
+            value for child in node if child.tag not in ignored_nodes
+            if (value := canonical(child, parent_tag=node.tag)) is not None
+        )
+        attributes = tuple(sorted(
+            (key, value) for key, value in node.attrib.items()
+            if key != "uuid" and not (root and key == "name")
+        ))
+        return node.tag, attributes, (node.text or "").strip(), children
+
+    return canonical(entry, root=True)
+
+
+def duplicate_object_groups(xml_bytes: bytes, scope: str, object_type: str) -> list[dict]:
+    """Return exact functional duplicate groups in one editable object scope."""
+    if object_type not in MERGEABLE_OBJECT_TYPES:
+        raise OfflineConfigError("Dubbele objecten samenvoegen is niet veilig ondersteund voor dit type")
+    root, snapshot = parse_snapshot(xml_bytes)
+    _, records = scoped_objects(xml_bytes, scope, object_type, parsed=(root, snapshot))
+    candidates = [record for record in records if record.get("editable")]
+    by_signature: dict[tuple, list[dict]] = {}
+    for record in candidates:
+        entry = _find_scoped_object_entry(root, snapshot, scope, object_type, record["name"])
+        if entry is None:
+            raise OfflineConfigError("De objectinventaris wijzigde tijdens het zoeken; vernieuw de workspace")
+        by_signature.setdefault(_merge_object_signature(entry, object_type), []).append({
+            "name": record["name"],
+            "owner": record["owner"],
+            "description": record.get("description") or record.get("comments", ""),
+            "tags": list(record.get("tag", []) or []),
+            "summary": record.get("summary", ""),
+            "fingerprint": hashlib.sha256(ET.tostring(entry, encoding="utf-8")).hexdigest(),
+        })
+    groups = []
+    for signature, items in by_signature.items():
+        if len(items) < 2:
+            continue
+        names = sorted(item["name"] for item in items)
+        group_id = hashlib.sha256((object_type + "\0" + scope + "\0" + "\0".join(names)).encode()).hexdigest()[:20]
+        groups.append({
+            "id": group_id,
+            "objects": sorted(items, key=lambda item: item["name"].casefold()),
+            "metadata_differs": len({item["description"] for item in items}) > 1,
+            "tags_differ": len({tuple(sorted(item["tags"])) for item in items}) > 1,
+        })
+    return sorted(groups, key=lambda group: group["objects"][0]["name"].casefold())
+
+
+def _find_scoped_object_entry(root: ET.Element, snapshot: ConfigSnapshot, scope: str, object_type: str, name: str) -> ET.Element | None:
+    scope_root = _scope_root(root, snapshot, scope)
+    if scope_root is None:
+        return None
+    collection = scope_root
+    for part in OBJECT_NODES[object_type].split("/"):
+        collection = collection.find(f"./{part}")
+        if collection is None:
+            return None
+    matches = [entry for entry in collection.findall("./entry") if entry.get("name") == name]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _typed_object_reference_nodes(root: ET.Element, object_type: str) -> tuple[list[ET.Element], list[ET.Element]]:
+    """Return recognized reference nodes and tag-filter expressions for a type."""
+    if object_type not in MERGEABLE_OBJECT_TYPES:
+        raise OfflineConfigError("Referenties herschrijven is niet veilig ondersteund voor dit objecttype")
+    parent = {child: node for node in root.iter() for child in node}
+    policy_kinds = set(POLICY_NODES.values())
+    rulebase_scopes = {"rulebase", "pre-rulebase", "post-rulebase"}
+    members: list[ET.Element] = []
+    expressions: list[ET.Element] = []
+    for node in root.iter():
+        owner = parent.get(node)
+        if node.tag != "member" and not (object_type == "schedules" and node.tag == "schedule") and not (
+            object_type in {"addresses", "address-groups", "regions"}
+            and node.tag in {"translated-address", "translated-port"}
+        ):
+            if object_type == "tags" and node.tag == "filter" and node.text:
+                chain = set()
+                current = node
+                while current is not None:
+                    chain.add(current.tag)
+                    current = parent.get(current)
+                if chain & {"address-group", "dynamic-user-group"}:
+                    expressions.append(node)
+            continue
+        chain = set()
+        current = node
+        while current is not None:
+            chain.add(current.tag)
+            current = parent.get(current)
+        is_reference = False
+        if object_type in {"addresses", "address-groups", "regions"}:
+            is_reference = (
+                node.tag == "member" and owner is not None
+                and ((owner.tag in {"source", "destination"} and chain & rulebase_scopes and bool(chain & policy_kinds))
+                     or (owner.tag == "static" and "address-group" in chain)
+                     or ("source-translation" in chain or "destination-translation" in chain))
+            )
+            if node.tag in {"translated-address", "translated-port"} and node.text and chain & {"source-translation", "destination-translation"}:
+                members.append(node)
+        elif object_type in {"services", "service-groups"}:
+            is_reference = node.tag == "member" and owner is not None and (
+                (owner.tag == "service" and chain & rulebase_scopes and bool(chain & policy_kinds))
+                or (owner.tag == "members" and "service-group" in chain)
+            )
+        elif object_type == "application-groups":
+            is_reference = node.tag == "member" and owner is not None and (
+                (owner.tag == "application" and chain & rulebase_scopes and bool(chain & policy_kinds))
+                or (owner.tag == "members" and "application-group" in chain)
+            )
+        elif object_type in {"applications", "application-filters"}:
+            is_reference = node.tag == "member" and owner is not None and (
+                (owner.tag in {"application", "application-filter"} and chain & rulebase_scopes and bool(chain & policy_kinds))
+                or (owner.tag == "members" and "application-group" in chain)
+            )
+        elif object_type == "schedules":
+            is_reference = node.tag == "schedule" and chain & rulebase_scopes and bool(chain & policy_kinds)
+        elif object_type == "security-profile-groups":
+            is_reference = node.tag == "member" and owner is not None and owner.tag == "group" and "profile-setting" in chain
+        elif object_type == "log-forwarding":
+            is_reference = node.tag == "log-setting" and chain & rulebase_scopes and bool(chain & policy_kinds)
+        elif object_type == "custom-url-categories":
+            is_reference = node.tag == "member" and owner is not None and owner.tag == "category" and chain & rulebase_scopes
+        elif object_type == "hip-profiles":
+            is_reference = node.tag == "member" and owner is not None and owner.tag in {"source-hip", "destination-hip"}
+        elif object_type == "dynamic-user-groups":
+            is_reference = node.tag == "member" and owner is not None and owner.tag in {"source-user", "destination-user"}
+        elif object_type == "tags":
+            is_reference = node.tag == "member" and owner is not None and owner.tag in {"tag", "tags"}
+        if is_reference:
+            members.append(node)
+    return members, expressions
+
+
+def merge_duplicate_objects(
+    xml_bytes: bytes, scope: str, object_type: str, selections: list[dict],
+) -> tuple[bytes, dict[str, int]]:
+    """Rewrite typed references and remove duplicates after one master is chosen per group."""
+    if object_type not in MERGEABLE_OBJECT_TYPES:
+        raise OfflineConfigError("Dubbele objecten samenvoegen is niet veilig ondersteund voor dit type")
+    root, snapshot = parse_snapshot(xml_bytes)
+    scope_root = _scope_root(root, snapshot, scope)
+    if scope_root is None:
+        raise OfflineConfigError("De geselecteerde scope bestaat niet meer")
+    collection = scope_root
+    for part in OBJECT_NODES[object_type].split("/"):
+        collection = collection.find(f"./{part}")
+        if collection is None:
+            raise OfflineConfigError("De objectcollectie bestaat niet meer")
+
+    duplicates: dict[str, str] = {}
+    selected_entries: dict[str, ET.Element] = {}
+    selected_names_seen: set[str] = set()
+    all_definitions: dict[str, list[ET.Element]] = {}
+    for candidate in root.findall(f".//{OBJECT_NODES[object_type]}/entry"):
+        all_definitions.setdefault(candidate.get("name", ""), []).append(candidate)
+
+    for selection in selections:
+        names = list(dict.fromkeys(str(value) for value in selection.get("names", []) if str(value)))
+        master_name = str(selection.get("master", ""))
+        if len(names) < 2 or master_name not in names:
+            raise OfflineConfigError("Kies precies één masterobject per duplicaatgroep")
+        if selected_names_seen.intersection(names):
+            raise OfflineConfigError("Duplicaatgroepen overlappen; maak een nieuwe preview")
+        selected_names_seen.update(names)
+        entries = {}
+        for name in names:
+            matches = [entry for entry in collection.findall("./entry") if entry.get("name") == name]
+            if len(matches) != 1:
+                raise OfflineConfigError(f"Object {name} is intussen gewijzigd of bestaat niet meer")
+            entries[name] = matches[0]
+            expected_fingerprint = (selection.get("fingerprints") or {}).get(name)
+            actual_fingerprint = hashlib.sha256(ET.tostring(matches[0], encoding="utf-8")).hexdigest()
+            if not isinstance(expected_fingerprint, str) or not hmac.compare_digest(expected_fingerprint, actual_fingerprint):
+                raise OfflineConfigError(f"Object {name} is intussen gewijzigd; maak een nieuwe merge-preview")
+            definitions = all_definitions.get(name, [])
+            if len(definitions) != 1 or definitions[0] is not entries[name]:
+                raise OfflineConfigError(f"Objectnaam {name} komt in meerdere scopes voor; samenvoegen is ambigu")
+        signatures = {_merge_object_signature(entry, object_type) for entry in entries.values()}
+        if len(signatures) != 1:
+            raise OfflineConfigError("De objecten zijn niet langer functioneel identiek; niets samengevoegd")
+        for name, entry in entries.items():
+            if name == master_name:
+                continue
+            if name in duplicates or master_name in duplicates:
+                raise OfflineConfigError("Duplicaatgroepen overlappen; maak een nieuwe preview")
+            duplicates[name] = master_name
+            selected_entries[name] = entry
+        if object_type in {"services", "service-groups"}:
+            # Tags on services are organizational metadata. Retain the union
+            # instead of dropping tags when aliases are removed.
+            master = entries[master_name]
+            master_tag = master.find("./tag")
+            seen_tags = {
+                (item.text or "").strip()
+                for item in (master_tag.findall("./member") if master_tag is not None else [])
+            }
+            for entry in entries.values():
+                if entry is master:
+                    continue
+                for tag in entry.findall("./tag/member"):
+                    value = (tag.text or "").strip()
+                    if value and value not in seen_tags:
+                        if master_tag is None:
+                            master_tag = ET.SubElement(master, "tag")
+                        ET.SubElement(master_tag, "member").text = value
+                        seen_tags.add(value)
+        if master_name in duplicates:
+            raise OfflineConfigError("Een gekozen master staat ook als duplicaat in een andere groep")
+        master = entries[master_name]
+    if not duplicates:
+        raise OfflineConfigError("Er zijn geen duplicaten geselecteerd")
+
+    # A name may be referenced outside this object family through a PAN-OS
+    # feature not modeled by the index. Refuse the operation if the full
+    # configuration index cannot prove all known references were rewritten.
+    refs, expressions = _typed_object_reference_nodes(root, object_type)
+    replaced_by_parent: dict[ET.Element, set[str]] = {}
+    parent_map = {child: parent for parent in root.iter() for child in parent}
+    for node in refs:
+        value = (node.text or "").strip()
+        if value in duplicates:
+            master_name = duplicates[value]
+            node.text = master_name
+            if node in parent_map:
+                replaced_by_parent.setdefault(parent_map[node], set()).add(master_name)
+    for node in expressions:
+        expression = node.text or ""
+        for old_name, new_name in duplicates.items():
+            expression = re.sub(
+                rf"(?<![\w.-]){re.escape(old_name)}(?![\w.-])",
+                lambda _: new_name,
+                expression,
+            )
+        node.text = expression
+
+    # Deduplicate reference lists after replacements so no member is written
+    # twice when both the old and master names were already present.
+    for parent, merged_names in replaced_by_parent.items():
+        children = list(parent)
+        if not children or any(child.tag != "member" for child in children):
+            continue
+        seen = set()
+        for child in children:
+            value = (child.text or "").strip()
+            if value in merged_names and value in seen:
+                parent.remove(child)
+            else:
+                if value in merged_names:
+                    seen.add(value)
+
+    remaining = object_reference_index(normalized_config_xml(root), object_type, duplicates)
+    if any(remaining.values()):
+        raise OfflineConfigError("Niet alle referenties konden veilig worden bijgewerkt; niets opgeslagen")
+
+    for old_name, entry in selected_entries.items():
+        collection.remove(entry)
+    return normalized_config_xml(root), {"merged": len(duplicates), "groups": len(selections)}
 
 
 # New generic objects need a real PAN-OS-shaped entry before the field editor can
@@ -1318,6 +1596,449 @@ def scoped_objects(xml_bytes: bytes, scope: str, object_type: str, parsed=None) 
         for entry in scope_root.findall(f"./{node}/entry"):
             records.append(object_record(entry, owner, owner == scope, object_type))
     return snapshot, records
+
+
+PANOS_SCOPE_MOVE_OBJECT_TYPES = frozenset({
+    "addresses", "address-groups", "regions", "dynamic-user-groups",
+    "applications", "application-groups", "application-filters",
+    "services", "service-groups", "tags", "external-dynamic-lists",
+    "hip-objects", "hip-profiles", "custom-url-categories",
+    "antivirus", "anti-spyware", "vulnerability-protection",
+    "url-filtering", "file-blocking", "wildfire-analysis", "dos-protection",
+    "schedules", "security-profile-groups", "log-forwarding",
+    "authentication", "decryption-profiles",
+})
+_PANOS_MOVE_BUILTINS = {"any", "application-default", "none", "unknown", "known-user", "auto"}
+# ISO 3166-1 alpha-2 codes used by PAN-OS predefined regions. Keep this list
+# explicit: a two-letter token alone is not enough to treat a policy value as
+# a built-in region.
+PANOS_GEO_REGION_CODES = frozenset("""
+AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ
+CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO
+FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE
+JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN
+MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS
+PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ
+TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW
+""".split())
+# PAN-DB names from Palo Alto Networks' predefined URL category inventory.
+# Custom categories are still resolved by exact name against the configuration.
+# Source: https://docs.paloaltonetworks.com/advanced-url-filtering/administration/url-filtering-basics/url-categories
+_PANOS_PREDEFINED_URL_CATEGORIES = frozenset("""
+abortion abused-drugs adult alcohol-and-tobacco artificial-intelligence auctions
+ai-code-assistant ai-conversational-assistant ai-data-and-workflow-optimizer ai-meeting-assistant
+ai-media-service ai-platform-service ai-website-generator ai-writing-assistant browser-runtime-attack
+business-and-economy command-and-control compromised-website computer-and-internet-info
+content-delivery-networks copyright-infringement cryptocurrency dating dynamic-dns
+educational-institutions encrypted-dns entertainment-and-arts extremism file-converter
+financial-services gambling games government grayware hacking health-and-medicine home-and-garden
+hunting-and-fishing insufficient-content internet-communications-and-telephony internet-portals
+job-search legal malware marijuana military motor-vehicles music newly-registered-domain news
+not-resolved nudity online-storage-and-backup parked peer-to-peer personal-sites-and-blogs
+philosophy-and-political-advocacy phishing private-ip-addresses proxy-avoidance-and-anonymizers
+questionable ransomware real-estate real-time-detection recreation-and-hobbies reference-and-research
+religion remote-access scanning-activity search-engines sex-education shareware-and-freeware shopping
+social-networking society sports stock-advice-and-tools streaming-media swimsuits-and-intimate-apparel
+training-and-tools translation travel unknown weapons web-advertisements web-based-email web-hosting
+high-risk medium-risk low-risk
+""".split())
+_PANOS_PROFILE_GROUP_NODES = {
+    "virus": "antivirus", "spyware": "anti-spyware",
+    "vulnerability": "vulnerability-protection", "url-filtering": "url-filtering",
+    "file-blocking": "file-blocking", "wildfire-analysis": "wildfire-analysis",
+    "dos-protection": "dos-protection",
+}
+
+
+def _panos_scope_root(root: ET.Element, scope: str) -> ET.Element | None:
+    if scope == "Shared":
+        return root.find("./shared")
+    return next((entry for entry in root.findall("./devices/entry/vsys/entry") if entry.get("name") == scope), None)
+
+
+def _panos_scope_collection(scope_root: ET.Element, item_kind: str, item_type: str) -> ET.Element | None:
+    if item_kind == "object":
+        collection = scope_root
+        for part in OBJECT_NODES[item_type].split("/"):
+            collection = collection.find(f"./{part}")
+            if collection is None:
+                return None
+        return collection
+    rules = scope_root.find(f"./rulebase/{POLICY_NODES[item_type]}/rules")
+    return rules
+
+
+def _panos_visible_object_names(root: ET.Element, scope: str, object_types: Iterable[str]) -> set[str]:
+    names: set[str] = set()
+    for owner in (["Shared"] if scope == "Shared" else ["Shared", scope]):
+        owner_root = _panos_scope_root(root, owner)
+        if owner_root is None:
+            continue
+        for object_type in object_types:
+            collection = _panos_scope_collection(owner_root, "object", object_type)
+            if collection is not None:
+                names.update(entry.get("name", "") for entry in collection.findall("./entry") if entry.get("name"))
+    return names
+
+
+def _panos_move_refs_for_policy(entry: ET.Element, kind: str) -> tuple[list[tuple[str, str]], str | None]:
+    references: list[tuple[str, str]] = []
+
+    def add(path: str, dependency: str) -> None:
+        references.extend((dependency, member.text.strip()) for member in entry.findall(path) if member.text and member.text.strip())
+
+    add("./from/member", "zones")
+    add("./to/member", "zones")
+    add("./source/member", "addresses")
+    add("./destination/member", "addresses")
+    add("./application/member", "applications")
+    add("./application-filter/member", "applications")
+    add("./service/member", "services")
+    add("./tag/member", "tags")
+    add("./category/member", "url-categories")
+    add("./source-hip/member", "hip-profiles")
+    add("./destination-hip/member", "hip-profiles")
+    add("./schedule", "schedules")
+    add("./log-setting", "log-forwarding")
+    add("./profile-setting/group/member", "security-profile-groups")
+    for profile_type in entry.findall("./profile-setting/profiles"):
+        for profile in profile_type:
+            dependency = _PANOS_PROFILE_GROUP_NODES.get(profile.tag)
+            members = [member.text.strip() for member in profile.findall("./member") if member.text and member.text.strip()]
+            if dependency is None and members:
+                return references, f"Onbekende directe security-profile-afhankelijkheid: {profile.tag}"
+            if dependency:
+                references.extend((dependency, name) for name in members)
+    # User-ID selectors are runtime usernames/groups, not PAN-OS XML objects.
+    # Their directory mappings are not represented in this candidate snapshot.
+    if kind == "nat":
+        add("./to-interface", "interfaces")
+        add(".//source-translation//interface-address/interface", "interfaces")
+    if kind == "pbf":
+        add(".//egress-interface", "interfaces")
+        add(".//next-hop/interface", "interfaces")
+        add(".//next-vr", "virtual-routers")
+    if kind == "nat":
+        service = entry.findtext("./service", "").strip()
+        if service:
+            references.append(("services", service))
+        for node in entry.findall(".//source-translation//translated-address") + entry.findall(".//destination-translation//translated-address"):
+            if node.text and node.text.strip():
+                references.append(("addresses", node.text.strip()))
+            references.extend(("addresses", member.text.strip()) for member in node.findall(".//member") if member.text and member.text.strip())
+    return references, None
+
+
+def _panos_move_refs_for_object(entry: ET.Element, object_type: str) -> tuple[list[tuple[str, str]], str | None]:
+    references: list[tuple[str, str]] = []
+    references.extend(("tags", member.text.strip()) for member in entry.findall("./tag/member") if member.text and member.text.strip())
+    if object_type == "address-groups":
+        references.extend(("addresses", member.text.strip()) for member in entry.findall("./static/member") if member.text and member.text.strip())
+        if entry.find("./dynamic") is not None:
+            return references, "Dynamische address groups kunnen niet veilig scope-verplaatst worden"
+    elif object_type == "service-groups":
+        references.extend(("services", member.text.strip()) for member in entry.findall("./members/member") if member.text and member.text.strip())
+    elif object_type == "application-groups":
+        references.extend(("applications", member.text.strip()) for member in entry.findall("./members/member") if member.text and member.text.strip())
+    elif object_type == "security-profile-groups":
+        for child in entry:
+            dependency_type = _PANOS_PROFILE_GROUP_NODES.get(child.tag)
+            if dependency_type is None:
+                if child.find("./member") is not None:
+                    return references, f"Onbekende profile-group-afhankelijkheid: {child.tag}"
+                continue
+            references.extend((dependency_type, member.text.strip()) for member in child.findall("./member") if member.text and member.text.strip())
+    elif object_type in {
+        "dynamic-user-groups", "external-dynamic-lists", "hip-objects", "hip-profiles",
+        "log-forwarding", "antivirus", "anti-spyware", "vulnerability-protection",
+        "url-filtering", "file-blocking", "wildfire-analysis", "dos-protection",
+        "authentication", "decryption-profiles",
+    }:
+        return references, f"Voor {object_type} is dependency-validatie niet volledig ondersteund"
+    return references, None
+
+
+def _panos_move_dependency_exists(
+    root: ET.Element, scope: str, dependency: str, name: str,
+    selected_entries: set[tuple[str, str]], selected_type: str,
+    predefined_applications: set[str], predefined_regions: set[str],
+) -> bool:
+    if name.casefold() in _PANOS_MOVE_BUILTINS:
+        return True
+    if dependency == "addresses":
+        try:
+            ipaddress.ip_network(name, strict=False)
+            return True
+        except ValueError:
+            if name in predefined_regions:
+                return True
+    if dependency == "zones":
+        if name.casefold() == "any":
+            return True
+        owner = _panos_scope_root(root, scope)
+        return owner is not None and scope != "Shared" and any(entry.get("name") == name for entry in owner.findall("./zone/entry"))
+    if dependency == "interfaces":
+        if name.casefold() in {"any", "auto"}:
+            return True
+        if scope == "Shared":
+            return False
+        configured = any(entry.get("name") == name for entry in root.findall("./devices/entry/network/interface//entry"))
+        owner = _panos_scope_root(root, scope)
+        if owner is None:
+            return False
+        assigned = any(
+            member.text and member.text.strip() == name
+            for zone in owner.findall("./zone/entry")
+            for network_type in ("layer3", "layer2", "virtual-wire", "tap", "tunnel")
+            for member in zone.findall(f"./network/{network_type}/member")
+        )
+        return configured and assigned
+    if dependency == "virtual-routers":
+        if scope == "Shared":
+            return False
+        owner = _panos_scope_root(root, scope)
+        if owner is None:
+            return False
+        routers = [entry for entry in root.findall("./devices/entry/network/virtual-router/entry") if entry.get("name") == name]
+        if len(routers) != 1:
+            return False
+        imported_routers = {
+            member.text.strip() for member in owner.findall("./import/network/virtual-router/member")
+            if member.text and member.text.strip()
+        }
+        return name in imported_routers
+    if dependency == "url-categories":
+        custom_names = _panos_visible_object_names(root, scope, ("custom-url-categories",))
+        if name in custom_names:
+            return True
+        if name in _PANOS_PREDEFINED_URL_CATEGORIES:
+            return True
+        # A same-name custom category in another VSYS shadows the predefined
+        # category for that scope; moving the policy there must require the
+        # custom definition to be visible in the target scope.
+        scopes = ["Shared", *(entry.get("name", "") for entry in root.findall("./devices/entry/vsys/entry"))]
+        for owner in scopes:
+            owner_root = _panos_scope_root(root, owner)
+            collection = _panos_scope_collection(owner_root, "object", "custom-url-categories") if owner_root is not None else None
+            if collection is not None and any(entry.get("name") == name for entry in collection.findall("./entry")):
+                return False
+        return False
+    candidate_types = {
+        "addresses": ("addresses", "address-groups", "regions"),
+        "applications": ("applications", "application-groups", "application-filters"),
+        "services": ("services", "service-groups"),
+        "tags": ("tags",),
+        "custom-url-categories": ("custom-url-categories",),
+        "schedules": ("schedules",),
+        "security-profile-groups": ("security-profile-groups",),
+        "log-forwarding": ("log-forwarding",),
+        "hip-profiles": ("hip-profiles",),
+        "dynamic-user-groups": ("dynamic-user-groups",),
+        "antivirus": ("antivirus",), "anti-spyware": ("anti-spyware",),
+        "vulnerability-protection": ("vulnerability-protection",),
+        "url-filtering": ("url-filtering",), "file-blocking": ("file-blocking",),
+        "wildfire-analysis": ("wildfire-analysis",), "dos-protection": ("dos-protection",),
+    }.get(dependency, ())
+    if selected_type in candidate_types and (selected_type, name) in selected_entries:
+        return True
+    if name in _panos_visible_object_names(root, scope, candidate_types):
+        return True
+    # Predefined applications are not included in the candidate configuration.
+    return dependency == "applications" and name in predefined_applications
+
+
+def _panos_scope_path(root: ET.Element, scope: str) -> str:
+    if scope == "Shared":
+        return "/config/shared"
+    device = next((entry for entry in root.findall("./devices/entry") if entry.find("./vsys") is not None), None)
+    device_name = device.get("name", "localhost.localdomain") if device is not None else "localhost.localdomain"
+    return f"/config/devices/entry[@name={device_name}]/vsys/entry[@name={scope}]"
+
+
+def move_panos_scope_entries(
+    xml_bytes: bytes, *, item_kind: str, item_type: str, names: Iterable[str],
+    source_scope: str, target_scope: str, predefined_applications: Iterable[str] = (),
+    predefined_regions: Iterable[str] = PANOS_GEO_REGION_CODES,
+    insertion_position: str = "top",
+) -> tuple[bytes, list[dict], list[dict]]:
+    """Move selected entries between a standalone PAN-OS VSYS and Shared.
+
+    The operation is per-item: failures stay at their source and successful
+    entries are moved in one normalized snapshot. Panorama and SCM ownership
+    models are intentionally excluded.
+    """
+    root, snapshot = parse_snapshot(xml_bytes)
+    if snapshot.kind != "panos":
+        raise OfflineConfigError("Scope-verplaatsen is alleen beschikbaar voor standalone PAN-OS")
+    if item_kind not in {"policy", "object"}:
+        raise OfflineConfigError("Ongeldig type configuratie-item")
+    if item_kind == "policy" and item_type not in POLICY_NODES:
+        raise OfflineConfigError("Onbekend policytype")
+    if item_kind == "object" and item_type not in PANOS_SCOPE_MOVE_OBJECT_TYPES:
+        raise OfflineConfigError("Voor dit objecttype is scope-verplaatsen niet veilig ondersteund")
+    if insertion_position not in {"top", "bottom"}:
+        raise OfflineConfigError("Ongeldige invoegpositie; kies top of bottom")
+    valid_scopes = {"Shared", *snapshot.vsys}
+    if source_scope not in valid_scopes or target_scope not in valid_scopes:
+        raise OfflineConfigError("Bron- of doelscope bestaat niet in deze PAN-OS-configuratie")
+    if source_scope == target_scope:
+        raise OfflineConfigError("Bron- en doelscope moeten verschillend zijn")
+    predefined_application_names = {str(name).strip() for name in predefined_applications if str(name).strip()}
+    predefined_region_names = {str(name).strip().upper() for name in predefined_regions if str(name).strip()}
+    requested = list(dict.fromkeys(str(name).strip() for name in names if str(name).strip()))
+    if not requested or len(requested) > 5000:
+        raise OfflineConfigError("Selecteer één tot 5000 configuratie-items")
+
+    candidates: list[tuple[str, ET.Element, ET.Element]] = []
+    failures: list[dict] = []
+    target_root = _panos_scope_root(root, target_scope)
+    for name in requested:
+        source_root = _panos_scope_root(root, source_scope)
+        source_collection = _panos_scope_collection(source_root, item_kind, item_type) if source_root is not None else None
+        matches = [entry for entry in source_collection.findall("./entry") if entry.get("name") == name] if source_collection is not None else []
+        if len(matches) != 1:
+            failures.append({"name": name, "reason": "Niet gevonden of dubbel in de bronscope"})
+            continue
+        if target_root is None and target_scope != "Shared":
+            failures.append({"name": name, "reason": "Doelscope ontbreekt"})
+            continue
+        target_collection = _panos_scope_collection(target_root, item_kind, item_type) if target_root is not None else None
+        if target_collection is not None and any(entry.get("name") == name for entry in target_collection.findall("./entry")):
+            failures.append({"name": name, "reason": "In de doelscope bestaat al een item met deze naam"})
+            continue
+        if target_scope != "Shared" and source_scope != "Shared":
+            shared_root = _panos_scope_root(root, "Shared")
+            shared_collection = _panos_scope_collection(shared_root, item_kind, item_type) if shared_root is not None else None
+            if shared_collection is not None and any(entry.get("name") == name for entry in shared_collection.findall("./entry")):
+                failures.append({"name": name, "reason": "In Shared bestaat al een item met deze naam"})
+                continue
+        candidates.append((name, matches[0], source_collection))
+
+    selected_entries = {(item_type, name) for name, _, _ in candidates} if item_kind == "object" else set()
+    reference_index: dict[str, list[str]] = {}
+    reference_index_error: OfflineConfigError | None = None
+    if item_kind == "object" and target_scope != "Shared" and candidates:
+        try:
+            reference_index = object_reference_index(xml_bytes, item_type, (name for name, _, _ in candidates))
+        except OfflineConfigError as exc:
+            reference_index_error = exc
+    accepted: list[tuple[str, ET.Element, ET.Element]] = []
+    for name, entry, source_collection in candidates:
+        if item_kind == "policy":
+            references, unsupported = _panos_move_refs_for_policy(entry, item_type)
+        else:
+            references, unsupported = _panos_move_refs_for_object(entry, item_type)
+        if unsupported:
+            failures.append({"name": name, "reason": unsupported})
+            selected_entries.discard((item_type, name))
+            continue
+        missing = [
+            f"{dependency}: {reference}" for dependency, reference in references
+            if not _panos_move_dependency_exists(
+                root, target_scope, dependency, reference, selected_entries,
+                item_type if item_kind == "object" else "",
+                predefined_application_names, predefined_region_names,
+            )
+        ]
+        if missing:
+            failures.append({"name": name, "reason": "Ontbrekende afhankelijkheden in doelscope: " + ", ".join(dict.fromkeys(missing[:8]))})
+            selected_entries.discard((item_type, name))
+            continue
+        if item_kind == "object" and target_scope != "Shared":
+            if reference_index_error is not None:
+                failures.append({"name": name, "reason": f"Referentiecontrole faalde: {reference_index_error}"})
+                selected_entries.discard((item_type, name))
+                continue
+            references_to_item = reference_index.get(name, [])
+            target_path = _panos_scope_path(root, target_scope)
+            if any(not path.startswith(target_path + "/") for path in references_to_item):
+                failures.append({"name": name, "reason": "Wordt nog gebruikt buiten de doelscope"})
+                selected_entries.discard((item_type, name))
+                continue
+        if item_kind == "object" and target_scope == "Shared":
+            collision = False
+            for other_scope in snapshot.vsys:
+                if other_scope == source_scope:
+                    continue
+                other_root = _panos_scope_root(root, other_scope)
+                other_collection = _panos_scope_collection(other_root, "object", item_type) if other_root is not None else None
+                if other_collection is not None and any(item.get("name") == name for item in other_collection.findall("./entry")):
+                    collision = True
+                    break
+            if collision:
+                failures.append({"name": name, "reason": "Een andere VSYS heeft al een lokaal item met deze naam"})
+                selected_entries.discard((item_type, name))
+                continue
+        accepted.append((name, entry, source_collection))
+
+    # A selected group cannot move if another selected dependency failed.
+    # Resolve selected-item dependencies to a fixed point. If C is rejected,
+    # B (which needs C) is rejected on one pass, then A (which needs B) on the
+    # next. A single pass can incorrectly leave A pointing at B in its source.
+    final = list(accepted)
+    while True:
+        remaining_names = {(item_type, name) for name, _, _ in final} if item_kind == "object" else set()
+        rejected: list[tuple[str, ET.Element, ET.Element, list[str]]] = []
+        for name, entry, source_collection in final:
+            references, _ = (
+                _panos_move_refs_for_policy(entry, item_type)
+                if item_kind == "policy" else _panos_move_refs_for_object(entry, item_type)
+            )
+            missing = [
+                reference for dependency, reference in references
+                if not _panos_move_dependency_exists(
+                    root, target_scope, dependency, reference, remaining_names,
+                    item_type if item_kind == "object" else "",
+                    predefined_application_names, predefined_region_names,
+                )
+            ]
+            if missing:
+                rejected.append((name, entry, source_collection, list(dict.fromkeys(missing[:8]))))
+        if not rejected:
+            break
+        rejected_names = {name for name, _, _, _ in rejected}
+        for name, _, _, missing in rejected:
+            failures.append({"name": name, "reason": "Afhankelijkheid is niet mee verplaatst: " + ", ".join(missing)})
+        final = [candidate for candidate in final if candidate[0] not in rejected_names]
+
+    # Policy rule order is meaningful. Keep the original source ordering for
+    # the moved block, then insert that block at the requested edge.
+    if item_kind == "policy":
+        source_collection = candidates[0][2] if candidates else None
+        if source_collection is not None:
+            source_order = {entry.get("name", ""): index for index, entry in enumerate(source_collection.findall("./entry"))}
+            final.sort(key=lambda candidate: source_order.get(candidate[0], len(source_order)))
+
+    moved = []
+    if final and target_root is None:
+        target_root = ET.SubElement(root, "shared")
+    for name, entry, source_collection in (reversed(final) if insertion_position == "top" else final):
+        source_collection.remove(entry)
+        target_collection = _panos_scope_collection(target_root, item_kind, item_type)
+        if target_collection is None:
+            if item_kind == "object":
+                target_collection = target_root
+                for part in OBJECT_NODES[item_type].split("/"):
+                    child = target_collection.find(f"./{part}")
+                    if child is None:
+                        child = ET.SubElement(target_collection, part)
+                    target_collection = child
+            else:
+                rulebase = target_root.find("./rulebase")
+                if rulebase is None:
+                    rulebase = ET.SubElement(target_root, "rulebase")
+                policy = rulebase.find(f"./{POLICY_NODES[item_type]}")
+                if policy is None:
+                    policy = ET.SubElement(rulebase, POLICY_NODES[item_type])
+                target_collection = policy.find("./rules")
+                if target_collection is None:
+                    target_collection = ET.SubElement(policy, "rules")
+        if insertion_position == "top":
+            target_collection.insert(0, entry)
+        else:
+            target_collection.append(entry)
+        moved.append({"name": name, "item_kind": item_kind, "item_type": item_type, "source_scope": source_scope, "target_scope": target_scope})
+    return (normalized_config_xml(root), moved, failures) if moved else (xml_bytes, moved, failures)
 
 
 def scoped_server_profiles(xml_bytes: bytes, scope: str, parsed=None) -> list[dict]:

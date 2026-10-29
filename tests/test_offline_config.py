@@ -11,7 +11,7 @@ from app.offline_config import (
     delete_policies_from_snapshot, insert_policy_in_snapshot, move_policies_in_snapshot,
     object_create_record, object_fingerprint, policy_create_record, policy_fingerprint, render_set_commands, replace_policy_in_snapshot,
     referenced_template, scoped_objects, scoped_policies,
-    scoped_server_profiles, object_reference_index,
+    scoped_server_profiles, object_reference_index, duplicate_object_groups, merge_duplicate_objects,
 )
 
 
@@ -23,6 +23,107 @@ INHERITED = b'''<config version="12.1"><shared><address><entry name="shared-a"><
 
 
 class OfflineConfigTests(unittest.TestCase):
+    def test_duplicate_services_rewrite_references_and_deduplicate_members(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><service>
+        <entry name="TCP443"><protocol><tcp><port>443</port></tcp></protocol><description>Primary</description><tag><member>Blue</member></tag></entry>
+        <entry name="service-https"><protocol><tcp><port>443</port><source-port>0-65535</source-port></tcp></protocol><description>HTTPS service</description><tag><member>Green</member></tag></entry>
+        <entry name="443_tcp"><protocol><tcp><port>443</port></tcp></protocol><tag><member>Blue</member></tag></entry>
+        <entry name="ssh"><protocol><tcp><port>22</port></tcp></protocol></entry>
+        </service><service-group><entry name="web-services"><members><member>TCP443</member><member>service-https</member></members></entry></service-group>
+        <rulebase><security><rules><entry name="allow-web"><service><member>TCP443</member><member>service-https</member><member>ssh</member></service></entry></rules></security></rulebase>
+        </entry></vsys></entry></devices></config>'''
+        groups = duplicate_object_groups(source, "vsys1", "services")
+        self.assertEqual(len(groups), 1)
+        self.assertEqual({item["name"] for item in groups[0]["objects"]}, {"TCP443", "service-https", "443_tcp"})
+        selection = {
+            "names": [item["name"] for item in groups[0]["objects"]],
+            "master": "service-https",
+            "fingerprints": {item["name"]: item["fingerprint"] for item in groups[0]["objects"]},
+        }
+        merged, summary = merge_duplicate_objects(source, "vsys1", "services", [selection])
+        _, objects = scoped_objects(merged, "vsys1", "services")
+        self.assertEqual({item["name"] for item in objects}, {"service-https", "ssh"})
+        root, _ = parse_snapshot(merged)
+        self.assertEqual(
+            [member.text for member in root.findall(".//service-group/entry[@name='web-services']/members/member")],
+            ["service-https"],
+        )
+        self.assertEqual(
+            [member.text for member in root.findall(".//rules/entry[@name='allow-web']/service/member")],
+            ["service-https", "ssh"],
+        )
+        self.assertEqual(
+            [member.text for member in root.findall(".//service/entry[@name='service-https']/tag/member")],
+            ["Green", "Blue"],
+        )
+        self.assertEqual(summary, {"merged": 2, "groups": 1})
+        self.assertEqual(object_reference_index(merged, "services", ["TCP443", "443_tcp"]), {"TCP443": [], "443_tcp": []})
+
+    def test_duplicate_objects_with_different_tags_are_not_grouped(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="server-a"><ip-netmask>10.0.0.1</ip-netmask><tag><member>Production</member></tag></entry><entry name="server-b"><ip-netmask>10.0.0.1</ip-netmask><tag><member>Test</member></tag></entry></address></entry></vsys></entry></devices></config>'''
+        self.assertEqual(duplicate_object_groups(source, "vsys1", "addresses"), [])
+
+    def test_service_source_port_only_normalizes_the_documented_unrestricted_range(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><service><entry name="omitted"><protocol><tcp><port>443</port></tcp></protocol></entry><entry name="full-range"><protocol><tcp><port>443</port><source-port>0-65535</source-port></tcp></protocol></entry><entry name="excludes-zero"><protocol><tcp><port>443</port><source-port>1-65535</source-port></tcp></protocol></entry></service></entry></vsys></entry></devices></config>'''
+        groups = duplicate_object_groups(source, "vsys1", "services")
+        self.assertEqual(len(groups), 1)
+        self.assertEqual({item["name"] for item in groups[0]["objects"]}, {"omitted", "full-range"})
+
+    def test_panorama_shared_merge_rewrites_pre_and_post_policy_references(self):
+        source = b'''<config><shared><service><entry name="tcp443"><protocol><tcp><port>443</port><source-port>1-65535</source-port></tcp></protocol></entry><entry name="https-alt"><protocol><tcp><port>443</port><source-port>1-65535</source-port></tcp></protocol></entry></service><pre-rulebase><security><rules><entry name="pre"><service><member>tcp443</member></service></entry></rules></security></pre-rulebase></shared><devices><entry name="localhost.localdomain"><device-group><entry name="Branch"><post-rulebase><nat><rules><entry name="post"><service><member>https-alt</member></service></entry></rules></nat></post-rulebase></entry></device-group></entry></devices></config>'''
+        groups = duplicate_object_groups(source, "Shared", "services")
+        self.assertEqual(len(groups), 1)
+        selection = {
+            "names": [item["name"] for item in groups[0]["objects"]],
+            "master": "https-alt",
+            "fingerprints": {item["name"]: item["fingerprint"] for item in groups[0]["objects"]},
+        }
+        merged, _ = merge_duplicate_objects(source, "Shared", "services", [selection])
+        root, _ = parse_snapshot(merged)
+        self.assertEqual(root.findtext(".//pre-rulebase/security/rules/entry/service/member"), "https-alt")
+        self.assertEqual(root.findtext(".//post-rulebase/nat/rules/entry/service/member"), "https-alt")
+
+    def test_tag_merge_rewrites_dynamic_filters_and_deduplicates_policy_tags(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><tag><entry name="blue"><color>color1</color></entry><entry name="blue-alt"><color>color1</color></entry></tag><address-group><entry name="dynamic"><dynamic><filter>'blue' or 'blue-alt'</filter></dynamic></entry></address-group><rulebase><security><rules><entry name="tagged"><tag><member>blue</member><member>blue-alt</member></tag></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'''
+        group = duplicate_object_groups(source, "vsys1", "tags")[0]
+        selection = {
+            "names": [item["name"] for item in group["objects"]],
+            "master": "blue",
+            "fingerprints": {item["name"]: item["fingerprint"] for item in group["objects"]},
+        }
+        merged, _ = merge_duplicate_objects(source, "vsys1", "tags", [selection])
+        root, _ = parse_snapshot(merged)
+        self.assertEqual(root.findtext(".//address-group/entry/dynamic/filter"), "'blue' or 'blue'")
+        self.assertEqual([item.text for item in root.findall(".//rules/entry/tag/member")], ["blue"])
+
+
+    def test_duplicate_merge_fails_closed_on_scope_shadowing_and_stale_preview(self):
+        source = b'''<config><shared><service><entry name="dup"><protocol><tcp><port>443</port></tcp></protocol></entry></service></shared><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><service><entry name="dup"><protocol><tcp><port>443</port></tcp></protocol></entry><entry name="master"><protocol><tcp><port>443</port></tcp></protocol></entry></service></entry></vsys></entry></devices></config>'''
+        groups = duplicate_object_groups(source, "vsys1", "services")
+        self.assertEqual(len(groups), 1)
+        selection = {
+            "names": [item["name"] for item in groups[0]["objects"]], "master": "master",
+            "fingerprints": {item["name"]: item["fingerprint"] for item in groups[0]["objects"]},
+        }
+        with self.assertRaisesRegex(OfflineConfigError, "meerdere scopes"):
+            merge_duplicate_objects(source, "vsys1", "services", [selection])
+
+        unshadowed = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><service><entry name="dup"><protocol><tcp><port>443</port></tcp></protocol></entry><entry name="master"><protocol><tcp><port>443</port></tcp></protocol></entry></service></entry></vsys></entry></devices></config>'''
+        stale = dict(selection, fingerprints={"dup": "0" * 64, "master": selection["fingerprints"]["master"]})
+        with self.assertRaisesRegex(OfflineConfigError, "intussen gewijzigd"):
+            merge_duplicate_objects(unshadowed, "vsys1", "services", [stale])
+
+    def test_duplicate_merge_rejects_overlapping_groups(self):
+        source = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><service><entry name="one"><protocol><tcp><port>443</port></tcp></protocol></entry><entry name="two"><protocol><tcp><port>443</port></tcp></protocol></entry><entry name="three"><protocol><tcp><port>443</port></tcp></protocol></entry></service></entry></vsys></entry></devices></config>'''
+        all_groups = duplicate_object_groups(source, "vsys1", "services")[0]["objects"]
+        fingerprints = {item["name"]: item["fingerprint"] for item in all_groups}
+        selections = [
+            {"names": ["one", "two"], "master": "one", "fingerprints": fingerprints},
+            {"names": ["one", "three"], "master": "three", "fingerprints": fingerprints},
+        ]
+        with self.assertRaisesRegex(OfflineConfigError, "overlappen"):
+            merge_duplicate_objects(source, "vsys1", "services", selections)
+
     def test_reference_index_protects_shared_objects_from_other_vsys(self):
         source = b'''<config><shared><address><entry name="SharedServer"/></address><service><entry name="tcp-8443"/></service><tag><entry name="Prod"/></tag></shared><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase><security><rules><entry name="allow"><source><member>SharedServer</member></source><service><member>tcp-8443</member></service><tag><member>Prod</member></tag></entry></rules></security></rulebase></entry><entry name="vsys2"><rulebase><nat><rules><entry name="translate"><destination-translation><translated-address>SharedServer</translated-address></destination-translation></entry></rules></nat></rulebase></entry></vsys></entry></devices></config>'''
         addresses = object_reference_index(source, "addresses", ["SharedServer", "unused"])

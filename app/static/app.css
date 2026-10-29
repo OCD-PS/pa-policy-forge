@@ -93,8 +93,15 @@ h3 { margin-bottom: 10px; font-size: 16px; }
 .config-tree-disabled { color: #666; cursor: not-allowed; }
 .config-tree-group { display: block; padding: 12px 10px 5px 18px; color: var(--orange); font-size: .76rem; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
 .workspace-object-search { display: grid; grid-template-columns: minmax(220px, 1fr) auto auto; gap: 8px; align-items: center; }
-.workspace-pagination { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 12px 16px 76px; }
+.workspace-pagination { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 12px; padding: 12px 16px 76px; }
 .workspace-pagination .disabled { opacity: .4; pointer-events: none; }
+.workspace-page-jump { display: inline-flex; align-items: center; justify-content: center; gap: 8px; margin: 0; white-space: nowrap; }
+.workspace-page-jump input[type="number"] { width: 72px; min-height: 36px; padding: 6px 8px; text-align: center; }
+.workspace-page-jump .btn { min-height: 36px; }
+.workspace-page-jump label, .inline-field { display: inline-flex; align-items: center; gap: 6px; margin: 0; }
+.workspace-merge-radio { width: auto; min-height: 0; accent-color: var(--orange); }
+.workspace-merge-group { padding: 16px; }
+.inline-field select { min-width: 86px; width: auto; }
 @media (max-width: 720px) { .workspace-object-search { grid-template-columns: 1fr; } }
 .config-tree.is-collapsed { width: 58px; overflow: hidden; }
 .config-tree.is-collapsed strong, .config-tree.is-collapsed details { display: none; }

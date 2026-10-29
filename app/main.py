@@ -67,7 +67,7 @@ from app.migration import (
     reconcile_model, scm_items, restore_migration_source_topology,
 )
 from app.offline_config import (
-    OBJECT_NODES, POLICY_NODES, PANOS_LOCATION_SECTIONS, REFERENCE_CHECK_OBJECT_TYPES, UNUSED_OBJECT_TYPES, OfflineConfigError, available_scopes, available_templates,
+    OBJECT_NODES, POLICY_NODES, PANOS_LOCATION_SECTIONS, PANOS_SCOPE_MOVE_OBJECT_TYPES, REFERENCE_CHECK_OBJECT_TYPES, MERGEABLE_OBJECT_TYPES, UNUSED_OBJECT_TYPES, OfflineConfigError, available_scopes, available_templates,
     apply_configuration_changes, apply_object_changes, configuration_inventory,
     create_basic_network_entry, configuration_create_templates, create_configuration_entry,
     configuration_records as scoped_configuration_records,
@@ -77,6 +77,8 @@ from app.offline_config import (
     policy_fingerprint as offline_policy_fingerprint, render_set_commands,
     panos_ui_decorate_record, scoped_server_profiles,
     object_reference_index,
+    duplicate_object_groups, merge_duplicate_objects,
+    move_panos_scope_entries,
     replace_policy_in_snapshot, replace_policies_in_snapshot, insert_policy_in_snapshot,
     delete_policies_from_snapshot, move_policies_in_snapshot,
     safe_workspace_path, scoped_objects,
@@ -4137,6 +4139,8 @@ def config_workspace_editor(workspace_id):
         config_create_templates = []
         if workspace_view == "policies":
             _, all_policies = scoped_policies(xml_bytes, scope, policy_kind, rulebase, parsed=(parsed_root, snapshot))
+            if snapshot.kind == "panos" and len(snapshot.vsys) > 1:
+                all_policies.sort(key=lambda item: not item["editable"])
             policy_inventory_total = len(all_policies)
             edit_policy = next(
                 (item for item in all_policies if item["name"] == edit_name and item["editable"]),
@@ -4184,6 +4188,8 @@ def config_workspace_editor(workspace_id):
             workspace_policy_catalog = extend_policy_catalog_with_current(workspace_policy_catalog, all_policies)
         elif workspace_view == "objects":
             _, all_objects = scoped_objects(xml_bytes, scope, object_type, parsed=(parsed_root, snapshot))
+            if snapshot.kind == "panos" and len(snapshot.vsys) > 1:
+                all_objects.sort(key=lambda item: not item["editable"])
             if object_query:
                 needle = object_query.casefold()
                 all_objects = [
@@ -4250,6 +4256,7 @@ def config_workspace_editor(workspace_id):
             object_query=object_query, object_page=object_page,
             object_page_count=object_page_count, object_total=object_total,
             workspace_object_page_size=WORKSPACE_OBJECT_PAGE_SIZE,
+            workspace_mergeable_object_types=MERGEABLE_OBJECT_TYPES,
             workspace_object_catalog=workspace_object_catalog,
             workspace_object_create_template=workspace_object_create_template,
             workspace_policy_catalog=workspace_policy_catalog,
@@ -4500,6 +4507,99 @@ def config_workspace_policy_move(workspace_id):
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, scope=scope, workspace_view="policies", policy_kind=kind, rulebase=rulebase))
 
 
+@app.post("/config-workspaces/<int:workspace_id>/scope-move")
+@login_required
+def config_workspace_scope_move(workspace_id):
+    """Move selected PAN-OS entries between VSYS and Shared in an offline workspace."""
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    source_scope = request.form.get("scope", "")
+    target_scope = request.form.get("target_scope", "")
+    item_kind = request.form.get("item_kind", "")
+    item_type = request.form.get("item_type", "")
+    workspace_view = request.form.get("workspace_view", "objects")
+    query_args = {
+        "workspace_view": workspace_view,
+        "scope": source_scope,
+        "policy_kind": item_type if item_kind == "policy" else "security",
+        "rulebase": request.form.get("rulebase", "standard"),
+        "object_type": item_type if item_kind == "object" else "addresses",
+    }
+    try:
+        xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
+        if snapshot.kind != "panos" or len(snapshot.vsys) < 2:
+            raise OfflineConfigError("Verplaatsen tussen Shared en VSYS is alleen beschikbaar voor standalone PAN-OS met meerdere VSYS")
+        scopes = ["Shared", *snapshot.vsys]
+        if source_scope not in scopes or target_scope not in scopes or source_scope == target_scope:
+            raise OfflineConfigError("Kies een geldige, andere doel-VSYS of Shared")
+        if item_kind == "policy" and item_type in POLICY_NODES:
+            _, records = scoped_policies(xml_bytes, source_scope, item_type, "standard", parsed=(parsed_root, snapshot))
+            names = request.form.getlist("policy_name")
+            move_all = request.form.get("move_all") == "yes"
+        elif item_kind == "object" and item_type in PANOS_SCOPE_MOVE_OBJECT_TYPES:
+            _, records = scoped_objects(xml_bytes, source_scope, item_type, parsed=(parsed_root, snapshot))
+            names = request.form.getlist("object_id")
+            move_all = request.form.get("move_all") == "yes"
+        else:
+            raise OfflineConfigError("Dit policy- of objecttype kan niet tussen scopes worden verplaatst")
+        available = {item["name"] for item in records if item.get("editable")}
+        if move_all:
+            if target_scope != "Shared" or source_scope == "Shared":
+                raise OfflineConfigError("Alles verplaatsen is alleen beschikbaar van een VSYS naar Shared")
+            names = [item["name"] for item in records if item.get("editable")]
+        else:
+            names = list(dict.fromkeys(name for name in names if name))
+        if not names:
+            raise OfflineConfigError("Geen lokale items geselecteerd om te verplaatsen")
+        if not set(names).issubset(available):
+            raise OfflineConfigError("Een selectie is intussen gewijzigd of bevat inherited items")
+
+        with db() as conn:
+            move_profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+        if not move_profile:
+            raise OfflineConfigError("Het gekoppelde firewallprofiel bestaat niet meer")
+        predefined_applications = [
+            item.get("name", "") for item in cached_application_catalog(move_profile).get("items", [])
+            if item.get("name")
+        ]
+
+        updated_xml, moved, failed = move_panos_scope_entries(
+            xml_bytes,
+            item_kind=item_kind,
+            item_type=item_type,
+            names=names,
+            source_scope=source_scope,
+            target_scope=target_scope,
+            predefined_applications=predefined_applications,
+            insertion_position=request.form.get("insertion_position", "top"),
+        )
+        result_workspace_id = workspace_id
+        if moved:
+            result_workspace_id = store_workspace_edit_version(
+                workspace, updated_xml, f"scope move {len(moved)} items"
+            )
+            audit(
+                "config-workspace-scope-moved",
+                f"source={workspace_id} workspace={result_workspace_id} kind={item_kind} type={item_type} from={source_scope} to={target_scope} moved={len(moved)} failed={len(failed)}",
+            )
+        return render_template(
+            "workspace_scope_move_result.html",
+            workspace=workspace,
+            result_workspace_id=result_workspace_id,
+            source_scope=source_scope,
+            target_scope=target_scope,
+            item_kind=item_kind,
+            item_type=item_type,
+            moved=moved,
+            failed=failed,
+            return_url=url_for("config_workspace_editor", workspace_id=result_workspace_id, **query_args),
+        )
+    except Exception as exc:
+        flash(f"Scope-verplaatsing niet uitgevoerd: {exc}", "error")
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, **query_args))
+
+
 @app.post("/config-workspaces/policy-bulk-drafts/<draft_id>/apply")
 @login_required
 def config_workspace_policy_bulk_apply(draft_id):
@@ -4675,6 +4775,50 @@ def config_workspace_object_preview(workspace_id):
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, scope=scope, workspace_view="objects", object_type=object_type))
 
 
+@app.post("/config-workspaces/<int:workspace_id>/objects/merge-preview")
+@login_required
+def config_workspace_object_merge_preview(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    scope = request.form.get("scope", "")
+    object_type = request.form.get("object_type", "")
+    try:
+        if object_type not in MERGEABLE_OBJECT_TYPES:
+            raise OfflineConfigError("Samenvoegen is voor dit objecttype niet veilig beschikbaar")
+        xml_bytes, parsed_root, snapshot = cached_workspace_config(
+            workspace["config_path"], workspace["sha256"],
+        )
+        if scope not in available_scopes(snapshot) and not (scope == "Shared" and snapshot.kind == "panos"):
+            raise OfflineConfigError("De geselecteerde scope bestaat niet meer")
+        groups = duplicate_object_groups(xml_bytes, scope, object_type)
+        if not groups:
+            flash("Geen functioneel identieke objecten gevonden in deze scope.", "info")
+            return redirect(url_for(
+                "config_workspace_editor", workspace_id=workspace_id, scope=scope,
+                workspace_view="objects", object_type=object_type,
+            ))
+        draft_id = secrets.token_urlsafe(24)
+        draft = {
+            "workspace_id": workspace_id, "scope": scope, "object_type": object_type,
+            "operation": "merge", "groups": groups, "created_at": now(),
+        }
+        draft_path = OBJECT_DRAFTS / f"offline-object-{draft_id}.json"
+        draft_path.write_text(json.dumps(draft))
+        draft_path.chmod(0o600)
+        return render_template(
+            "workspace_object_merge_preview.html", workspace=workspace,
+            draft=draft, draft_id=draft_id,
+            object_label=SCM_OBJECT_TYPES.get(object_type, {}).get("label", object_type),
+        )
+    except Exception as exc:
+        flash(f"Duplicaten niet voorbereid: {exc}", "error")
+        return redirect(url_for(
+            "config_workspace_editor", workspace_id=workspace_id, scope=scope,
+            workspace_view="objects", object_type=object_type,
+        ))
+
+
 @app.post("/config-workspaces/<int:workspace_id>/objects/delete-preview")
 @login_required
 def config_workspace_object_delete_preview(workspace_id):
@@ -4744,16 +4888,38 @@ def config_workspace_object_apply(draft_id):
         workspace = workspace_row(int(draft["workspace_id"]))
         if not workspace:
             raise OfflineConfigError("De bronworkspace bestaat niet meer")
-        if draft.get("operation") == "delete":
+        if draft.get("operation") == "merge":
+            if draft.get("object_type") not in MERGEABLE_OBJECT_TYPES:
+                raise OfflineConfigError("Samenvoegen is voor dit objecttype niet veilig beschikbaar")
+            selections = []
+            for group in draft.get("groups", []):
+                names = [item["name"] for item in group.get("objects", [])]
+                master = request.form.get(f"master_{group.get('id', '')}", "")
+                if master not in names:
+                    raise OfflineConfigError("Kies precies één masterobject per duplicaatgroep")
+                selections.append({
+                    "names": names,
+                    "master": master,
+                    "fingerprints": {item["name"]: item["fingerprint"] for item in group["objects"]},
+                })
+            new_xml, merge_summary = merge_duplicate_objects(
+                workspace_config_path(workspace).read_bytes(), draft["scope"],
+                draft["object_type"], selections,
+            )
+        elif draft.get("operation") == "delete":
             source_xml = workspace_config_path(workspace).read_bytes()
             validate_workspace_object_deletions(
                 source_xml, draft["object_type"],
                 [change["original_name"] for change in draft["changes"]],
             )
-        new_xml = apply_object_changes(
-            workspace_config_path(workspace).read_bytes(), draft["scope"],
-            draft["object_type"], draft["changes"],
-        )
+            new_xml = apply_object_changes(
+                source_xml, draft["scope"], draft["object_type"], draft["changes"],
+            )
+        else:
+            new_xml = apply_object_changes(
+                workspace_config_path(workspace).read_bytes(), draft["scope"],
+                draft["object_type"], draft["changes"],
+            )
         with db() as conn:
             profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
         if not profile:
@@ -4766,7 +4932,13 @@ def config_workspace_object_apply(draft_id):
             set_active_config_workspace(workspace["profile_id"], new_id)
         draft_path.unlink(missing_ok=True)
         audit("config-workspace-object-edited", f"source={workspace['id']} workspace={new_id} scope={draft['scope']} type={draft['object_type']} operation={draft['operation']}")
-        flash("Opgeslagen", "success")
+        if draft.get("operation") == "merge":
+            flash(
+                f"{merge_summary['merged']} duplicaatobject(en) samengevoegd in {merge_summary['groups']} groep(en); referenties bijgewerkt.",
+                "success",
+            )
+        else:
+            flash("Opgeslagen", "success")
         return redirect(url_for("config_workspace_editor", workspace_id=new_id, scope=draft["scope"], workspace_view="objects", object_type=draft["object_type"]))
     except Exception as exc:
         flash(f"Objectwijziging niet bewaard: {exc}", "error")
@@ -6010,6 +6182,29 @@ def config_workspace_push(workspace_id):
         available = {item["selection_key"] for item in changes}
         if not selected.issubset(available):
             raise RuntimeError("De geselecteerde scope/familie hoort niet bij deze candidatepreview")
+        scope_move_additions = defaultdict(list)
+        for addition in changes:
+            if addition["action"] == "set" and addition["family"].startswith(("object:", "policy:")):
+                scope_move_additions[(addition["family"], addition["name"])].append(addition)
+        scope_move_pairs = []
+        for removal in changes:
+            if removal["action"] != "delete" or not removal["family"].startswith(("object:", "policy:")):
+                continue
+            counterparts = [
+                addition for addition in scope_move_additions.get((removal["family"], removal["name"]), [])
+                if addition["scope"] != removal["scope"]
+            ]
+            if any(
+                (removal["selection_key"] in selected) != (addition["selection_key"] in selected)
+                for addition in counterparts
+            ):
+                scope_move_pairs.append(removal["name"])
+        if scope_move_pairs:
+            examples = ", ".join(dict.fromkeys(scope_move_pairs[:3]))
+            raise RuntimeError(
+                f"Verplaatsing van {examples} vereist zowel de bron- als doelscope. "
+                "Selecteer beide scope/familie-rijen; er is niets geschreven."
+            )
         chosen = [item for item in changes if item["selection_key"] in selected]
         if any(item["family"] == "protected" for item in chosen):
             raise RuntimeError("Management-, administrator- en credentialinstellingen zijn beschermd tegen workspace-push")
