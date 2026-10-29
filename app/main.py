@@ -5984,7 +5984,7 @@ def panos_scope_move_plan(
         if not object_type or object_type not in PANOS_SCOPE_MOVE_OBJECT_TYPES:
             continue
         name = str(removal.get("name", ""))
-        if not name or removal_counts[(removal["family"], name)] != 1:
+        if not name:
             continue
         targets = [
             item for item in selected_sets
@@ -5998,6 +5998,11 @@ def panos_scope_move_plan(
                 consumed_deletes.add(id(removal))
                 moved_names.add((object_type, name))
                 continue
+        # Several VSYS can each contain a local duplicate of one Shared
+        # object. Collapse each source scope transactionally before applying
+        # the uniqueness guard used by ordinary native moves.
+        if removal_counts[(removal["family"], name)] != 1:
+            continue
         if len(targets) != 1:
             continue
         target = targets[0]
