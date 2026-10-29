@@ -122,7 +122,27 @@ class OfflineConfigTests(unittest.TestCase):
         self.assertEqual([item.text for item in root.findall(".//rules/entry/tag/member")], ["blue"])
 
 
-    def test_duplicate_merge_fails_closed_on_scope_shadowing_and_stale_preview(self):
+    def test_duplicate_merge_uses_effective_scope_and_preserves_same_name_in_other_scopes(self):
+        source = b'''<config><shared><address><entry name="0_NAC_10_10_130_0_24"><ip-netmask>10.10.130.0/24</ip-netmask></entry></address></shared><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="0_NAC_10_10_130_0_24"><ip-netmask>10.10.130.0/24</ip-netmask></entry><entry name="NAC_Network"><ip-netmask>10.10.130.0/24</ip-netmask></entry></address><rulebase><security><rules><entry name="allow-nac"><source><member>0_NAC_10_10_130_0_24</member></source></entry></rules></security></rulebase></entry><entry name="vsys2"><address><entry name="0_NAC_10_10_130_0_24"><ip-netmask>192.0.2.0/24</ip-netmask></entry></address><rulebase><security><rules><entry name="other-nac"><source><member>0_NAC_10_10_130_0_24</member></source></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'''
+        groups = duplicate_object_groups(source, "vsys1", "addresses")
+        group = next(group for group in groups if {item["name"] for item in group["objects"]} == {
+            "0_NAC_10_10_130_0_24", "NAC_Network",
+        })
+        selection = {
+            "names": [item["name"] for item in group["objects"]], "master": "NAC_Network",
+            "fingerprints": {item["name"]: item["fingerprint"] for item in group["objects"]},
+        }
+
+        merged, _ = merge_duplicate_objects(source, "vsys1", "addresses", [selection])
+
+        root, _ = parse_snapshot(merged)
+        self.assertEqual(root.findtext(".//vsys/entry[@name='vsys1']/rulebase/security/rules/entry/source/member"), "NAC_Network")
+        self.assertEqual(root.findtext(".//vsys/entry[@name='vsys2']/rulebase/security/rules/entry/source/member"), "0_NAC_10_10_130_0_24")
+        self.assertIsNotNone(root.find("./shared/address/entry[@name='0_NAC_10_10_130_0_24']"))
+        self.assertIsNotNone(root.find(".//vsys/entry[@name='vsys2']/address/entry[@name='0_NAC_10_10_130_0_24']"))
+        self.assertIsNone(root.find(".//vsys/entry[@name='vsys1']/address/entry[@name='0_NAC_10_10_130_0_24']"))
+
+    def test_duplicate_merge_rejects_shadowed_master_and_stale_preview(self):
         source = b'''<config><shared><service><entry name="dup"><protocol><tcp><port>443</port></tcp></protocol></entry></service></shared><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><service><entry name="dup"><protocol><tcp><port>443</port></tcp></protocol></entry><entry name="master"><protocol><tcp><port>443</port></tcp></protocol></entry></service></entry></vsys></entry></devices></config>'''
         groups = duplicate_object_groups(source, "vsys1", "services")
         self.assertEqual(len(groups), 1)
@@ -130,13 +150,51 @@ class OfflineConfigTests(unittest.TestCase):
             "names": [item["name"] for item in groups[0]["objects"]], "master": "master",
             "fingerprints": {item["name"]: item["fingerprint"] for item in groups[0]["objects"]},
         }
-        with self.assertRaisesRegex(OfflineConfigError, "meerdere scopes"):
-            merge_duplicate_objects(source, "vsys1", "services", [selection])
+        merged, _ = merge_duplicate_objects(source, "vsys1", "services", [selection])
+        root, _ = parse_snapshot(merged)
+        self.assertIsNotNone(root.find("./shared/service/entry[@name='dup']"))
+        self.assertIsNone(root.find(".//vsys/entry[@name='vsys1']/service/entry[@name='dup']"))
 
         unshadowed = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><service><entry name="dup"><protocol><tcp><port>443</port></tcp></protocol></entry><entry name="master"><protocol><tcp><port>443</port></tcp></protocol></entry></service></entry></vsys></entry></devices></config>'''
         stale = dict(selection, fingerprints={"dup": "0" * 64, "master": selection["fingerprints"]["master"]})
         with self.assertRaisesRegex(OfflineConfigError, "intussen gewijzigd"):
             merge_duplicate_objects(unshadowed, "vsys1", "services", [stale])
+
+    def test_duplicate_merge_rejects_master_shadowed_by_reference_scope(self):
+        source = b'''<config><shared><address><entry name="alias"><ip-netmask>10.0.0.1/24</ip-netmask></entry><entry name="master"><ip-netmask>10.0.0.1/24</ip-netmask></entry></address></shared><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="master"><ip-netmask>192.0.2.1/32</ip-netmask></entry></address><rulebase><security><rules><entry name="allow"><source><member>alias</member></source></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'''
+        groups = duplicate_object_groups(source, "Shared", "addresses")
+        selection = {
+            "names": [item["name"] for item in groups[0]["objects"]], "master": "master",
+            "fingerprints": {item["name"]: item["fingerprint"] for item in groups[0]["objects"]},
+        }
+        with self.assertRaisesRegex(OfflineConfigError, "overschaduwd"):
+            merge_duplicate_objects(source, "Shared", "addresses", [selection])
+
+    def test_duplicate_merge_fails_closed_for_selected_reference_without_scope(self):
+        source = b'''<config><rulebase><security><rules><entry name="unscoped"><source><member>alias</member></source></entry></rules></security></rulebase><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="alias"><ip-netmask>10.0.0.1/24</ip-netmask></entry><entry name="master"><ip-netmask>10.0.0.1/24</ip-netmask></entry></address></entry></vsys></entry></devices></config>'''
+        groups = duplicate_object_groups(source, "vsys1", "addresses")
+        selection = {
+            "names": [item["name"] for item in groups[0]["objects"]], "master": "master",
+            "fingerprints": {item["name"]: item["fingerprint"] for item in groups[0]["objects"]},
+        }
+        with self.assertRaisesRegex(OfflineConfigError, "geen herkenbare scope"):
+            merge_duplicate_objects(source, "vsys1", "addresses", [selection])
+
+    def test_panorama_merge_rewrites_inherited_child_reference_but_preserves_shadow(self):
+        source = b'''<config><shared/><devices><entry name="localhost.localdomain"><device-group><entry name="Parent"><address><entry name="alias"><ip-netmask>10.0.0.1/24</ip-netmask></entry><entry name="master"><ip-netmask>10.0.0.1/24</ip-netmask></entry></address></entry><entry name="Child"><parent-dg>Parent</parent-dg><pre-rulebase><security><rules><entry name="inherited"><source><member>alias</member></source></entry></rules></security></pre-rulebase></entry><entry name="ChildShadow"><parent-dg>Parent</parent-dg><address><entry name="alias"><ip-netmask>192.0.2.1/32</ip-netmask></entry></address><pre-rulebase><security><rules><entry name="local"><source><member>alias</member></source></entry></rules></security></pre-rulebase></entry></device-group></entry></devices></config>'''
+        groups = duplicate_object_groups(source, "Parent", "addresses")
+        selection = {
+            "names": [item["name"] for item in groups[0]["objects"]], "master": "master",
+            "fingerprints": {item["name"]: item["fingerprint"] for item in groups[0]["objects"]},
+        }
+
+        merged, _ = merge_duplicate_objects(source, "Parent", "addresses", [selection])
+
+        root, _ = parse_snapshot(merged)
+        self.assertEqual(root.findtext(".//device-group/entry[@name='Child']/pre-rulebase/security/rules/entry/source/member"), "master")
+        self.assertEqual(root.findtext(".//device-group/entry[@name='ChildShadow']/pre-rulebase/security/rules/entry/source/member"), "alias")
+        self.assertIsNone(root.find(".//device-group/entry[@name='Parent']/address/entry[@name='alias']"))
+        self.assertIsNotNone(root.find(".//device-group/entry[@name='ChildShadow']/address/entry[@name='alias']"))
 
     def test_duplicate_merge_rejects_overlapping_groups(self):
         source = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><service><entry name="one"><protocol><tcp><port>443</port></tcp></protocol></entry><entry name="two"><protocol><tcp><port>443</port></tcp></protocol></entry><entry name="three"><protocol><tcp><port>443</port></tcp></protocol></entry></service></entry></vsys></entry></devices></config>'''
