@@ -3800,6 +3800,11 @@ def validate_incremental_object_deletions(
     selected_families: set[str],
 ) -> None:
     """Validate all selected object deletions with one scan per XML snapshot."""
+    reference_bearing_object_types = {
+        "address-groups", "application-groups", "service-groups",
+        "dynamic-user-groups", "security-profile-groups", "log-forwarding",
+        "hip-profiles",
+    }
     names_by_type = {
         object_type: list(dict.fromkeys(str(name) for name in names if str(name)))
         for object_type, names in deleted_objects.items()
@@ -3852,11 +3857,100 @@ def validate_incremental_object_deletions(
         indexed_references=desired_indexes,
         indexed_reference_nodes=desired_reference_nodes,
         original_indexed_reference_nodes=current_reference_nodes,
-        # A Shared-owned reference cannot point at the VSYS-local duplicate.
-        # Other scopes remain fail-closed here; inheritance alone is not
-        # treated as proof that their references are safe to leave untouched.
+        # Resolve ordinary references conservatively. A narrow exception for
+        # newly introduced references to unchanged Shared entries follows.
         allowed_reference_scopes={"Shared"},
     )
+    current_root, current_snapshot = current_parsed
+    desired_root, desired_snapshot = desired_parsed
+    for object_type, names in names_by_type.items():
+        current_nodes = current_reference_nodes.get(object_type, {})
+        desired_nodes = desired_reference_nodes.get(object_type, {})
+        for name in names:
+            unresolved_list = unresolved_references[object_type].get(name, [])
+            unresolved_paths = set(unresolved_list)
+            if not unresolved_paths:
+                continue
+            # A new rule member may name an existing Shared object while the
+            # same-named, unused VSYS copy is deleted in this push. Permit that
+            # inheritance only when existing references already resolve to
+            # Shared or behaviorally identical copies. Comparing paths alone
+            # is unsafe: renaming a rule/group changes its XPath without making
+            # its object reference new.
+            previous_nodes = current_nodes.get(name, ())
+            try:
+                current_shared = _resolve_scoped_object_entry(
+                    current_root, current_snapshot, "Shared", object_type, name,
+                )
+                desired_shared = _resolve_scoped_object_entry(
+                    desired_root, desired_snapshot, "Shared", object_type, name,
+                )
+            except OfflineConfigError:
+                continue
+            if (
+                current_shared is None
+                or desired_shared is None
+                or _merge_object_signature(current_shared, object_type)
+                != _merge_object_signature(desired_shared, object_type)
+            ):
+                continue
+            current_shared_signature = _merge_object_signature(current_shared, object_type)
+            unsafe_previous_reference = False
+            current_scope_is_safe: dict[str, bool] = {}
+            for path, _node in previous_nodes:
+                scope = config_push_scope(path)
+                if scope == "Shared":
+                    continue
+                if scope is None:
+                    unsafe_previous_reference = True
+                    break
+                if scope not in current_scope_is_safe:
+                    try:
+                        current_effective = _resolve_scoped_object_entry(
+                            current_root, current_snapshot, scope, object_type, name,
+                        )
+                    except OfflineConfigError:
+                        current_scope_is_safe[scope] = False
+                    else:
+                        current_scope_is_safe[scope] = (
+                            current_effective is not None
+                        and (
+                            current_effective is current_shared
+                            or (
+                                object_type not in reference_bearing_object_types
+                                and _merge_object_signature(current_effective, object_type)
+                                == current_shared_signature
+                            )
+                        )
+                        )
+                if not current_scope_is_safe[scope]:
+                    unsafe_previous_reference = True
+                    break
+            if unsafe_previous_reference:
+                continue
+            inherited_paths = set()
+            desired_scope_inherits_shared: dict[str, bool] = {}
+            for path, _node in desired_nodes.get(name, ()):
+                if path not in unresolved_paths:
+                    continue
+                scope = config_push_scope(path)
+                if scope in (None, "Shared"):
+                    continue
+                if scope not in desired_scope_inherits_shared:
+                    try:
+                        resolved = _resolve_scoped_object_entry(
+                            desired_root, desired_snapshot, scope, object_type, name,
+                        )
+                    except OfflineConfigError:
+                        desired_scope_inherits_shared[scope] = False
+                    else:
+                        desired_scope_inherits_shared[scope] = resolved is desired_shared
+                if desired_scope_inherits_shared[scope]:
+                    inherited_paths.add(path)
+            if inherited_paths:
+                unresolved_references[object_type][name] = [
+                    path for path in unresolved_list if path not in inherited_paths
+                ]
     used = [
         (name, unresolved_references[object_type][name])
         for object_type, names in names_by_type.items()
