@@ -941,6 +941,152 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertTrue(all(item.get("newname", "").startswith("PF_TMP_") for item in transaction.findall("rename")))
         self.assertEqual(sum(item.tag == "edit" for item in transaction), 2)
 
+    def test_new_shared_service_merge_handles_multiple_vsys_references(self):
+        base_root = main.ET.fromstring(
+            b'<config><devices><entry name="localhost.localdomain"><vsys>'
+            b'<entry name="vsys1"><service><entry name="RadSec"><protocol><tcp><port>2083</port>'
+            b'<override><no /></override></tcp></protocol></entry></service>'
+            b'<rulebase><security><rules><entry name="rule-vsys1">'
+            b'<service><member>RadSec</member></service></entry></rules></security></rulebase></entry>'
+            b'<entry name="vsys2"><service><entry name="RadSec"><protocol><tcp><port>2083</port>'
+            b'<override><no /></override></tcp></protocol></entry></service>'
+            b'<rulebase><security><rules><entry name="rule-vsys2">'
+            b'<service><member>RadSec</member></service></entry></rules></security></rulebase></entry>'
+            b'</vsys></entry></devices></config>'
+        )
+        base = main.normalized_config_xml(base_root)
+        desired_root = main.ET.fromstring(base)
+        first_local_service = desired_root.find(
+            "./devices/entry/vsys/entry[@name='vsys1']/service/entry[@name='RadSec']"
+        )
+        desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/service").clear()
+        desired_root.find("./devices/entry/vsys/entry[@name='vsys2']/service").clear()
+        shared = main.ET.SubElement(desired_root, "shared")
+        shared_services = main.ET.SubElement(shared, "service")
+        shared_services.append(main.copy.deepcopy(first_local_service))
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "promote RadSec into new Shared scope", "candidate.xml", desired,
+            "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        changes = [
+            item for item in main.config_push_delta(base, desired)
+            if item["family"] == "object:service"
+        ]
+        self.assertEqual({item["action"] for item in changes}, {"set", "delete"})
+        self.assertEqual(sum(item["action"] == "delete" for item in changes), 2)
+        requests = []
+
+        def api_response(endpoint, params, ctx):
+            requests.append(dict(params))
+            if params["type"] == "config":
+                if params["action"] == "multi-config":
+                    nested = "".join(
+                        f'<response status="success" code="20" id="{index}"/>'
+                        for index in range(1, 8)
+                    )
+                    return f'<response status="success" code="20"><result>{nested}</result></response>'
+                return '<response status="success" code="20"><result/></response>'
+            if params["type"] == "op":
+                return '<response status="success"><result><job>619</job></result></response>'
+            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post", side_effect=api_response), \
+             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": [item["selection_key"] for item in changes]},
+                follow_redirects=True,
+            )
+
+        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
+        self.assertFalse(any(item["type"] == "commit" for item in requests))
+        config_calls = [item for item in requests if item["type"] == "config"]
+        self.assertEqual([item["action"] for item in config_calls], ["multi-config"])
+        transaction = main.ET.fromstring(config_calls[0]["element"])
+        self.assertEqual([item.tag for item in transaction], ["set"] + ["rename", "edit", "delete"] * 2)
+        self.assertTrue(transaction[0].get("xpath", "").endswith("/shared/service"))
+        self.assertEqual(transaction[0].find("entry").get("name"), "RadSec")
+        edited_paths = [item.get("xpath", "") for item in transaction.findall("edit")]
+        self.assertEqual(len(edited_paths), 2)
+        self.assertTrue(any("rule-vsys1" in path and path.endswith("/service") for path in edited_paths))
+        self.assertTrue(any("rule-vsys2" in path and path.endswith("/service") for path in edited_paths))
+        self.assertTrue(all("RadSec" in (item.text or "") for edit in transaction.findall("edit") for item in edit.findall("./member")))
+
+        incomplete_requests = []
+
+        def incomplete_api_response(endpoint, params, ctx):
+            incomplete_requests.append(dict(params))
+            if params["type"] == "config" and params["action"] == "multi-config":
+                nested = "".join(
+                    f'<response status="success" code="20" id="{index}"/>'
+                    for index in range(1, 7)
+                )
+                return f'<response status="success" code="20"><result>{nested}</result></response>'
+            self.fail(f"Unexpected request after incomplete transaction response: {params}")
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post", side_effect=incomplete_api_response), \
+             patch("app.main.wait_panos_job") as wait_job:
+            incomplete = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": [item["selection_key"] for item in changes]},
+                follow_redirects=True,
+            )
+
+        self.assertIn("bevestigde 6 van 7 bewerkingen", incomplete.get_data(as_text=True))
+        self.assertIn("API-uitkomst onzeker", incomplete.get_data(as_text=True))
+        self.assertIn("candidate opnieuw op", incomplete.get_data(as_text=True))
+        self.assertNotIn("candidate niet gewijzigd", incomplete.get_data(as_text=True))
+        self.assertFalse(any(item["type"] == "op" for item in incomplete_requests))
+        wait_job.assert_not_called()
+
+    def test_new_shared_service_merge_blocks_changed_target_definition(self):
+        base_root = main.ET.fromstring(
+            b'<config><devices><entry name="localhost.localdomain"><vsys>'
+            b'<entry name="vsys1"><service><entry name="RadSec"><protocol><tcp><port>2083</port>'
+            b'</tcp></protocol></entry></service><rulebase><security><rules><entry name="rule-vsys1">'
+            b'<service><member>RadSec</member></service></entry></rules></security></rulebase></entry>'
+            b'<entry name="vsys2"><service><entry name="RadSec"><protocol><tcp><port>2083</port>'
+            b'</tcp></protocol></entry></service><rulebase><security><rules><entry name="rule-vsys2">'
+            b'<service><member>RadSec</member></service></entry></rules></security></rulebase></entry>'
+            b'</vsys></entry></devices></config>'
+        )
+        base = main.normalized_config_xml(base_root)
+        desired_root = main.ET.fromstring(base)
+        desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/service").clear()
+        desired_root.find("./devices/entry/vsys/entry[@name='vsys2']/service").clear()
+        shared = main.ET.SubElement(desired_root, "shared")
+        services = main.ET.SubElement(shared, "service")
+        services.append(main.ET.fromstring(
+            b'<entry name="RadSec"><protocol><tcp><port>2084</port></tcp></protocol></entry>'
+        ))
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "reject changed RadSec shared target", "candidate.xml", desired,
+            "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        changes = [
+            item for item in main.config_push_delta(base, desired)
+            if item["family"] == "object:service"
+        ]
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post") as api_post:
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": [item["selection_key"] for item in changes]},
+                follow_redirects=True,
+            )
+
+        message = response.get_data(as_text=True)
+        self.assertIn("objecten zijn nog in gebruik", message)
+        self.assertIn("rule-vsys1", message)
+        api_post.assert_not_called()
+
     def test_same_name_shared_address_merge_restores_device_path_monitor_reference(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><shared><address><entry name="Google"><ip-netmask>8.8.8.8/32</ip-netmask>'

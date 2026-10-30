@@ -5795,6 +5795,7 @@ def panos_scope_move_plan(
     consumed_deletes: set[int] = set()
     moved_names: set[tuple[str, str]] = set()
     safe_merge_ops: list[dict] = []
+    shared_target_seed_entries: dict[int, dict[str, ET.Element]] = defaultdict(dict)
     shared_merge_contexts: dict[str, dict | None] = {}
     shared_merge_names: dict[str, set[str]] = defaultdict(set)
     for removal in selected_deletes:
@@ -5947,14 +5948,14 @@ def panos_scope_move_plan(
             shared_merge_contexts[object_type] = None
             return None
 
-    def existing_shared_merge(removal, object_type):
+    def existing_shared_merge(removal, object_type, pending_shared_target=None):
         """Plan a same-name local-to-Shared collapse without deleting live refs.
 
-        When Shared already owns an equivalent object, PAN-OS cannot multi-move
-        the local entry into that occupied name. Rename the local entry to a
-        short-lived unique name, point its unchanged reference fields back at
-        the equivalent Shared object, then delete the now-unused temporary
-        entry. The final candidate keeps the original reference names.
+        When Shared already owns an equivalent object, or this push creates
+        that object first, rename the local entry to a short-lived unique name,
+        point its unchanged reference fields back at the equivalent Shared
+        object, then delete the now-unused temporary entry. The final candidate
+        keeps the original reference names.
         """
         name = str(removal.get("name", ""))
         source_scope = str(removal.get("scope", ""))
@@ -5996,15 +5997,31 @@ def panos_scope_move_plan(
             shared = next((item for item in shared_records if item.get("owner") == "Shared" and item.get("name") == name), None)
             desired_source = next((item for item in desired_source_records if item.get("owner") == source_scope and item.get("name") == name), None)
             desired_shared = next((item for item in desired_shared_records if item.get("owner") == "Shared" and item.get("name") == name), None)
-            if not source or not shared or desired_source or not desired_shared:
+            pending_target_entry = (
+                target_entries(pending_shared_target).get(name)
+                if pending_shared_target is not None
+                and pending_shared_target.get("action") == "set"
+                and pending_shared_target.get("scope") == "Shared"
+                else None
+            )
+            if (
+                not source or desired_source or not desired_shared
+                or (shared is None and pending_target_entry is None)
+            ):
                 return None
             source_entry = SafeET.fromstring(source["_xml"])
-            shared_entry = SafeET.fromstring(shared["_xml"])
             desired_shared_entry = SafeET.fromstring(desired_shared["_xml"])
             source_signature = _merge_object_signature(source_entry, object_type)
-            if source_signature != _merge_object_signature(shared_entry, object_type):
+            if shared is not None and source_signature != _merge_object_signature(
+                SafeET.fromstring(shared["_xml"]), object_type,
+            ):
                 return None
-            if source_signature != _merge_object_signature(desired_shared_entry, object_type):
+            desired_shared_signature = _merge_object_signature(desired_shared_entry, object_type)
+            if source_signature != desired_shared_signature:
+                return None
+            if pending_target_entry is not None and source_signature != _merge_object_signature(
+                pending_target_entry, object_type,
+            ):
                 return None
             current_source_entry = _resolve_scoped_object_entry(
                 current_root, current_snapshot, source_scope, object_type, name,
@@ -6144,6 +6161,12 @@ def panos_scope_move_plan(
                 "action": "delete", "xpath": temporary_xpath, "element": "",
                 "family": removal["family"], "label": label, "name": name,
             })
+            if shared is None:
+                # The new Shared entry must exist before the reference fields
+                # are restored from the temporary local name to the original.
+                shared_target_seed_entries[id(pending_shared_target)][name] = copy.deepcopy(
+                    pending_target_entry,
+                )
             return ops
         except (OfflineConfigError, KeyError, TypeError, ValueError, ET.ParseError):
             return None
@@ -6175,6 +6198,15 @@ def panos_scope_move_plan(
                 consumed_deletes.add(id(removal))
                 moved_names.add((object_type, name))
                 continue
+        elif removal_counts[(removal["family"], name)] > 1:
+            shared_targets = [item for item in targets if item.get("scope") == "Shared"]
+            if len(shared_targets) == 1:
+                merge_ops = existing_shared_merge(removal, object_type, shared_targets[0])
+                if merge_ops:
+                    safe_merge_ops.extend(merge_ops)
+                    consumed_deletes.add(id(removal))
+                    moved_names.add((object_type, name))
+                    continue
         # Several VSYS can each contain a local duplicate of one Shared
         # object. Collapse each source scope transactionally before applying
         # the uniqueness guard used by ordinary native moves.
@@ -6242,15 +6274,24 @@ def panos_scope_move_plan(
         moved_names.add((object_type, name))
 
     # Apply each same-name Shared merge as one transactional XML API request.
-    # PAN-OS rolls the batch back if one step fails, so a transient rename can
-    # never strand the candidate between the rename and reference repair.
+    # Seed new Shared entries in that same batch so a rejected reference repair
+    # cannot leave an orphaned Shared object in the candidate.
     write_plan = []
     embedded_policy_paths = {
         change["policy_change_path"] for change in safe_merge_ops
         if change.get("policy_change_path")
     }
+    seed_operation_count = 0
     if safe_merge_ops:
         transaction = ET.Element("multi-config")
+        for target in selected_sets:
+            entries = shared_target_seed_entries.get(id(target), {})
+            if not entries:
+                continue
+            action = ET.SubElement(transaction, "set", {"xpath": target["xpath"]})
+            for entry in entries.values():
+                action.append(copy.deepcopy(entry))
+            seed_operation_count += 1
         for change in safe_merge_ops:
             attributes = {"xpath": change["xpath"]}
             if change.get("newname"):
@@ -6266,17 +6307,21 @@ def panos_scope_move_plan(
             "action": "multi-config", "xpath": "/config", "element": ET.tostring(transaction, encoding="unicode"),
             "family": safe_merge_ops[0]["family"], "label": "Shared object merge",
             "name": ", ".join(dict.fromkeys(change["name"] for change in safe_merge_ops)),
-            "operation_count": len(safe_merge_ops),
+            "operation_count": len(safe_merge_ops) + seed_operation_count,
         })
     for change in chosen:
         if change["family"].startswith("policy:") and change["xpath"] in embedded_policy_paths:
             continue
         move_ops = moves_by_target.get(id(change), [])
-        if move_ops:
+        consumed_target_names = set(shared_target_seed_entries.get(id(change), {}))
+        if move_ops or consumed_target_names:
             write_plan.extend(move_ops)
-            moved = {item["name"] for item in move_ops if item["action"] == "multi-move"}
+            consumed_target_names.update(
+                item["name"] for item in move_ops if item["action"] == "multi-move"
+            )
             residual = [
-                node for name, node in target_entries(change).items() if name not in moved
+                node for name, node in target_entries(change).items()
+                if name not in consumed_target_names
             ]
             if residual:
                 residual_change = dict(change)
@@ -7084,6 +7129,7 @@ def config_workspace_push(workspace_id):
         flash(f"Incremental push geblokkeerd: {block_reason}", "error")
         return redirect(url_for("migration_project", project_id=output["project_id"]))
     applied_changes = 0
+    candidate_write_outcome_unknown = False
     commit_record_id = None
     commit_requested = request.form.get("commit_after_push") == "yes"
     push_started = time.perf_counter()
@@ -7231,6 +7277,7 @@ def config_workspace_push(workspace_id):
                 if change.get("dst"):
                     params["dst"] = change["dst"]
             api_write_started = time.perf_counter()
+            candidate_write_outcome_unknown = True
             try:
                 response = panos_api_post(endpoint, params, ctx)
             finally:
@@ -7239,19 +7286,30 @@ def config_workspace_push(workspace_id):
             action_label = f"{change['action']} {change['label']} {change['name']}"
             response_root = policy_api.require_success(response, action_label)
             if change["action"] == "multi-config":
-                failures = [
+                failed_action_responses = [
                     item for item in response_root.iter("response")
                     if item is not response_root and item.get("status") != "success"
                 ]
-                if failures:
-                    detail = " ".join(" ".join(node.itertext()).strip() for node in failures)
-                    code = next((item.get("code", "") for item in failures if item.get("code")), "")
+                if failed_action_responses:
+                    detail = " ".join(" ".join(node.itertext()).strip() for node in failed_action_responses)
+                    code = next((item.get("code", "") for item in failed_action_responses if item.get("code")), "")
                     raise RuntimeError(
                         f"multi-config {change['label']} failed: status='error' code='{code}' msg={detail[:180]}"
+                    )
+                successful_actions = [
+                    item for item in response_root.iter("response")
+                    if item is not response_root
+                ]
+                expected_actions = int(change.get("operation_count", 1))
+                if len(successful_actions) != expected_actions:
+                    raise RuntimeError(
+                        f"multi-config {change['label']} incomplete: PAN-OS bevestigde "
+                        f"{len(successful_actions)} van {expected_actions} bewerkingen"
                     )
                 applied_changes += int(change.get("operation_count", 1))
             else:
                 applied_changes += 1
+            candidate_write_outcome_unknown = False
         start_push_phase("candidate_validation")
         validation_root = policy_api.require_success(
             panos_api_post(endpoint, {"type": "op", "cmd": "<validate><full></full></validate>", "key": key}, ctx),
@@ -7374,10 +7432,18 @@ def config_workspace_push(workspace_id):
             push_trace["desired_bytes"], push_trace["candidate_bytes"], push_trace["delta_count"],
             {name: round(value, 1) for name, value in push_trace["phase_ms"].items()},
         )
-        state = (
-            f"{applied_changes} wijziging(en) staan al in de candidate; niet gecommit"
-            if applied_changes else "candidate niet gewijzigd"
-        )
+        if candidate_write_outcome_unknown:
+            state = "API-uitkomst onzeker; haal eerst de actuele candidate opnieuw op voordat je opnieuw pusht"
+            if applied_changes:
+                state = (
+                    f"{applied_changes} wijziging(en) zijn bevestigd; de laatste API-uitkomst is onzeker. "
+                    "Haal eerst de actuele candidate opnieuw op voordat je opnieuw pusht"
+                )
+        else:
+            state = (
+                f"{applied_changes} wijziging(en) staan al in de candidate; niet gecommit"
+                if applied_changes else "candidate niet gewijzigd"
+            )
         flash(f"Incremental push gestopt: {concise_incremental_push_error(exc)}; {state}.", "error")
     if commit_record_id is not None:
         return redirect(url_for("config_workspace_commit_status", workspace_id=workspace_id, commit_id=commit_record_id))
