@@ -986,6 +986,51 @@ class IncrementalPushCommitTests(unittest.TestCase):
             current, desired, {"addresses": ["Route-Object"]}, selected_families,
         )
 
+    def test_virtual_router_reference_change_stays_selectable_when_entry_has_certificate(self):
+        current = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address><entry name="Shared-Server"><ip-netmask>10.10.120.100/32</ip-netmask>'
+            b'</entry></address></shared><devices><entry name="localhost.localdomain"><network>'
+            b'<virtual-router><entry name="default"><routing-table><ip><static-route>'
+            b'<entry name="route"><destination>Local-Server</destination></entry></static-route></ip>'
+            b'</routing-table><certificate>fixture-cert-reference</certificate></entry></virtual-router>'
+            b'</network><vsys><entry name="vsys1"><address><entry name="Local-Server">'
+            b'<ip-netmask>10.10.120.100/32</ip-netmask></entry></address></entry>'
+            b'<entry name="vsys2"/></vsys></entry></devices></config>'
+        ))
+        group = next(
+            item for item in main.duplicate_object_groups_across_panos_scopes(current, "addresses")
+            if {obj["scope"] for obj in item["objects"]} == {"Shared", "vsys1"}
+        )
+        desired, _ = main.merge_duplicate_object_groups_to_shared(current, [{
+            "object_type": "addresses", "objects": group["objects"],
+            "master": {"scope": "Shared", "name": "Shared-Server"},
+        }])
+
+        delta = main.config_push_delta(current, desired)
+        virtual_router_changes = [
+            item for item in delta if item["family"] == "network:virtual-router"
+        ]
+        self.assertTrue(virtual_router_changes)
+        self.assertTrue(any(item["xpath"].endswith("/destination") for item in virtual_router_changes))
+        self.assertFalse(any(
+            item["family"] == "protected" and "/network/virtual-router/" in item["xpath"]
+            for item in delta
+        ))
+        self.assertNotIn("fixture-cert-reference", "".join(item["element"] for item in delta))
+
+        address_only = {
+            item["selection_key"] for item in delta if item["family"].startswith("object:")
+        }
+        with self.assertRaisesRegex(main.OfflineConfigError, "selecteer Network · Virtual Router"):
+            main.validate_incremental_object_deletions(
+                current, desired, {"addresses": ["Local-Server"]}, address_only,
+            )
+
+        main.validate_incremental_object_deletions(
+            current, desired, {"addresses": ["Local-Server"]},
+            {item["selection_key"] for item in delta if item["family"] != "protected"},
+        )
+
     def test_same_name_shared_merge_stops_on_nested_transaction_error(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><shared><address><entry name="same-object"><ip-netmask>192.0.2.10/32</ip-netmask>'
