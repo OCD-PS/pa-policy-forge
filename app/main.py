@@ -5597,6 +5597,9 @@ _PUSH_ENTRY_COLLECTIONS = set(_PUSH_OBJECT_NODES) | set(_PUSH_POLICY_NODES) | {
     "global-protect-gateway", "authentication-profile", "authentication-sequence", "user-id-collector",
     "vm-info-source", "routing-profile", "profiles", "local-user-database", "admin-roles",
 }
+# Existing virtual-router entries can contain certificate material. Diff their
+# children independently so route updates stay selectable without resending it.
+_PUSH_NARROW_ENTRY_COLLECTIONS = {"virtual-router"}
 _PANOS_RESPONSE_METADATA_ATTRIBUTES = frozenset({"admin", "dirtyId", "time"})
 
 
@@ -6306,7 +6309,11 @@ def config_push_delta(base_xml: bytes, desired_xml: bytes, desired_root=None) ->
                 # made on the firewall after this workspace was pulled. Walk
                 # into the entry so scalar changes become narrow set requests
                 # and repeated-list changes stay confined to their own field.
-                if parent_name in _PUSH_POLICY_NODES or parent_name == "rules":
+                if (
+                    parent_name in _PUSH_POLICY_NODES
+                    or parent_name == "rules"
+                    or parent_name in _PUSH_NARROW_ENTRY_COLLECTIONS
+                ):
                     before_children = {child.tag: child for child in list(before)}
                     after_children = {child.tag: child for child in list(after)}
                     for tag in dict.fromkeys((*before_children, *after_children)):
