@@ -5638,13 +5638,43 @@ def config_push_scope(xpath: str) -> str:
     if re.search(r"/shared(?:/|$)", xpath):
         return "Shared"
     for node in ("device-group", "template-stack", "template", "vsys"):
-        match = re.search(rf"/{node}/entry\[@name=(.*?)\]", xpath)
+        match = re.search(rf"/{re.escape(node)}/entry\[@name\s*=\s*", xpath)
         if not match:
             continue
-        literal = match.group(1).strip()
-        if len(literal) >= 2 and literal[0] == literal[-1] and literal[0] in "'\"":
-            return literal[1:-1]
-        return "Scope"
+        value_start = match.end()
+        if value_start >= len(xpath):
+            return "Scope"
+
+        quote = xpath[value_start] if xpath[value_start] in "'\"" else None
+        if quote:
+            # PAN-OS API XPaths normally quote scope names. Find the matching
+            # delimiter before accepting the closing predicate bracket, so a
+            # quoted name containing `]` is not truncated.
+            value_end = xpath.find(quote, value_start + 1)
+            if value_end < 0:
+                return "Scope"
+            scope = xpath[value_start + 1:value_end]
+            predicate_end = value_end + 1
+            while predicate_end < len(xpath) and xpath[predicate_end].isspace():
+                predicate_end += 1
+            if predicate_end >= len(xpath) or xpath[predicate_end] != "]":
+                return "Scope"
+        else:
+            # The reference index emits generated XPaths with raw @name values
+            # (for example, entry[@name=vsys1]). Accept that internal form, but
+            # reject predicate syntax that could make a partial value look like
+            # a real scope. A closing bracket inside an unquoted name is
+            # ambiguous and is rejected by checking the following delimiter.
+            predicate_end = xpath.find("]", value_start)
+            if predicate_end < 0:
+                return "Scope"
+            scope = xpath[value_start:predicate_end].strip()
+            if not scope or any(char in scope for char in "[]'\"()="):
+                return "Scope"
+
+        if predicate_end + 1 < len(xpath) and xpath[predicate_end + 1] != "/":
+            return "Scope"
+        return scope or "Scope"
     return "Global"
 
 
