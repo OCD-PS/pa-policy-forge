@@ -64,6 +64,50 @@ class IncrementalPushCommitTests(unittest.TestCase):
             "delete Addresses host-a: PAN-OS kan dit object niet verwijderen zolang er verwijzingen naar bestaan (code 10)",
         )
 
+    def test_explicit_api_rejection_after_confirmed_write_requests_refresh_without_uncertain_label(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address>'
+            b'<entry name="remove-me"><ip-netmask>192.0.2.1/32</ip-netmask></entry>'
+            b'</address></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        addresses = desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/address")
+        addresses.clear()
+        addresses.append(main.ET.fromstring(
+            b'<entry name="add-me"><ip-netmask>192.0.2.2/32</ip-netmask></entry>'
+        ))
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "known rejected API write", "candidate.xml", desired,
+            "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        selection_key = main.config_push_delta(base, desired)[0]["selection_key"]
+        requests = []
+
+        def api_response(endpoint, params, ctx):
+            requests.append(dict(params))
+            if params["action"] == "set":
+                return '<response status="success" code="20"><result/></response>'
+            if params["action"] == "delete":
+                return '<response status="error" code="10"><msg>still referenced</msg></response>'
+            self.fail(f"Unexpected PAN-OS API action: {params.get('action')}")
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post", side_effect=api_response):
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": selection_key},
+                follow_redirects=True,
+            )
+
+        message = response.get_data(as_text=True)
+        self.assertIn("code 10", message)
+        self.assertIn("1 wijziging(en) staan al in de candidate; niet gecommit", message)
+        self.assertIn("Haal eerst de actuele candidate opnieuw op voordat je opnieuw pusht", message)
+        self.assertNotIn("API-uitkomst onzeker", message)
+        self.assertEqual([item.get("action") for item in requests], ["set", "delete"])
+
     def create_policy_workspace(self, description_current="old"):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys2">'
@@ -741,6 +785,213 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertTrue(transaction[1].get("xpath").endswith("/source"))
         self.assertIn("0_NAC_10_10_130_0_24", main.ET.tostring(transaction[1], encoding="unicode"))
         self.assertIn("PF_TMP_", transaction[2].get("xpath"))
+
+    def test_same_name_shared_merge_deletes_unused_local_shadow_before_new_policy_reference(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address>'
+            b'<entry name="shared-target"><ip-netmask>192.0.2.10/32</ip-netmask></entry>'
+            b'<entry name="existing-source"><ip-netmask>192.0.2.20/32</ip-netmask></entry>'
+            b'</address><address-group><entry name="shared-group"><static><member>shared-target</member>'
+            b'</static></entry></address-group></shared><devices><entry name="localhost.localdomain">'
+            b'<vsys><entry name="vsys1"><address><entry name="shared-target">'
+            b'<ip-netmask>192.0.2.10/32</ip-netmask></entry></address><rulebase><security><rules>'
+            b'<entry name="Migrated sites to Untrust"><source><member>existing-source</member></source>'
+            b'</entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/address").clear()
+        source = desired_root.find(
+            "./devices/entry/vsys/entry[@name='vsys1']/rulebase/security/rules/entry/source"
+        )
+        main.ET.SubElement(source, "member").text = "shared-target"
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "new reference to existing Shared object", "candidate.xml", desired,
+            "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        changes = main.config_push_delta(base, desired)
+        deletion = next(
+            item for item in changes
+            if item["action"] == "delete" and item["family"] == "object:address"
+            and item["name"] == "shared-target"
+        )
+        policy_edit = next(
+            item for item in changes
+            if item["family"] == "policy:security" and item["xpath"].endswith("/source")
+        )
+        requests = []
+
+        def api_response(endpoint, params, ctx):
+            requests.append(dict(params))
+            if params["type"] == "config":
+                return '<response status="success" code="20"><result/></response>'
+            if params["type"] == "op":
+                return '<response status="success"><result><job>613</job></result></response>'
+            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post", side_effect=api_response), \
+             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={
+                    "csrf": "incremental-commit-csrf",
+                    "family": [deletion["selection_key"], policy_edit["selection_key"]],
+                },
+                follow_redirects=True,
+            )
+
+        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
+        config_calls = [item for item in requests if item["type"] == "config"]
+        self.assertEqual([item["action"] for item in config_calls], ["delete", "edit"])
+        self.assertTrue(config_calls[0]["xpath"].endswith("/vsys/entry[@name='vsys1']/address/entry[@name='shared-target']"))
+        self.assertTrue(config_calls[1]["xpath"].endswith("/rulebase/security/rules/entry[@name='Migrated sites to Untrust']/source"))
+        self.assertEqual(
+            [node.text for node in main.ET.fromstring(config_calls[1]["element"]).iter("member")],
+            ["existing-source", "shared-target"],
+        )
+
+    def test_same_name_shared_merge_deletes_unused_shadows_before_new_references_in_each_vsys(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address>'
+            b'<entry name="shared-target"><ip-netmask>192.0.2.10/32</ip-netmask></entry>'
+            b'<entry name="existing-source"><ip-netmask>192.0.2.20/32</ip-netmask></entry>'
+            b'</address><address-group><entry name="shared-group"><static><member>shared-target</member>'
+            b'</static></entry></address-group></shared><devices><entry name="localhost.localdomain">'
+            b'<vsys><entry name="vsys1"><address><entry name="shared-target">'
+            b'<ip-netmask>192.0.2.10/32</ip-netmask></entry></address><rulebase><security><rules>'
+            b'<entry name="rule-vsys1"><source><member>existing-source</member></source></entry>'
+            b'</rules></security></rulebase></entry><entry name="vsys2"><address><entry name="shared-target">'
+            b'<ip-netmask>192.0.2.10/32</ip-netmask></entry></address><rulebase><security><rules>'
+            b'<entry name="rule-vsys2"><source><member>existing-source</member></source></entry>'
+            b'</rules></security></rulebase></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        for scope in ("vsys1", "vsys2"):
+            desired_root.find(f"./devices/entry/vsys/entry[@name='{scope}']/address").clear()
+            source = desired_root.find(
+                f"./devices/entry/vsys/entry[@name='{scope}']/rulebase/security/rules/entry/source"
+            )
+            main.ET.SubElement(source, "member").text = "shared-target"
+        desired = main.normalized_config_xml(desired_root)
+        changes = main.config_push_delta(base, desired)
+        selected = {item["selection_key"] for item in changes}
+        plan, _moved = main.panos_scope_move_plan(
+            base, desired, changes,
+            {node: kind for kind, node in main.OBJECT_NODES.items()},
+        )
+
+        self.assertEqual(
+            [item["action"] for item in plan], ["delete", "delete", "edit", "edit"],
+        )
+        self.assertEqual(
+            {item["scope"] for item in plan[:2]}, {"vsys1", "vsys2"},
+        )
+        self.assertTrue(all(item["family"] == "policy:security" for item in plan[2:]))
+        main.validate_incremental_object_deletions(
+            base, desired, {"addresses": ["shared-target"]}, selected,
+        )
+
+    def test_panorama_shared_merge_deletes_unused_shadow_before_new_policy_reference(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address>'
+            b'<entry name="shared-target"><ip-netmask>192.0.2.10/32</ip-netmask></entry>'
+            b'<entry name="existing-source"><ip-netmask>192.0.2.20/32</ip-netmask></entry>'
+            b'</address><address-group><entry name="shared-group"><static><member>shared-target</member>'
+            b'</static></entry></address-group></shared><devices><entry name="localhost.localdomain">'
+            b'<device-group><entry name="DG-A"><address><entry name="shared-target">'
+            b'<ip-netmask>192.0.2.10/32</ip-netmask></entry></address><pre-rulebase><security><rules>'
+            b'<entry name="allow"><source><member>existing-source</member></source></entry>'
+            b'</rules></security></pre-rulebase></entry></device-group></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find("./devices/entry/device-group/entry[@name='DG-A']/address").clear()
+        source = desired_root.find(
+            "./devices/entry/device-group/entry[@name='DG-A']/pre-rulebase/security/rules/entry/source"
+        )
+        main.ET.SubElement(source, "member").text = "shared-target"
+        desired = main.normalized_config_xml(desired_root)
+        changes = main.config_push_delta(base, desired)
+        selected = {item["selection_key"] for item in changes}
+        plan, _moved = main.panos_scope_move_plan(
+            base, desired, changes,
+            {node: kind for kind, node in main.OBJECT_NODES.items()},
+        )
+
+        self.assertEqual([item["action"] for item in plan], ["delete", "edit"])
+        self.assertEqual(plan[0]["scope"], "DG-A")
+        self.assertEqual(plan[1]["scope"], "DG-A")
+        self.assertEqual(plan[1]["family"], "policy:security")
+        main.validate_incremental_object_deletions(
+            base, desired, {"addresses": ["shared-target"]}, selected,
+        )
+
+    def test_panorama_shared_merge_blocks_new_reference_shadowed_by_parent_group(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address>'
+            b'<entry name="shared-target"><ip-netmask>192.0.2.10/32</ip-netmask></entry>'
+            b'<entry name="existing-source"><ip-netmask>192.0.2.20/32</ip-netmask></entry>'
+            b'</address></shared><devices><entry name="localhost.localdomain"><device-group>'
+            b'<entry name="DG-P"><address><entry name="shared-target">'
+            b'<ip-netmask>198.51.100.10/32</ip-netmask></entry></address></entry>'
+            b'<entry name="DG-A"><parent-dg>DG-P</parent-dg><address><entry name="shared-target">'
+            b'<ip-netmask>192.0.2.10/32</ip-netmask></entry></address><pre-rulebase><security><rules>'
+            b'<entry name="allow"><source><member>existing-source</member></source></entry>'
+            b'</rules></security></pre-rulebase></entry></device-group></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find("./devices/entry/device-group/entry[@name='DG-A']/address").clear()
+        source = desired_root.find(
+            "./devices/entry/device-group/entry[@name='DG-A']/pre-rulebase/security/rules/entry/source"
+        )
+        main.ET.SubElement(source, "member").text = "shared-target"
+        desired = main.normalized_config_xml(desired_root)
+        changes = main.config_push_delta(base, desired)
+
+        with self.assertRaisesRegex(main.OfflineConfigError, "bovenliggende scope"):
+            main.panos_scope_move_plan(
+                base, desired, changes,
+                {node: kind for kind, node in main.OBJECT_NODES.items()},
+            )
+
+    def test_new_shared_seed_and_unreferenced_multi_vsys_shadows_are_atomic(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><devices><entry name="localhost.localdomain"><vsys>'
+            b'<entry name="vsys1"><address><entry name="promote-me">'
+            b'<ip-netmask>192.0.2.10/32</ip-netmask></entry></address></entry>'
+            b'<entry name="vsys2"><address><entry name="promote-me">'
+            b'<ip-netmask>192.0.2.10/32</ip-netmask></entry></address></entry>'
+            b'</vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        shared_root = main.ET.SubElement(desired_root, "shared")
+        shared_address = main.ET.SubElement(shared_root, "address")
+        shared_entry = main.ET.SubElement(shared_address, "entry", {"name": "promote-me"})
+        main.ET.SubElement(shared_entry, "ip-netmask").text = "192.0.2.10/32"
+        for scope in ("vsys1", "vsys2"):
+            desired_root.find(
+                f"./devices/entry/vsys/entry[@name='{scope}']/address"
+            ).clear()
+        desired = main.normalized_config_xml(desired_root)
+        changes = main.config_push_delta(base, desired)
+
+        plan, moved = main.panos_scope_move_plan(
+            base, desired, changes,
+            {node: kind for kind, node in main.OBJECT_NODES.items()},
+        )
+
+        self.assertEqual([item["action"] for item in plan], ["multi-config"])
+        transaction = main.ET.fromstring(plan[0]["element"])
+        self.assertEqual([item.tag for item in transaction], ["set", "delete", "delete"])
+        self.assertEqual(transaction[0].get("xpath"), "/config/shared/address")
+        self.assertEqual(transaction[0].find("entry").get("name"), "promote-me")
+        self.assertEqual(
+            {item.get("xpath").split("/vsys/entry[@name='")[1].split("'")[0]
+             for item in transaction.findall("delete")},
+            {"vsys1", "vsys2"},
+        )
+        self.assertEqual(moved, {("addresses", "promote-me")})
 
     def test_same_name_shared_merge_keeps_selected_policy_merge_in_transaction(self):
         base = main.normalized_config_xml(main.ET.fromstring(

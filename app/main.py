@@ -5775,6 +5775,10 @@ def config_push_scope(xpath: str) -> str:
     return "Global"
 
 
+class _UnsafeScopeMergeError(Exception):
+    """Internal signal for a same-name object that would resolve ambiguously."""
+
+
 def panos_scope_move_plan(
     current_xml: bytes, desired_xml: bytes, chosen: list[dict],
     object_type_by_node: dict[str, str],
@@ -5798,6 +5802,7 @@ def panos_scope_move_plan(
     shared_target_seed_entries: dict[int, dict[str, ET.Element]] = defaultdict(dict)
     shared_merge_contexts: dict[str, dict | None] = {}
     shared_merge_names: dict[str, set[str]] = defaultdict(set)
+    early_deletes: list[dict] = []
     for removal in selected_deletes:
         node = removal["family"].split(":", 1)[1]
         object_type = object_type_by_node.get(node)
@@ -5912,8 +5917,28 @@ def panos_scope_move_plan(
                 if value in current_references:
                     refs_by_name[value].append(ref)
             current_api_paths, current_reference_paths, parent = cached_xml_paths(current_root)
-            desired_api_paths, _, _ = cached_xml_paths(desired_root)
+            desired_api_paths, _, desired_parent = cached_xml_paths(desired_root)
             desired_by_path = {path: node for node, path in desired_api_paths.items()}
+            current_nodes_by_api_path = {path: node for node, path in current_api_paths.items()}
+            desired_refs, desired_expressions = _typed_object_reference_nodes(
+                desired_root, object_type,
+            )
+            current_names_by_field: dict[tuple[str, str], dict[str, set[str]]] = defaultdict(
+                lambda: defaultdict(set),
+            )
+            for ref in (*refs, *expressions):
+                value = (ref.text or "").strip()
+                scope = _reference_scope(ref, parent, current_snapshot)
+                field = ref if ref.tag != "member" else parent.get(ref)
+                field_path = current_api_paths.get(field) if field is not None else None
+                if value and scope is not None and field_path:
+                    current_names_by_field[(scope, value)][field_path].add(value)
+            desired_refs_by_scope_name: dict[tuple[str, str], list[ET.Element]] = defaultdict(list)
+            for ref in (*desired_refs, *desired_expressions):
+                value = (ref.text or "").strip()
+                scope = _reference_scope(ref, desired_parent, desired_snapshot)
+                if value and scope is not None:
+                    desired_refs_by_scope_name[(scope, value)].append(ref)
             scope_records: dict[tuple[str, str], list[dict]] = {}
 
             def records(version, scope):
@@ -5937,7 +5962,11 @@ def panos_scope_move_plan(
                 "current_api_paths": current_api_paths,
                 "current_reference_paths": current_reference_paths,
                 "desired_api_paths": desired_api_paths,
+                "desired_parent": desired_parent,
                 "desired_by_path": desired_by_path,
+                "current_nodes_by_api_path": current_nodes_by_api_path,
+                "current_names_by_field": current_names_by_field,
+                "desired_refs_by_scope_name": desired_refs_by_scope_name,
                 "parent": parent,
                 "records": records,
                 "used_names": used_names(current_root),
@@ -5948,7 +5977,9 @@ def panos_scope_move_plan(
             shared_merge_contexts[object_type] = None
             return None
 
-    def existing_shared_merge(removal, object_type, pending_shared_target=None):
+    def existing_shared_merge(
+        removal, object_type, pending_shared_target=None,
+    ) -> tuple[list[dict], bool] | None:
         """Plan a same-name local-to-Shared collapse without deleting live refs.
 
         When Shared already owns an equivalent object, or this push creates
@@ -6067,8 +6098,6 @@ def panos_scope_move_plan(
                     return None
                 source_fields[field_path] = copy.deepcopy(field)
 
-            if not reference_inventory or not source_fields:
-                return None
             if set(reference_inventory) != recognized_paths:
                 return None
             desired_shared_entry = _resolve_scoped_object_entry(
@@ -6076,6 +6105,64 @@ def panos_scope_move_plan(
             )
             if desired_shared_entry is None:
                 return None
+            if not source_fields:
+                # No current reference resolves to the local copy. Remove an
+                # identical local shadow before the ordinary plan can add a
+                # same-name Shared reference; keep a new Shared seed and the
+                # local delete together in one multi-config request.
+                for ref in refs_by_name.get(name, []):
+                    if (ref.text or "").strip() != name:
+                        continue
+                    scope = _reference_scope(ref, parent, current_snapshot)
+                    if scope is None:
+                        return None
+                    resolved = _resolve_scoped_object_entry(
+                        current_root, current_snapshot, scope, object_type, name,
+                    )
+                    if resolved is current_source_entry:
+                        return None
+                # In Panorama, a parent device group's same-name object wins
+                # over Shared. Do not silently redirect a newly added policy
+                # reference to that parent while collapsing a local shadow.
+                current_names_by_field = context["current_names_by_field"].get(
+                    (source_scope, name), {},
+                )
+                for desired_ref in context["desired_refs_by_scope_name"].get(
+                    (source_scope, name), (),
+                ):
+                    desired_field = (
+                        desired_ref if desired_ref.tag != "member"
+                        else context["desired_parent"].get(desired_ref)
+                    )
+                    desired_field_path = (
+                        context["desired_api_paths"].get(desired_field)
+                        if desired_field is not None else None
+                    )
+                    current_field = context["current_nodes_by_api_path"].get(desired_field_path)
+                    current_field_path = (
+                        all_paths.get(current_field) if current_field is not None else None
+                    )
+                    if name in current_names_by_field.get(current_field_path, set()):
+                        continue
+                    if _resolve_scoped_object_entry(
+                        desired_root, desired_snapshot, source_scope, object_type, name,
+                    ) is not desired_shared_entry:
+                        raise _UnsafeScopeMergeError(
+                            f"Shared-merge voor {name} geblokkeerd: een bovenliggende scope "
+                            "bepaalt een ander object met dezelfde naam; niets geschreven",
+                        )
+                if shared is None:
+                    shared_target_seed_entries[id(pending_shared_target)][name] = copy.deepcopy(
+                        pending_target_entry,
+                    )
+                    # The Shared seed and its now-unused local shadows must be
+                    # one atomic API operation. Otherwise the normal selected
+                    # set can consume the seed without actually writing it.
+                    return ([{
+                        "action": "delete", "xpath": removal["xpath"], "element": "",
+                        "family": removal["family"], "label": removal["label"], "name": name,
+                    }], False)
+                return ([], True)
             # Panorama resolves device-group references through parent groups
             # before Shared. Confirm every affected reference still resolves
             # to the intended Shared entry after the local definition leaves.
@@ -6167,7 +6254,7 @@ def panos_scope_move_plan(
                 shared_target_seed_entries[id(pending_shared_target)][name] = copy.deepcopy(
                     pending_target_entry,
                 )
-            return ops
+            return ops, False
         except (OfflineConfigError, KeyError, TypeError, ValueError, ET.ParseError):
             return None
 
@@ -6191,22 +6278,28 @@ def panos_scope_move_plan(
             if item["family"] == removal["family"] and item["scope"] != removal["scope"]
             and name in config_push_change_names(item)
         ]
+        merge_plan = None
         if not targets:
-            merge_ops = existing_shared_merge(removal, object_type)
-            if merge_ops:
-                safe_merge_ops.extend(merge_ops)
-                consumed_deletes.add(id(removal))
-                moved_names.add((object_type, name))
-                continue
+            try:
+                merge_plan = existing_shared_merge(removal, object_type)
+            except _UnsafeScopeMergeError as exc:
+                raise OfflineConfigError(str(exc)) from exc
         elif removal_counts[(removal["family"], name)] > 1:
             shared_targets = [item for item in targets if item.get("scope") == "Shared"]
             if len(shared_targets) == 1:
-                merge_ops = existing_shared_merge(removal, object_type, shared_targets[0])
-                if merge_ops:
-                    safe_merge_ops.extend(merge_ops)
-                    consumed_deletes.add(id(removal))
-                    moved_names.add((object_type, name))
-                    continue
+                try:
+                    merge_plan = existing_shared_merge(removal, object_type, shared_targets[0])
+                except _UnsafeScopeMergeError as exc:
+                    raise OfflineConfigError(str(exc)) from exc
+        if merge_plan is not None:
+            merge_ops, delete_before_selected_changes = merge_plan
+            if delete_before_selected_changes:
+                early_deletes.append(removal)
+            else:
+                safe_merge_ops.extend(merge_ops)
+                moved_names.add((object_type, name))
+            consumed_deletes.add(id(removal))
+            continue
         # Several VSYS can each contain a local duplicate of one Shared
         # object. Collapse each source scope transactionally before applying
         # the uniqueness guard used by ordinary native moves.
@@ -6276,7 +6369,9 @@ def panos_scope_move_plan(
     # Apply each same-name Shared merge as one transactional XML API request.
     # Seed new Shared entries in that same batch so a rejected reference repair
     # cannot leave an orphaned Shared object in the candidate.
-    write_plan = []
+    # Remove proven-unused local shadows before selected changes can introduce
+    # references that PAN-OS would otherwise resolve to the local copy.
+    write_plan = list(early_deletes)
     embedded_policy_paths = {
         change["policy_change_path"] for change in safe_merge_ops
         if change.get("policy_change_path")
@@ -7284,6 +7379,12 @@ def config_workspace_push(workspace_id):
                 push_trace["api_write_count"] += 1
                 push_trace["api_write_ms"] += (time.perf_counter() - api_write_started) * 1000
             action_label = f"{change['action']} {change['label']} {change['name']}"
+            response_status, _response_code, _response_root = policy_api.parse_api_response(response)
+            if response_status in {"error", "unauth"}:
+                # A parsed PAN-OS rejection is a known outcome. Keep the
+                # candidate-refresh warning when earlier writes succeeded,
+                # but do not mislabel this failed request as uncertain.
+                candidate_write_outcome_unknown = False
             response_root = policy_api.require_success(response, action_label)
             if change["action"] == "multi-config":
                 failed_action_responses = [
@@ -7441,7 +7542,8 @@ def config_workspace_push(workspace_id):
                 )
         else:
             state = (
-                f"{applied_changes} wijziging(en) staan al in de candidate; niet gecommit"
+                f"{applied_changes} wijziging(en) staan al in de candidate; niet gecommit. "
+                "Haal eerst de actuele candidate opnieuw op voordat je opnieuw pusht"
                 if applied_changes else "candidate niet gewijzigd"
             )
         flash(f"Incremental push gestopt: {concise_incremental_push_error(exc)}; {state}.", "error")
