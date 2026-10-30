@@ -889,6 +889,59 @@ class IncrementalPushCommitTests(unittest.TestCase):
                 current, desired, {"addresses": ["Google"]}, set(),
             )
 
+    def test_config_push_scope_parses_generated_and_quoted_scope_names(self):
+        quoted_scope = "T]emplate's"
+        quoted_scope_literal = main.policy_api.xpath_literal(quoted_scope)
+        paths = {
+            "/config/devices/entry[@name=localhost.localdomain]/vsys/entry[@name=vsys1]/address": "vsys1",
+            "/config/devices/entry[@name=localhost.localdomain]/device-group/entry[@name=DG-A]/address": "DG-A",
+            "/config/devices/entry[@name=localhost.localdomain]/template/entry[@name=Template-A]/config/devices/entry[@name=localhost.localdomain]/vsys/entry[@name=vsys1]/address": "Template-A",
+            "/config/devices/entry[@name=localhost.localdomain]/template-stack/entry[@name=Stack-A]/template": "Stack-A",
+            f"/config/devices/entry[@name='localhost.localdomain']/template/entry[@name = {quoted_scope_literal}]/config/devices/entry[@name=localhost.localdomain]/vsys/entry[@name=vsys1]/address": quoted_scope,
+        }
+        for path, expected in paths.items():
+            with self.subTest(path=path):
+                self.assertEqual(main.config_push_scope(path), expected)
+
+        self.assertEqual(
+            main.config_push_scope("/config/devices/entry[@name=localhost.localdomain]/vsys/entry[@name='vsys1]/address"),
+            "Scope",
+        )
+
+    def test_generated_unquoted_reference_scope_matches_incremental_dependency_selection(self):
+        current = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<address><entry name="host-a"><ip-netmask>192.0.2.10/32</ip-netmask></entry></address>'
+            b'<address-group><entry name="group-a"><static><member>host-a</member></static></entry></address-group>'
+            b'<rulebase><security><rules><entry name="allow-host"><source><member>host-a</member></source>'
+            b'</entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(current)
+        scope = desired_root.find("./devices/entry/vsys/entry[@name='vsys1']")
+        scope.find("address").clear()
+        scope.find("address-group").clear()
+        scope.find("./rulebase/security/rules/entry/source").clear()
+        desired = main.normalized_config_xml(desired_root)
+
+        changes = main.config_push_delta(current, desired)
+        selected_families = {item["selection_key"] for item in changes}
+        self.assertIn('["vsys1","object:address-group"]', selected_families)
+        self.assertIn('["vsys1","policy:security"]', selected_families)
+        self.assertEqual(
+            main.config_push_scope(
+                "/config/devices/entry[@name=localhost.localdomain]/vsys/entry[@name=vsys1]/"
+                "address-group/entry[@name=group-a]/static/member"
+            ),
+            "vsys1",
+        )
+
+        main.validate_incremental_object_deletions(
+            current,
+            desired,
+            {"addresses": ["host-a"], "address-groups": ["group-a"]},
+            selected_families,
+        )
+
     def test_static_route_destination_reference_without_shared_address_blocks_delete(self):
         current = main.normalized_config_xml(main.ET.fromstring(
             b'<config><shared><address><entry name="Route-Object">'
