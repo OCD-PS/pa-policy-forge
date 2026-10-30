@@ -742,6 +742,142 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertIn("0_NAC_10_10_130_0_24", main.ET.tostring(transaction[1], encoding="unicode"))
         self.assertIn("PF_TMP_", transaction[2].get("xpath"))
 
+    def test_same_name_shared_merge_keeps_selected_policy_merge_in_transaction(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address>'
+            b'<entry name="0_NAC_10_10_130_0_24"><ip-netmask>10.10.130.0/24</ip-netmask></entry>'
+            b'<entry name="canonical-host"><ip-netmask>192.0.2.10/32</ip-netmask></entry>'
+            b'</address></shared><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<address>'
+            b'<entry name="0_NAC_10_10_130_0_24"><ip-netmask>10.10.130.0/24</ip-netmask></entry>'
+            b'<entry name="duplicate-host"><ip-netmask>192.0.2.10/32</ip-netmask></entry>'
+            b'</address><rulebase><security><rules><entry name="Migrated sites to Untrust">'
+            b'<source><member>0_NAC_10_10_130_0_24</member><member>duplicate-host</member></source>'
+            b'</entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/address").clear()
+        source = desired_root.find(
+            "./devices/entry/vsys/entry[@name='vsys1']/rulebase/security/rules/entry/source"
+        )
+        source.find("member[.='duplicate-host']").text = "canonical-host"
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "same-name merge plus duplicate reference", "candidate.xml", desired, "api",
+            baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        changes = main.config_push_delta(base, desired)
+        deletion = next(
+            item for item in changes
+            if item["action"] == "delete" and item["name"] == "0_NAC_10_10_130_0_24"
+        )
+        policy_edit = next(
+            item for item in changes
+            if item["family"] == "policy:security" and item["xpath"].endswith("/source")
+        )
+        requests = []
+
+        def api_response(endpoint, params, ctx):
+            requests.append(dict(params))
+            if params["type"] == "config":
+                if params["action"] == "multi-config":
+                    return (
+                        '<response status="success" code="20"><result>'
+                        '<response status="success" code="20" id="1"/>'
+                        '<response status="success" code="20" id="2"/>'
+                        '<response status="success" code="20" id="3"/>'
+                        '</result></response>'
+                    )
+                return '<response status="success" code="20"><result/></response>'
+            if params["type"] == "op":
+                return '<response status="success"><result><job>611</job></result></response>'
+            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post", side_effect=api_response), \
+             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": [deletion["selection_key"], policy_edit["selection_key"]]},
+                follow_redirects=True,
+            )
+
+        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
+        config_calls = [item for item in requests if item["type"] == "config"]
+        self.assertEqual([item["action"] for item in config_calls], ["multi-config", "delete"])
+        transaction = main.ET.fromstring(config_calls[0]["element"])
+        self.assertEqual([item.tag for item in transaction], ["rename", "edit", "delete"])
+        policy_source = transaction[1]
+        self.assertTrue(policy_source.get("xpath").endswith("/source"))
+        policy_members = [node.text for node in policy_source.findall("./source/member")]
+        self.assertEqual(policy_members, ["0_NAC_10_10_130_0_24", "canonical-host"])
+        self.assertNotIn("duplicate-host", " ".join(policy_members))
+
+        object_only_changes = [item for item in changes if item["family"] == "object:address"]
+        object_only_plan, _ = main.panos_scope_move_plan(
+            base, desired, object_only_changes,
+            {node: kind for kind, node in main.OBJECT_NODES.items()},
+        )
+        object_only_transaction = main.ET.fromstring(object_only_plan[0]["element"])
+        preserved_source = object_only_transaction.find("./edit/source")
+        self.assertIsNotNone(preserved_source)
+        self.assertEqual(
+            [node.text for node in preserved_source.findall("./member")],
+            ["0_NAC_10_10_130_0_24", "duplicate-host"],
+        )
+        with self.assertRaisesRegex(main.OfflineConfigError, "selecteer Security policies"):
+            main.validate_incremental_object_deletions(
+                base, desired, {"addresses": ["duplicate-host"]}, {deletion["selection_key"]},
+            )
+
+    def test_panorama_shared_merge_keeps_selected_policy_delta_in_transaction(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address>'
+            b'<entry name="same-object"><ip-netmask>192.0.2.10/32</ip-netmask></entry>'
+            b'<entry name="canonical-host"><ip-netmask>192.0.2.20/32</ip-netmask></entry>'
+            b'</address></shared><devices><entry name="localhost.localdomain"><device-group>'
+            b'<entry name="DG-A"><address>'
+            b'<entry name="same-object"><ip-netmask>192.0.2.10/32</ip-netmask></entry>'
+            b'<entry name="duplicate-host"><ip-netmask>192.0.2.20/32</ip-netmask></entry>'
+            b'</address><pre-rulebase><security><rules><entry name="allow">'
+            b'<source><member>same-object</member><member>duplicate-host</member></source>'
+            b'</entry></rules></security></pre-rulebase></entry></device-group>'
+            b'</entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find("./devices/entry/device-group/entry[@name='DG-A']/address").clear()
+        source = desired_root.find(
+            "./devices/entry/device-group/entry[@name='DG-A']/pre-rulebase/security/rules/entry/source"
+        )
+        source.find("member[.='duplicate-host']").text = "canonical-host"
+        desired = main.normalized_config_xml(desired_root)
+        changes = main.config_push_delta(base, desired)
+        deletion = next(
+            item for item in changes
+            if item["action"] == "delete" and item["name"] == "same-object"
+        )
+        policy_edit = next(
+            item for item in changes
+            if item["family"] == "policy:security" and item["xpath"].endswith("/source")
+        )
+
+        plan, moved = main.panos_scope_move_plan(
+            base, desired, [deletion, policy_edit],
+            {node: kind for kind, node in main.OBJECT_NODES.items()},
+        )
+
+        self.assertEqual([item["action"] for item in plan], ["multi-config"])
+        self.assertEqual(moved, {("addresses", "same-object")})
+        transaction = main.ET.fromstring(plan[0]["element"])
+        self.assertEqual([item.tag for item in transaction], ["rename", "edit", "delete"])
+        policy_source = transaction[1]
+        self.assertTrue(policy_source.get("xpath").endswith("/source"))
+        self.assertEqual(
+            [node.text for node in policy_source.findall("./source/member")],
+            ["same-object", "canonical-host"],
+        )
+
     def test_same_name_shared_service_merge_handles_multiple_vsys_deletes(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><shared><service><entry name="RadSec"><protocol><tcp><port>2083</port>'

@@ -5977,12 +5977,48 @@ def panos_scope_move_plan(
             if unresolved:
                 return None
 
-            # Fail closed if the merge would also change any reference field.
             desired_by_path = context["desired_by_path"]
+            selected_policy_changes_by_path = {}
+            selected_policy_deletions = []
+            for change in chosen:
+                if not change["family"].startswith("policy:"):
+                    continue
+                selected_policy_changes_by_path[change["xpath"]] = change
+                if change["action"] == "delete":
+                    selected_policy_deletions.append(change)
+
+            def selected_policy_change_for_field(field_path):
+                exact = selected_policy_changes_by_path.get(field_path)
+                if exact is not None:
+                    return exact
+                # A selected policy deletion can remove the whole rule that
+                # owns this field. Keep its current reference in place during
+                # the object transaction; the selected delete runs afterward.
+                return next((
+                    change for change in selected_policy_deletions
+                    if field_path.startswith(change["xpath"].rstrip("/") + "/")
+                ), None)
+
+            reference_fields_to_write = {}
             for field_path, field in source_fields.items():
                 desired_field = desired_by_path.get(field_path)
-                if desired_field is None or ET.tostring(desired_field) != ET.tostring(field):
-                    return None
+                selected_policy_change = selected_policy_change_for_field(field_path)
+                if selected_policy_change is not None and selected_policy_change["action"] == "delete":
+                    # The current field still points at the original name.
+                    # After the local entry is renamed, that name resolves to
+                    # the equivalent Shared object until the selected delete.
+                    continue
+                if desired_field is not None and selected_policy_change is not None:
+                    # Include a policy edit only when its scope/family is part
+                    # of this push. The transaction then owns the field write,
+                    # so the regular plan must not send it a second time.
+                    reference_fields_to_write[field_path] = copy.deepcopy(desired_field)
+                else:
+                    # With no selected policy delta, preserve the live
+                    # reference content while re-homing it to Shared. This
+                    # prevents an object-only push from smuggling in unrelated
+                    # policy edits from the workspace snapshot.
+                    reference_fields_to_write[field_path] = field
 
             used_names = context["used_names"]
             temporary_name = f"PF_TMP_{secrets.token_hex(8)}"
@@ -5995,12 +6031,21 @@ def panos_scope_move_plan(
                 "action": "rename", "xpath": removal["xpath"], "newname": temporary_name,
                 "family": removal["family"], "label": label, "name": name,
             }]
-            for field_path, field in source_fields.items():
-                ops.append({
+            for field_path, field in reference_fields_to_write.items():
+                operation = {
                     "action": "edit", "xpath": field_path,
                     "element": ET.tostring(field, encoding="unicode"),
                     "family": removal["family"], "label": label, "name": name,
-                })
+                }
+                selected_policy_change = selected_policy_change_for_field(field_path)
+                desired_field = desired_by_path.get(field_path)
+                if (
+                    selected_policy_change is not None
+                    and desired_field is not None
+                    and ET.tostring(desired_field) != ET.tostring(source_fields[field_path])
+                ):
+                    operation["policy_change_path"] = field_path
+                ops.append(operation)
             ops.append({
                 "action": "delete", "xpath": temporary_xpath, "element": "",
                 "family": removal["family"], "label": label, "name": name,
@@ -6106,6 +6151,10 @@ def panos_scope_move_plan(
     # PAN-OS rolls the batch back if one step fails, so a transient rename can
     # never strand the candidate between the rename and reference repair.
     write_plan = []
+    embedded_policy_paths = {
+        change["policy_change_path"] for change in safe_merge_ops
+        if change.get("policy_change_path")
+    }
     if safe_merge_ops:
         transaction = ET.Element("multi-config")
         for change in safe_merge_ops:
@@ -6126,6 +6175,8 @@ def panos_scope_move_plan(
             "operation_count": len(safe_merge_ops),
         })
     for change in chosen:
+        if change["family"].startswith("policy:") and change["xpath"] in embedded_policy_paths:
+            continue
         move_ops = moves_by_target.get(id(change), [])
         if move_ops:
             write_plan.extend(move_ops)
