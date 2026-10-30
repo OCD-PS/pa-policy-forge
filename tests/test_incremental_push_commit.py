@@ -1078,6 +1078,215 @@ class IncrementalPushCommitTests(unittest.TestCase):
             selected_families,
         )
 
+    def test_new_vsys_reference_to_unchanged_shared_address_allows_local_delete(self):
+        current = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address><entry name="shared-net">'
+            b'<ip-netmask>10.10.115.0/24</ip-netmask></entry></address><address-group>'
+            b'<entry name="shared-group"><static><member>shared-net</member></static>'
+            b'</entry></address-group></shared>'
+            b'<devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<address><entry name="shared-net"><ip-netmask>10.10.115.0/24</ip-netmask>'
+            b'</entry><entry name="legacy-net"><ip-netmask>10.10.115.0/24</ip-netmask>'
+            b'</entry></address><rulebase><security><rules><entry name="Migrated sites to Untrust">'
+            b'<source><member>legacy-net</member></source>'
+            b'</entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(current)
+        desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/address").remove(
+            desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/address/entry[@name='shared-net']")
+        )
+        desired_root.find(
+            "./devices/entry/vsys/entry[@name='vsys1']/rulebase/security/rules/entry/source/member"
+        ).text = "shared-net"
+        desired = main.normalized_config_xml(desired_root)
+        changes = main.config_push_delta(current, desired)
+
+        main.validate_incremental_object_deletions(
+            current,
+            desired,
+            {"addresses": ["shared-net"]},
+            {item["selection_key"] for item in changes},
+        )
+
+    def test_new_vsys_reference_to_changed_shared_address_stays_blocked(self):
+        current = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address><entry name="shared-net">'
+            b'<ip-netmask>10.10.115.0/24</ip-netmask></entry></address><address-group>'
+            b'<entry name="shared-group"><static><member>shared-net</member></static>'
+            b'</entry></address-group></shared>'
+            b'<devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<address><entry name="shared-net"><ip-netmask>10.10.115.0/24</ip-netmask>'
+            b'</entry><entry name="legacy-net"><ip-netmask>10.10.115.0/24</ip-netmask>'
+            b'</entry></address><rulebase><security><rules><entry name="Migrated sites to Untrust">'
+            b'<source><member>legacy-net</member></source>'
+            b'</entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(current)
+        desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/address").remove(
+            desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/address/entry[@name='shared-net']")
+        )
+        desired_root.find("./shared/address/entry[@name='shared-net']/ip-netmask").text = "10.10.115.128/25"
+        desired_root.find(
+            "./devices/entry/vsys/entry[@name='vsys1']/rulebase/security/rules/entry/source/member"
+        ).text = "shared-net"
+        desired = main.normalized_config_xml(desired_root)
+        changes = main.config_push_delta(current, desired)
+
+        with self.assertRaisesRegex(main.OfflineConfigError, "objecten zijn nog in gebruik"):
+            main.validate_incremental_object_deletions(
+                current,
+                desired,
+                {"addresses": ["shared-net"]},
+                {item["selection_key"] for item in changes},
+            )
+
+    def test_renamed_rule_does_not_make_existing_local_reference_look_new(self):
+        current = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address><entry name="duplicate-net">'
+            b'<ip-netmask>10.10.115.20/32</ip-netmask></entry></address></shared>'
+            b'<devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<address><entry name="duplicate-net"><ip-netmask>10.10.115.10/32</ip-netmask>'
+            b'</entry></address><rulebase><security><rules><entry name="old-rule">'
+            b'<source><member>duplicate-net</member></source>'
+            b'</entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(current)
+        scope = desired_root.find("./devices/entry/vsys/entry[@name='vsys1']")
+        scope.find("address").remove(scope.find("address/entry[@name='duplicate-net']"))
+        rule = scope.find("./rulebase/security/rules/entry[@name='old-rule']")
+        rule.set("name", "renamed-rule")
+        desired = main.normalized_config_xml(desired_root)
+        changes = main.config_push_delta(current, desired)
+
+        with self.assertRaisesRegex(main.OfflineConfigError, "objecten zijn nog in gebruik"):
+            main.validate_incremental_object_deletions(
+                current,
+                desired,
+                {"addresses": ["duplicate-net"]},
+                {item["selection_key"] for item in changes},
+            )
+
+    def test_existing_reference_in_other_vsys_can_already_inherit_shared_object(self):
+        current = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address><entry name="shared-net">'
+            b'<ip-netmask>10.10.115.20/32</ip-netmask></entry></address></shared>'
+            b'<devices><entry name="localhost.localdomain"><vsys>'
+            b'<entry name="vsys1"><address><entry name="shared-net">'
+            b'<ip-netmask>10.10.115.20/32</ip-netmask></entry></address></entry>'
+            b'<entry name="vsys2"><rulebase><security><rules><entry name="existing-rule">'
+            b'<source><member>shared-net</member></source>'
+            b'</entry></rules></security></rulebase></entry>'
+            b'</vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(current)
+        vsys1 = desired_root.find("./devices/entry/vsys/entry[@name='vsys1']")
+        vsys1.find("address").remove(vsys1.find("address/entry[@name='shared-net']"))
+        vsys1.append(main.ET.fromstring(
+            b'<rulebase><security><rules><entry name="new-rule">'
+            b'<source><member>shared-net</member></source>'
+            b'</entry></rules></security></rulebase>'
+        ))
+        desired = main.normalized_config_xml(desired_root)
+        changes = main.config_push_delta(current, desired)
+
+        main.validate_incremental_object_deletions(
+            current,
+            desired,
+            {"addresses": ["shared-net"]},
+            {item["selection_key"] for item in changes},
+        )
+
+    def test_same_address_group_xml_does_not_prove_shadowed_members_are_equivalent(self):
+        current = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><address><entry name="A"><ip-netmask>10.10.115.20/32</ip-netmask>'
+            b'</entry></address><address-group><entry name="G"><static><member>A</member>'
+            b'</static></entry></address-group></shared>'
+            b'<devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<address><entry name="A"><ip-netmask>10.10.115.10/32</ip-netmask></entry></address>'
+            b'<address-group><entry name="G"><static><member>A</member></static></entry></address-group>'
+            b'<rulebase><security><rules><entry name="allow-group">'
+            b'<source><member>G</member></source>'
+            b'</entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(current)
+        desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/address-group").remove(
+            desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/address-group/entry[@name='G']")
+        )
+        desired = main.normalized_config_xml(desired_root)
+        changes = main.config_push_delta(current, desired)
+
+        with self.assertRaisesRegex(main.OfflineConfigError, "objecten zijn nog in gebruik"):
+            main.validate_incremental_object_deletions(
+                current,
+                desired,
+                {"address-groups": ["G"]},
+                {item["selection_key"] for item in changes},
+            )
+
+    def test_same_log_forwarding_xml_does_not_prove_scoped_syslog_targets_match(self):
+        current = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><server-profile><syslog><entry name="siem"><server>'
+            b'<entry name="collector"><server>192.0.2.10</server><transport>UDP</transport>'
+            b'<port>514</port></entry></server></entry></syslog></server-profile>'
+            b'<log-settings><profiles><entry name="forward"><match-list><entry name="traffic">'
+            b'<log-type>traffic</log-type><send-syslog><member>siem</member></send-syslog>'
+            b'</entry></match-list></entry></profiles></log-settings></shared>'
+            b'<devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<server-profile><syslog><entry name="siem"><server><entry name="collector">'
+            b'<server>192.0.2.20</server><transport>UDP</transport><port>514</port>'
+            b'</entry></server></entry></syslog></server-profile>'
+            b'<log-settings><syslog><entry name="siem"/></syslog><profiles>'
+            b'<entry name="forward"><match-list><entry name="traffic"><log-type>traffic</log-type>'
+            b'<send-syslog><member>siem</member></send-syslog></entry></match-list></entry>'
+            b'</profiles></log-settings><rulebase><security><rules><entry name="allow-logged">'
+            b'<log-setting>forward</log-setting></entry></rules></security></rulebase>'
+            b'</entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(current)
+        desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/log-settings/profiles").remove(
+            desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/log-settings/profiles/entry[@name='forward']")
+        )
+        desired = main.normalized_config_xml(desired_root)
+        changes = main.config_push_delta(current, desired)
+
+        with self.assertRaisesRegex(main.OfflineConfigError, "objecten zijn nog in gebruik"):
+            main.validate_incremental_object_deletions(
+                current,
+                desired,
+                {"log-forwarding": ["forward"]},
+                {item["selection_key"] for item in changes},
+            )
+
+    def test_same_hip_profile_expression_does_not_prove_scoped_hip_objects_match(self):
+        current = main.normalized_config_xml(main.ET.fromstring(
+            b'<config><shared><hip-objects><entry name="endpoint-check"><host-info>'
+            b'<criteria><os><contains><Microsoft>Windows</Microsoft></contains></os></criteria>'
+            b'</host-info></entry></hip-objects><hip-profiles><entry name="posture">'
+            b'<match>endpoint-check</match></entry></hip-profiles></shared>'
+            b'<devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">'
+            b'<hip-objects><entry name="endpoint-check"><host-info><criteria><os>'
+            b'<contains><Microsoft>Linux</Microsoft></contains></os></criteria></host-info>'
+            b'</entry></hip-objects><hip-profiles><entry name="posture">'
+            b'<match>endpoint-check</match></entry></hip-profiles>'
+            b'<rulebase><security><rules><entry name="allow-healthy">'
+            b'<source-hip><member>posture</member></source-hip>'
+            b'</entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(current)
+        desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/hip-profiles").remove(
+            desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/hip-profiles/entry[@name='posture']")
+        )
+        desired = main.normalized_config_xml(desired_root)
+        changes = main.config_push_delta(current, desired)
+
+        with self.assertRaisesRegex(main.OfflineConfigError, "objecten zijn nog in gebruik"):
+            main.validate_incremental_object_deletions(
+                current,
+                desired,
+                {"hip-profiles": ["posture"]},
+                {item["selection_key"] for item in changes},
+            )
+
     def test_static_route_destination_reference_without_shared_address_blocks_delete(self):
         current = main.normalized_config_xml(main.ET.fromstring(
             b'<config><shared><address><entry name="Route-Object">'
