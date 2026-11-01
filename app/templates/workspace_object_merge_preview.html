@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Dubbele objecten samenvoegen · PA Policy Forge</title>
+  <title>Duplicaten samenvoegen naar Shared · PA Policy Forge</title>
   <link rel="icon" href="{{url_for('static',filename='favicon.svg',v=asset_version)}}" type="image/svg+xml">
   <link rel="stylesheet" href="{{url_for('static',filename='app.css',v=asset_version)}}">
 </head>
@@ -11,17 +11,15 @@
 <main class="content" style="margin:auto">
   <div class="page-header">
     <div>
-      <p class="eyebrow">{{workspace.name}} · {{draft.scope}}</p>
-      <h1>Dubbele {{object_label}} samenvoegen</h1>
-      <p class="muted">Kies per groep precies één master. {% if draft.operation=='merge_to_shared' %}De gekozen definitie wordt Shared; resolvabele policy- en objectreferenties in alle VSYS worden daarnaar omgezet.{% else %}Policy- en objectreferenties worden naar de master omgezet.{% endif %} De nieuwe workspaceversie verwijdert de duplicaten.</p>
+      <p class="eyebrow">{{workspace.profile_name}} · {{draft.scope}}</p>
+      <h1>{{object_label}} samenvoegen naar Shared</h1>
+      <p class="muted">Kies per groep precies één master. De gekozen definitie wordt Shared; resolvabele policy- en objectreferenties in alle VSYS worden daarnaar omgezet. De nieuwe workspaceversie verwijdert de duplicaten.</p>
     </div>
   </div>
   <div class="card stack">
     <div class="callout">
       <strong>{{draft.groups|length}} duplicaatgroep(en) gevonden</strong><br>
-      {% if draft.operation=='merge_to_shared' %}De scan vergelijkt definities in Shared en alle VSYS van deze standalone multi-VSYS-firewall. Shared is standaard geselecteerd waar beschikbaar. Lokale objecten met dezelfde naam die niet in de groep zitten, en onveilige verwijzingen, blokkeren de samenvoeging.{% else %}
-      Alleen dezelfde instellingen komen in een groep. Description en comments van de gekozen master blijven behouden. Bij services worden tags samengevoegd. De scan omvat objecttypen met een volledige, getypeerde referentiecontrole.
-      {% endif %}
+      De scan vergelijkt definities in Shared en alle VSYS van deze standalone multi-VSYS-firewall. Shared is standaard geselecteerd waar beschikbaar. Lokale objecten met dezelfde naam die niet in de groep zitten, en onveilige verwijzingen, blokkeren de samenvoeging.
     </div>
     <form method="post" action="{{url_for('config_workspace_object_apply',draft_id=draft_id)}}" class="stack">
       <input type="hidden" name="csrf" value="{{csrf_token()}}">
@@ -45,7 +43,7 @@
             <tbody>
             {% for item in group.objects %}
             <tr>
-              <td><input class="workspace-merge-radio" type="radio" name="master_{{group.id}}" value="{{item.candidate_id if draft.operation=='merge_to_shared' else item.name}}" {{'checked' if loop.first else ''}} required aria-label="Gebruik {{item.name}} uit {{item.owner}} als master"></td>
+              <td><input class="workspace-merge-radio" type="radio" name="master_{{group.id}}" value="{{item.candidate_id}}" {{'checked' if loop.first else ''}} required aria-label="Gebruik {{item.name}} uit {{item.owner}} als master"></td>
               <td><strong>{{item.name}}</strong></td>
               <td>{{item.owner}}</td>
               <td>{{item.summary or '—'}}</td>

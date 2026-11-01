@@ -81,8 +81,7 @@ from app.offline_config import (
     _merge_object_signature, _reference_scope, _resolve_scoped_object_entry,
     _is_panos_global_address_reference,
     _typed_object_reference_nodes,
-    duplicate_object_groups, duplicate_object_groups_across_panos_scopes,
-    merge_duplicate_object_groups, merge_duplicate_object_groups_to_shared,
+    duplicate_object_groups_across_panos_scopes, merge_duplicate_object_groups_to_shared,
     move_panos_scope_entries,
     replace_policy_in_snapshot, replace_policies_in_snapshot, insert_policy_in_snapshot,
     delete_policies_from_snapshot, move_policies_in_snapshot,
@@ -4493,13 +4492,6 @@ def config_workspace_editor(workspace_id):
             object_query=object_query, object_page=object_page,
             object_page_count=object_page_count, object_total=object_total,
             workspace_object_page_size=WORKSPACE_OBJECT_PAGE_SIZE,
-            # Duplicate merging rewrites PAN-OS XML references; SCM uses a
-            # different API model and must not expose this XML-only action.
-            workspace_mergeable_object_types=(
-                MERGEABLE_OBJECT_TYPES
-                if workspace_profile["target_type"] in {"panos", "panorama"}
-                else ()
-            ),
             workspace_object_catalog=workspace_object_catalog,
             workspace_object_create_template=workspace_object_create_template,
             workspace_policy_catalog=workspace_policy_catalog,
@@ -5018,74 +5010,6 @@ def config_workspace_object_preview(workspace_id):
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, scope=scope, workspace_view="objects", object_type=object_type))
 
 
-@app.post("/config-workspaces/<int:workspace_id>/objects/merge-preview")
-@login_required
-def config_workspace_object_merge_preview(workspace_id):
-    workspace = workspace_row(workspace_id)
-    if not workspace:
-        return "Not found", 404
-    scope = request.form.get("scope", "")
-    return_object_type = request.form.get("object_type", "")
-    merge_all_types = request.form.get("merge_all_types") == "yes"
-    object_type = "__all__" if merge_all_types else return_object_type
-    try:
-        if workspace["target_type"] not in {"panos", "panorama"}:
-            raise OfflineConfigError("Duplicaten samenvoegen is alleen beschikbaar voor PAN-OS- en Panorama-XML")
-        if not merge_all_types and object_type not in MERGEABLE_OBJECT_TYPES:
-            raise OfflineConfigError("Samenvoegen is voor dit objecttype niet veilig beschikbaar")
-        xml_bytes, parsed_root, snapshot = cached_workspace_config(
-            workspace["config_path"], workspace["sha256"],
-        )
-        if scope not in available_scopes(snapshot) and not (scope == "Shared" and snapshot.kind == "panos"):
-            raise OfflineConfigError("De geselecteerde scope bestaat niet meer")
-        object_types = sorted(MERGEABLE_OBJECT_TYPES) if merge_all_types else [object_type]
-        groups = []
-        for candidate_type in object_types:
-            label = SCM_OBJECT_TYPES.get(candidate_type, {}).get("label", candidate_type)
-            candidate_groups = duplicate_object_groups(
-                xml_bytes, scope, candidate_type, parsed=(parsed_root, snapshot),
-            )
-            groups.extend({
-                **group,
-                "object_type": candidate_type,
-                "object_label": label,
-            } for group in candidate_groups)
-        if not groups:
-            flash(
-                f"Geen functioneel identieke objecten gevonden in {len(object_types)} ondersteunde object- en servicetypen binnen {scope}.",
-                "info",
-            )
-            return redirect(url_for(
-                "config_workspace_editor", workspace_id=workspace_id, scope=scope,
-                workspace_view="objects", object_type=return_object_type,
-            ))
-        draft_id = secrets.token_urlsafe(24)
-        draft = {
-            "workspace_id": workspace_id, "scope": scope, "object_type": object_type,
-            "return_object_type": return_object_type,
-            "object_types": object_types,
-            "operation": "merge", "groups": groups, "created_at": now(),
-        }
-        draft_path = OBJECT_DRAFTS / f"offline-object-{draft_id}.json"
-        draft_path.write_text(json.dumps(draft))
-        draft_path.chmod(0o600)
-        return render_template(
-            "workspace_object_merge_preview.html", workspace=workspace,
-            draft=draft, draft_id=draft_id,
-            object_label=(
-                "alle ondersteunde objecten en services"
-                if merge_all_types
-                else SCM_OBJECT_TYPES.get(object_type, {}).get("label", object_type)
-            ),
-        )
-    except Exception as exc:
-        flash(f"Duplicaten niet voorbereid: {exc}", "error")
-        return redirect(url_for(
-            "config_workspace_editor", workspace_id=workspace_id, scope=scope,
-            workspace_view="objects", object_type=return_object_type,
-        ))
-
-
 @app.post("/config-workspaces/<int:workspace_id>/objects/merge-shared-preview")
 @login_required
 def config_workspace_object_merge_shared_preview(workspace_id):
@@ -5138,7 +5062,7 @@ def config_workspace_object_merge_shared_preview(workspace_id):
         return render_template(
             "workspace_object_merge_preview.html", workspace=workspace,
             draft=draft, draft_id=draft_id,
-            object_label="alle ondersteunde objecten en services tussen scopes",
+            object_label="Duplicaten",
         )
     except Exception as exc:
         flash(f"Duplicaten niet voorbereid: {exc}", "error")
@@ -5236,24 +5160,7 @@ def config_workspace_object_apply(draft_id):
                 workspace_config_path(workspace).read_bytes(), selections,
             )
         elif draft.get("operation") == "merge":
-            selections = []
-            for group in draft.get("groups", []):
-                object_type = group.get("object_type", draft.get("object_type"))
-                if object_type not in MERGEABLE_OBJECT_TYPES:
-                    raise OfflineConfigError("Samenvoegen is voor dit objecttype niet veilig ondersteund")
-                names = [item["name"] for item in group.get("objects", [])]
-                master = request.form.get(f"master_{group.get('id', '')}", "")
-                if master not in names:
-                    raise OfflineConfigError("Kies precies één masterobject per duplicaatgroep")
-                selections.append({
-                    "object_type": object_type,
-                    "names": names,
-                    "master": master,
-                    "fingerprints": {item["name"]: item["fingerprint"] for item in group["objects"]},
-                })
-            new_xml, merge_summary = merge_duplicate_object_groups(
-                workspace_config_path(workspace).read_bytes(), draft["scope"], selections,
-            )
+            raise OfflineConfigError("Deze samenvoegactie is verwijderd; maak een nieuwe preview")
         elif draft.get("operation") == "delete":
             source_xml = workspace_config_path(workspace).read_bytes()
             validate_workspace_object_deletions(
@@ -5285,10 +5192,10 @@ def config_workspace_object_apply(draft_id):
             f"types={','.join(draft.get('object_types', [draft['object_type']]))} "
             f"operation={draft['operation']}",
         )
-        if draft.get("operation") in {"merge", "merge_to_shared"}:
-            destination = " naar Shared" if draft.get("operation") == "merge_to_shared" else ""
+        if draft.get("operation") == "merge_to_shared":
             flash(
-                f"{merge_summary['merged']} duplicaatobject(en){destination} samengevoegd in {merge_summary['groups']} groep(en); referenties bijgewerkt.",
+                f"{merge_summary['merged']} duplicaatobject(en) naar Shared samengevoegd in "
+                f"{merge_summary['groups']} groep(en); referenties bijgewerkt.",
                 "success",
             )
         else:
