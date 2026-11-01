@@ -2560,6 +2560,48 @@ def migration_discovery(model: MigrationModel) -> dict:
     }
 
 
+def panos_candidate_zone_reference_errors_from_root(
+    root: ET.Element,
+    selected_policy_scopes: Iterable[str],
+) -> list[str]:
+    """Check zone references only in VSYS scopes affected by a PAN-OS push.
+
+    The incremental-push path needs this one safety check before writing. A full
+    migration analysis also builds a migration model and scans applications,
+    addresses, services, and groups, so using it here needlessly walks a large
+    candidate multiple times.
+    """
+    if root.tag != "config":
+        raise MigrationError("Geen PAN-OS <config>-root gevonden")
+
+    scopes = {str(scope).strip() for scope in selected_policy_scopes if str(scope).strip()}
+    if not scopes:
+        return []
+    check_all_vsyses = "Shared" in scopes
+    unresolved_zones = []
+    for device in root.findall("./devices/entry"):
+        for vsys in device.findall("./vsys/entry"):
+            vsys_name = str(vsys.get("name", "")).strip() or "<unnamed-vsys>"
+            if not check_all_vsyses and vsys_name not in scopes:
+                continue
+            zone_names = {
+                str(entry.get("name", "")).strip()
+                for entry in vsys.findall("./zone/entry")
+                if str(entry.get("name", "")).strip()
+            }
+            for rulebase_name in ("rulebase", "pre-rulebase", "post-rulebase"):
+                for rule in vsys.findall(f"./{rulebase_name}/*/rules/entry"):
+                    rule_name = str(rule.get("name", "")).strip() or "<unnamed-rule>"
+                    for field in ("from", "to"):
+                        for member in rule.findall(f"./{field}/member"):
+                            zone = str(member.text or "").strip()
+                            if zone and zone.casefold() != "any" and zone not in zone_names:
+                                unresolved_zones.append(
+                                    f"vsys {vsys_name}: {rule_name} -> {field} -> {zone}"
+                                )
+    return sorted(set(unresolved_zones), key=str.casefold)
+
+
 def panos_candidate_analysis(
     content: bytes | str,
     predefined_applications: Iterable[str] | None = None,

@@ -117,6 +117,21 @@ class IncrementalPushCommitTests(unittest.TestCase):
             with self.subTest(config=config_xml):
                 self.assertIs(main.batch_panos_config_write_plan(plan, config_xml), plan)
 
+    def test_multi_config_batching_caps_roundtrips_at_one_hundred_operations(self):
+        plan = [
+            {"action": "set", "xpath": f"/config/shared/address/entry[@name='host-{index}']",
+             "element": f"<entry name='host-{index}'><ip-netmask>192.0.2.{index % 254 + 1}/32</ip-netmask></entry>",
+             "family": "object:address", "label": "Addresses", "name": f"host-{index}"}
+            for index in range(101)
+        ]
+
+        batched = main.batch_panos_config_write_plan(plan, b'<config version="12.1.0" />')
+
+        self.assertEqual(len(batched), 2)
+        self.assertEqual(batched[0]["action"], "multi-config")
+        self.assertEqual(batched[0]["operation_count"], 100)
+        self.assertIs(batched[1], plan[100])
+
     def test_explicit_api_rejection_after_confirmed_write_requests_refresh_without_uncertain_label(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address>'
