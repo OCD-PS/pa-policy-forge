@@ -13,7 +13,7 @@ os.environ.setdefault("PPF_DATA_DIR", tempfile.mkdtemp(prefix="forge-migration-t
 os.environ.setdefault("PPF_SYSLOG_PORT", "55149")
 os.environ.setdefault("PPF_BOOTSTRAP_PASSWORD", "unit-test-bootstrap-password")
 
-from app.migration import Address, MigrationModel, PARSERS, MigrationError, apply_family_mappings, apply_merge_rules, apply_transform_rules, auto_map_nat_topology, merge_inventory, merge_model_into_panos_xml, migration_analysis, migration_api_plan, migration_base_xml, migration_best_practices, migration_collision_report, migration_discovery, migration_filter_inventory, migration_health_dashboard, migration_review_findings, migration_zone_names, panos_candidate_analysis, parse_vendor, panos_fragment, reconcile_model, scm_items, set_panos_ha_mode
+from app.migration import Address, MigrationModel, PARSERS, MigrationError, apply_family_mappings, apply_merge_rules, apply_transform_rules, auto_map_nat_topology, merge_inventory, merge_model_into_panos_xml, migration_analysis, migration_api_plan, migration_base_xml, migration_best_practices, migration_collision_report, migration_discovery, migration_filter_inventory, migration_health_dashboard, migration_review_findings, migration_zone_names, panos_candidate_analysis, panos_candidate_zone_reference_errors_from_root, parse_vendor, panos_fragment, reconcile_model, scm_items, set_panos_ha_mode
 from app import main
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -821,6 +821,26 @@ access-list OUT extended permit tcp any object WEB eq 443''', "asa.txt")
         candidate = b'''<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase><security><rules><entry name="allow-update"><from><member>any</member></from><to><member>any</member></to><source><member>any</member></source><destination><member>any</member></destination><application><member>ms-update</member></application><service><member>application-default</member></service><action>allow</action></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'''
         analysis = panos_candidate_analysis(candidate)
         self.assertNotIn("ms-update", analysis["unresolved_application_references"])
+
+    def test_incremental_push_zone_check_scans_only_selected_vsys_or_all_for_shared(self):
+        candidate = ET.fromstring(b'''<config><devices><entry name="localhost.localdomain"><vsys>
+            <entry name="vsys1"><zone><entry name="Trust"/></zone><rulebase><security><rules>
+                <entry name="valid"><from><member>Trust</member></from><to><member>any</member></to></entry>
+            </rules></security></rulebase></entry>
+            <entry name="vsys2"><zone><entry name="DMZ"/></zone><rulebase><security><rules>
+                <entry name="invalid"><from><member>Missing</member></from><to><member>DMZ</member></to></entry>
+            </rules></security></rulebase></entry>
+        </vsys></entry></devices></config>''')
+
+        self.assertEqual(panos_candidate_zone_reference_errors_from_root(candidate, {"vsys1"}), [])
+        self.assertEqual(
+            panos_candidate_zone_reference_errors_from_root(candidate, {"vsys2"}),
+            ["vsys vsys2: invalid -> from -> Missing"],
+        )
+        self.assertEqual(
+            panos_candidate_zone_reference_errors_from_root(candidate, {"Shared"}),
+            ["vsys vsys2: invalid -> from -> Missing"],
+        )
 
     def test_nat_topology_is_inferred_only_from_unambiguous_target(self):
         target = b'''<config><devices><entry name="localhost.localdomain"><network><interface><ethernet><entry name="ethernet1/1"><layer3><ip><entry name="10.0.0.1/24"/></ip></layer3></entry><entry name="ethernet1/2"><layer3><ip><entry name="198.51.100.1/24"/></ip></layer3></entry></ethernet></interface><virtual-router><entry name="default"><routing-table><ip><static-route><entry name="default"><destination>0.0.0.0/0</destination><interface>ethernet1/2</interface></entry></static-route></ip></routing-table></entry></virtual-router></network><vsys><entry name="vsys1"><zone><entry name="Trust"><network><layer3><member>ethernet1/1</member></layer3></network></entry><entry name="Untrust"><network><layer3><member>ethernet1/2</member></layer3></network></entry></zone><rulebase/></entry></vsys></entry></devices></config>'''

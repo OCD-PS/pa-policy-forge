@@ -63,7 +63,8 @@ from app.migration import (
     migration_discovery, migration_filter_inventory, migration_health_dashboard, migration_zone_names, migration_topology_targets,
     migration_interface_zone_memberships,
     clean_name, item_selector, merge_member_names, migration_analysis, migration_item_semantic, migration_review_findings,
-    migration_search, model_collections, panos_candidate_analysis, panos_fragment, parse_vendor, raw_item_payload,
+    migration_search, model_collections, panos_candidate_analysis,
+    panos_candidate_zone_reference_errors_from_root, panos_fragment, parse_vendor, raw_item_payload,
     reconcile_model, scm_items, restore_migration_source_topology,
 )
 from app.offline_config import (
@@ -3797,7 +3798,8 @@ def validate_selected_deletion_dependencies(
 
 def validate_incremental_object_deletions(
     current_xml: bytes, desired_xml: bytes, deleted_objects: dict[str, list[str]],
-    selected_families: set[str],
+    selected_families: set[str], parsed_pair: tuple | None = None,
+    desired_parsed: tuple | None = None,
 ) -> None:
     """Validate all selected object deletions with one scan per XML snapshot."""
     reference_bearing_object_types = {
@@ -3812,8 +3814,11 @@ def validate_incremental_object_deletions(
     }
     if not names_by_type:
         return
-    current_parsed = parse_snapshot(current_xml)
-    desired_parsed = parse_snapshot(desired_xml)
+    if parsed_pair is None:
+        current_parsed = parse_snapshot(current_xml)
+        desired_parsed = desired_parsed or parse_snapshot(desired_xml)
+    else:
+        current_parsed, desired_parsed = parsed_pair
     current_reference_nodes = {}
     desired_reference_nodes = {}
     current_indexes = object_reference_indexes(
@@ -5781,8 +5786,8 @@ class _UnsafeScopeMergeError(Exception):
 
 def panos_scope_move_plan(
     current_xml: bytes, desired_xml: bytes, chosen: list[dict],
-    object_type_by_node: dict[str, str],
-) -> tuple[list[dict], set[tuple[str, str]]]:
+    object_type_by_node: dict[str, str], *, return_parsed: bool = False,
+) -> tuple[list[dict], set[tuple[str, str]]] | tuple[list[dict], set[tuple[str, str]], tuple | None]:
     """Use PAN-OS multi-move for objects relocated between scopes.
 
     A set-then-delete sequence fails when policies still reference a local
@@ -6438,12 +6443,17 @@ def panos_scope_move_plan(
             continue
         if id(change) not in consumed_deletes:
             write_plan.append(change)
+    if return_parsed:
+        return write_plan, moved_names, parsed_snapshots_cache
     return write_plan, moved_names
 
 
 PANOS_MULTI_CONFIG_MIN_VERSION = (10, 2)
-PANOS_MULTI_CONFIG_BATCH_SIZE = 25
-PANOS_MULTI_CONFIG_MAX_BYTES = 256 * 1024
+PANOS_MULTI_CONFIG_BATCH_SIZE = 100
+# PAN-OS documents a 5 MiB ceiling for XML API POST bodies. Leave headroom for
+# URL-encoding expansion and request parameters; the XML element itself stays
+# below 512 KiB even when configuration names contain non-ASCII characters.
+PANOS_MULTI_CONFIG_MAX_BYTES = 512 * 1024
 
 
 def panos_multi_config_supported(config_xml: bytes) -> bool:
@@ -7393,7 +7403,7 @@ def config_workspace_push(workspace_id):
         available = {item["selection_key"] for item in changes}
         if not selected.issubset(available):
             raise RuntimeError("De geselecteerde scope/familie hoort niet bij deze candidatepreview")
-        start_push_phase("plan_and_dependency_checks")
+        start_push_phase("selection_checks")
         scope_move_targets = defaultdict(list)
         for target_change in changes:
             # A same-name object may already exist in Shared. Updating that
@@ -7428,21 +7438,25 @@ def config_workspace_push(workspace_id):
         if not chosen:
             raise RuntimeError("De selectie bevat geen wijzigingen")
         object_type_by_node = {node: kind for kind, node in OBJECT_NODES.items()}
-        write_plan, native_moved_names = panos_scope_move_plan(
-            current_xml, push_desired_xml, chosen, object_type_by_node,
+        selected_policy_scopes = {
+            item["scope"] for item in chosen if item["family"].startswith("policy:")
+        }
+        start_push_phase("scope_move_planning")
+        write_plan, native_moved_names, parsed_pair = panos_scope_move_plan(
+            current_xml, push_desired_xml, chosen, object_type_by_node, return_parsed=True,
         )
         invalidate_candidate_preview_cache(int(profile["id"]))
-        if profile["target_type"] == "panos":
-            analysis = panos_candidate_analysis(push_desired_xml)
-            invalid_zones = analysis.get("unresolved_zone_references", [])
-            selected_policy_scopes = {
-                item["scope"] for item in chosen if item["family"].startswith("policy:")
-            }
-            relevant_zone_errors = [
-                issue for issue in invalid_zones
-                if "Shared" in selected_policy_scopes
-                or any(issue.startswith(f"vsys {scope}:") for scope in selected_policy_scopes)
-            ]
+        desired_parsed_for_checks = None
+        start_push_phase("zone_reference_check")
+        if profile["target_type"] == "panos" and selected_policy_scopes:
+            if parsed_pair is None:
+                desired_parsed_for_checks = parse_snapshot(push_desired_xml)
+                desired_root = desired_parsed_for_checks[0]
+            else:
+                desired_root = parsed_pair[1][0]
+            relevant_zone_errors = panos_candidate_zone_reference_errors_from_root(
+                desired_root, selected_policy_scopes,
+            )
             if relevant_zone_errors:
                 raise RuntimeError(
                     "Candidate bevat zoneverwijzingen die ongeldig zijn voor de geselecteerde VSYS; los die eerst op"
@@ -7462,9 +7476,12 @@ def config_workspace_push(workspace_id):
         # PAN-OS rejects deletes that leave references unresolved after scope
         # inheritance is applied. Validate every family before the first API
         # write; the reference indexes are shared across all deleted types.
+        start_push_phase("deletion_dependency_checks")
         validate_incremental_object_deletions(
             current_xml, push_desired_xml, deleted_objects, selected,
+            parsed_pair=parsed_pair, desired_parsed=desired_parsed_for_checks,
         )
+        start_push_phase("batch_write_planning")
         write_plan = batch_panos_config_write_plan(write_plan, current_xml)
         start_push_phase("api_writes")
         for change in write_plan:
@@ -7655,9 +7672,14 @@ def config_workspace_push(workspace_id):
                     f"workspace={workspace_id} profile={profile['id']} status={status}",
                 )
         else:
-            flash(f"{len(chosen)} wijzigingen uit {len(selected)} configuratiefamilie(s) naar de candidate geschreven en gevalideerd; niet gecommit.", "success")
+            elapsed_seconds = time.perf_counter() - push_started
+            flash(
+                f"{len(chosen)} wijzigingen uit {len(selected)} configuratiefamilie(s) "
+                f"naar de candidate geschreven en gevalideerd in {elapsed_seconds:.1f} s; niet gecommit.",
+                "success",
+            )
         start_push_phase("complete")
-        app.logger.info(
+        app.logger.warning(
             "Incremental push timing workspace_id=%s desired_bytes=%s candidate_bytes=%s "
             "delta_count=%s api_write_count=%s api_write_ms=%.1f phase_ms=%s total_ms=%.1f",
             workspace_id, push_trace["desired_bytes"], push_trace["candidate_bytes"],
