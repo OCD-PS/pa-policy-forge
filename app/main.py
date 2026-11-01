@@ -78,7 +78,7 @@ from app.offline_config import (
     panos_ui_decorate_record, scoped_object_names, scoped_object_page, scoped_server_profiles,
     object_reference_index, object_reference_indexes,
     _merge_object_signature, _reference_scope, _resolve_scoped_object_entry,
-    _is_panos_path_monitor_address_reference,
+    _is_panos_global_address_reference,
     _typed_object_reference_nodes,
     duplicate_object_groups, duplicate_object_groups_across_panos_scopes,
     merge_duplicate_object_groups, merge_duplicate_object_groups_to_shared,
@@ -6077,12 +6077,12 @@ def panos_scope_move_plan(
                 if value.strip() != name:
                     continue
                 scope = _reference_scope(ref, parent, current_snapshot)
-                device_path_monitor_reference = _is_panos_path_monitor_address_reference(
+                global_address_reference = _is_panos_global_address_reference(
                     ref, parent, current_snapshot, object_type,
                 )
-                if scope != source_scope and not (scope is None and device_path_monitor_reference):
+                if scope != source_scope and not (scope is None and global_address_reference):
                     continue
-                if not device_path_monitor_reference:
+                if not global_address_reference:
                     try:
                         resolved = _resolve_scoped_object_entry(current_root, current_snapshot, scope, object_type, name)
                     except OfflineConfigError:
@@ -6090,6 +6090,10 @@ def panos_scope_move_plan(
                     if resolved is not current_source_entry:
                         continue
                     source_reference_scopes.add(scope)
+                elif shared is None and pending_target_entry is None:
+                    # PAN-OS device-level address references resolve only in
+                    # Shared. Do not treat a local VSYS object as their target.
+                    return None
                 field = ref if ref.tag != "member" else parent.get(ref)
                 if field is None:
                     return None
@@ -6115,6 +6119,14 @@ def panos_scope_move_plan(
                         continue
                     scope = _reference_scope(ref, parent, current_snapshot)
                     if scope is None:
+                        if _is_panos_global_address_reference(
+                            ref, parent, current_snapshot, object_type,
+                        ):
+                            # Global PAN-OS route references are valid only
+                            # while the same name is present in Shared. The
+                            # desired Shared entry was checked above.
+                            if shared is not None or pending_target_entry is not None:
+                                continue
                         return None
                     resolved = _resolve_scoped_object_entry(
                         current_root, current_snapshot, scope, object_type, name,
@@ -6427,6 +6439,103 @@ def panos_scope_move_plan(
         if id(change) not in consumed_deletes:
             write_plan.append(change)
     return write_plan, moved_names
+
+
+PANOS_MULTI_CONFIG_MIN_VERSION = (10, 2)
+PANOS_MULTI_CONFIG_BATCH_SIZE = 25
+PANOS_MULTI_CONFIG_MAX_BYTES = 256 * 1024
+
+
+def panos_multi_config_supported(config_xml: bytes) -> bool:
+    """Return whether this PAN-OS/Panorama snapshot advertises multi-config support."""
+    # Read only the root start tag. Candidate XML can be tens of MiB, so do not
+    # parse the full snapshot a second time just to inspect its version.
+    header = config_xml[:1024].decode("utf-8", errors="ignore")
+    match = re.search(r"<config\b[^>]*\bversion=[\"'](\d+)\.(\d+)", header)
+    if not match:
+        return False
+    return (int(match.group(1)), int(match.group(2))) >= PANOS_MULTI_CONFIG_MIN_VERSION
+
+
+def batch_panos_config_write_plan(write_plan: list[dict], config_xml: bytes) -> list[dict]:
+    """Batch ordered simple XML API writes when the target supports multi-config.
+
+    Preserve the planner's dependency order. Moves, native multi-moves, and
+    existing merge transactions are barriers and stay as separate calls. Small
+    batches and large individual payloads remain ordinary API requests.
+    """
+    if not panos_multi_config_supported(config_xml):
+        return write_plan
+
+    batchable_actions = {"set", "edit", "delete", "rename"}
+    result: list[dict] = []
+    pending: list[tuple[dict, ET.Element, int]] = []
+    pending_size = 0
+
+    def flush_pending() -> None:
+        nonlocal pending, pending_size
+        if len(pending) < 2:
+            result.extend(change for change, _operation, _size in pending)
+            pending = []
+            pending_size = 0
+            return
+        transaction = ET.Element("multi-config")
+        for _change, operation, _size in pending:
+            transaction.append(copy.deepcopy(operation))
+        first = pending[0][0]
+        count = len(pending)
+        result.append({
+            "action": "multi-config",
+            "xpath": "/config",
+            "element": ET.tostring(transaction, encoding="unicode"),
+            "family": first["family"],
+            "label": f"batch van {count} configuratiewijzigingen",
+            "name": f"{count} configuratiewijzigingen",
+            "operation_count": count,
+            "batch_changes": [change for change, _operation, _size in pending],
+        })
+        pending = []
+        pending_size = 0
+
+    for change in write_plan:
+        action = change.get("action")
+        if action not in batchable_actions:
+            flush_pending()
+            result.append(change)
+            continue
+
+        attributes = {"xpath": str(change.get("xpath", ""))}
+        if action == "rename":
+            attributes["newname"] = str(change.get("newname", ""))
+        operation = ET.Element(action, attributes)
+        if action in {"set", "edit"}:
+            try:
+                fragment = SafeET.fromstring(f"<fragment>{change.get('element', '')}</fragment>")
+            except Exception as exc:
+                raise OfflineConfigError("Incremental push bevat ongeldige XML; niets geschreven") from exc
+            if not list(fragment):
+                raise OfflineConfigError("Incremental push bevat een lege XML-wijziging; niets geschreven")
+            operation.extend(copy.deepcopy(list(fragment)))
+
+        encoded_size = len(ET.tostring(operation, encoding="utf-8"))
+        if encoded_size > PANOS_MULTI_CONFIG_MAX_BYTES:
+            flush_pending()
+            result.append(change)
+            continue
+        if pending and (
+            len(pending) >= PANOS_MULTI_CONFIG_BATCH_SIZE
+            or pending_size + encoded_size > PANOS_MULTI_CONFIG_MAX_BYTES
+        ):
+            flush_pending()
+        pending.append((change, operation, encoded_size))
+        pending_size += encoded_size
+
+    flush_pending()
+    if len(result) == len(write_plan) and all(
+        left is right for left, right in zip(result, write_plan)
+    ):
+        return write_plan
+    return result
 
 
 def normalize_legacy_server_profile_paths(xml_bytes: bytes) -> bytes:
@@ -7356,14 +7465,15 @@ def config_workspace_push(workspace_id):
         validate_incremental_object_deletions(
             current_xml, push_desired_xml, deleted_objects, selected,
         )
+        write_plan = batch_panos_config_write_plan(write_plan, current_xml)
         start_push_phase("api_writes")
         for change in write_plan:
             params = {"type": "config", "action": change["action"], "xpath": change["xpath"], "key": key}
             if change["action"] in {"set", "edit", "multi-move", "multi-config"}:
                 params["element"] = change["element"]
             if change["action"] == "multi-config":
-                # Keep the batch transactional without rolling back other
-                # pending candidate changes owned by this administrator.
+                # Match the existing multi-config mode; per-action outcomes
+                # are checked below because a request can report child errors.
                 params["strict-transactional"] = "no"
             if change["action"] == "rename":
                 params["newname"] = change["newname"]
@@ -7380,35 +7490,69 @@ def config_workspace_push(workspace_id):
                 push_trace["api_write_ms"] += (time.perf_counter() - api_write_started) * 1000
             action_label = f"{change['action']} {change['label']} {change['name']}"
             response_status, _response_code, _response_root = policy_api.parse_api_response(response)
-            if response_status in {"error", "unauth"}:
-                # A parsed PAN-OS rejection is a known outcome. Keep the
-                # candidate-refresh warning when earlier writes succeeded,
-                # but do not mislabel this failed request as uncertain.
-                candidate_write_outcome_unknown = False
-            response_root = policy_api.require_success(response, action_label)
             if change["action"] == "multi-config":
-                failed_action_responses = [
-                    item for item in response_root.iter("response")
-                    if item is not response_root and item.get("status") != "success"
-                ]
-                if failed_action_responses:
-                    detail = " ".join(" ".join(node.itertext()).strip() for node in failed_action_responses)
-                    code = next((item.get("code", "") for item in failed_action_responses if item.get("code")), "")
-                    raise RuntimeError(
-                        f"multi-config {change['label']} failed: status='error' code='{code}' msg={detail[:180]}"
-                    )
-                successful_actions = [
+                response_root = _response_root
+                child_responses = [
                     item for item in response_root.iter("response")
                     if item is not response_root
                 ]
                 expected_actions = int(change.get("operation_count", 1))
-                if len(successful_actions) != expected_actions:
-                    raise RuntimeError(
-                        f"multi-config {change['label']} incomplete: PAN-OS bevestigde "
-                        f"{len(successful_actions)} van {expected_actions} bewerkingen"
+                results_complete = len(child_responses) == expected_actions
+                failed_action_responses = [
+                    item for item in child_responses if item.get("status") != "success"
+                ]
+                if results_complete:
+                    successful_count = sum(
+                        1 for item in child_responses if item.get("status") == "success"
                     )
-                applied_changes += int(change.get("operation_count", 1))
+                    applied_changes += successful_count
+                    candidate_write_outcome_unknown = False
+                else:
+                    # Without a complete per-action result list, the firewall
+                    # may have applied an unknown subset of the batch.
+                    candidate_write_outcome_unknown = True
+                if failed_action_responses:
+                    failed_index = next(
+                        index for index, item in enumerate(child_responses)
+                        if item.get("status") != "success"
+                    )
+                    failed_response = failed_action_responses[0]
+                    detail = " ".join(" ".join(failed_response.itertext()).split())
+                    code = failed_response.get("code", "")
+                    batch_changes = change.get("batch_changes", [])
+                    if failed_index < len(batch_changes):
+                        failed_change = batch_changes[failed_index]
+                        failed_label = (
+                            f"{failed_change['action']} {failed_change['label']} "
+                            f"{failed_change['name']}"
+                        )
+                        raise RuntimeError(
+                            f"{failed_label} failed: status='error' code='{code}' "
+                            f"msg={detail[:180]}"
+                        )
+                    raise RuntimeError(
+                        f"multi-config {change['label']} failed: status='error' "
+                        f"code='{code}' msg={detail[:180]}"
+                    )
+                response_root = policy_api.require_success(response, action_label)
+                if not results_complete:
+                    raise RuntimeError(
+                        f"multi-config {change['label']} incompleet: PAN-OS bevestigde "
+                        f"{len(child_responses)} van {expected_actions} bewerkingen"
+                    )
+                # The child responses are authoritative for each operation.
+                # A non-success outer response with all-success children is
+                # inconsistent; fail closed while retaining the applied count.
+                if response_status != "success":
+                    policy_api.require_success(response, action_label)
             else:
+                if response_status in {"error", "unauth"}:
+                    # A parsed PAN-OS rejection is a known outcome. Keep the
+                    # candidate-refresh warning when earlier writes succeeded,
+                    # but do not mislabel this failed request as uncertain.
+                    candidate_write_outcome_unknown = False
+                response_root = policy_api.require_success(response, action_label)
+            if change["action"] != "multi-config":
                 applied_changes += 1
             candidate_write_outcome_unknown = False
         start_push_phase("candidate_validation")

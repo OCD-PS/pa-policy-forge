@@ -64,6 +64,59 @@ class IncrementalPushCommitTests(unittest.TestCase):
             "delete Addresses host-a: PAN-OS kan dit object niet verwijderen zolang er verwijzingen naar bestaan (code 10)",
         )
 
+    def test_multi_config_batches_keep_order_and_stop_at_non_batchable_actions(self):
+        plan = [
+            {"action": "set", "xpath": f"/config/shared/address/entry[@name='host-{index}']",
+             "element": f"<entry name=\"host-{index}\"><ip-netmask>192.0.2.{index}/32</ip-netmask></entry>",
+             "family": "object:address", "label": "Addresses", "name": f"host-{index}"}
+            for index in range(3)
+        ]
+        barrier = {"action": "multi-config", "xpath": "/config", "element": "<multi-config/>",
+                   "family": "object:address", "label": "Shared object merge", "name": "host-a",
+                   "operation_count": 3}
+        move = {"action": "move", "xpath": "/config/devices/rule", "element": "",
+                "family": "policy:security", "label": "Security policy", "name": "allow"}
+        trailing = [
+            {"action": "delete", "xpath": f"/config/shared/address/entry[@name='old-{index}']",
+             "element": "", "family": "object:address", "label": "Addresses", "name": f"old-{index}"}
+            for index in range(2)
+        ]
+        source = [*plan, barrier, *plan, move, *trailing]
+
+        batched = main.batch_panos_config_write_plan(
+            source, b'<config version="12.1.0" />',
+        )
+
+        self.assertEqual(
+            [item["action"] for item in batched],
+            ["multi-config", "multi-config", "multi-config", "move", "multi-config"],
+        )
+        transactions = [
+            main.ET.fromstring(item["element"])
+            for item in batched if item["action"] == "multi-config"
+        ]
+        self.assertEqual(
+            [[operation.get("xpath") for operation in transaction] for transaction in transactions],
+            [
+                [item["xpath"] for item in plan],
+                [],
+                [item["xpath"] for item in plan],
+                [item["xpath"] for item in trailing],
+            ],
+        )
+        self.assertIs(batched[1], barrier)
+        self.assertIs(batched[3], move)
+        self.assertEqual([item["operation_count"] for item in batched if item["action"] == "multi-config"], [3, 3, 3, 2])
+
+    def test_multi_config_batching_fails_closed_for_unknown_or_unsupported_versions(self):
+        write = {"action": "set", "xpath": "/config/shared/address", "element": "<entry name='a'/>",
+                 "family": "object:address", "label": "Addresses", "name": "a"}
+        plan = [dict(write), dict(write)]
+
+        for config_xml in (b"<config />", b'<config version="10.1.9" />'):
+            with self.subTest(config=config_xml):
+                self.assertIs(main.batch_panos_config_write_plan(plan, config_xml), plan)
+
     def test_explicit_api_rejection_after_confirmed_write_requests_refresh_without_uncertain_label(self):
         base = main.normalized_config_xml(main.ET.fromstring(
             b'<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address>'
@@ -1401,6 +1454,189 @@ class IncrementalPushCommitTests(unittest.TestCase):
             for path in edit_paths
         ))
         self.assertTrue(any("/monitor-destinations/entry[@name='Google']/destination" in path for path in edit_paths))
+
+    def test_same_name_shared_address_merge_restores_static_route_reference(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config version="12.1.0"><shared><address><entry name="Route-Address">'
+            b'<ip-netmask>8.8.8.8/32</ip-netmask></entry></address></shared>'
+            b'<devices><entry name="localhost.localdomain"><network><virtual-router>'
+            b'<entry name="default"><routing-table><ip><static-route><entry name="default_route">'
+            b'<destination>Route-Address</destination></entry></static-route></ip></routing-table>'
+            b'</entry></virtual-router></network><vsys><entry name="vsys1"><address>'
+            b'<entry name="Route-Address"><ip-netmask>8.8.8.8/32</ip-netmask></entry>'
+            b'</address><rulebase><security><rules><entry name="allow-google"><destination>'
+            b'<member>Route-Address</member></destination></entry></rules></security></rulebase>'
+            b'</entry><entry name="vsys2"/></vsys></entry></devices></config>'
+        ))
+        desired_root = main.ET.fromstring(base)
+        desired_root.find("./devices/entry/vsys/entry[@name='vsys1']/address").clear()
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "merge same-name address referenced by static route", "candidate.xml",
+            desired, "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        deletion = next(
+            item for item in main.config_push_delta(base, desired)
+            if item["action"] == "delete" and item["family"] == "object:address"
+        )
+        requests = []
+
+        def api_response(endpoint, params, ctx):
+            requests.append(dict(params))
+            if params["type"] == "config" and params["action"] == "multi-config":
+                transaction = main.ET.fromstring(params["element"])
+                nested = "".join(
+                    f'<response status="success" code="20" id="{index}"/>'
+                    for index, _operation in enumerate(transaction, start=1)
+                )
+                return f'<response status="success" code="20"><result>{nested}</result></response>'
+            if params["type"] == "config":
+                return '<response status="success" code="20"><result/></response>'
+            if params["type"] == "op":
+                return '<response status="success"><result><job>612</job></result></response>'
+            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post", side_effect=api_response), \
+             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": deletion["selection_key"]},
+                follow_redirects=True,
+            )
+
+        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
+        self.assertFalse(any(item["type"] == "commit" for item in requests))
+        config_call = next(item for item in requests if item["type"] == "config")
+        self.assertEqual(config_call["action"], "multi-config")
+        transaction = main.ET.fromstring(config_call["element"])
+        self.assertEqual([item.tag for item in transaction], ["rename", "edit", "edit", "delete"])
+        self.assertTrue(any(
+            item.get("xpath", "").endswith(
+                "/network/virtual-router/entry[@name='default']/routing-table/ip/"
+                "static-route/entry[@name='default_route']/destination"
+            )
+            for item in transaction.findall("edit")
+        ))
+
+    def test_cross_name_duplicate_merge_pushes_static_route_edit_before_old_address_delete(self):
+        base = main.normalized_config_xml(main.ET.fromstring(
+            b'<config version="12.1.0"><shared><address><entry name="Preferred">'
+            b'<ip-netmask>85.91.172.252/32</ip-netmask></entry></address></shared>'
+            b'<devices><entry name="localhost.localdomain"><network><virtual-router>'
+            b'<entry name="default"><routing-table><ip><static-route><entry name="Publilink_ftp_Social_Security">'
+            b'<destination>85.91.172.252</destination></entry></static-route></ip></routing-table>'
+            b'</entry></virtual-router></network><vsys><entry name="vsys1"><address>'
+            b'<entry name="85.91.172.252"><ip-netmask>85.91.172.252/32</ip-netmask></entry>'
+            b'</address></entry><entry name="vsys2"/></vsys></entry></devices></config>'
+        ))
+        group = next(
+            item for item in main.duplicate_object_groups_across_panos_scopes(base, "addresses")
+            if {obj["name"] for obj in item["objects"]} == {"Preferred", "85.91.172.252"}
+        )
+        desired, _summary = main.merge_duplicate_object_groups_to_shared(base, [{
+            "object_type": "addresses", "objects": group["objects"],
+            "master": {"scope": "Shared", "name": "Preferred"},
+        }])
+        workspace_id = main.store_config_workspace(
+            self.profile, "merge address referenced by static route", "candidate.xml",
+            desired, "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        changes = main.config_push_delta(base, desired)
+        selected_families = list(dict.fromkeys(item["selection_key"] for item in changes))
+        requests = []
+
+        def api_response(endpoint, params, ctx):
+            requests.append(dict(params))
+            if params["type"] == "config" and params["action"] == "multi-config":
+                transaction = main.ET.fromstring(params["element"])
+                nested = "".join(
+                    f'<response status="success" code="20" id="{index}"/>'
+                    for index, _operation in enumerate(transaction, start=1)
+                )
+                return f'<response status="success" code="20">{nested}</response>'
+            if params["type"] == "config":
+                return '<response status="success" code="20"><result/></response>'
+            if params["type"] == "op":
+                return '<response status="success"><result><job>612</job></result></response>'
+            self.fail(f"Unexpected PAN-OS request type: {params['type']}")
+
+        with (
+            patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)),
+            patch("app.main.panos_api_post", side_effect=api_response),
+            patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}),
+        ):
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": selected_families},
+                follow_redirects=True,
+            )
+
+        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
+        self.assertFalse(any(item["type"] == "commit" for item in requests))
+        config_writes = [item for item in requests if item["type"] == "config"]
+        transaction = main.ET.fromstring(config_writes[0]["element"])
+        self.assertEqual([item.tag for item in transaction], ["edit", "delete"])
+        self.assertTrue(transaction[0].get("xpath", "").endswith("/destination"))
+        self.assertEqual(
+            transaction[0][0].text,
+            "Preferred",
+        )
+        self.assertTrue(transaction[1].get("xpath", "").endswith("/address/entry[@name='85.91.172.252']"))
+
+    def test_large_incremental_write_plan_batches_simple_api_writes(self):
+        root = main.ET.Element("config", {"version": "12.1.0"})
+        devices = main.ET.SubElement(root, "devices")
+        device = main.ET.SubElement(devices, "entry", {"name": "localhost.localdomain"})
+        vsys = main.ET.SubElement(device, "vsys")
+        scope = main.ET.SubElement(vsys, "entry", {"name": "vsys1"})
+        addresses = main.ET.SubElement(scope, "address")
+        for index in range(10):
+            entry = main.ET.SubElement(addresses, "entry", {"name": f"host-{index}"})
+            main.ET.SubElement(entry, "ip-netmask").text = f"192.0.2.{index}/32"
+        base = main.normalized_config_xml(root)
+        desired_root = main.ET.fromstring(base)
+        for index, entry in enumerate(desired_root.findall("./devices/entry/vsys/entry/address/entry")):
+            entry.find("ip-netmask").text = f"198.51.100.{index}/32"
+        desired = main.normalized_config_xml(desired_root)
+        workspace_id = main.store_config_workspace(
+            self.profile, "batch incremental writes", "candidate.xml", desired,
+            "api", baseline_xml=base,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        changes = main.config_push_delta(base, desired)
+        self.assertEqual(len(changes), 10)
+        requests = []
+
+        def api_response(endpoint, params, ctx):
+            requests.append(dict(params))
+            if params["type"] == "config" and params["action"] == "multi-config":
+                transaction = main.ET.fromstring(params["element"])
+                nested = "".join(
+                    f'<response status="success" code="20" id="{index}"/>'
+                    for index, _operation in enumerate(transaction, start=1)
+                )
+                return f'<response status="success" code="20"><result>{nested}</result></response>'
+            if params["type"] == "op":
+                return '<response status="success"><result><job>612</job></result></response>'
+            self.fail(f"Unexpected PAN-OS request: {params}")
+
+        with patch("app.main.fetch_panos_candidate_xml", return_value=("https://fw.example.invalid", "test-key", object(), base)), \
+             patch("app.main.panos_api_post", side_effect=api_response), \
+             patch("app.main.wait_panos_job", return_value={"status": "FIN", "result": "OK", "details": []}):
+            response = self.client.post(
+                f"/config-workspaces/{workspace_id}/push", base_url="https://forge.test",
+                data={"csrf": "incremental-commit-csrf", "family": changes[0]["selection_key"]},
+                follow_redirects=True,
+            )
+
+        self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
+        config_writes = [item for item in requests if item["type"] == "config"]
+        self.assertEqual(len(config_writes), 1)
+        self.assertEqual(config_writes[0]["action"], "multi-config")
+        self.assertEqual(len(main.ET.fromstring(config_writes[0]["element"])), 10)
 
     def test_path_monitor_reference_without_shared_address_blocks_delete(self):
         current = main.normalized_config_xml(main.ET.fromstring(
