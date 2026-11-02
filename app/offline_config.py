@@ -545,6 +545,22 @@ def unresolved_object_reference_indexes(
     }
 
 
+def _canonical_ip_netmask_host(value: str) -> str:
+    """Normalize a bare IP host and its explicit full-length prefix equally."""
+    candidate = value.strip()
+    address_text, separator, prefix_text = candidate.partition("/")
+    try:
+        address = ipaddress.ip_address(address_text)
+    except ValueError:
+        return candidate
+
+    if not separator:
+        return f"{address}/{address.max_prefixlen}"
+    if prefix_text == str(address.max_prefixlen):
+        return f"{address}/{address.max_prefixlen}"
+    return candidate
+
+
 def _merge_object_signature(entry: ET.Element, object_type: str) -> tuple:
     """Compare behavior-bearing XML; service tags are preserved as metadata."""
     ignored_nodes = {"description", "comments"}
@@ -567,7 +583,12 @@ def _merge_object_signature(entry: ET.Element, object_type: str) -> tuple:
             (key, value) for key, value in node.attrib.items()
             if key != "uuid" and not (root and key == "name")
         ))
-        return node.tag, attributes, (node.text or "").strip(), children
+        text = (node.text or "").strip()
+        if object_type == "addresses" and node.tag == "ip-netmask":
+            # PAN-OS treats a bare host address as the full-length host prefix.
+            # Keep shorter prefixes distinct; only normalize the host case.
+            text = _canonical_ip_netmask_host(text)
+        return node.tag, attributes, text, children
 
     return canonical(entry, root=True)
 

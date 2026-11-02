@@ -229,6 +229,49 @@ class OfflineConfigTests(unittest.TestCase):
             {"TCP443", "service-https", "443_tcp"},
         )
 
+    def test_cross_scope_address_merge_normalizes_bare_host_to_full_prefix(self):
+        source = b'''<config><shared><address>
+        <entry name="Unifi CCdewerf"><ip-netmask>10.50.103.204/32</ip-netmask></entry>
+        </address></shared><devices><entry name="localhost.localdomain"><vsys>
+        <entry name="vsys1"><address>
+        <entry name="Unifi CCDeWerf"><ip-netmask>10.50.103.204</ip-netmask></entry>
+        </address><rulebase><security><rules><entry name="allow-unifi">
+        <source><member>Unifi CCDeWerf</member></source>
+        </entry></rules></security></rulebase></entry>
+        <entry name="vsys2"><address>
+        <entry name="different-subnet"><ip-netmask>10.50.103.204/24</ip-netmask></entry>
+        <entry name="malformed-plus-prefix"><ip-netmask>10.50.103.204/+32</ip-netmask></entry>
+        <entry name="malformed-underscore-prefix"><ip-netmask>10.50.103.204/3_2</ip-netmask></entry>
+        </address></entry></vsys></entry></devices></config>'''
+
+        groups = duplicate_object_groups_across_panos_scopes(source, "addresses")
+
+        self.assertEqual(len(groups), 1)
+        group = groups[0]
+        self.assertEqual(
+            {(item["scope"], item["name"]) for item in group["objects"]},
+            {("Shared", "Unifi CCdewerf"), ("vsys1", "Unifi CCDeWerf")},
+        )
+        merged, summary = merge_duplicate_object_groups_to_shared(source, [{
+            "object_type": "addresses",
+            "objects": group["objects"],
+            "master": {"scope": "Shared", "name": "Unifi CCdewerf"},
+        }])
+
+        root, _ = parse_snapshot(merged)
+        self.assertIsNone(root.find(
+            "./devices/entry/vsys/entry[@name='vsys1']/address/entry[@name='Unifi CCDeWerf']",
+        ))
+        self.assertEqual(
+            root.findtext("./devices/entry/vsys/entry[@name='vsys1']/rulebase/security/rules/entry/source/member"),
+            "Unifi CCdewerf",
+        )
+        self.assertEqual(
+            root.findtext("./devices/entry/vsys/entry[@name='vsys2']/address/entry[@name='different-subnet']/ip-netmask"),
+            "10.50.103.204/24",
+        )
+        self.assertEqual(summary, {"merged": 1, "groups": 1})
+
     def test_cross_scope_duplicates_keep_behavioral_tags_distinct(self):
         source = b'''<config><shared><address><entry name="server-a"><ip-netmask>10.0.0.1</ip-netmask><tag><member>Production</member></tag></entry></address></shared><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address><entry name="server-b"><ip-netmask>10.0.0.1</ip-netmask><tag><member>Test</member></tag></entry></address></entry><entry name="vsys2"/></vsys></entry></devices></config>'''
         self.assertEqual(duplicate_object_groups_across_panos_scopes(source, "addresses"), [])
