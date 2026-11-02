@@ -747,7 +747,10 @@ def _merge_vsys_settings(
         for kind in PANOS_SCOPE_MOVE_OBJECT_TYPES
         if kind in OBJECT_NODES and "/" not in OBJECT_NODES[kind]
     }
-    scope_managed = {"zone", *_RULEBASES, "vsys-id", *shareable_root_tags}
+    # display-name belongs to the VSYS identity that survives the merge. The
+    # removed source VSYS names are expected to differ, so keep the target's
+    # display name instead of treating those labels as mergeable settings.
+    scope_managed = {"display-name", "zone", *_RULEBASES, "vsys-id", *shareable_root_tags}
     for source_name in ordered_names:
         if source_name == target_vsys:
             continue
