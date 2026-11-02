@@ -4161,30 +4161,26 @@ def scm_object_reference_index(profile, object_type: str, names: list[str]) -> d
     return references
 
 
-def validate_scm_object_deletions(profile, object_type: str, names: list[str]) -> dict[str, list[str]]:
-    try:
-        references = scm_object_reference_index(profile, object_type, names)
-    except Exception as exc:
-        raise ValueError("SCM-referentiecontrole is mislukt; niets verwijderd") from exc
-    used = {name: paths for name, paths in references.items() if paths}
-    if used:
-        details = "; ".join(f"{name}: {', '.join(paths[:3])}" for name, paths in list(used.items())[:5])
-        raise ValueError(f"Niet verwijderd: objecten zijn nog in gebruik ({details})")
-    return references
-
-
-def validate_live_object_deletions(profile, object_type: str, names: list[str]) -> dict[str, list[str]]:
-    """Validate deletes against the complete target configuration, not the UI scope."""
+def live_object_reference_index(profile, object_type: str, names: list[str]) -> dict[str, list[str]]:
+    """Inventory the complete target before selecting or validating deletions."""
     if profile["target_type"] == "scm":
-        return validate_scm_object_deletions(profile, object_type, names)
+        try:
+            return scm_object_reference_index(profile, object_type, names)
+        except Exception as exc:
+            raise ValueError("SCM-referentiecontrole is mislukt; niets verwijderd") from exc
     try:
         _, _, _, xml_bytes = fetch_panos_candidate_xml(profile)
     except Exception as exc:
         raise ValueError("Volledige PAN-OS/Panorama-config kon niet worden gecontroleerd; niets verwijderd") from exc
     try:
-        references = object_reference_index(xml_bytes, object_type, names)
+        return object_reference_index(xml_bytes, object_type, names)
     except Exception as exc:
         raise ValueError("PAN-OS/Panorama-referentiecontrole is mislukt; niets verwijderd") from exc
+
+
+def validate_live_object_deletions(profile, object_type: str, names: list[str]) -> dict[str, list[str]]:
+    """Reject selected deletions if any reference remains anywhere on the target."""
+    references = live_object_reference_index(profile, object_type, names)
     used = {name: paths for name, paths in references.items() if paths}
     if used:
         details = "; ".join(f"{name}: {', '.join(paths[:3])}" for name, paths in list(used.items())[:5])
@@ -5156,8 +5152,19 @@ def config_workspace_object_apply(draft_id):
                     "objects": group["objects"],
                     "master": {"scope": candidates[0]["scope"], "name": candidates[0]["name"]},
                 })
+            predefined_applications = []
+            if any(item["object_type"] == "application-groups" for item in selections):
+                with db() as conn:
+                    merge_profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+                if not merge_profile:
+                    raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
+                predefined_applications = [
+                    item["name"] for item in cached_application_catalog(merge_profile).get("items", [])
+                    if item.get("predefined") and item.get("name")
+                ]
             new_xml, merge_summary = merge_duplicate_object_groups_to_shared(
                 workspace_config_path(workspace).read_bytes(), selections,
+                predefined_applications=predefined_applications,
             )
         elif draft.get("operation") == "merge":
             raise OfflineConfigError("Deze samenvoegactie is verwijderd; maak een nieuwe preview")
@@ -10048,7 +10055,7 @@ def object_delete_preview(profile_id, object_type):
         if not selected_ids and not delete_unused:
             raise ValueError("Selecteer minstens één object")
         if delete_unused:
-            references = validate_live_object_deletions(profile, object_type, [str(item.get("name", "")) for item in current])
+            references = live_object_reference_index(profile, object_type, [str(item.get("name", "")) for item in current])
             selected_ids = {
                 str(item.get("id", "")) for item in current
                 if item.get("name") and not references.get(str(item["name"]))

@@ -1,7 +1,9 @@
 """UI contracts rendered without importing the application or starting workers."""
 import unittest
+import re
 from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urlencode, parse_qs, urlsplit
 
 from jinja2 import Environment, FileSystemLoader
 
@@ -44,6 +46,49 @@ class FrontendTemplateTests(unittest.TestCase):
         for name in environment.list_templates():
             with self.subTest(template=name):
                 environment.parse(environment.loader.get_source(environment, name)[0])
+
+    def test_object_page_jump_submits_context_as_get_fields(self):
+        environment = self.environment()
+        source = environment.loader.get_source(environment, "workspace_editor.html")[0]
+        form_source = next(form for form in re.findall(r'<form class="workspace-page-jump".*?</form>', source, re.S)
+                           if 'id="object-page-jump"' in form)
+        environment.globals["url_for"] = lambda endpoint, **values: "/edit?" + urlencode(values)
+        context = dict(workspace={"id": 1}, scope="vsys2", template="Branch & West", object_type="services",
+                       object_query="web & proxy", object_page=3, object_page_count=5, workspace_object_page_size=100)
+        markup = environment.from_string(form_source).render(**context)
+
+        class Form(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.fields = {}
+                self.action = ""
+
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                if tag == "form":
+                    self.action = attrs["action"]
+                if tag == "input" and attrs.get("name"):
+                    self.fields[attrs["name"]] = attrs.get("value", "")
+
+        form = Form()
+        form.feed(markup)
+        # Browser GET submission replaces, rather than extends, action's query.
+        destination = urlsplit(form.action)._replace(query=urlencode(form.fields)).geturl()
+        self.assertEqual(parse_qs(urlsplit(destination).query), {
+            "scope": ["vsys2"], "template": ["Branch & West"], "workspace_view": ["objects"],
+            "object_type": ["services"], "object_query": ["web & proxy"], "object_page": ["3"],
+        })
+        policy_source = next(form for form in re.findall(r'<form class="workspace-page-jump".*?</form>', source, re.S)
+                             if 'id="policy-page-jump"' in form)
+        form = Form()
+        form.feed(environment.from_string(policy_source).render(
+            **context, policy_kind="nat", rulebase="post", policy_query="NAT & HTTPS",
+            policy_page=2, policy_page_count=4, workspace_policy_page_size=100,
+        ))
+        self.assertEqual(form.fields, {
+            "scope": "vsys2", "template": "Branch & West", "workspace_view": "policies",
+            "policy_kind": "nat", "rulebase": "post", "policy_query": "NAT & HTTPS", "policy_page": "2",
+        })
 
     def test_policy_member_macro_keeps_long_rules_compact(self):
         macro = self.environment().get_template("_policy_members.html").module.compact_members

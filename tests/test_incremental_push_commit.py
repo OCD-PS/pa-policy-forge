@@ -64,6 +64,28 @@ class IncrementalPushCommitTests(unittest.TestCase):
             "delete Addresses host-a: PAN-OS kan dit object niet verwijderen zolang er verwijzingen naar bestaan (code 10)",
         )
 
+    def test_same_name_shared_service_merge_repairs_nat_scalar_in_both_xml_flavours(self):
+        for scope_node, rulebase in (("vsys", "rulebase"), ("device-group", "post-rulebase")):
+            with self.subTest(scope_node=scope_node):
+                service = '<service><entry name="tcp443"><protocol><tcp><port>443</port></tcp></protocol></entry></service>'
+                current = f'''<config><shared>{service}</shared><devices><entry name="localhost.localdomain"><{scope_node}>
+                <entry name="branch">{service}<{rulebase}><nat><rules><entry name="nat1"><service>tcp443</service>
+                </entry></rules></nat></{rulebase}></entry></{scope_node}></entry></devices></config>'''.encode()
+                desired_root = main.ET.fromstring(current)
+                owner = desired_root.find(f"./devices/entry/{scope_node}/entry")
+                collection = owner.find("./service")
+                collection.remove(collection.find("./entry"))
+                desired = main.normalized_config_xml(desired_root)
+                chosen = main.config_push_delta(current, desired)
+                plan, moved = main.panos_scope_move_plan(
+                    current, desired, chosen, {node: kind for kind, node in main.OBJECT_NODES.items()},
+                )
+                self.assertIn(("services", "tcp443"), moved)
+                transaction = main.ET.fromstring(next(change["element"] for change in plan if change["action"] == "multi-config"))
+                repair = next(change for change in transaction.findall("./edit") if change.get("xpath", "").endswith("/service"))
+                self.assertEqual(repair.findtext("./service"), "tcp443")
+                self.assertEqual([change.tag for change in transaction], ["rename", "edit", "delete"])
+
     def test_multi_config_batches_keep_order_and_stop_at_non_batchable_actions(self):
         plan = [
             {"action": "set", "xpath": f"/config/shared/address/entry[@name='host-{index}']",

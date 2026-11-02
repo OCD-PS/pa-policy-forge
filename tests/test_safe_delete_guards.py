@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -12,6 +13,56 @@ from app import main
 
 
 class SafeDeleteGuardTests(unittest.TestCase):
+    def test_delete_unused_preview_filters_before_validating_across_targets(self):
+        current = [{"id": "used-id", "name": "used"}, {"id": "unused-id", "name": "unused"}]
+        for target, scope in (("panos", "vsys1"), ("panos", "vsys2"), ("panos", "Shared"),
+                              ("panorama", "Shared"), ("scm", "Parent")):
+            with self.subTest(target=target, scope=scope):
+                stamp = main.now()
+                with main.db() as conn:
+                    cursor = conn.execute(
+                        "INSERT INTO profiles(name,target_type,settings_json,secret_blob,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                        ("delete-unused-test", target, json.dumps({"vsys": scope}), b"", stamp, stamp),
+                    )
+                    profile_id = cursor.lastrowid
+                client = main.app.test_client()
+                with client.session_transaction(base_url="https://forge.test") as login:
+                    login.update(user_id=1, username="test", must_change=False, csrf="delete-csrf")
+                xml = b'<config><shared><address-group><entry name="consumers"><static><member>used</member></static></entry></address-group></shared></config>'
+                draft_path = None
+                try:
+                    with patch("app.main.fetch_scm_objects", return_value=current), \
+                         patch("app.main.fetch_panos_candidate_xml", return_value=("", "", None, xml)), \
+                         patch("app.main.scm_object_reference_index", return_value={"used": ["Parent/rule/source"], "unused": []}), \
+                         patch("app.main.render_template", return_value="preview") as render:
+                        response = client.post(
+                            f"/objects/{profile_id}/addresses/delete-preview",
+                            data={"csrf": "delete-csrf", "delete_unused": "yes"}, base_url="https://forge.test",
+                        )
+                        self.assertEqual(response.status_code, 200)
+                        self.assertEqual(render.call_args.kwargs["delete_objects"], [current[1]])
+                        draft_path = main.OBJECT_DRAFTS / (render.call_args.kwargs["draft_id"] + ".json")
+                        render.reset_mock()
+                        rejected = client.post(
+                            f"/objects/{profile_id}/addresses/delete-preview",
+                            data={"csrf": "delete-csrf", "object_id": "used-id"}, base_url="https://forge.test",
+                        )
+                        self.assertEqual(rejected.status_code, 302)
+                        render.assert_not_called()
+                finally:
+                    if draft_path is not None:
+                        draft_path.unlink(missing_ok=True)
+                    with main.db() as conn:
+                        conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+
+    def test_reference_inventory_failure_still_blocks_selected_deletions(self):
+        for target in ("panos", "panorama", "scm"):
+            with self.subTest(target=target), \
+                 patch("app.main.fetch_panos_candidate_xml", side_effect=RuntimeError("unavailable")), \
+                 patch("app.main.scm_object_reference_index", side_effect=RuntimeError("unavailable")):
+                with self.assertRaisesRegex(ValueError, "niets verwijderd"):
+                    main.validate_live_object_deletions({"target_type": target}, "addresses", ["unused"])
+
     def test_scm_reference_inventory_continues_after_short_page_when_total_requires_it(self):
         responses = [
             {"data": [{"name": "one"}], "total": 2},

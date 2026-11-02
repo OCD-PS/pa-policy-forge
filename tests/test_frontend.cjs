@@ -9,6 +9,27 @@ const { JSDOM } = require('jsdom');
 const source = fs.readFileSync(path.join(__dirname, '..', 'app', 'static', 'app.js'), 'utf8');
 const styles = fs.readFileSync(path.join(__dirname, '..', 'app', 'static', 'app.css'), 'utf8');
 
+test('workspace page-jump controls own GET forms without detaching policy bulk controls', () => {
+  const template = fs.readFileSync(path.join(__dirname, '..', 'app', 'templates', 'workspace_editor.html'), 'utf8');
+  // Parse the complete markup: extracting a form fragment hides nested-form
+  // repair by the browser, which can attach navigation controls to bulk POST.
+  const dom = new JSDOM(template);
+  const document = dom.window.document;
+  for (const id of ['policy-page-jump', 'object-page-jump']) {
+    const input = document.getElementById(id);
+    assert.equal(input.form.method, 'get');
+    assert.match(input.form.getAttribute('action'), /config_workspace_editor/);
+    for (const name of ['scope', 'template', 'workspace_view']) {
+      assert.ok(input.form.querySelector(`input[name="${name}"]`));
+    }
+  }
+  const bulkForm = document.querySelector('[data-policy-bulk-form]');
+  assert.equal(document.querySelector('[data-policy-select]').form, bulkForm);
+  assert.equal(document.querySelector('[name="description_append"]').form, bulkForm);
+  assert.equal(bulkForm.method, 'post');
+  dom.window.close();
+});
+
 async function page(markup, options = {}) {
   const dom = new JSDOM(markup, {url: options.url || 'https://forge.test/', runScripts: 'outside-only', pretendToBeVisual:true});
   for (const [key, value] of Object.entries(options.sessionStorage || {})) dom.window.sessionStorage.setItem(key, value);
