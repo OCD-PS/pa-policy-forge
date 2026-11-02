@@ -3092,6 +3092,16 @@ def configuration_records(
     parents = _element_parents(root)
     records: list[dict] = []
     seen_sections: set[int] = set()
+    if view == "network" and section == "zones":
+        # Zone definitions live in the VSYS config container (or inside the
+        # embedded device config of a Panorama template). Searching every
+        # descendant named "zone" also matches unrelated nested XML nodes and
+        # renders them as nameless, repeated "Zones" records.
+        paths = (
+            ("./config/devices/entry/vsys/entry/zone",)
+            if snapshot.kind == "panorama"
+            else ("./zone",)
+        )
     config_roots = _config_roots(root, snapshot, scope, template)
     if snapshot.kind == "panos" and section in PANOS_LOCATION_SECTIONS.get(view, set()):
         selected_root = _scope_root(root, snapshot, scope)
