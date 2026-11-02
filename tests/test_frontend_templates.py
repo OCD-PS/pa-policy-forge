@@ -54,6 +54,8 @@ class FrontendTemplateTests(unittest.TestCase):
         self.assertIn('name="vsys_order_json"', source)
         self.assertIn('name="zone_mappings_json"', source)
         self.assertIn('name="preview_token"', source)
+        self.assertIn("preview_plan.renamed_policies", source)
+        self.assertIn("maximaal 63 tekens", source)
         self.assertIn("app.js", source)
         script = (Path(__file__).parents[1] / "app" / "static" / "app.js").read_text()
         self.assertIn("JSON.stringify(order)", script)

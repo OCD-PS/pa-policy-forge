@@ -28,6 +28,7 @@ class VsysMergeError(ValueError):
 
 
 _RULEBASES = ("pre-rulebase", "rulebase", "post-rulebase")
+_MAX_POLICY_NAME_LENGTH = 63
 _SHARED_EXTRA_PATHS = (
     "log-settings/syslog",
     "log-settings/email",
@@ -517,16 +518,117 @@ def _rewrite_policy_zones(rule: ET.Element, source_vsys: str, mappings: dict[tup
                 member.text = mapped
 
 
+def _policy_vsys_numbers(vsyses: list[ET.Element]) -> dict[str, int]:
+    """Resolve stable numeric prefixes from PAN-OS IDs, names, or source order."""
+    numbers: dict[str, int] = {}
+    used: set[int] = set()
+    unresolved: list[tuple[str, int]] = []
+
+    for index, vsys in enumerate(vsyses, start=1):
+        name = str(vsys.get("name", ""))
+        raw_id = (vsys.findtext("./vsys-id") or "").strip()
+        match = re.fullmatch(r"vsys([1-9][0-9]*)", name, flags=re.IGNORECASE)
+        if raw_id.isdecimal():
+            number = int(raw_id)
+        elif match and int(match.group(1)) <= 255:
+            number = int(match.group(1))
+        else:
+            unresolved.append((name, index))
+            continue
+        numbers[name] = number
+        used.add(number)
+
+    for name, preferred in unresolved:
+        number = preferred
+        while number in used and number <= 255:
+            number += 1
+        if number > 255:
+            raise VsysMergeError("Kan geen uniek VSYS-nummer bepalen voor automatisch hernoemde policies")
+        numbers[name] = number
+        used.add(number)
+
+    return numbers
+
+
+def _policy_name_assignments(
+    source_bases: list[tuple[str, ET.Element]],
+    vsys_numbers: dict[str, int],
+    base_name: str,
+) -> tuple[dict[tuple[str, str, str], str], list[dict[str, str]]]:
+    """Plan unique, length-limited names for policies duplicated across VSYS."""
+    names_by_category: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+    names_by_scope_category: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for scope, source_base in source_bases:
+        for category in list(source_base):
+            rules = category.find("./rules")
+            if rules is None:
+                continue
+            for rule in rules.findall("./entry"):
+                name = str(rule.get("name", "")).strip()
+                if not name:
+                    raise VsysMergeError(f"Policy zonder naam bij {base_name}/{category.tag}")
+                scope_names = names_by_scope_category[(scope, category.tag)]
+                if name in scope_names:
+                    raise VsysMergeError(
+                        f"Dubbele policynaam '{name}' binnen {scope}/{base_name}/{category.tag}; "
+                        "controleer de bronconfiguratie."
+                    )
+                scope_names.add(name)
+                names_by_category[category.tag][name].append(scope)
+
+    assignments: dict[tuple[str, str, str], str] = {}
+    renamed: list[dict[str, str]] = []
+    for category_name, names in names_by_category.items():
+        # Reserve original names so generated prefixes cannot shadow a rule
+        # that already exists in one of the VSYS.
+        used_names = set(names)
+        pending = []
+        for name, scopes in names.items():
+            if len(scopes) <= 1:
+                continue
+            if len({vsys_numbers[scope] for scope in scopes}) != len(scopes):
+                raise VsysMergeError("VSYS-ID's leveren geen eenduidige prefix op voor dubbele policynamen")
+            ordered_scopes = sorted(scopes, key=lambda scope: vsys_numbers[scope])
+            for scope in ordered_scopes[1:]:
+                pending.append((vsys_numbers[scope], scope, name))
+
+        for number, scope, name in sorted(pending):
+            prefix = f"{number}_"
+            suffix_number = 1
+            while True:
+                suffix = "" if suffix_number == 1 else f"_{suffix_number}"
+                available = _MAX_POLICY_NAME_LENGTH - len(prefix) - len(suffix)
+                if available < 1:
+                    raise VsysMergeError("Kan geen unieke policynaam binnen de PAN-OS-limiet van 63 tekens maken")
+                candidate = f"{prefix}{name[:available]}{suffix}"
+                if candidate not in used_names:
+                    break
+                suffix_number += 1
+
+            used_names.add(candidate)
+            assignments[(scope, category_name, name)] = candidate
+            renamed.append({
+                "rulebase": base_name,
+                "policy_type": category_name,
+                "vsys": scope,
+                "old_name": name,
+                "new_name": candidate,
+            })
+    return assignments, renamed
+
+
 def _merge_rulebases(
     vsyses: list[ET.Element],
     ordered_names: list[str],
     target_vsys: str,
     default_rule_source: str,
     zone_mappings: dict[tuple[str, str], str],
-) -> int:
+    vsys_numbers: dict[str, int],
+) -> tuple[int, list[dict[str, str]]]:
     by_name = {str(vsys.get("name", "")): vsys for vsys in vsyses}
     target = by_name[target_vsys]
     policy_total = 0
+    renamed_policies: list[dict[str, str]] = []
     for base_name in _RULEBASES:
         source_bases = [
             (scope, by_name[scope].find(f"./{base_name}"))
@@ -535,6 +637,10 @@ def _merge_rulebases(
         ]
         if not source_bases:
             continue
+        name_assignments, base_renames = _policy_name_assignments(
+            source_bases, vsys_numbers, base_name,
+        )
+        renamed_policies.extend(base_renames)
         original = target.find(f"./{base_name}")
         insert_at = list(target).index(original) if original is not None else len(list(target))
         if original is not None:
@@ -542,7 +648,6 @@ def _merge_rulebases(
         merged_base = ET.Element(base_name)
         categories: dict[str, ET.Element] = {}
         rule_entries: dict[str, list[ET.Element]] = defaultdict(list)
-        seen_rules: dict[str, set[str]] = defaultdict(set)
         selected_default_rules: dict[tuple[str, str], ET.Element] = {}
         default_rule_sources: dict[tuple[str, str], set[str]] = defaultdict(set)
 
@@ -578,14 +683,11 @@ def _merge_rulebases(
                             name = str(rule_item.get("name", "")).strip()
                             if not name:
                                 raise VsysMergeError(f"Policy zonder naam bij {base_name}/{source_category.tag}")
-                            if name in seen_rules[source_category.tag]:
-                                raise VsysMergeError(
-                                    f"Policynaam '{name}' komt in meerdere VSYS voor onder {base_name}/{source_category.tag}; "
-                                    "hernoem de policy in de bronworkspace en probeer opnieuw."
-                                )
                             clone = copy.deepcopy(rule_item)
+                            renamed_name = name_assignments.get((scope, source_category.tag, name))
+                            if renamed_name:
+                                clone.set("name", renamed_name)
                             _rewrite_policy_zones(clone, scope, zone_mappings)
-                            seen_rules[source_category.tag].add(name)
                             rule_entries[source_category.tag].append(clone)
                             policy_total += 1
                         elif rule_item.tag == "default-rule":
@@ -630,7 +732,7 @@ def _merge_rulebases(
                 category.append(category_default)
 
         target.insert(min(insert_at, len(list(target))), merged_base)
-    return policy_total
+    return policy_total, renamed_policies
 
 
 def _merge_vsys_settings(
@@ -719,7 +821,10 @@ def merge_panos_vsys_config(
     _check_duplicate_interface_assignments(vsyses)
     shared_moved, shared_reused = _move_shareable_objects(root, vsyses)
     zone_total, merged_zone_total = _merge_zones(vsyses, vsys_order, target_vsys, zone_mappings)
-    policy_total = _merge_rulebases(vsyses, vsys_order, target_vsys, default_rule_source, zone_mappings)
+    policy_total, renamed_policies = _merge_rulebases(
+        vsyses, vsys_order, target_vsys, default_rule_source, zone_mappings,
+        _policy_vsys_numbers(vsyses),
+    )
     _merge_vsys_settings(vsyses, vsys_order, target_vsys)
 
     for item in list(vsys_container.findall("./entry")):
@@ -739,6 +844,7 @@ def merge_panos_vsys_config(
         "source_order": list(vsys_order),
         "removed_vsys": [name for name in original_names if name != target_vsys],
         "policy_total": policy_total,
+        "renamed_policies": renamed_policies,
         "zones_in_sources": zone_total,
         "zones_in_target": merged_zone_total,
         "shareable_objects_moved": shared_moved,

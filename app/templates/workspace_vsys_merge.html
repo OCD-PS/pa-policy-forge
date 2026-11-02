@@ -134,6 +134,16 @@
         <li>Doel: {{preview_plan.target_vsys}}. Verwijderd uit de output: {{preview_plan.removed_vsys|join(', ')}}.</li>
         <li>Netwerk- en transitconfiguratie blijft staan; er worden geen policies automatisch samengevoegd of verwijderd.</li>
       </ul>
+      {% if preview_plan.renamed_policies %}
+      <details>
+        <summary>{{preview_plan.renamed_policies|length}} policies krijgen automatisch een unieke naam</summary>
+        <p class="help">Bij dubbele namen blijft de policy uit de VSYS met het laagste nummer ongewijzigd. De andere naam krijgt het VSYS-nummer als prefix. PAN-OS laat maximaal 63 tekens toe; zo nodig wordt het einde van de oorspronkelijke naam ingekort. Als een prefixnaam al bestaat, voegt de wizard een volgnummer toe.</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>VSYS</th><th>Rulebase</th><th>Huidige naam</th><th>Nieuwe naam</th></tr></thead>
+          <tbody>{% for item in preview_plan.renamed_policies %}<tr><td>{{item.vsys}}</td><td>{{item.rulebase}} · {{item.policy_type}}</td><td>{{item.old_name}}</td><td><strong>{{item.new_name}}</strong></td></tr>{% endfor %}</tbody>
+        </table></div>
+      </details>
+      {% endif %}
       {% if preview_plan.warnings %}<details><summary>Aandachtspunten</summary><ul>{% for item in preview_plan.warnings %}<li>{{item}}</li>{% endfor %}</ul></details>{% endif %}
       <label class="check-row"><input type="checkbox" name="confirm_policy_order" value="yes"><span>Ik heb de policy-volgorde nagekeken en begrijp dat deze de evaluatievolgorde bepaalt.</span></label>
       <label class="check-row"><input type="checkbox" name="confirm_scope_model" value="yes"><span>Ik begrijp dat policies en zones in vsys1 blijven en dat netwerkconfiguratie apparaatbreed blijft.</span></label>
