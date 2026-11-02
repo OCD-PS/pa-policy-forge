@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import copy
+from collections import Counter
 import shlex
 import re
 import ipaddress
@@ -109,9 +110,9 @@ def merge_config_xml(
             def member_values(children):
                 return [(child.text or "").strip() for child in children]
 
-            b_values = member_values(base_children)
-            d_values = member_values(desired_children)
-            c_values = member_values(current_children)
+            b_values = Counter(member_values(base_children))
+            d_values = Counter(member_values(desired_children))
+            c_values = Counter(member_values(current_children))
             if d_values == b_values:
                 chosen = current_children
             elif c_values == b_values or d_values == c_values:
