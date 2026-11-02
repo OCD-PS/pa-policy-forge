@@ -440,6 +440,7 @@ def init_db() -> None:
           source TEXT NOT NULL, original_name TEXT NOT NULL, config_path TEXT NOT NULL,
           sha256 TEXT NOT NULL, baseline_config_path TEXT NOT NULL DEFAULT '',
           baseline_sha256 TEXT NOT NULL DEFAULT '', baseline_target_sha256 TEXT NOT NULL DEFAULT '',
+          history_parent_id INTEGER, history_root_id INTEGER,
           metadata_json TEXT NOT NULL DEFAULT '{}',
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
           FOREIGN KEY(profile_id) REFERENCES profiles(id)
@@ -567,6 +568,11 @@ def init_db() -> None:
             conn.execute("ALTER TABLE config_workspaces ADD COLUMN baseline_sha256 TEXT NOT NULL DEFAULT ''")
         if "baseline_target_sha256" not in workspace_columns:
             conn.execute("ALTER TABLE config_workspaces ADD COLUMN baseline_target_sha256 TEXT NOT NULL DEFAULT ''")
+        if "history_parent_id" not in workspace_columns:
+            conn.execute("ALTER TABLE config_workspaces ADD COLUMN history_parent_id INTEGER")
+        if "history_root_id" not in workspace_columns:
+            conn.execute("ALTER TABLE config_workspaces ADD COLUMN history_root_id INTEGER")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_config_workspace_history ON config_workspaces(history_root_id,id)")
         initialize_workspace_access(conn)
         monitor_columns = {row[1] for row in conn.execute("PRAGMA table_info(post_deploy_monitors)")}
         if "target_type" not in monitor_columns:
@@ -2768,7 +2774,8 @@ def accessible_workspace_rows(rows):
 def store_config_workspace(
     profile, name: str, original_name: str, xml_bytes: bytes, source: str,
     project_id: int | None = None, baseline_workspace=None, baseline_xml: bytes | None = None,
-    parsed_config=None,
+    parsed_config=None, history_parent_id: int | None = None,
+    connection: sqlite3.Connection | None = None, log_creation: bool = True,
 ) -> int:
     expected = "panorama" if profile["target_type"] == "panorama" else "panos"
     if parsed_config is None:
@@ -2821,29 +2828,58 @@ def store_config_workspace(
         ).hexdigest()
         created_baseline_path = baseline_path_object
     timestamp = now()
+    def insert_workspace(conn: sqlite3.Connection) -> int:
+        nonlocal project_id
+        history_root_id = None
+        if history_parent_id is not None:
+            parent = conn.execute(
+                "SELECT id,profile_id,history_root_id FROM config_workspaces WHERE id=?",
+                (history_parent_id,),
+            ).fetchone()
+            if not parent or int(parent["profile_id"]) != int(profile["id"]):
+                raise OfflineConfigError("De vorige configuratieversie hoort niet bij dit profiel")
+            history_root_id = int(parent["history_root_id"] or parent["id"])
+            if not parent["history_root_id"]:
+                conn.execute(
+                    "UPDATE config_workspaces SET history_root_id=? WHERE id=?",
+                    (history_root_id, history_parent_id),
+                )
+        cursor = conn.execute(
+            "INSERT INTO config_workspaces(profile_id,name,source,original_name,config_path,sha256,baseline_config_path,baseline_sha256,baseline_target_sha256,history_parent_id,history_root_id,metadata_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                profile["id"], name[:120], source, original_name[:255], str(path),
+                snapshot_sha256(normalized), baseline_path, baseline_hash, baseline_target_hash,
+                history_parent_id, history_root_id, json.dumps(snapshot.as_dict()), timestamp, timestamp,
+            ),
+        )
+        workspace_id = int(cursor.lastrowid)
+        if project_id is None and has_request_context():
+            project_id = (request.view_args or {}).get("project_id")
+        if project_id and source.startswith("migration-"):
+            link_workspace_project(conn, workspace_id, int(project_id))
+        return workspace_id
+
     try:
-        with db() as conn:
-            cursor = conn.execute(
-                "INSERT INTO config_workspaces(profile_id,name,source,original_name,config_path,sha256,baseline_config_path,baseline_sha256,baseline_target_sha256,metadata_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (profile["id"], name[:120], source, original_name[:255], str(path), snapshot_sha256(normalized), baseline_path, baseline_hash, baseline_target_hash, json.dumps(snapshot.as_dict()), timestamp, timestamp),
-            )
-            workspace_id = int(cursor.lastrowid)
-            if project_id is None and has_request_context():
-                project_id = (request.view_args or {}).get("project_id")
-            if project_id and source.startswith("migration-"):
-                link_workspace_project(conn, workspace_id, int(project_id))
+        if connection is not None:
+            workspace_id = insert_workspace(connection)
+        else:
+            with db() as conn:
+                workspace_id = insert_workspace(conn)
     except Exception:
         path.unlink(missing_ok=True)
         if created_baseline_path is not None:
             created_baseline_path.unlink(missing_ok=True)
         raise
-    audit("config-workspace-created", f"workspace={workspace_id} profile={profile['name']} source={source} kind={snapshot.kind}")
+    if log_creation:
+        audit("config-workspace-created", f"workspace={workspace_id} profile={profile['name']} source={source} kind={snapshot.kind}")
     return workspace_id
 
 
-def advance_migration_staging_workspace(previous_workspace_id: int, new_workspace_id: int) -> bool:
+def advance_migration_staging_workspace(
+    previous_workspace_id: int, new_workspace_id: int, connection: sqlite3.Connection | None = None,
+) -> bool:
     """Keep an imported source attached to the newest immutable workspace version."""
-    with db() as conn:
+    def advance(conn: sqlite3.Connection) -> bool:
         inherit_workspace_access(conn, previous_workspace_id, new_workspace_id)
         linked_sources = conn.execute(
             "SELECT id,project_id FROM migration_sources WHERE staging_workspace_id=?",
@@ -2862,7 +2898,12 @@ def advance_migration_staging_workspace(previous_workspace_id: int, new_workspac
                 "WHERE id=? AND base_workspace_id=?",
                 (new_workspace_id, now(), project_id, previous_workspace_id),
             )
-    return True
+        return True
+
+    if connection is not None:
+        return advance(connection)
+    with db() as conn:
+        return advance(conn)
 
 
 def workspace_version_source(workspace) -> str:
@@ -2877,9 +2918,10 @@ def advance_migration_output_workspace(
     previous_workspace_id: int,
     new_workspace_id: int,
     new_xml: bytes,
+    connection: sqlite3.Connection | None = None,
 ) -> bool:
     """Keep safety metadata attached to edited migration candidate versions."""
-    with db() as conn:
+    def advance(conn: sqlite3.Connection) -> bool:
         outputs = conn.execute(
             "SELECT id,sanity_json FROM migration_outputs WHERE workspace_id=?",
             (previous_workspace_id,),
@@ -2910,26 +2952,83 @@ def advance_migration_output_workspace(
                 "UPDATE migration_outputs SET workspace_id=?,sanity_json=? WHERE id=?",
                 (new_workspace_id, json.dumps(sanity, sort_keys=True), output["id"]),
             )
-    return True
+        return True
+
+    if connection is not None:
+        return advance(connection)
+    with db() as conn:
+        return advance(conn)
 
 
 def store_workspace_edit_version(workspace, new_xml: bytes, label: str) -> int:
-    """Store one immutable edit and advance any linked migration staging source."""
-    with db() as conn:
-        profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
-    if not profile:
-        raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
-    new_id = store_config_workspace(
-        profile,
-        f"{workspace['name']} · {label} {now()}",
-        workspace["original_name"],
-        new_xml,
-        workspace_version_source(workspace),
-        baseline_workspace=workspace,
+    """Atomically append an edit, advance its pointer, then prune old snapshots."""
+    workspace_id = int(workspace["id"])
+    profile_id = int(workspace["profile_id"])
+    new_id = None
+    new_config_path = None
+    try:
+        with db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+            current = conn.execute(
+                "SELECT * FROM config_workspaces WHERE id=? AND profile_id=?", (workspace_id, profile_id)
+            ).fetchone()
+            if not profile or not current:
+                raise OfflineConfigError("De configuratiewerkruimte bestaat niet meer")
+            settings = json.loads(profile["settings_json"] or "{}")
+            active_id = int(settings.get("config_workspace_id") or 0)
+            is_staging = bool(conn.execute(
+                "SELECT 1 FROM migration_sources WHERE staging_workspace_id=? LIMIT 1", (workspace_id,)
+            ).fetchone())
+            is_output = bool(conn.execute(
+                "SELECT 1 FROM migration_outputs WHERE workspace_id=? LIMIT 1", (workspace_id,)
+            ).fetchone())
+            is_migration_base = bool(conn.execute(
+                "SELECT 1 FROM migration_projects WHERE base_workspace_id=? LIMIT 1", (workspace_id,)
+            ).fetchone())
+            is_migration_linked = is_staging or is_output or is_migration_base
+            if str(current["source"]).startswith("migration-") and not is_migration_linked:
+                raise OfflineConfigError("Deze migratiewerkruimte is verouderd; open de actuele migratieversie opnieuw")
+            if not is_migration_linked and active_id not in {0, workspace_id}:
+                raise OfflineConfigError("Deze werkruimte is verouderd; open de actuele configuratie opnieuw")
+            new_id = store_config_workspace(
+                profile,
+                f"{current['name']} · {label} {now()}",
+                current["original_name"],
+                new_xml,
+                workspace_version_source(current),
+                baseline_workspace=current,
+                history_parent_id=workspace_id,
+                connection=conn,
+                log_creation=False,
+            )
+            new_path_row = conn.execute(
+                "SELECT config_path FROM config_workspaces WHERE id=?", (new_id,)
+            ).fetchone()
+            new_config_path = str(new_path_row["config_path"]) if new_path_row else None
+            if not advance_migration_staging_workspace(workspace_id, new_id, connection=conn):
+                advance_migration_output_workspace(workspace_id, new_id, new_xml, connection=conn)
+                conn.execute(
+                    "UPDATE migration_projects SET base_workspace_id=?,updated_at=? WHERE base_workspace_id=?",
+                    (new_id, now(), workspace_id),
+                )
+                set_active_config_workspace(profile_id, new_id, connection=conn)
+    except Exception:
+        if new_config_path:
+            try:
+                safe_workspace_path(CONFIG_WORKSPACES, new_config_path).unlink(missing_ok=True)
+            except (OSError, ValueError):
+                app.logger.exception("Unable to remove uncommitted workspace XML for workspace_id=%s", new_id)
+        raise
+    audit(
+        "config-workspace-created",
+        f"workspace={new_id} profile={profile['name']} source={workspace_version_source(current)}",
     )
-    if not advance_migration_staging_workspace(workspace["id"], new_id):
-        advance_migration_output_workspace(workspace["id"], new_id, new_xml)
-        set_active_config_workspace(workspace["profile_id"], new_id)
+    try:
+        prune_workspace_history(new_id)
+    except Exception:
+        # A retention cleanup failure must not make a successfully saved edit look failed.
+        app.logger.exception("Unable to prune workspace undo history for workspace_id=%s", new_id)
     return new_id
 
 
@@ -3657,8 +3756,10 @@ def active_config_workspace_id(profile) -> int:
         return 0
 
 
-def set_active_config_workspace(profile_id: int, workspace_id: int | None) -> None:
-    with db() as conn:
+def set_active_config_workspace(
+    profile_id: int, workspace_id: int | None, connection: sqlite3.Connection | None = None,
+) -> None:
+    def update(conn: sqlite3.Connection) -> None:
         profile = conn.execute("SELECT settings_json FROM profiles WHERE id=?", (profile_id,)).fetchone()
         if not profile:
             raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
@@ -3675,6 +3776,172 @@ def set_active_config_workspace(profile_id: int, workspace_id: int | None) -> No
             settings.pop("config_workspace_id", None)
         conn.execute("UPDATE profiles SET settings_json=? WHERE id=?", (json.dumps(settings), profile_id))
 
+    if connection is not None:
+        update(connection)
+        return
+    with db() as conn:
+        update(conn)
+
+
+WORKSPACE_UNDO_LIMIT = 15
+
+
+def _workspace_history_chain(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    undo_limit: int = WORKSPACE_UNDO_LIMIT,
+    username: str = "",
+    check_access: bool = True,
+) -> list[int]:
+    chain: list[int] = []
+    current = conn.execute(
+        "SELECT id,profile_id,history_parent_id,history_root_id FROM config_workspaces WHERE id=?",
+        (workspace_id,),
+    ).fetchone()
+    if not current:
+        return chain
+    root_id = int(current["history_root_id"] or current["id"])
+    seen: set[int] = set()
+    for _ in range(undo_limit + 1):
+        current_id = int(current["id"])
+        if current_id in seen:
+            break
+        seen.add(current_id)
+        chain.append(current_id)
+        parent_id = current["history_parent_id"]
+        if not parent_id:
+            break
+        parent = conn.execute(
+            "SELECT id,profile_id,history_parent_id,history_root_id FROM config_workspaces WHERE id=?",
+            (parent_id,),
+        ).fetchone()
+        if (
+            not parent
+            or int(parent["profile_id"]) != int(current["profile_id"])
+            or int(parent["history_root_id"] or parent["id"]) != root_id
+            or (
+                check_access and has_request_context()
+                and not workspace_allowed(conn, int(parent_id), username, write=True)
+            )
+        ):
+            break
+        current = parent
+    return chain
+
+
+def workspace_history_chain(workspace_id: int, undo_limit: int = WORKSPACE_UNDO_LIMIT) -> list[int]:
+    """Return the accessible current-to-parent history, bounded to the undo window."""
+    username = str(session.get("username", "")) if has_request_context() else ""
+    with db() as conn:
+        return _workspace_history_chain(conn, workspace_id, undo_limit, username)
+
+
+def prune_workspace_history(workspace_id: int) -> int:
+    """Keep the current snapshot and 15 undo steps; discard inactive branches safely."""
+    deleted: list[tuple[str, str]] = []
+    expired_count = 0
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            "SELECT id,profile_id,history_parent_id,history_root_id FROM config_workspaces WHERE id=?",
+            (workspace_id,),
+        ).fetchone()
+        if not current or not current["history_root_id"]:
+            return 0
+        root_id = int(current["history_root_id"])
+        profile = conn.execute(
+            "SELECT settings_json FROM profiles WHERE id=?", (current["profile_id"],)
+        ).fetchone()
+        try:
+            settings = json.loads(profile["settings_json"] or "{}") if profile else {}
+            active_id = int(settings.get("config_workspace_id") or 0) if isinstance(settings, dict) else 0
+        except (TypeError, ValueError, json.JSONDecodeError):
+            active_id = 0
+        live_workspace = conn.execute(
+            "SELECT id,history_root_id FROM config_workspaces WHERE id=? AND profile_id=?",
+            (active_id, current["profile_id"]),
+        ).fetchone() if active_id else None
+        staging = conn.execute(
+            "SELECT s.staging_workspace_id AS id FROM migration_sources s "
+            "JOIN config_workspaces w ON w.id=s.staging_workspace_id "
+            "WHERE w.profile_id=? AND w.history_root_id=? ORDER BY s.staging_workspace_id DESC LIMIT 1",
+            (current["profile_id"], root_id),
+        ).fetchone()
+        output = conn.execute(
+            "SELECT o.workspace_id AS id FROM migration_outputs o "
+            "JOIN config_workspaces w ON w.id=o.workspace_id "
+            "WHERE w.profile_id=? AND w.history_root_id=? ORDER BY o.workspace_id DESC LIMIT 1",
+            (current["profile_id"], root_id),
+        ).fetchone()
+        if staging:
+            live_workspace_id = int(staging["id"])
+        elif output:
+            live_workspace_id = int(output["id"])
+        elif live_workspace and int(live_workspace["history_root_id"] or live_workspace["id"]) == root_id:
+            live_workspace_id = active_id
+        else:
+            live_workspace_id = workspace_id
+        username = str(session.get("username", "")) if has_request_context() else ""
+        chain = _workspace_history_chain(conn, live_workspace_id, check_access=False)
+        if not chain:
+            return 0
+        keep_ids = set(chain)
+        all_versions = conn.execute(
+            "SELECT id,config_path,baseline_config_path FROM config_workspaces "
+            "WHERE profile_id=? AND history_root_id=?",
+            (current["profile_id"], root_id),
+        ).fetchall()
+        # Detach the oldest retained snapshot so the UI can never offer a 16th undo.
+        if len(chain) == WORKSPACE_UNDO_LIMIT + 1:
+            oldest = conn.execute(
+                "SELECT id,history_parent_id FROM config_workspaces WHERE id=?", (chain[-1],)
+            ).fetchone()
+            if oldest and oldest["history_parent_id"]:
+                conn.execute(
+                    "UPDATE config_workspaces SET history_parent_id=NULL WHERE id=?", (oldest["id"],)
+                )
+        for version in all_versions:
+            version_id = int(version["id"])
+            if version_id in keep_ids or version_id == active_id:
+                continue
+            referenced = conn.execute(
+                "SELECT 1 FROM migration_projects WHERE base_workspace_id=? "
+                "UNION ALL SELECT 1 FROM migration_sources WHERE staging_workspace_id=? "
+                "UNION ALL SELECT 1 FROM migration_outputs WHERE workspace_id=? LIMIT 1",
+                (version_id, version_id, version_id),
+            ).fetchone()
+            pending_commit = conn.execute(
+                "SELECT 1 FROM config_workspace_commits WHERE workspace_id=? "
+                "AND status IN ('SUBMITTING','PEND','ACT') LIMIT 1",
+                (version_id,),
+            ).fetchone()
+            if referenced or pending_commit:
+                continue
+            conn.execute("DELETE FROM config_workspace_commits WHERE workspace_id=?", (version_id,))
+            conn.execute("DELETE FROM config_workspace_projects WHERE workspace_id=?", (version_id,))
+            conn.execute("DELETE FROM config_workspaces WHERE id=?", (version_id,))
+            deleted.append((str(version["config_path"]), str(version["baseline_config_path"] or "")))
+        expired_count = len(deleted)
+    for config_path, baseline_path in deleted:
+        try:
+            safe_workspace_path(CONFIG_WORKSPACES, config_path).unlink(missing_ok=True)
+            if baseline_path:
+                with db() as conn:
+                    baseline_in_use = conn.execute(
+                        "SELECT 1 FROM config_workspaces WHERE baseline_config_path=? LIMIT 1",
+                        (baseline_path,),
+                    ).fetchone()
+                if not baseline_in_use:
+                    safe_workspace_path(CONFIG_WORKSPACES, baseline_path).unlink(missing_ok=True)
+        except (OSError, ValueError) as exc:
+            app.logger.warning("Unable to remove expired workspace snapshot: %s", exc)
+    if expired_count:
+        audit(
+            "config-workspace-history-pruned",
+            f"workspace={live_workspace_id} profile={current['profile_id']} expired={expired_count}",
+        )
+    return expired_count
+
 
 @app.post("/config-workspaces/<int:workspace_id>/select")
 @login_required
@@ -3684,11 +3951,104 @@ def config_workspace_select(workspace_id):
         return "Not found", 404
     try:
         set_active_config_workspace(workspace["profile_id"], workspace_id)
+        try:
+            prune_workspace_history(workspace_id)
+        except Exception:
+            app.logger.exception("Unable to prune workspace history after selecting workspace_id=%s", workspace_id)
         audit("config-workspace-selected", f"workspace={workspace_id} profile={workspace['profile_name']}")
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
     except Exception as exc:
         flash(f"Configuratie niet geselecteerd: {exc}", "error")
         return redirect(url_for("index", policy_profile=workspace["profile_id"], policy_source="choose") + "#policy-management")
+
+
+@app.post("/config-workspaces/<int:workspace_id>/undo")
+@login_required
+def config_workspace_undo(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    return_context = {
+        "scope": request.form.get("scope", "")[:127],
+        "template": request.form.get("template", "")[:127],
+        "workspace_view": request.form.get("workspace_view", "policies"),
+        "policy_kind": request.form.get("policy_kind", "security"),
+        "rulebase": request.form.get("rulebase", "standard"),
+        "object_type": request.form.get("object_type", "addresses"),
+        "config_section": request.form.get("config_section", "")[:127],
+        "policy_query": request.form.get("policy_query", "")[:200],
+        "policy_page": max(1, request.form.get("policy_page", default=1, type=int) or 1),
+        "object_query": request.form.get("object_query", "")[:200],
+        "object_page": max(1, request.form.get("object_page", default=1, type=int) or 1),
+    }
+    if return_context["workspace_view"] not in {"policies", "objects", "network", "device"}:
+        return_context["workspace_view"] = "policies"
+    if return_context["policy_kind"] not in POLICY_NODES:
+        return_context["policy_kind"] = "security"
+    if return_context["rulebase"] not in {"standard", "pre", "post"}:
+        return_context["rulebase"] = "standard"
+    if return_context["object_type"] not in OBJECT_NODES:
+        return_context["object_type"] = "addresses"
+    chain = workspace_history_chain(workspace_id)
+    if len(chain) < 2 or chain[0] != workspace_id:
+        flash("Er is geen eerdere wijziging beschikbaar om ongedaan te maken.", "error")
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, **return_context))
+    parent_id = chain[1]
+    parent = workspace_row(parent_id)
+    if not parent or int(parent["profile_id"]) != int(workspace["profile_id"]):
+        flash("De vorige configuratieversie is niet meer beschikbaar.", "error")
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, **return_context))
+    try:
+        parent_xml, _, _ = cached_workspace_config(parent["config_path"], parent["sha256"])
+        with db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+            current_chain = _workspace_history_chain(
+                conn, workspace_id, username=str(session.get("username", ""))
+            )
+            if len(current_chain) < 2 or current_chain[:2] != [workspace_id, parent_id]:
+                raise OfflineConfigError("De werkruimte is intussen gewijzigd; ververs de pagina en probeer opnieuw")
+            current = conn.execute(
+                "SELECT 1 FROM config_workspaces WHERE id=? AND profile_id=?",
+                (workspace_id, workspace["profile_id"]),
+            ).fetchone()
+            if not current or not profile:
+                raise OfflineConfigError("De configuratiewerkruimte bestaat niet meer")
+            staged = conn.execute(
+                "SELECT 1 FROM migration_sources WHERE staging_workspace_id=? LIMIT 1", (workspace_id,)
+            ).fetchone()
+            output = conn.execute(
+                "SELECT 1 FROM migration_outputs WHERE workspace_id=? LIMIT 1", (workspace_id,)
+            ).fetchone()
+            migration_base = conn.execute(
+                "SELECT 1 FROM migration_projects WHERE base_workspace_id=? LIMIT 1", (workspace_id,)
+            ).fetchone()
+            migration_linked = bool(staged or output or migration_base)
+            is_active = active_config_workspace_id(profile) == workspace_id
+            if str(workspace["source"]).startswith("migration-") and not migration_linked:
+                raise OfflineConfigError("Deze migratiewerkruimte is verouderd; open de actuele migratieversie opnieuw")
+            if not is_active and not migration_linked:
+                raise OfflineConfigError("Deze versie is verouderd; open de actuele configuratiewerkruimte opnieuw")
+            if not advance_migration_staging_workspace(workspace_id, parent_id, connection=conn):
+                advance_migration_output_workspace(workspace_id, parent_id, parent_xml, connection=conn)
+                conn.execute(
+                    "UPDATE migration_projects SET base_workspace_id=?,updated_at=? WHERE base_workspace_id=?",
+                    (parent_id, now(), workspace_id),
+                )
+                set_active_config_workspace(workspace["profile_id"], parent_id, connection=conn)
+        audit(
+            "config-workspace-undone",
+            f"workspace={workspace_id} restored={parent_id} profile={workspace['profile_name']}",
+        )
+        try:
+            prune_workspace_history(parent_id)
+        except Exception:
+            app.logger.exception("Unable to prune workspace history after undo workspace_id=%s", parent_id)
+        flash("Laatste wijziging ongedaan gemaakt.", "success")
+        return redirect(url_for("config_workspace_editor", workspace_id=parent_id, **return_context))
+    except Exception as exc:
+        flash(f"Wijziging niet ongedaan gemaakt: {exc}", "error")
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, **return_context))
 
 
 OFFLINE_POLICY_FIELDS = (
@@ -4293,6 +4653,10 @@ def config_workspace_editor(workspace_id):
                 "WHERE migration_outputs.workspace_id=? ORDER BY migration_outputs.id DESC LIMIT 1",
                 (workspace_id,),
             ).fetchone()
+            migration_base = conn.execute(
+                "SELECT 1 FROM migration_projects WHERE base_workspace_id=? LIMIT 1",
+                (workspace_id,),
+            ).fetchone()
         if not workspace_profile:
             raise OfflineConfigError("Het gekoppelde firewallprofiel bestaat niet meer")
         xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
@@ -4471,6 +4835,17 @@ def config_workspace_editor(workspace_id):
         migration_output_push_blocked = bool(
             migration_output and migration_output_push_block(workspace["id"])[1]
         )
+        undo_chain = workspace_history_chain(workspace_id)
+        workspace_undo_count = max(0, len(undo_chain) - 1)
+        workspace_undo_available = bool(
+            workspace_undo_count
+            and (
+                active_config_workspace_id(workspace_profile) == workspace_id
+                or staging_source
+                or migration_output
+                or migration_base
+            )
+        )
         return render_template(
             "workspace_editor.html", workspace=workspace, snapshot=snapshot,
             scopes=scopes, scope=scope, templates=templates, template=template,
@@ -4506,6 +4881,8 @@ def config_workspace_editor(workspace_id):
             migration_output_sanity=migration_output_sanity,
             migration_output_push_blocked=migration_output_push_blocked,
             migration_staging=str(workspace["source"]) in {"migration-staging", "migration-import", "migration-api"},
+            workspace_undo_available=workspace_undo_available,
+            workspace_undo_count=workspace_undo_count,
         )
     except Exception as exc:
         flash(f"Workspace niet geopend: {exc}", "error")
@@ -4850,11 +5227,7 @@ def config_workspace_policy_bulk_apply(draft_id):
                 "replacement_xml": change["replacement_xml"],
             } for change in draft["changes"]],
         )
-        with db() as conn: profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
-        if not profile: raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
-        new_id = store_config_workspace(profile, f"{workspace['name']} · bulk edit {now()}", workspace["original_name"], new_xml, workspace_version_source(workspace), baseline_workspace=workspace)
-        if not advance_migration_staging_workspace(workspace["id"], new_id):
-            set_active_config_workspace(workspace["profile_id"], new_id)
+        new_id = store_workspace_edit_version(workspace, new_xml, "policy bulk edit")
         audit("config-workspace-policy-bulk-edited", f"source={workspace['id']} workspace={new_id} scope={draft['scope']} rules={len(draft['changes'])}")
         draft_path.unlink(missing_ok=True)
         flash(f"{len(draft['changes'])} policies gewijzigd in een nieuwe workspaceversie.", "success")
@@ -4888,16 +5261,7 @@ def config_workspace_policy_apply(draft_id):
                 workspace_config_path(workspace).read_bytes(), draft["scope"], draft["kind"],
                 draft["rulebase"], draft["policy_name"], draft["fingerprint"], draft["replacement_xml"],
             )
-        with db() as conn:
-            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
-        if not profile:
-            raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
-        new_id = store_config_workspace(
-            profile, f"{workspace['name']} · edit {now()}", workspace["original_name"], new_xml,
-            workspace_version_source(workspace), baseline_workspace=workspace,
-        )
-        if not advance_migration_staging_workspace(workspace["id"], new_id):
-            set_active_config_workspace(workspace["profile_id"], new_id)
+        new_id = store_workspace_edit_version(workspace, new_xml, "policy edit")
         audit("config-workspace-policy-edited", f"source={workspace['id']} workspace={new_id} scope={draft['scope']} policy={draft['policy_name']}")
         draft_path.unlink(missing_ok=True)
         flash("Policy gewijzigd in een nieuwe workspaceversie; de bronsnapshot bleef onaangeroerd.", "success")
@@ -5182,16 +5546,7 @@ def config_workspace_object_apply(draft_id):
                 workspace_config_path(workspace).read_bytes(), draft["scope"],
                 draft["object_type"], draft["changes"],
             )
-        with db() as conn:
-            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
-        if not profile:
-            raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
-        new_id = store_config_workspace(
-            profile, f"{workspace['name']} · object edit {now()}", workspace["original_name"], new_xml,
-            workspace_version_source(workspace), baseline_workspace=workspace,
-        )
-        if not advance_migration_staging_workspace(workspace["id"], new_id):
-            set_active_config_workspace(workspace["profile_id"], new_id)
+        new_id = store_workspace_edit_version(workspace, new_xml, "object edit")
         draft_path.unlink(missing_ok=True)
         audit(
             "config-workspace-object-edited",
@@ -5229,16 +5584,7 @@ def _workspace_config_redirect(workspace_id: int, draft: dict):
 
 def _store_workspace_configuration_version(workspace, context: dict, changes: list[dict]) -> int:
     new_xml = apply_configuration_changes(workspace_config_path(workspace).read_bytes(), changes)
-    with db() as conn:
-        profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
-    if not profile:
-        raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
-    new_id = store_config_workspace(
-        profile, f"{workspace['name']} · {context['view']} edit {now()}",
-        workspace["original_name"], new_xml, workspace_version_source(workspace), baseline_workspace=workspace,
-    )
-    if not advance_migration_staging_workspace(workspace["id"], new_id):
-        set_active_config_workspace(workspace["profile_id"], new_id)
+    new_id = store_workspace_edit_version(workspace, new_xml, f"{context['view']} edit")
     audit("config-workspace-configuration-edited", f"source={workspace['id']} workspace={new_id} view={context['view']} section={context['section']} operation={context.get('operation','update')}")
     return new_id
 
@@ -5278,17 +5624,7 @@ def config_workspace_configuration_create_basic(workspace_id):
                 context["section"], request.form.get("name", ""),
                 request.form.get("interface_type", "ethernet"), request.form.get("zone_type", "layer3"),
             )
-        with db() as conn:
-            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
-        if not profile:
-            raise OfflineConfigError("Het firewallprofiel bestaat niet meer")
-        new_id = store_config_workspace(
-            profile, f"{workspace['name']} · {context['view']} add {now()}", workspace["original_name"],
-            new_xml, workspace_version_source(workspace), baseline_workspace=workspace,
-        )
-        if not advance_migration_staging_workspace(workspace["id"], new_id):
-            advance_migration_output_workspace(workspace["id"], new_id, new_xml)
-            set_active_config_workspace(workspace["profile_id"], new_id)
+        new_id = store_workspace_edit_version(workspace, new_xml, f"{context['view']} add")
         audit("config-workspace-configuration-created", f"source={workspace_id} workspace={new_id} section={context['section']}")
         flash("Opgeslagen", "success")
         return _workspace_config_redirect(new_id, context)
