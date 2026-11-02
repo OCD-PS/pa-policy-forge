@@ -159,16 +159,93 @@ class VsysMergeTests(unittest.TestCase):
                 zone_mappings=zone_mappings(),
             )
 
-    def test_duplicate_policy_name_aborts(self):
+    def test_duplicate_policy_names_are_prefixed_by_vsys_id(self):
         conflict = MULTI_VSYS.replace(b"name=\"transit-to-internet\"", b"name=\"servers-to-transit\"")
-        with self.assertRaisesRegex(VsysMergeError, "Policynaam"):
-            merge_panos_vsys_config(
-                conflict,
-                target_vsys="vsys1",
-                vsys_order=["vsys1", "vsys2", "vsys3"],
-                default_rule_source="vsys1",
-                zone_mappings=zone_mappings(),
-            )
+        merged, plan = merge_panos_vsys_config(
+            conflict,
+            target_vsys="vsys1",
+            # Rule order must not change which source keeps the base name.
+            vsys_order=["vsys2", "vsys1", "vsys3"],
+            default_rule_source="vsys1",
+            zone_mappings=zone_mappings(),
+        )
+        root, _ = parse_snapshot(merged)
+        names = [rule.get("name") for rule in root.findall("./devices/entry/vsys/entry/rulebase/security/rules/entry")]
+        self.assertEqual(names, ["2_servers-to-transit", "servers-to-transit", "admin-to-servers"])
+        self.assertEqual(plan["renamed_policies"], [{
+            "rulebase": "rulebase",
+            "policy_type": "security",
+            "vsys": "vsys2",
+            "old_name": "servers-to-transit",
+            "new_name": "2_servers-to-transit",
+        }])
+
+    def test_policy_name_comparison_respects_pan_os_case_sensitivity(self):
+        different_case = MULTI_VSYS.replace(
+            b'name="transit-to-internet"', b'name="Servers-to-transit"',
+        )
+        _merged, plan = merge_panos_vsys_config(
+            different_case,
+            target_vsys="vsys1",
+            vsys_order=["vsys1", "vsys2", "vsys3"],
+            default_rule_source="vsys1",
+            zone_mappings=zone_mappings(),
+        )
+        self.assertEqual(plan["renamed_policies"], [])
+
+    def test_duplicate_names_between_later_vsys_keep_first_numbered_scope_unprefixed(self):
+        conflict = MULTI_VSYS.replace(b"name=\"admin-to-servers\"", b"name=\"transit-to-internet\"")
+        merged, plan = merge_panos_vsys_config(
+            conflict,
+            target_vsys="vsys1",
+            vsys_order=["vsys3", "vsys1", "vsys2"],
+            default_rule_source="vsys1",
+            zone_mappings=zone_mappings(),
+        )
+        root, _ = parse_snapshot(merged)
+        names = [rule.get("name") for rule in root.findall("./devices/entry/vsys/entry/rulebase/security/rules/entry")]
+        self.assertEqual(names, ["3_transit-to-internet", "servers-to-transit", "transit-to-internet"])
+        self.assertEqual(plan["renamed_policies"][0]["vsys"], "vsys3")
+        self.assertEqual(plan["renamed_policies"][0]["new_name"], "3_transit-to-internet")
+
+    def test_prefixed_policy_name_is_trimmed_to_pan_os_limit(self):
+        long_name = "A" * 63
+        conflict = MULTI_VSYS.replace(b"transit-to-internet", long_name.encode("ascii"))
+        conflict = conflict.replace(b"servers-to-transit", long_name.encode("ascii"))
+        merged, plan = merge_panos_vsys_config(
+            conflict,
+            target_vsys="vsys1",
+            vsys_order=["vsys1", "vsys2", "vsys3"],
+            default_rule_source="vsys1",
+            zone_mappings=zone_mappings(),
+        )
+        root, _ = parse_snapshot(merged)
+        names = [rule.get("name") for rule in root.findall("./devices/entry/vsys/entry/rulebase/security/rules/entry")]
+        generated = next(name for name in names if name.startswith("2_"))
+        self.assertEqual(generated, "2_" + "A" * 61)
+        self.assertEqual(len(generated), 63)
+        self.assertEqual(plan["renamed_policies"][0]["new_name"], generated)
+
+    def test_prefixed_policy_names_avoid_existing_names_after_trimming(self):
+        root = ET.fromstring(MULTI_VSYS)
+        vsys1_rules = root.find("./devices/entry/vsys/entry[@name='vsys1']/rulebase/security/rules")
+        existing = ET.fromstring(ET.tostring(vsys1_rules.find("./entry")))
+        existing.set("name", "2_servers-to-transit")
+        vsys1_rules.append(existing)
+        vsys2_rule = root.find("./devices/entry/vsys/entry[@name='vsys2']/rulebase/security/rules/entry")
+        vsys2_rule.set("name", "servers-to-transit")
+        merged, plan = merge_panos_vsys_config(
+            ET.tostring(root, encoding="utf-8"),
+            target_vsys="vsys1",
+            vsys_order=["vsys1", "vsys2", "vsys3"],
+            default_rule_source="vsys1",
+            zone_mappings=zone_mappings(),
+        )
+        merged_root, _ = parse_snapshot(merged)
+        names = [rule.get("name") for rule in merged_root.findall("./devices/entry/vsys/entry/rulebase/security/rules/entry")]
+        self.assertEqual(names, ["servers-to-transit", "2_servers-to-transit", "2_servers-to-transit_2", "admin-to-servers"])
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(plan["renamed_policies"][0]["new_name"], "2_servers-to-transit_2")
 
     def test_external_zone_must_map_to_a_local_zone(self):
         mappings = zone_mappings()
