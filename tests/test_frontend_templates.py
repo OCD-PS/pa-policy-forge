@@ -47,6 +47,22 @@ class FrontendTemplateTests(unittest.TestCase):
             with self.subTest(template=name):
                 environment.parse(environment.loader.get_source(environment, name)[0])
 
+    def test_vsys_merge_form_serializes_large_scope_choices_into_bounded_fields(self):
+        environment = self.environment()
+        source = environment.loader.get_source(environment, "workspace_vsys_merge.html")[0]
+        environment.parse(source)
+        self.assertIn('name="vsys_order_json"', source)
+        self.assertIn('name="zone_mappings_json"', source)
+        self.assertIn('name="preview_token"', source)
+        self.assertIn("app.js", source)
+        script = (Path(__file__).parents[1] / "app" / "static" / "app.js").read_text()
+        self.assertIn("JSON.stringify(order)", script)
+        self.assertIn("JSON.stringify(zones)", script)
+        self.assertNotIn('name="vsys_order_name"', source)
+        self.assertNotIn('name="vsys_order_rank"', source)
+        self.assertNotIn('name="zone_source_vsys"', source)
+        self.assertNotIn('name="zone_source_name"', source)
+
     def test_object_page_jump_submits_context_as_get_fields(self):
         environment = self.environment()
         source = environment.loader.get_source(environment, "workspace_editor.html")[0]

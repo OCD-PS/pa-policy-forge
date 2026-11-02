@@ -1080,6 +1080,21 @@
     }
   }
 
+  function setupVsysMergeForm() {
+    all("form[data-vsys-merge-form]").forEach(function (form) {
+      form.addEventListener("submit", function () {
+        var order = all("[data-vsys-order]", form).map(function (input) {
+          return {name: input.dataset.vsysOrder, rank: Number(input.value)};
+        });
+        var zones = all("[data-zone-target]", form).map(function (input) {
+          return {vsys: input.dataset.vsys, zone: input.dataset.zone, target: input.value};
+        });
+        form.elements.vsys_order_json.value = JSON.stringify(order);
+        form.elements.zone_mappings_json.value = JSON.stringify(zones);
+      });
+    });
+  }
+
   function setupConfigPullProgress() {
     all("form[data-config-pull]").forEach(function (form) {
       form.addEventListener("submit", function () {
@@ -1496,6 +1511,7 @@
     runSetup("object-management", setupObjectManagement);
     runSetup("offline-policy", setupOfflinePolicyTabs);
     runSetup("configuration-editor", setupWorkspaceConfigurationEditor);
+    runSetup("vsys-merge-form", setupVsysMergeForm);
     runSetup("pull-progress", setupConfigPullProgress);
     runSetup("incremental-push-controls", setupIncrementalPushControls);
     runSetup("workspace-commit-status", setupCommitStatusPolling);

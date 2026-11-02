@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>VSYS samenvoegen · {{workspace.profile_name}} · PA Policy Forge</title>
+  <link rel="icon" href="{{url_for('static',filename='favicon.svg',v=asset_version)}}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{url_for('static',filename='app.css',v=asset_version)}}">
+  <script src="{{url_for('static',filename='app.js',v=asset_version)}}" defer></script>
+</head>
+<body>
+<header class="topbar workspace-topbar">
+  <div class="brand">OCD <span>PA Policy Forge</span></div>
+  <a class="btn" href="{{url_for('config_workspace_editor',workspace_id=workspace.id)}}">Terug naar bronworkspace</a>
+</header>
+<main class="content">
+  {% with messages=get_flashed_messages(with_categories=true) %}
+    {% for category,message in messages %}<div class="flash {{category}}">{{message}}</div>{% endfor %}
+  {% endwith %}
+  <div class="page-header">
+    <div>
+      <p class="eyebrow">{{workspace.profile_name}} · PAN-OS · {{analysis.vsys_count}} VSYS</p>
+      <h1>VSYS samenvoegen</h1>
+      <p class="lede">Maak een nieuwe workspace met één gekozen VSYS. De bronconfiguratie blijft bewaard.</p>
+    </div>
+  </div>
+
+  <div class="callout">
+    <strong>Zo werkt de PAN-OS-scope:</strong>
+    PAN-OS vereist dat <code>vsys1</code> blijft bestaan, dus de nieuwe workspace bevat altijd één <code>vsys1</code>. Policies en zones blijven VSYS-lokaal; ondersteunde objecten gaan naar Shared. Interfaces, routing, tunnels en andere netwerkconfiguratie blijven apparaatbreed. De wizard verwijdert geen routes, transitinterfaces of policies.
+  </div>
+  {% if not has_baseline %}
+  <div class="callout">Deze bronworkspace heeft geen firewall-baseline. De nieuwe workspace is bruikbaar om offline te bewerken en exporteren. Een migratiepush blijft geblokkeerd totdat er een aparte volledige VSYS-migratiestroom bestaat.</div>
+  {% endif %}
+  {% if form_error %}<div class="flash error">{{form_error}}</div>{% endif %}
+
+  <form class="stack" method="post" data-vsys-merge-form>
+    <input type="hidden" name="csrf" value="{{csrf_token()}}">
+    <input type="hidden" name="source_sha256" value="{{source_sha256}}">
+    <input type="hidden" name="vsys_order_json" value="">
+    <input type="hidden" name="zone_mappings_json" value="">
+    {% if preview_plan %}<input type="hidden" name="preview_sha256" value="{{source_sha256}}"><input type="hidden" name="preview_token" value="{{preview_token}}">{% endif %}
+
+    <section class="card">
+      <div class="card-header"><div><h2>1. Doel kiezen</h2><p class="muted">De bestaande VSYS die je kiest blijft de enige VSYS in de nieuwe workspace.</p></div></div>
+      <div class="grid two">
+        <div class="field">
+          <label for="workspace_name">Naam nieuwe workspace</label>
+          <input id="workspace_name" name="workspace_name" maxlength="120" required value="{{form_values.workspace_name}}" placeholder="stad_aalst_merged">
+        </div>
+        <div class="field">
+          <label>VSYS die blijft bestaan</label>
+          <input type="hidden" name="target_vsys" value="vsys1">
+          <input value="vsys1 · verplicht door PAN-OS" readonly>
+        </div>
+        <div class="field">
+          <label for="default_rule_source">Default rules overnemen van</label>
+          <select id="default_rule_source" name="default_rule_source" required>
+            {% for item in analysis.vsys %}<option value="{{item.name}}" {{'selected' if item.name==form_values.default_rule_source else ''}}>{{item.name}}</option>{% endfor %}
+          </select>
+          <small>Elke rulebase heeft na het samenvoegen één default rule.</small>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-header"><div><h2>2. Policy-volgorde bepalen</h2><p class="muted">Policies blijven afzonderlijke regels. De gekozen volgorde bepaalt hoe de ruleblocks uit de oude VSYS achter elkaar komen.</p></div><span class="badge">{{analysis.policy_total}} policies</span></div>
+      <p class="help">Kies elke prioriteit van 1 tot {{analysis.vsys_count}} precies één keer. Lagere nummers komen eerst. Dit kan de verkeersuitkomst veranderen.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>VSYS</th><th>Policyfamilies</th><th>Totaal</th><th>Prioriteit</th></tr></thead>
+        <tbody>
+          {% for item in analysis.vsys %}
+          <tr>
+              <td><strong>{{item.name}}</strong></td>
+            <td>{% for family,count in item.policy_counts.items() %}<span class="token">{{family}}: {{count}}</span>{% else %}—{% endfor %}</td>
+            <td>{{item.policy_total}}</td>
+              <td><input aria-label="Prioriteit voor {{item.name}}" type="number" min="1" max="{{analysis.vsys_count}}" data-vsys-order="{{item.name}}" required value="{{form_values.vsys_order.index(item.name)+1}}"></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table></div>
+    </section>
+
+    <section class="card">
+      <div class="card-header"><div><h2>3. Zones koppelen</h2><p class="muted">Elke policy-verwijzing naar een bronzone wordt naar de doelzone vertaald. Externe zones moeten aan een lokale zone worden gekoppeld.</p></div><span class="badge">{{analysis.zone_mappings|length}} bronzones</span></div>
+      {% if analysis.zone_mappings %}
+      <div class="table-wrap"><table>
+        <thead><tr><th>Bron</th><th>Type</th><th>Interface(s)</th><th>Doelzone</th></tr></thead>
+        <tbody>
+          {% for zone in analysis.zone_mappings %}
+          <tr>
+            <td>
+              <strong>{{zone.vsys}} · {{zone.name}}</strong>
+              {% if zone.external %}<span class="badge">External</span>{% endif %}
+            </td>
+            <td>{{zone.network_type}}</td>
+            <td>{{zone.interfaces|join(', ') or '—'}}</td>
+            <td><input data-zone-target data-vsys="{{zone.vsys}}" data-zone="{{zone.name}}" required maxlength="31" value="{{form_values.zone_targets.get((zone.vsys,zone.name),'')}}" aria-label="Doelzone voor {{zone.vsys}} {{zone.name}}"></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table></div>
+      {% else %}<p class="muted">Er zijn geen zones in de bronconfiguratie.</p>{% endif %}
+    </section>
+
+    <section class="card">
+      <div class="card-header"><div><h2>4. Apparaatbrede netwerkconfiguratie</h2><p class="muted">Deze onderdelen veranderen niet automatisch door de VSYS-samenvoeging.</p></div></div>
+      {% if analysis.network_inventory %}
+      <div class="table-wrap"><table>
+        <thead><tr><th>Onderdeel</th><th>Aantal in config</th></tr></thead>
+        <tbody>{% for item in analysis.network_inventory %}<tr><td>{{item.name}}</td><td>{{item.count}}</td></tr>{% endfor %}</tbody>
+      </table></div>
+      {% else %}<p class="muted">Geen apparaatbrede netwerkobjecten herkend in deze snapshot.</p>{% endif %}
+      <label class="check-row"><input type="checkbox" name="confirm_network" value="yes"><span>Ik heb het netwerkoverzicht nagekeken. Routes, interfaces, VPN's en andere apparaatbrede instellingen blijven behouden; de wizard bewijst niet dat elke transitafhankelijkheid is gevonden.</span></label>
+    </section>
+
+    {% if analysis.possible_transit_subnets %}
+    <section class="card">
+      <div class="card-header"><div><h2>Mogelijke transitnetwerken</h2><p class="muted">Dit zijn aanwijzingen op basis van gekoppelde interface-subnets, geen automatische conclusie.</p></div><span class="badge">{{analysis.possible_transit_subnets|length}}</span></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Subnet</th><th>VSYS</th><th>Zones</th></tr></thead>
+        <tbody>{% for item in analysis.possible_transit_subnets %}<tr><td>{{item.subnet}}</td><td>{{item.vsys|join(', ')}}</td><td>{{item.zones|join(', ') or '—'}}</td></tr>{% endfor %}</tbody>
+      </table></div>
+      <p class="help">Deze migratie houdt de interfaces en routes. Je kan ze in de nieuwe workspace nakijken en daarna bewust aanpassen.</p>
+    </section>
+    {% endif %}
+
+    {% if preview_plan %}
+    <section class="card">
+      <div class="card-header"><div><h2>Preview</h2><p class="muted">De kandidaat wordt lokaal opgebouwd. Er wordt niets naar de firewall geschreven.</p></div><span class="badge">{{preview_plan.policy_total}} policies behouden</span></div>
+      <ul>
+        <li>{{preview_plan.zones_in_sources}} bronzones worden {{preview_plan.zones_in_target}} doelzones.</li>
+        <li>{{preview_plan.shareable_objects_moved}} objecten gaan naar Shared; {{preview_plan.shared_objects_reused}} identieke Shared-definities worden hergebruikt.</li>
+        <li>Doel: {{preview_plan.target_vsys}}. Verwijderd uit de output: {{preview_plan.removed_vsys|join(', ')}}.</li>
+        <li>Netwerk- en transitconfiguratie blijft staan; er worden geen policies automatisch samengevoegd of verwijderd.</li>
+      </ul>
+      {% if preview_plan.warnings %}<details><summary>Aandachtspunten</summary><ul>{% for item in preview_plan.warnings %}<li>{{item}}</li>{% endfor %}</ul></details>{% endif %}
+      <label class="check-row"><input type="checkbox" name="confirm_policy_order" value="yes"><span>Ik heb de policy-volgorde nagekeken en begrijp dat deze de evaluatievolgorde bepaalt.</span></label>
+      <label class="check-row"><input type="checkbox" name="confirm_scope_model" value="yes"><span>Ik begrijp dat policies en zones in vsys1 blijven en dat netwerkconfiguratie apparaatbreed blijft.</span></label>
+      {% if preview_plan.possible_transit_subnets %}<label class="check-row"><input type="checkbox" name="confirm_transit" value="yes"><span>Ik heb de mogelijke transitnetwerken bekeken; ze blijven voorlopig behouden in de nieuwe workspace.</span></label>{% endif %}
+      <div class="callout">De nieuwe workspace is een aparte snapshot. De bronworkspace wordt niet gewijzigd. Deze actie pusht of commit niets.</div>
+      <div class="cluster"><button class="btn btn-primary" type="submit" name="action" value="create">Nieuwe workspace aanmaken</button></div>
+    </section>
+    {% else %}
+    <div class="cluster"><button class="btn btn-primary" type="submit" name="action" value="preview">Preview samenvoeging</button><a class="btn" href="{{url_for('config_workspace_editor',workspace_id=workspace.id)}}">Annuleren</a></div>
+    {% endif %}
+  </form>
+</main>
+</body>
+</html>

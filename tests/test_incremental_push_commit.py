@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -63,6 +64,109 @@ class IncrementalPushCommitTests(unittest.TestCase):
             message,
             "delete Addresses host-a: PAN-OS kan dit object niet verwijderen zolang er verwijzingen naar bestaan (code 10)",
         )
+
+    def test_vsys_merge_creates_separate_workspace_and_blocks_partial_incremental_push(self):
+        source_xml = b'''<config version="12.1.0"><devices><entry name="localhost.localdomain">
+        <network><virtual-router><entry name="default"/></virtual-router></network><vsys>
+          <entry name="vsys1"><vsys-id>1</vsys-id><zone>
+            <entry name="Inside"><network><layer3/></network></entry>
+            <entry name="External"><network><external><member>vsys2</member></external></network></entry>
+          </zone><rulebase><security><rules><entry name="inside-out"><from><member>Inside</member></from><to><member>External</member></to><source><member>any</member></source><destination><member>any</member></destination><action>allow</action></entry></rules><default-rule><entry name="interzone-default"><action>deny</action></entry></default-rule></security></rulebase></entry>
+          <entry name="vsys2"><vsys-id>2</vsys-id><zone>
+            <entry name="Transit"><network><layer3/></network></entry>
+            <entry name="Internet"><network><layer3/></network></entry>
+          </zone><rulebase><security><rules><entry name="transit-out"><from><member>Transit</member></from><to><member>Internet</member></to><source><member>any</member></source><destination><member>any</member></destination><action>allow</action></entry></rules><default-rule><entry name="interzone-default"><action>drop</action></entry></default-rule></security></rulebase></entry>
+        </vsys></entry></devices></config>'''
+        workspace_id = main.store_config_workspace(
+            self.profile, "VSYS merge source", "source.xml", source_xml, "test",
+            baseline_xml=source_xml,
+        )
+        self.extra_workspace_ids.append(workspace_id)
+        source = main.workspace_row(workspace_id)
+        common = {
+            "csrf": "incremental-commit-csrf",
+            "source_sha256": source["sha256"],
+            "workspace_name": "Test_VSYS_merged",
+            "target_vsys": "vsys1",
+            "default_rule_source": "vsys1",
+            "vsys_order_json": json.dumps([
+                {"name": "vsys1", "rank": 1}, {"name": "vsys2", "rank": 2},
+            ]),
+            "zone_mappings_json": json.dumps([
+                {"vsys": "vsys1", "zone": "Inside", "target": "Inside"},
+                {"vsys": "vsys1", "zone": "External", "target": "Internet"},
+                {"vsys": "vsys2", "zone": "Transit", "target": "Inside"},
+                {"vsys": "vsys2", "zone": "Internet", "target": "Internet"},
+            ]),
+        }
+        wizard = self.client.post(
+            f"/config-workspaces/{workspace_id}/merge-vsys",
+            data={**common, "action": "preview"}, base_url="https://forge.test",
+        )
+        self.assertEqual(wizard.status_code, 200)
+        html = wizard.get_data(as_text=True)
+        token_match = re.search(r'name="preview_token" value="([a-f0-9]+)"', html)
+        self.assertIsNotNone(token_match)
+
+        created = self.client.post(
+            f"/config-workspaces/{workspace_id}/merge-vsys",
+            data={
+                **common,
+                "action": "create",
+                "preview_sha256": source["sha256"],
+                "preview_token": token_match.group(1),
+                "confirm_policy_order": "yes",
+                "confirm_scope_model": "yes",
+                "confirm_network": "yes",
+            },
+            base_url="https://forge.test",
+        )
+        self.assertEqual(created.status_code, 302)
+        new_id = int(re.search(r"/config-workspaces/(\d+)/edit", created.headers["Location"]).group(1))
+        self.extra_workspace_ids.append(new_id)
+        merged = main.workspace_row(new_id)
+        self.assertEqual(merged["source"], "vsys-merge")
+        merged_xml, root, snapshot = main.cached_workspace_config(merged["config_path"], merged["sha256"])
+        self.assertEqual(snapshot.vsys, ["vsys1"])
+        self.assertEqual(len(root.findall("./devices/entry/vsys/entry/rulebase/security/rules/entry")), 2)
+        with main.db() as conn:
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (self.profile_id,)).fetchone()
+        self.assertEqual(main.active_config_workspace_id(profile), new_id)
+
+        editor = self.client.get(f"/config-workspaces/{new_id}/edit", base_url="https://forge.test")
+        self.assertEqual(editor.status_code, 200)
+        self.assertIn("<h1>Test_VSYS_merged</h1>", editor.get_data(as_text=True))
+        self.assertIn("Migratiepush geblokkeerd", editor.get_data(as_text=True))
+        with patch.object(main, "fetch_panos_candidate_xml_for_preview", side_effect=AssertionError("must not fetch")) as fetch:
+            blocked_preview = self.client.get(
+                f"/config-workspaces/{new_id}/push-preview", base_url="https://forge.test",
+            )
+            self.assertEqual(blocked_preview.status_code, 302)
+            fetch.assert_not_called()
+        with patch.object(main, "fetch_panos_candidate_xml", side_effect=AssertionError("must not fetch")) as fetch:
+            blocked_push = self.client.post(
+                f"/config-workspaces/{new_id}/push",
+                data={"csrf": "incremental-commit-csrf", "family": "policy:security"},
+                base_url="https://forge.test",
+            )
+            self.assertEqual(blocked_push.status_code, 302)
+            fetch.assert_not_called()
+
+        edited_root = main.ET.fromstring(merged_xml)
+        policy = edited_root.find("./devices/entry/vsys/entry/rulebase/security/rules/entry")
+        main.ET.SubElement(policy, "description").text = "Offline migratie-edit"
+        edited_id = main.store_workspace_edit_version(
+            merged, main.normalized_config_xml(edited_root), "description edit",
+        )
+        self.extra_workspace_ids.append(edited_id)
+        edited = main.workspace_row(edited_id)
+        self.assertEqual(edited["source"], "vsys-merge")
+        with patch.object(main, "fetch_panos_candidate_xml_for_preview", side_effect=AssertionError("must not fetch")) as fetch:
+            blocked_edited_preview = self.client.get(
+                f"/config-workspaces/{edited_id}/push-preview", base_url="https://forge.test",
+            )
+            self.assertEqual(blocked_edited_preview.status_code, 302)
+            fetch.assert_not_called()
 
     def test_same_name_shared_service_merge_repairs_nat_scalar_in_both_xml_flavours(self):
         for scope_node, rulebase in (("vsys", "rulebase"), ("device-group", "post-rulebase")):

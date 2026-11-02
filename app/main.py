@@ -89,6 +89,9 @@ from app.offline_config import (
     scoped_policies, snapshot_sha256, referenced_template,
     unresolved_object_reference_index, unresolved_object_reference_indexes,
 )
+from app.vsys_merge import (
+    VsysMergeError, analyze_panos_vsys_merge, merge_panos_vsys_config,
+)
 
 BASE = Path(__file__).resolve().parent.parent
 BEST_PRACTICE_BASE = BASE / "app" / "bases" / "ocd-bpa-v11.xml"
@@ -2907,11 +2910,11 @@ def advance_migration_staging_workspace(
 
 
 def workspace_version_source(workspace) -> str:
-    return (
-        "migration-staging"
-        if str(workspace["source"]) in {"migration-staging", "migration-import", "migration-api"}
-        else "edit"
-    )
+    source = str(workspace["source"])
+    if source == "vsys-merge":
+        # Keep the migration safety marker on every immutable edit version.
+        return "vsys-merge"
+    return "migration-staging" if source in {"migration-staging", "migration-import", "migration-api"} else "edit"
 
 
 def advance_migration_output_workspace(
@@ -4844,6 +4847,7 @@ def config_workspace_editor(workspace_id):
                 or staging_source
                 or migration_output
                 or migration_base
+                or str(workspace["source"]) == "vsys-merge"
             )
         )
         return render_template(
@@ -4887,6 +4891,222 @@ def config_workspace_editor(workspace_id):
     except Exception as exc:
         flash(f"Workspace niet geopend: {exc}", "error")
         return redirect(url_for("index", policy_profile=workspace["profile_id"]) + "#policy-management")
+
+
+@app.route("/config-workspaces/<int:workspace_id>/merge-vsys", methods=["GET", "POST"])
+@login_required
+def config_workspace_merge_vsys(workspace_id):
+    """Build a separate offline workspace that consolidates standalone VSYS."""
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    if request.method == "POST" and not workspace_access_allowed(workspace_id, write=True):
+        return "Forbidden", 403
+
+    try:
+        xml_bytes, parsed_root, parsed_snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
+        parsed_config = (parsed_root, parsed_snapshot)
+        analysis = analyze_panos_vsys_merge(xml_bytes, parsed_config=parsed_config)
+    except Exception as exc:
+        flash(f"VSYS-samenvoeging niet beschikbaar: {exc}", "error")
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
+
+    def default_workspace_name() -> str:
+        profile_name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(workspace["profile_name"] or "firewall"))
+        return f"{profile_name.strip('._-') or 'firewall'}_merged"[:120]
+
+    target_local_zones = {
+        zone["name"] for zone in analysis["zone_mappings"] if not zone["external"]
+    }
+    zone_targets = {
+        (zone["vsys"], zone["name"]): (
+            zone["name"] if not zone["external"] or zone["name"] in target_local_zones else ""
+        )
+        for zone in analysis["zone_mappings"]
+    }
+    vsys_order = [item["name"] for item in analysis["vsys"]]
+    form_values = {
+        "workspace_name": default_workspace_name(),
+        "target_vsys": "vsys1",
+        "default_rule_source": vsys_order[0],
+        "vsys_order": vsys_order,
+        "zone_targets": zone_targets,
+    }
+    preview_plan = None
+    form_error = ""
+    preview_token = ""
+    action = request.form.get("action", "") if request.method == "POST" else ""
+
+    if request.method == "POST":
+        form_values["workspace_name"] = request.form.get("workspace_name", "").strip()
+        form_values["target_vsys"] = request.form.get("target_vsys", "").strip()
+        form_values["default_rule_source"] = request.form.get("default_rule_source", "").strip()
+        try:
+            if action not in {"preview", "create"}:
+                raise VsysMergeError("Kies eerst preview of maak een bevestigde workspace aan.")
+            if request.form.get("source_sha256", "") != workspace["sha256"]:
+                raise VsysMergeError("De bronworkspace wijzigde sinds deze pagina werd geopend; laad de wizard opnieuw.")
+
+            order_json = request.form.get("vsys_order_json", "")
+            zone_json = request.form.get("zone_mappings_json", "")
+            if len(order_json) + len(zone_json) > 8_000_000:
+                raise VsysMergeError("De wizardkeuzes zijn te groot; laad de wizard opnieuw en beperk de configuratie.")
+            try:
+                ranked_order = json.loads(order_json)
+                submitted_zones = json.loads(zone_json)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise VsysMergeError("De wizardkeuzes konden niet worden gelezen; laad de wizard opnieuw.") from exc
+            if not isinstance(ranked_order, list) or len(ranked_order) != analysis["vsys_count"]:
+                raise VsysMergeError("De rule-volgorde is onvolledig; vernieuw de wizard en probeer opnieuw.")
+            if any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("name"), str)
+                or type(item.get("rank")) is not int
+                for item in ranked_order
+            ):
+                raise VsysMergeError("Gebruik een geheel getal voor elke VSYS-prioriteit.")
+            ranked_order = [(item["rank"], item["name"]) for item in ranked_order]
+            if {name for _, name in ranked_order} != {item["name"] for item in analysis["vsys"]}:
+                raise VsysMergeError("De rule-volgorde bevat een onbekende of dubbele VSYS.")
+            if len({name for _, name in ranked_order}) != len(ranked_order):
+                raise VsysMergeError("Een VSYS staat meer dan één keer in de rule-volgorde.")
+            if len({rank for rank, _ in ranked_order}) != len(ranked_order):
+                raise VsysMergeError("Elke VSYS moet een unieke prioriteit hebben.")
+            if {rank for rank, _ in ranked_order} != set(range(1, analysis["vsys_count"] + 1)):
+                raise VsysMergeError("Gebruik elke prioriteit van 1 tot het aantal VSYS precies één keer.")
+            form_values["vsys_order"] = [name for _, name in sorted(ranked_order)]
+
+            if not isinstance(submitted_zones, list) or len(submitted_zones) != len(analysis["zone_mappings"]):
+                raise VsysMergeError("De zone-mapping is onvolledig; vernieuw de wizard en probeer opnieuw.")
+            posted_zone_targets = {}
+            for item in submitted_zones:
+                if not isinstance(item, dict):
+                    raise VsysMergeError("De zone-mapping bevat een ongeldig item.")
+                source_scope = str(item.get("vsys", ""))
+                source_name = str(item.get("zone", ""))
+                destination = item.get("target", "")
+                if not isinstance(destination, str):
+                    raise VsysMergeError("De doelzone moet tekst zijn.")
+                key = (source_scope, source_name)
+                if key in posted_zone_targets:
+                    raise VsysMergeError("Een zone is meer dan één keer opgegeven.")
+                posted_zone_targets[key] = destination.strip()
+            expected_zone_keys = {
+                (zone["vsys"], zone["name"]) for zone in analysis["zone_mappings"]
+            }
+            if set(posted_zone_targets) != expected_zone_keys:
+                raise VsysMergeError("De zone-mapping bevat een onbekende zone of mist een bestaande zone.")
+            form_values["zone_targets"] = posted_zone_targets
+
+            workspace_name = form_values["workspace_name"]
+            if (
+                not workspace_name or len(workspace_name) > 120
+                or re.search(r"[\x00-\x1f/\\]", workspace_name)
+            ):
+                raise VsysMergeError("Geef een werkruimtenaam van maximaal 120 tekens zonder paden op.")
+
+            merged_xml, preview_plan = merge_panos_vsys_config(
+                xml_bytes,
+                target_vsys=form_values["target_vsys"],
+                vsys_order=form_values["vsys_order"],
+                default_rule_source=form_values["default_rule_source"],
+                zone_mappings=posted_zone_targets,
+                parsed_config=parsed_config,
+            )
+            merged_root = SafeET.fromstring(merged_xml)
+            zone_errors = panos_candidate_zone_reference_errors_from_root(
+                merged_root, [form_values["target_vsys"]],
+            )
+            if zone_errors:
+                raise VsysMergeError(
+                    "De samengevoegde policies verwijzen nog naar onbekende zones: "
+                    + "; ".join(zone_errors[:12])
+                )
+
+            preview_payload = json.dumps({
+                "workspace_id": workspace_id,
+                "source_sha256": workspace["sha256"],
+                "workspace_name": workspace_name,
+                "target_vsys": form_values["target_vsys"],
+                "default_rule_source": form_values["default_rule_source"],
+                "vsys_order": form_values["vsys_order"],
+                "zone_mappings": sorted(
+                    (source_vsys, source_zone, target_zone)
+                    for (source_vsys, source_zone), target_zone in posted_zone_targets.items()
+                ),
+            }, sort_keys=True, separators=(",", ":"))
+            preview_token = hmac.new(
+                str(app.secret_key or "").encode("utf-8"),
+                preview_payload.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+
+            if action == "create":
+                if request.form.get("preview_sha256", "") != workspace["sha256"]:
+                    raise VsysMergeError("Maak eerst een preview van deze exacte bronworkspace.")
+                if not hmac.compare_digest(request.form.get("preview_token", ""), preview_token):
+                    raise VsysMergeError("De keuzes zijn sinds de preview gewijzigd; maak eerst een nieuwe preview.")
+                if request.form.get("confirm_policy_order") != "yes":
+                    raise VsysMergeError("Bevestig dat je de gekozen policy-volgorde hebt nagekeken.")
+                if request.form.get("confirm_scope_model") != "yes":
+                    raise VsysMergeError("Bevestig dat policies/zones VSYS-lokaal blijven en netwerk device-breed blijft.")
+                if request.form.get("confirm_network") != "yes":
+                    raise VsysMergeError("Controleer het netwerkoverzicht en bevestig dat routing en interfaces behouden blijven.")
+                if preview_plan["possible_transit_subnets"] and request.form.get("confirm_transit") != "yes":
+                    raise VsysMergeError("Controleer de mogelijke transitnetwerken en bevestig dat ze voorlopig behouden blijven.")
+                with db() as conn:
+                    duplicate = conn.execute(
+                        "SELECT 1 FROM config_workspaces WHERE profile_id=? AND lower(name)=lower(?) LIMIT 1",
+                        (workspace["profile_id"], workspace_name),
+                    ).fetchone()
+                    profile = conn.execute(
+                        "SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],),
+                    ).fetchone()
+                if duplicate:
+                    raise VsysMergeError("Er bestaat al een workspace met deze naam voor dit profiel.")
+                if not profile:
+                    raise VsysMergeError("Het gekoppelde firewallprofiel bestaat niet meer.")
+                new_workspace_id = store_config_workspace(
+                    profile,
+                    workspace_name,
+                    str(workspace["original_name"] or workspace["name"]),
+                    merged_xml,
+                    "vsys-merge",
+                    baseline_workspace=workspace,
+                )
+                with db() as conn:
+                    inherit_workspace_access(conn, workspace_id, new_workspace_id)
+                    set_active_config_workspace(
+                        int(workspace["profile_id"]), new_workspace_id, connection=conn,
+                    )
+                audit(
+                    "config-workspace-vsys-merged",
+                    f"source={workspace_id} workspace={new_workspace_id} target_vsys={form_values['target_vsys']} "
+                    f"vsys_count={analysis['vsys_count']} policies={preview_plan['policy_total']}",
+                )
+                flash(
+                    f"Nieuwe workspace {workspace_name} aangemaakt met één VSYS. "
+                    "De bronworkspace bleef ongewijzigd; er is niets naar de firewall geschreven of gecommit.",
+                    "success",
+                )
+                return redirect(url_for(
+                    "config_workspace_editor", workspace_id=new_workspace_id,
+                    scope=form_values["target_vsys"], workspace_view="policies",
+                ))
+        except Exception as exc:
+            form_error = str(exc)
+
+    return render_template(
+        "workspace_vsys_merge.html",
+        workspace=workspace,
+        analysis=analysis,
+        form_values=form_values,
+        preview_plan=preview_plan,
+        form_error=form_error,
+        source_sha256=workspace["sha256"],
+        preview_token=preview_token,
+        has_baseline=bool(workspace["baseline_config_path"]),
+    )
 
 
 @app.post("/config-workspaces/<int:workspace_id>/policies/preview")
@@ -7365,6 +7585,12 @@ def config_workspace_push_preview(workspace_id):
     workspace = workspace_row(workspace_id)
     if not workspace:
         return "Not found", 404
+    if str(workspace["source"]) == "vsys-merge":
+        flash(
+            "Push geblokkeerd: dit is een offline VSYS-migratieworkspace. Beoordeel en valideer de volledige migratie voordat een aparte migratiepush wordt gebruikt.",
+            "error",
+        )
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
     output, block_reason = migration_output_push_block(workspace_id)
     if int(workspace["profile_system"] or 0):
         flash("Koppel eerst een push target aan het migratieproject.", "error")
@@ -7585,6 +7811,12 @@ def config_workspace_push(workspace_id):
     workspace = workspace_row(workspace_id)
     if not workspace:
         return "Not found", 404
+    if str(workspace["source"]) == "vsys-merge":
+        flash(
+            "Push geblokkeerd: dit is een offline VSYS-migratieworkspace. Beoordeel en valideer de volledige migratie voordat een aparte migratiepush wordt gebruikt.",
+            "error",
+        )
+        return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
     output, block_reason = migration_output_push_block(workspace_id)
     if int(workspace["profile_system"] or 0):
         flash("Koppel eerst een push target aan het migratieproject.", "error")

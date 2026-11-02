@@ -308,6 +308,18 @@ shows every changed value before a separate candidate write. The candidate
 write re-fetches the live rules and stops on concurrent changes. No connector
 automatically commits or deploys the candidate configuration.
 
+Standalone PAN-OS workspaces with multiple VSYS can create a separate offline
+single-VSYS migration workspace. PAN-OS requires `vsys1`, so the wizard keeps
+`vsys1`, asks for zone mappings, policy-block order, and the source of each
+default rule, and fails on conflicting object or policy names. Supported
+shareable objects move to Shared; policies and zones remain in `vsys1`, while
+device-wide interfaces, routing, tunnels, and other network configuration are
+preserved for review. Transit detection is only a subnet hint and does not
+prove that a routing migration is complete. Incremental push is blocked for
+these workspaces until a separate full migration-push flow can remove the old
+VSYS and validate the complete candidate safely. Panorama and SCM are not
+handled by this VSYS-specific transform.
+
 Flow aggregation happens continuously while syslog arrives. CPU-parallel builder work
 defaults to `max(1, detected CPUs - 2)`, reserving two logical CPUs for the web UI,
 syslog receiver, and operating system.

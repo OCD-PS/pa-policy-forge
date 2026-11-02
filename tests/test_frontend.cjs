@@ -43,6 +43,26 @@ async function page(markup, options = {}) {
   return {dom, window: dom.window, document: dom.window.document, errors};
 }
 
+test('VSYS merge packs arbitrarily many displayed decisions into two form fields', async () => {
+  const {dom, document, window, errors} = await page(`<form data-vsys-merge-form>
+    <input type="hidden" name="vsys_order_json"><input type="hidden" name="zone_mappings_json">
+    <input data-vsys-order="vsys1" value="1"><input data-vsys-order="vsys2" value="2">
+    <input data-zone-target data-vsys="vsys1" data-zone="Inside" value="Inside">
+    <input data-zone-target data-vsys="vsys2" data-zone="Internet" value="Outside">
+  </form>`);
+  const form = document.querySelector('[data-vsys-merge-form]');
+  form.dispatchEvent(new window.Event('submit', {bubbles:true, cancelable:true}));
+  assert.deepEqual(JSON.parse(form.elements.vsys_order_json.value), [
+    {name:'vsys1', rank:1}, {name:'vsys2', rank:2},
+  ]);
+  assert.deepEqual(JSON.parse(form.elements.zone_mappings_json.value), [
+    {vsys:'vsys1', zone:'Inside', target:'Inside'},
+    {vsys:'vsys2', zone:'Internet', target:'Outside'},
+  ]);
+  assert.deepEqual(errors, []);
+  dom.window.close();
+});
+
 test('inactive SCM scope never blocks standalone or Panorama target creation', async () => {
   const {dom, document, window, errors} = await page(`<form>
     <select data-target-select><option>panos</option><option>panorama</option><option>scm</option></select>
