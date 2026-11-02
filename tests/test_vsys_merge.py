@@ -112,6 +112,31 @@ class VsysMergeTests(unittest.TestCase):
         self.assertEqual(root.findtext("./mgt-config/users/entry[@name='admin']/phash"), "keep-this-hash")
         self.assertEqual(MULTI_VSYS, before)
 
+    def test_merge_keeps_target_vsys_display_name_and_ignores_removed_vsys_names(self):
+        config = MULTI_VSYS.replace(
+            b'<entry name="vsys1"><vsys-id>1</vsys-id>',
+            b'<entry name="vsys1"><display-name>Internal</display-name><vsys-id>1</vsys-id>',
+            1,
+        ).replace(
+            b'<entry name="vsys2"><vsys-id>2</vsys-id>',
+            b'<entry name="vsys2"><display-name>External</display-name><vsys-id>2</vsys-id>',
+            1,
+        )
+        merged, _plan = merge_panos_vsys_config(
+            config,
+            target_vsys="vsys1",
+            vsys_order=["vsys1", "vsys2", "vsys3"],
+            default_rule_source="vsys1",
+            zone_mappings=zone_mappings(),
+        )
+
+        root, snapshot = parse_snapshot(merged, expected_kind="panos")
+        self.assertEqual(snapshot.vsys, ["vsys1"])
+        self.assertEqual(
+            root.findtext("./devices/entry/vsys/entry/display-name"),
+            "Internal",
+        )
+
     def test_conflicting_shared_object_aborts_without_changing_source(self):
         conflict = MULTI_VSYS.replace(b"10.1.0.10/32", b"10.1.0.11/32", 1)
         with self.assertRaisesRegex(VsysMergeError, "verschillende inhoud"):
