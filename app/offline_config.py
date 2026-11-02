@@ -311,6 +311,8 @@ def object_reference_indexes(
     candidate_tags = {
         "member", "translated-address", "translated-port", "schedule", "log-setting", "filter",
     }
+    if {"services", "service-groups"} & wanted_by_type.keys():
+        candidate_tags.add("service")
     if "addresses" in wanted_by_type:
         candidate_tags.add("destination")
     if "certificates" in wanted_by_type:
@@ -369,6 +371,10 @@ def object_reference_indexes(
                     if ancestors() & {"source-translation", "destination-translation"}:
                         add(object_type, node.text, node)
             elif object_type in {"services", "service-groups"}:
+                # NAT stores its service match as text, unlike security rules'
+                # service/member lists. Both forms must protect the object.
+                if node.tag == "service" and "nat" in ancestors() and ancestors() & rulebase_scopes:
+                    add(object_type, node.text or "", node)
                 if node.tag == "member" and owner_tag == "service":
                     if ancestors() & rulebase_scopes and ancestors() & policy_kinds:
                         add(object_type, node.text or "", node)
@@ -750,6 +756,8 @@ def _typed_object_reference_nodes(root: ET.Element, object_type: str) -> tuple[l
     for node in root.iter():
         owner = parent.get(node)
         if node.tag != "member" and not (object_type == "schedules" and node.tag == "schedule") and not (
+            object_type in {"services", "service-groups"} and node.tag == "service"
+        ) and not (
             object_type in {"addresses", "address-groups", "regions"}
             and node.tag in {"translated-address", "translated-port", "destination"}
         ):
@@ -786,9 +794,13 @@ def _typed_object_reference_nodes(root: ET.Element, object_type: str) -> tuple[l
             if node.tag in {"translated-address", "translated-port"} and node.text and chain & {"source-translation", "destination-translation"}:
                 members.append(node)
         elif object_type in {"services", "service-groups"}:
-            is_reference = node.tag == "member" and owner is not None and (
-                (owner.tag == "service" and chain & rulebase_scopes and bool(chain & policy_kinds))
-                or (owner.tag == "members" and "service-group" in chain)
+            is_reference = (
+                node.tag == "service" and "nat" in chain and bool(chain & rulebase_scopes)
+            ) or (
+                node.tag == "member" and owner is not None and (
+                    (owner.tag == "service" and chain & rulebase_scopes and bool(chain & policy_kinds))
+                    or (owner.tag == "members" and "service-group" in chain)
+                )
             )
         elif object_type == "application-groups":
             is_reference = node.tag == "member" and owner is not None and (
@@ -819,8 +831,100 @@ def _typed_object_reference_nodes(root: ET.Element, object_type: str) -> tuple[l
     return members, expressions
 
 
+def _shared_merge_dependency_signature(
+    root: ET.Element, snapshot: ConfigSnapshot, scope: str, object_type: str,
+    entry: ET.Element, predefined_applications: set[str], cache: dict, visiting: set,
+) -> tuple:
+    """Compare effective group members, including nested groups, across scopes.
+
+    Replace reference names with the referenced definitions' signatures so a
+    jointly selected member rename does not hide, or falsely imply, a change in
+    behavior. Unknown local dependencies and cycles cannot prove a safe move.
+    """
+    key = (scope, object_type, id(entry))
+    if key in cache:
+        return cache[key]
+    if key in visiting:
+        raise OfflineConfigError("Cyclische groepsafhankelijkheid; niets samengevoegd")
+    visiting.add(key)
+    try:
+        normalized = copy.deepcopy(entry)
+        _, unsupported = _panos_move_refs_for_object(entry, object_type)
+        if unsupported:
+            if scope != "Shared":
+                raise OfflineConfigError(f"Onveilige groepsafhankelijkheid: {unsupported}")
+            # An existing Shared dependency keeps its existing resolution scope.
+            result = (object_type, _merge_object_signature(normalized, object_type))
+            cache[key] = result
+            return result
+
+        references = [("tags", node) for node in normalized.findall("./tag/member")]
+        member_dependencies = {
+            "address-groups": ("./static/member", "addresses"),
+            "service-groups": ("./members/member", "services"),
+            "application-groups": ("./members/member", "applications"),
+        }
+        if object_type in member_dependencies:
+            path, dependency = member_dependencies[object_type]
+            references.extend((dependency, node) for node in normalized.findall(path))
+        elif object_type == "security-profile-groups":
+            for child in normalized:
+                dependency = _PANOS_PROFILE_GROUP_NODES.get(child.tag)
+                if dependency:
+                    references.extend((dependency, node) for node in child.findall("./member"))
+
+        for dependency, node in references:
+            name = (node.text or "").strip()
+            candidate_types = {
+                "addresses": ("addresses", "address-groups", "regions"),
+                "services": ("services", "service-groups"),
+                "applications": ("applications", "application-groups", "application-filters"),
+            }.get(dependency, (dependency,))
+            resolved = []
+            for owner in ([scope, "Shared"] if scope != "Shared" else ["Shared"]):
+                resolution_key = ("dependency-index", owner, dependency)
+                if resolution_key not in cache:
+                    index = {}
+                    scope_root = _scope_root(root, snapshot, owner)
+                    if scope_root is not None:
+                        for candidate_type in candidate_types:
+                            for candidate in scope_root.findall(f"./{OBJECT_NODES[candidate_type]}/entry"):
+                                index.setdefault(candidate.get("name", ""), []).append((candidate_type, candidate, owner))
+                    cache[resolution_key] = index
+                resolved = cache[resolution_key].get(name, [])
+                if resolved:
+                    break
+            if len(resolved) != 1:
+                if not resolved and dependency == "applications" and name in predefined_applications:
+                    node.text = f"predefined-application:{name}"
+                    continue
+                raise OfflineConfigError(f"Groepsafhankelijkheid {dependency}: {name} ontbreekt of is ambigu in {scope}")
+            candidate_type, candidate, owner = resolved[0]
+            signature = _shared_merge_dependency_signature(
+                root, snapshot, owner, candidate_type, candidate,
+                predefined_applications, cache, visiting,
+            )
+            node.text = hashlib.sha256(repr(signature).encode("utf-8")).hexdigest()
+        # Several old member names may collapse to one definition in this merge.
+        for path, _dependency in member_dependencies.values():
+            members = normalized.findall(path)
+            if members:
+                parent_path = path.rsplit("/", 1)[0]
+                container = normalized.find(parent_path)
+                values = sorted({node.text for node in members})
+                for node in members:
+                    container.remove(node)
+                for value in values:
+                    ET.SubElement(container, "member").text = value
+        result = (object_type, _merge_object_signature(normalized, object_type))
+        cache[key] = result
+        return result
+    finally:
+        visiting.remove(key)
+
+
 def merge_duplicate_object_groups_to_shared(
-    xml_bytes: bytes, selections: list[dict],
+    xml_bytes: bytes, selections: list[dict], *, predefined_applications: Iterable[str] = (),
 ) -> tuple[bytes, dict[str, int]]:
     """Merge identical local/Shared PAN-OS objects into one Shared definition."""
     root, snapshot = parse_snapshot(xml_bytes)
@@ -907,6 +1011,12 @@ def merge_duplicate_object_groups_to_shared(
 
     if not selected_by_key:
         raise OfflineConfigError("Er zijn geen scope-overstijgende duplicaten geselecteerd")
+
+    dependency_types = {
+        "address-groups", "service-groups", "application-groups", "security-profile-groups",
+        "dynamic-user-groups", "hip-profiles", "log-forwarding",
+    }
+    original_root = copy.deepcopy(root) if dependency_types & {group["object_type"] for group in merged_groups} else None
 
     # A Shared master cannot be shadowed by a different local definition in any VSYS.
     for group in merged_groups:
@@ -1082,6 +1192,27 @@ def merge_duplicate_object_groups_to_shared(
         expected_entry = shared_entries.get((object_type, master_name))
         if expected_entry is None or resolved is not expected_entry:
             raise OfflineConfigError("Een verwijzing naar de nieuwe Shared-master wordt lokaal overschaduwd; niets opgeslagen")
+
+    if original_root is not None:
+        original_cache, shared_cache = {}, {}
+        predefined = set(predefined_applications)
+        for group in merged_groups:
+            object_type = group["object_type"]
+            if object_type not in dependency_types:
+                continue
+            shared_signature = _shared_merge_dependency_signature(
+                root, snapshot, "Shared", object_type,
+                shared_entries[(object_type, group["master_name"])], predefined, shared_cache, set(),
+            )
+            for (_kind, owner, name), _collection, _entry in group["entries"]:
+                original = _resolve_scoped_object_entry(original_root, snapshot, owner, object_type, name)
+                original_signature = _shared_merge_dependency_signature(
+                    original_root, snapshot, owner, object_type, original, predefined, original_cache, set(),
+                )
+                if original_signature != shared_signature:
+                    raise OfflineConfigError(
+                        f"Groepsafhankelijkheden van {name} in {owner} veranderen in Shared; niets samengevoegd",
+                    )
 
     return normalized_config_xml(root), {"merged": len(selected_by_key) - len(merged_groups), "groups": len(merged_groups)}
 

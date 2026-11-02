@@ -245,6 +245,125 @@ class OfflineConfigTests(unittest.TestCase):
         self.assertTrue(tags["Prod"])
         self.assertEqual(tags["unused"], [])
 
+    def test_nat_scalar_service_is_indexed_in_panos_and_panorama_rulebases(self):
+        for scope in ("vsys", "device-group"):
+            for rulebase in ("rulebase", "pre-rulebase", "post-rulebase"):
+                with self.subTest(scope=scope, rulebase=rulebase):
+                    source = f'''<config><devices><entry name="localhost.localdomain"><{scope}>
+                    <entry name="branch"><{rulebase}><nat><rules><entry name="translate">
+                    <service>tcp443</service></entry></rules></nat></{rulebase}></entry>
+                    </{scope}></entry></devices></config>'''.encode()
+                    references = object_reference_index(source, "services", ["tcp443", "unused"])
+                    self.assertEqual(len(references["tcp443"]), 1)
+                    self.assertTrue(references["tcp443"][0].endswith("/nat/rules/entry[@name=translate]/service"))
+                    self.assertEqual(references["unused"], [])
+
+    def test_service_merge_rewrites_nat_scalar_and_security_members(self):
+        source = b'''<config><shared><service><entry name="shared443"><protocol><tcp><port>443</port></tcp></protocol></entry></service></shared>
+        <devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><service>
+        <entry name="local443"><protocol><tcp><port>443</port></tcp></protocol></entry></service>
+        <rulebase><nat><rules><entry name="nat"><service>local443</service></entry></rules></nat>
+        <security><rules><entry name="allow"><service><member>local443</member></service></entry></rules></security>
+        </rulebase></entry><entry name="vsys2"/></vsys></entry></devices></config>'''
+        group = duplicate_object_groups_across_panos_scopes(source, "services")[0]
+        merged, _ = merge_duplicate_object_groups_to_shared(source, [{
+            "object_type": "services", "objects": group["objects"],
+            "master": {"scope": "Shared", "name": "shared443"},
+        }])
+        root, _ = parse_snapshot(merged)
+        self.assertEqual(root.findtext(".//nat/rules/entry/service"), "shared443")
+        self.assertEqual(root.findtext(".//security/rules/entry/service/member"), "shared443")
+        self.assertIsNone(root.find(".//vsys/entry/service/entry[@name='local443']"))
+
+    def shared_group_source(self, shared_service=b"", local_port=b"443"):
+        return b'''<config><shared>''' + shared_service + b'''</shared><devices><entry name="localhost.localdomain"><vsys>
+        <entry name="vsys1"><service><entry name="local"><protocol><tcp><port>443</port></tcp></protocol></entry></service>
+        <service-group><entry name="group1"><members><member>local</member></members></entry></service-group></entry>
+        <entry name="vsys2"><service><entry name="local"><protocol><tcp><port>''' + local_port + b'''</port></tcp></protocol></entry></service>
+        <service-group><entry name="group2"><members><member>local</member></members></entry></service-group></entry>
+        </vsys></entry></devices></config>'''
+
+    def group_selections(self, source, object_types):
+        return [{"object_type": object_type, "objects": group["objects"],
+                 "master": {"scope": group["objects"][0]["scope"], "name": group["objects"][0]["name"]}}
+                for object_type in object_types
+                for group in duplicate_object_groups_across_panos_scopes(source, object_type)]
+
+    def test_shared_group_merge_rejects_missing_or_different_effective_members(self):
+        for shared in (b"", b'<service><entry name="local"><protocol><tcp><port>443</port></tcp></protocol></entry></service>'):
+            with self.subTest(shared_member=bool(shared)):
+                source = self.shared_group_source(shared, b"8443")
+                with self.assertRaisesRegex(OfflineConfigError, "[Gg]roepsafhankelijkhe"):
+                    merge_duplicate_object_groups_to_shared(source, self.group_selections(source, ["service-groups"]))
+
+    def test_shared_group_merge_accepts_equivalent_shared_members(self):
+        source = self.shared_group_source(b'<service><entry name="local"><protocol><tcp><port>443</port></tcp></protocol></entry></service>')
+        merged, _ = merge_duplicate_object_groups_to_shared(source, self.group_selections(source, ["service-groups"]))
+        root, _ = parse_snapshot(merged)
+        self.assertEqual(root.findtext("./shared/service-group/entry/members/member"), "local")
+
+    def test_shared_group_merge_supports_joint_member_promotion_and_rename(self):
+        source = self.shared_group_source(b'<service><entry name="global443"><protocol><tcp><port>443</port></tcp></protocol></entry></service>')
+        merged, _ = merge_duplicate_object_groups_to_shared(source, self.group_selections(source, ["services", "service-groups"]))
+        root, _ = parse_snapshot(merged)
+        self.assertEqual(root.findtext("./shared/service-group/entry/members/member"), "global443")
+        self.assertEqual(root.findall(".//vsys/entry/service/entry"), [])
+
+    def test_shared_group_merge_checks_transitive_members_and_cycles(self):
+        shared = b'<service><entry name="local"><protocol><tcp><port>443</port></tcp></protocol></entry></service><service-group><entry name="inner"><members><member>local</member></members></entry></service-group>'
+        source = self.shared_group_source(shared, b"8443")
+        source = source.replace(b'<member>local</member></members></entry></service-group></entry>',
+                                b'<member>inner</member></members></entry><entry name="inner"><members><member>local</member></members></entry></service-group></entry>')
+        selections = [item for item in self.group_selections(source, ["service-groups"])
+                      if item["objects"][0]["name"] != "inner"]
+        with self.assertRaisesRegex(OfflineConfigError, "Groepsafhankelijkheden"):
+            merge_duplicate_object_groups_to_shared(source, selections)
+
+        cycle = self.shared_group_source().replace(b'<member>local</member>', b'<member>cycle</member>')
+        cycle = cycle.replace(b'name="group1"', b'name="cycle"').replace(b'name="group2"', b'name="cycle"')
+        with self.assertRaisesRegex(OfflineConfigError, "Cyclische"):
+            merge_duplicate_object_groups_to_shared(cycle, self.group_selections(cycle, ["service-groups"]))
+
+    def test_shared_application_group_merge_keeps_predefined_and_custom_resolution_distinct(self):
+        source = b'''<config><shared/><devices><entry name="localhost.localdomain"><vsys>
+        <entry name="vsys1"><application-group><entry name="apps1"><members><member>ssl</member></members></entry></application-group></entry>
+        <entry name="vsys2"><application-group><entry name="apps2"><members><member>ssl</member></members></entry></application-group></entry>
+        </vsys></entry></devices></config>'''
+        merged, _ = merge_duplicate_object_groups_to_shared(
+            source, self.group_selections(source, ["application-groups"]), predefined_applications=["ssl"],
+        )
+        root, _ = parse_snapshot(merged)
+        self.assertEqual(root.findtext("./shared/application-group/entry/members/member"), "ssl")
+        shadowed = source.replace(b'<entry name="vsys2">', b'<entry name="vsys2"><application><entry name="ssl"><default><port>tcp/8443</port></default></entry></application>')
+        with self.assertRaisesRegex(OfflineConfigError, "Groepsafhankelijkheden"):
+            merge_duplicate_object_groups_to_shared(
+                shadowed, self.group_selections(shadowed, ["application-groups"]), predefined_applications=["ssl"],
+            )
+
+    def test_shared_address_group_merge_preserves_effective_member_addresses(self):
+        source = b'''<config><shared><address><entry name="server"><ip-netmask>192.0.2.1/32</ip-netmask></entry></address></shared>
+        <devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><address-group><entry name="servers1"><static><member>server</member></static></entry></address-group></entry>
+        <entry name="vsys2"><address><entry name="server"><ip-netmask>192.0.2.2/32</ip-netmask></entry></address>
+        <address-group><entry name="servers2"><static><member>server</member></static></entry></address-group></entry></vsys></entry></devices></config>'''
+        with self.assertRaisesRegex(OfflineConfigError, "Groepsafhankelijkheden"):
+            merge_duplicate_object_groups_to_shared(source, self.group_selections(source, ["address-groups"]))
+
+    def test_shared_group_merge_checks_tags_and_rejects_unknown_dynamic_dependencies(self):
+        tag = b'<tag><entry name="Blue"><color>color1</color></entry></tag>'
+        source = self.shared_group_source(tag + b'<service><entry name="local"><protocol><tcp><port>443</port></tcp></protocol><tag><member>Blue</member></tag></entry></service>')
+        source = source.replace(b'</protocol></entry>', b'</protocol><tag><member>Blue</member></tag></entry>')
+        merged, _ = merge_duplicate_object_groups_to_shared(source, self.group_selections(source, ["service-groups"]))
+        self.assertTrue(parse_snapshot(merged)[0].findall("./shared/service-group/entry"))
+        missing_tag = source.replace(tag, b"")
+        with self.assertRaisesRegex(OfflineConfigError, "Groepsafhankelijkheid tags"):
+            merge_duplicate_object_groups_to_shared(missing_tag, self.group_selections(missing_tag, ["service-groups"]))
+
+        dynamic = b'''<config><shared/><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1">
+        <address-group><entry name="dyn1"><dynamic><filter>'Blue'</filter></dynamic></entry></address-group></entry>
+        <entry name="vsys2"><address-group><entry name="dyn2"><dynamic><filter>'Blue'</filter></dynamic></entry></address-group></entry></vsys></entry></devices></config>'''
+        with self.assertRaisesRegex(OfflineConfigError, "Dynamische address groups"):
+            merge_duplicate_object_groups_to_shared(dynamic, self.group_selections(dynamic, ["address-groups"]))
+
     def test_reference_index_includes_panos_virtual_router_path_monitor_destinations(self):
         source = b'''<config><shared><address><entry name="Google"><ip-netmask>8.8.8.8/32</ip-netmask></entry></address></shared><devices><entry name="localhost.localdomain"><network><virtual-router><entry name="VR_Telenet_Archief"><routing-table><ip><static-route><entry name="default_route"><path-monitor><enable>yes</enable><monitor-destinations><entry name="Google"><enable>yes</enable><destination>Google</destination></entry></monitor-destinations></path-monitor></entry></static-route></ip></routing-table></entry></virtual-router></network></entry></devices></config>'''
 
