@@ -118,10 +118,27 @@ def merge_config_xml(
             elif c_values == b_values or d_values == c_values:
                 chosen = desired_children
             else:
-                # PAN-OS member lists commonly mean OR alternatives. Combining
-                # two distinct edits could widen a security rule unexpectedly.
-                conflict(f"{path}/member-list")
-                chosen = current_children
+                desired_removed = b_values - d_values
+                current_removed = b_values - c_values
+                desired_added = d_values - b_values
+                current_added = c_values - b_values
+                same_list_size = (
+                    sum(b_values.values()) == sum(d_values.values()) == sum(c_values.values())
+                )
+                if (
+                    same_list_size
+                    and not (current_removed - desired_removed)
+                    and not (current_added - desired_added)
+                ):
+                    # A previous incremental merge may have applied only some
+                    # one-for-one member substitutions. Reapply this exact
+                    # draft only when the candidate delta is a subset of it.
+                    chosen = desired_children
+                else:
+                    # PAN-OS member lists commonly mean OR alternatives.
+                    # Combining unrelated edits could widen a security rule.
+                    conflict(f"{path}/member-list")
+                    chosen = current_children
             for child in chosen:
                 merged.append(copy.deepcopy(child))
             return merged
