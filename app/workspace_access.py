@@ -1,5 +1,8 @@
 """Keep migration permissions attached to immutable configuration versions."""
 
+import json
+import re
+
 READ_ROLES = {"owner", "editor", "reviewer", "viewer"}
 WRITE_ROLES = {"owner", "editor"}
 
@@ -48,7 +51,82 @@ def initialize_workspace_access(conn):
           ON linked.profile_id=older.profile_id
          AND linked.original_name=older.original_name
         JOIN config_workspace_projects acl ON acl.workspace_id=linked.id
-        WHERE older.source='edit' OR older.source LIKE 'migration-%'""")
+        WHERE older.source='edit' OR older.source LIKE 'migration-%' OR older.source='vsys-merge'""")
+    # Older VSYS merges did not record whether an ACL-free source was public.
+    # Recover that fact only from the successful merge audit's exact source ID;
+    # unresolved legacy merges will fail closed in workspace_allowed().
+    merge_sources = {}
+    for row in conn.execute(
+        "SELECT detail,created_at FROM audit WHERE action='config-workspace-vsys-merged' ORDER BY id DESC"
+    ):
+        match = re.search(r"\bsource=(\d+)\s+workspace=(\d+)\b", str(row["detail"] or ""))
+        if match:
+            merge_sources.setdefault(
+                int(match.group(2)), (int(match.group(1)), str(row["created_at"] or "")),
+            )
+    for merge_id, (source_id, audit_created_at) in merge_sources.items():
+        merge = conn.execute(
+            "SELECT id,profile_id,original_name,metadata_json,created_at,history_root_id FROM config_workspaces "
+            "WHERE id=? AND source='vsys-merge'", (merge_id,),
+        ).fetchone()
+        source = conn.execute(
+            "SELECT id,profile_id,original_name,source,created_at FROM config_workspaces WHERE id=?", (source_id,),
+        ).fetchone()
+        if (
+            not merge or not source
+            or int(merge["profile_id"]) != int(source["profile_id"])
+            or int(source["id"]) >= int(merge["id"])
+            or str(merge["original_name"] or "") != str(source["original_name"] or "")
+        ):
+            continue
+        # The exact audit pair is authoritative for older rows. `created_at`
+        # has second precision, so allow equality only when the source predates
+        # the merge by row ID and both rows retain the same original name.
+        if (
+            not audit_created_at
+            or str(source["created_at"] or "") > audit_created_at
+            or str(merge["created_at"] or "") > audit_created_at
+        ):
+            continue
+        if conn.execute(
+            "SELECT 1 FROM config_workspace_projects WHERE workspace_id=? LIMIT 1", (merge_id,),
+        ).fetchone():
+            continue
+        if str(source["source"]).startswith("migration-"):
+            continue
+        if conn.execute(
+            "SELECT 1 FROM config_workspace_projects WHERE workspace_id=? LIMIT 1", (source_id,),
+        ).fetchone():
+            continue
+        try:
+            metadata = json.loads(merge["metadata_json"] or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        if not isinstance(metadata, dict) or metadata.get("workspace_access_mode"):
+            continue
+        metadata["workspace_access_mode"] = "shared"
+        root_id = int(merge["history_root_id"] or merge_id)
+        lineage = conn.execute(
+            "SELECT id,metadata_json FROM config_workspaces WHERE profile_id=? AND source='vsys-merge' "
+            "AND COALESCE(history_root_id,id)=?",
+            (merge["profile_id"], root_id),
+        ).fetchall()
+        for version in lineage:
+            if conn.execute(
+                "SELECT 1 FROM config_workspace_projects WHERE workspace_id=? LIMIT 1", (version["id"],),
+            ).fetchone():
+                continue
+            try:
+                version_metadata = json.loads(version["metadata_json"] or "{}")
+            except (TypeError, ValueError):
+                version_metadata = {}
+            if not isinstance(version_metadata, dict) or version_metadata.get("workspace_access_mode"):
+                continue
+            version_metadata["workspace_access_mode"] = "shared"
+            conn.execute(
+                "UPDATE config_workspaces SET metadata_json=? WHERE id=?",
+                (json.dumps(version_metadata, sort_keys=True), version["id"]),
+            )
 
 
 def link_workspace_project(conn, workspace_id, project_id):
@@ -89,6 +167,14 @@ def workspace_allowed(conn, workspace_id, username, write=False):
     if not project_grants:
         # Normal policy-builder workspaces remain shared as before. Orphaned
         # migration snapshots fail closed instead of leaking customer configs.
+        if str(workspace["source"]) == "vsys-merge":
+            try:
+                metadata = json.loads(conn.execute(
+                    "SELECT metadata_json FROM config_workspaces WHERE id=?", (workspace_id,),
+                ).fetchone()[0] or "{}")
+            except (TypeError, ValueError, IndexError):
+                metadata = {}
+            return isinstance(metadata, dict) and metadata.get("workspace_access_mode") == "shared"
         return not str(workspace["source"]).startswith("migration-")
     permitted = WRITE_ROLES if write else READ_ROLES
     for project_id, identity in project_grants:

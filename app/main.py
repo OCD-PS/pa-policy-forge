@@ -2990,9 +2990,19 @@ def store_workspace_edit_version(workspace, new_xml: bytes, label: str) -> int:
                 "SELECT 1 FROM migration_projects WHERE base_workspace_id=? LIMIT 1", (workspace_id,)
             ).fetchone())
             is_migration_linked = is_staging or is_output or is_migration_base
+            is_vsys_merge = str(current["source"]) == "vsys-merge"
+            if is_vsys_merge:
+                merge_root_id = int(current["history_root_id"] or current["id"])
+                latest_merge = conn.execute(
+                    "SELECT id FROM config_workspaces WHERE profile_id=? AND source='vsys-merge' "
+                    "AND COALESCE(history_root_id,id)=? ORDER BY id DESC LIMIT 1",
+                    (profile_id, merge_root_id),
+                ).fetchone()
+                if latest_merge and int(latest_merge["id"]) != workspace_id:
+                    raise OfflineConfigError("Deze VSYS-merge is verouderd; open de nieuwste merged workspace opnieuw")
             if str(current["source"]).startswith("migration-") and not is_migration_linked:
                 raise OfflineConfigError("Deze migratiewerkruimte is verouderd; open de actuele migratieversie opnieuw")
-            if not is_migration_linked and active_id not in {0, workspace_id}:
+            if not is_migration_linked and not is_vsys_merge and active_id not in {0, workspace_id}:
                 raise OfflineConfigError("Deze werkruimte is verouderd; open de actuele configuratie opnieuw")
             new_id = store_config_workspace(
                 profile,
@@ -3006,16 +3016,31 @@ def store_workspace_edit_version(workspace, new_xml: bytes, label: str) -> int:
                 log_creation=False,
             )
             new_path_row = conn.execute(
-                "SELECT config_path FROM config_workspaces WHERE id=?", (new_id,)
+                "SELECT config_path,metadata_json FROM config_workspaces WHERE id=?", (new_id,)
             ).fetchone()
             new_config_path = str(new_path_row["config_path"]) if new_path_row else None
+            if is_vsys_merge:
+                old_metadata = json.loads(current["metadata_json"] or "{}")
+                access_mode = old_metadata.get("workspace_access_mode") if isinstance(old_metadata, dict) else None
+                if access_mode:
+                    new_metadata = json.loads(new_path_row["metadata_json"] or "{}") if new_path_row else {}
+                    if isinstance(new_metadata, dict):
+                        new_metadata["workspace_access_mode"] = access_mode
+                        conn.execute(
+                            "UPDATE config_workspaces SET metadata_json=? WHERE id=?",
+                            (json.dumps(new_metadata, sort_keys=True), new_id),
+                        )
             if not advance_migration_staging_workspace(workspace_id, new_id, connection=conn):
                 advance_migration_output_workspace(workspace_id, new_id, new_xml, connection=conn)
                 conn.execute(
                     "UPDATE migration_projects SET base_workspace_id=?,updated_at=? WHERE base_workspace_id=?",
                     (new_id, now(), workspace_id),
                 )
-                set_active_config_workspace(profile_id, new_id, connection=conn)
+                # A merged VSYS snapshot is a separate offline branch. Editing it
+                # from its home-page card must not silently replace the profile's
+                # selected live-source workspace.
+                if not is_vsys_merge:
+                    set_active_config_workspace(profile_id, new_id, connection=conn)
     except Exception:
         if new_config_path:
             try:
@@ -3846,7 +3871,7 @@ def prune_workspace_history(workspace_id: int) -> int:
     with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
         current = conn.execute(
-            "SELECT id,profile_id,history_parent_id,history_root_id FROM config_workspaces WHERE id=?",
+            "SELECT id,profile_id,history_parent_id,history_root_id,source FROM config_workspaces WHERE id=?",
             (workspace_id,),
         ).fetchone()
         if not current or not current["history_root_id"]:
@@ -3864,6 +3889,15 @@ def prune_workspace_history(workspace_id: int) -> int:
             "SELECT id,history_root_id FROM config_workspaces WHERE id=? AND profile_id=?",
             (active_id, current["profile_id"]),
         ).fetchone() if active_id else None
+        if str(current["source"]) == "vsys-merge":
+            latest_merge = conn.execute(
+                "SELECT id FROM config_workspaces WHERE profile_id=? AND source='vsys-merge' "
+                "AND COALESCE(history_root_id,id)=? ORDER BY id DESC LIMIT 1",
+                (current["profile_id"], root_id),
+            ).fetchone()
+            live_workspace_id = int(latest_merge["id"]) if latest_merge else workspace_id
+        else:
+            live_workspace_id = 0
         staging = conn.execute(
             "SELECT s.staging_workspace_id AS id FROM migration_sources s "
             "JOIN config_workspaces w ON w.id=s.staging_workspace_id "
@@ -3876,14 +3910,15 @@ def prune_workspace_history(workspace_id: int) -> int:
             "WHERE w.profile_id=? AND w.history_root_id=? ORDER BY o.workspace_id DESC LIMIT 1",
             (current["profile_id"], root_id),
         ).fetchone()
-        if staging:
-            live_workspace_id = int(staging["id"])
-        elif output:
-            live_workspace_id = int(output["id"])
-        elif live_workspace and int(live_workspace["history_root_id"] or live_workspace["id"]) == root_id:
-            live_workspace_id = active_id
-        else:
-            live_workspace_id = workspace_id
+        if not live_workspace_id:
+            if staging:
+                live_workspace_id = int(staging["id"])
+            elif output:
+                live_workspace_id = int(output["id"])
+            elif live_workspace and int(live_workspace["history_root_id"] or live_workspace["id"]) == root_id:
+                live_workspace_id = active_id
+            else:
+                live_workspace_id = workspace_id
         username = str(session.get("username", "")) if has_request_context() else ""
         chain = _workspace_history_chain(conn, live_workspace_id, check_access=False)
         if not chain:
@@ -3953,7 +3988,10 @@ def config_workspace_select(workspace_id):
     if not workspace:
         return "Not found", 404
     try:
-        set_active_config_workspace(workspace["profile_id"], workspace_id)
+        # A merged VSYS workspace is an independent offline branch, not the
+        # profile's active source configuration.
+        if str(workspace["source"]) != "vsys-merge":
+            set_active_config_workspace(workspace["profile_id"], workspace_id)
         try:
             prune_workspace_history(workspace_id)
         except Exception:
@@ -5054,7 +5092,9 @@ def config_workspace_merge_vsys(workspace_id):
                     raise VsysMergeError("Controleer het netwerkoverzicht en bevestig dat routing en interfaces behouden blijven.")
                 if preview_plan["possible_transit_subnets"] and request.form.get("confirm_transit") != "yes":
                     raise VsysMergeError("Controleer de mogelijke transitnetwerken en bevestig dat ze voorlopig behouden blijven.")
+                created_workspace_path = ""
                 with db() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
                     duplicate = conn.execute(
                         "SELECT 1 FROM config_workspaces WHERE profile_id=? AND lower(name)=lower(?) LIMIT 1",
                         (workspace["profile_id"], workspace_name),
@@ -5062,23 +5102,46 @@ def config_workspace_merge_vsys(workspace_id):
                     profile = conn.execute(
                         "SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],),
                     ).fetchone()
-                if duplicate:
-                    raise VsysMergeError("Er bestaat al een workspace met deze naam voor dit profiel.")
-                if not profile:
-                    raise VsysMergeError("Het gekoppelde firewallprofiel bestaat niet meer.")
-                new_workspace_id = store_config_workspace(
-                    profile,
-                    workspace_name,
-                    str(workspace["original_name"] or workspace["name"]),
-                    merged_xml,
-                    "vsys-merge",
-                    baseline_workspace=workspace,
-                )
-                with db() as conn:
-                    inherit_workspace_access(conn, workspace_id, new_workspace_id)
-                    set_active_config_workspace(
-                        int(workspace["profile_id"]), new_workspace_id, connection=conn,
-                    )
+                    if duplicate:
+                        raise VsysMergeError("Er bestaat al een workspace met deze naam voor dit profiel.")
+                    if not profile:
+                        raise VsysMergeError("Het gekoppelde firewallprofiel bestaat niet meer.")
+                    try:
+                        new_workspace_id = store_config_workspace(
+                            profile,
+                            workspace_name,
+                            str(workspace["original_name"] or workspace["name"]),
+                            merged_xml,
+                            "vsys-merge",
+                            baseline_workspace=workspace,
+                            connection=conn,
+                            log_creation=False,
+                        )
+                        workspace_path_row = conn.execute(
+                            "SELECT config_path,metadata_json FROM config_workspaces WHERE id=?", (new_workspace_id,)
+                        ).fetchone()
+                        created_workspace_path = (
+                            str(workspace_path_row["config_path"]) if workspace_path_row else ""
+                        )
+                        inherit_workspace_access(conn, workspace_id, new_workspace_id)
+                        inherited_acl = conn.execute(
+                            "SELECT 1 FROM config_workspace_projects WHERE workspace_id=? LIMIT 1",
+                            (new_workspace_id,),
+                        ).fetchone()
+                        workspace_metadata = json.loads(workspace_path_row["metadata_json"] or "{}") if workspace_path_row else {}
+                        if isinstance(workspace_metadata, dict):
+                            workspace_metadata["workspace_access_mode"] = "project" if inherited_acl else "shared"
+                            conn.execute(
+                                "UPDATE config_workspaces SET metadata_json=? WHERE id=?",
+                                (json.dumps(workspace_metadata, sort_keys=True), new_workspace_id),
+                            )
+                    except Exception:
+                        if created_workspace_path:
+                            try:
+                                safe_workspace_path(CONFIG_WORKSPACES, created_workspace_path).unlink(missing_ok=True)
+                            except (OSError, ValueError):
+                                app.logger.exception("Unable to remove uncommitted VSYS merge workspace XML")
+                        raise
                 audit(
                     "config-workspace-vsys-merged",
                     f"source={workspace_id} workspace={new_workspace_id} target_vsys={form_values['target_vsys']} "
@@ -8329,6 +8392,25 @@ def index():
             except Exception as exc:
                 profile_group_error = str(exc)
     configured_profiles = [profile for profile in profiles if profile["configured"]]
+    with db() as conn:
+        merged_workspace_rows = conn.execute(
+            "SELECT w.id,w.name,w.source,w.profile_id,w.created_at,w.updated_at,w.history_root_id,"
+            "p.name profile_name FROM config_workspaces w "
+            "JOIN profiles p ON p.id=w.profile_id "
+            "WHERE w.source='vsys-merge' AND p.system=0 AND p.target_type='panos' "
+        "AND w.id=(SELECT MAX(latest.id) FROM config_workspaces latest "
+        "WHERE latest.profile_id=w.profile_id AND latest.source='vsys-merge' "
+        "AND COALESCE(latest.history_root_id,latest.id)=COALESCE(w.history_root_id,w.id)) "
+            "ORDER BY w.id DESC"
+        ).fetchall()
+    vsys_merge_workspaces = []
+    seen_merge_roots = set()
+    for row in accessible_workspace_rows(merged_workspace_rows):
+        lineage_root = int(row["history_root_id"] or row["id"])
+        if lineage_root in seen_merge_roots:
+            continue
+        seen_merge_roots.add(lineage_root)
+        vsys_merge_workspaces.append(dict(row))
     policy_profile = None; policies = []; policy_error = ""; policy_objects = []; object_catalog = []; policy_catalog = []; policy_workspaces = []; live_application_state = {}; scm_config_records = []; object_create_template = None
     policy_source = request.args.get("policy_source", "").strip()
     force_live_refresh = request.args.get("refresh") == "1"
@@ -8356,7 +8438,7 @@ def index():
                 policy_workspaces = accessible_workspace_rows(policy_workspaces)
                 active_id = active_config_workspace_id(policy_profile)
                 active_workspace = next((item for item in policy_workspaces if item["id"] == active_id), None)
-                if policy_source != "choose" and active_workspace:
+                if policy_source != "choose" and active_workspace and active_workspace["source"] != "vsys-merge":
                     return redirect(url_for("config_workspace_editor", workspace_id=active_workspace["id"]))
                 policy_source = "choose"
             else:
@@ -8399,7 +8481,7 @@ def index():
                             fetch_object_catalog(policy_profile, "policy-picker"), policies
                         )
                 except Exception as exc: policy_error = str(exc)
-    return render_template("app.html", profiles=profiles, configured_profiles=configured_profiles, editing_profile=editing_profile, profile_zone_rows=profile_zone_rows, profile_zone_error=profile_zone_error, profile_group_options=profile_group_options, profile_group_error=profile_group_error, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, object_create_template=object_create_template, policy_catalog=policy_catalog, live_application_state=live_application_state, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, config_section=config_section, scm_configuration_sections=SCM_CONFIGURATION_SECTIONS, config_records=scm_config_records, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats(), certificate=certificate_summary(CERT_DIR / "tls.crt", APPLIANCE_CONFIG), application_catalog_settings=application_catalog_configuration())
+    return render_template("app.html", profiles=profiles, configured_profiles=configured_profiles, vsys_merge_workspaces=vsys_merge_workspaces, editing_profile=editing_profile, profile_zone_rows=profile_zone_rows, profile_zone_error=profile_zone_error, profile_group_options=profile_group_options, profile_group_error=profile_group_error, selected_flow_profile=selected_flow_profile, selected_run_profile=selected_run_profile, policy_profile=policy_profile, policy_source=policy_source, policy_workspaces=policy_workspaces, policies=policies, policy_objects=policy_objects, object_catalog=object_catalog, object_create_template=object_create_template, policy_catalog=policy_catalog, live_application_state=live_application_state, policy_view=policy_view, policy_kind=policy_kind, policy_types=SCM_POLICY_TYPES, unsupported_policy_types=SCM_UNAVAILABLE_POLICY_TYPES, object_type=object_type, object_types=SCM_OBJECT_TYPES, config_section=config_section, scm_configuration_sections=SCM_CONFIGURATION_SECTIONS, config_records=scm_config_records, policy_error=policy_error, sources=sources, runs=runs, flows=flows, audits=audits, stats=stats(), certificate=certificate_summary(CERT_DIR / "tls.crt", APPLIANCE_CONFIG), application_catalog_settings=application_catalog_configuration())
 
 
 @app.get("/migration")
