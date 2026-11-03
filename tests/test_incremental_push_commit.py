@@ -82,6 +82,7 @@ class IncrementalPushCommitTests(unittest.TestCase):
             baseline_xml=source_xml,
         )
         self.extra_workspace_ids.append(workspace_id)
+        main.set_active_config_workspace(self.profile_id, workspace_id)
         source = main.workspace_row(workspace_id)
         common = {
             "csrf": "incremental-commit-csrf",
@@ -129,9 +130,32 @@ class IncrementalPushCommitTests(unittest.TestCase):
         merged_xml, root, snapshot = main.cached_workspace_config(merged["config_path"], merged["sha256"])
         self.assertEqual(snapshot.vsys, ["vsys1"])
         self.assertEqual(len(root.findall("./devices/entry/vsys/entry/rulebase/security/rules/entry")), 2)
+        # Older deployments wrote the merge audit in the same second as both
+        # workspace rows. Confirm this legitimate legacy case stays discoverable.
+        with main.db() as conn:
+            audit_row = conn.execute(
+                "SELECT created_at FROM audit WHERE action='config-workspace-vsys-merged' "
+                "AND detail LIKE ? ORDER BY id DESC LIMIT 1",
+                (f"%source={workspace_id} workspace={new_id}%",),
+            ).fetchone()
+            self.assertIsNotNone(audit_row)
+            conn.execute(
+                "UPDATE config_workspaces SET created_at=? WHERE id IN (?,?)",
+                (audit_row["created_at"], workspace_id, new_id),
+            )
+            conn.execute("UPDATE config_workspaces SET metadata_json='{}' WHERE id=?", (new_id,))
+            main.initialize_workspace_access(conn)
+        legacy_merged = main.workspace_row(new_id)
+        merge_metadata = json.loads(legacy_merged["metadata_json"] or "{}")
+        self.assertEqual(merge_metadata.get("workspace_access_mode"), "shared")
         with main.db() as conn:
             profile = conn.execute("SELECT * FROM profiles WHERE id=?", (self.profile_id,)).fetchone()
-        self.assertEqual(main.active_config_workspace_id(profile), new_id)
+        self.assertEqual(main.active_config_workspace_id(profile), workspace_id)
+        chooser = self.client.get("/", base_url="https://forge.test")
+        chooser_html = chooser.get_data(as_text=True)
+        self.assertIn("Samengevoegde workspaces", chooser_html)
+        self.assertIn(f"/config-workspaces/{new_id}/edit", chooser_html)
+        self.assertIn("Offline · VSYS merge", chooser_html)
 
         editor = self.client.get(f"/config-workspaces/{new_id}/edit", base_url="https://forge.test")
         self.assertEqual(editor.status_code, 200)
@@ -161,6 +185,13 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.extra_workspace_ids.append(edited_id)
         edited = main.workspace_row(edited_id)
         self.assertEqual(edited["source"], "vsys-merge")
+        with self.assertRaises(main.OfflineConfigError):
+            main.store_workspace_edit_version(
+                merged, main.normalized_config_xml(edited_root), "stale second edit",
+            )
+        latest_chooser_html = self.client.get("/", base_url="https://forge.test").get_data(as_text=True)
+        self.assertIn(f"/config-workspaces/{edited_id}/edit", latest_chooser_html)
+        self.assertNotIn(f"/config-workspaces/{new_id}/edit", latest_chooser_html)
         with patch.object(main, "fetch_panos_candidate_xml_for_preview", side_effect=AssertionError("must not fetch")) as fetch:
             blocked_edited_preview = self.client.get(
                 f"/config-workspaces/{edited_id}/push-preview", base_url="https://forge.test",
