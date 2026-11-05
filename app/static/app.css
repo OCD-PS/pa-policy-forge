@@ -74,12 +74,23 @@ h3 { margin-bottom: 10px; font-size: 16px; }
 .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .device-selector-grid { grid-template-columns: repeat(auto-fit, minmax(220px, 320px)); align-items: stretch; }
+.workspace-selector-card { display: flex; flex-direction: column; align-items: flex-start; gap: 14px; }
+.workspace-selector-link { display: block; width: 100%; flex: 1; color: inherit; text-decoration: none; }
+.workspace-selector-link:hover { color: inherit; text-decoration: none; }
+.workspace-selector-link h2 { margin-bottom: 10px; }
+.workspace-selector-link p { margin-bottom: 10px; }
 .config-import-grid { margin-bottom: 18px; }
 .config-workspace-tabs { display: flex; gap: 8px; overflow-x: auto; margin: 22px 0; padding-bottom: 4px; }
-.config-workspace-tabs a, .config-workspace-tabs button { display: block; min-width: 190px; padding: 10px 13px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); text-align: left; cursor: pointer; }
-.config-workspace-tabs form { margin: 0; }
+.config-workspace-entry { display: flex; min-width: 220px; max-width: 320px; flex-direction: column; align-items: flex-end; gap: 7px; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+.config-workspace-tabs form { width: 100%; margin: 0; }
+.config-workspace-entry form button { display: block; width: 100%; min-height: 60px; padding: 6px; border: 0; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
 .config-workspace-tabs a.active { border-color: var(--orange); background: var(--orange-soft); }
 .config-workspace-tabs small { display: block; color: var(--muted); margin-top: 3px; }
+.workspace-delete-dialog { width: min(640px,calc(100vw - 28px)); }
+.workspace-delete-dialog .bulk-dialog-body { display: grid; gap: 14px; }
+.workspace-delete-dialog .bulk-dialog-body > p { margin: 0; }
+.workspace-delete-profile-warning { border-left-color: var(--danger); }
+.workspace-delete-actions { justify-content: flex-end; flex-wrap: wrap; }
 .config-workspace-shell { display: grid; grid-template-columns: 250px minmax(0,1fr); gap: 18px; align-items: start; }
 .config-tree { position: sticky; top: 94px; max-height: calc(100vh - 120px); overflow: auto; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius); background: #101010; }
 .config-tree-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 2px 3px 10px; }

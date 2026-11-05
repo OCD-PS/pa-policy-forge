@@ -153,7 +153,7 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertEqual(main.active_config_workspace_id(profile), workspace_id)
         chooser = self.client.get("/", base_url="https://forge.test")
         chooser_html = chooser.get_data(as_text=True)
-        self.assertIn("Samengevoegde workspaces", chooser_html)
+        self.assertIn("workspace-selector-card", chooser_html)
         self.assertIn(f"/config-workspaces/{new_id}/edit", chooser_html)
         self.assertIn("Offline · VSYS merge", chooser_html)
 

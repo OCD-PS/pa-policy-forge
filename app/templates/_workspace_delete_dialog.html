@@ -1,0 +1,29 @@
+<dialog class="bulk-dialog workspace-delete-dialog" data-workspace-delete-dialog aria-labelledby="workspace-delete-title">
+  <div class="push-dialog-brand">PA POLICY FORGE</div>
+  <div class="bulk-dialog-body">
+    <div class="card-header">
+      <div>
+        <h2 id="workspace-delete-title">Workspace verwijderen</h2>
+        <p class="muted"><span data-delete-workspace-name></span> · <span data-delete-profile-name></span></p>
+      </div>
+      <button class="btn" type="button" data-workspace-delete-close>Sluiten</button>
+    </div>
+    <p>Dit verwijdert de workspace en de lokale versiegeschiedenis. Er wordt niets op de firewall gewijzigd.</p>
+    <div class="callout">
+      <strong>Alleen de workspace</strong><br>
+      De firewallkoppeling, instellingen en credentials blijven bestaan. Je kunt daarna met <em>Ophalen</em> of <em>Import</em> een nieuwe workspace maken.
+    </div>
+    {% if is_admin %}<div class="callout workspace-delete-profile-warning">
+      <strong>Ook het firewallprofiel verwijderen</strong><br>
+      Dit wist de opgeslagen koppeling en credentials, plus alle workspaces van dit profiel. De firewall zelf wordt niet aangepast. Lopende commits, policy runs of migratieprojecten blokkeren deze actie.
+    </div>{% endif %}
+    <form method="post" action="" data-workspace-delete-form>
+      <input type="hidden" name="csrf" value="{{csrf_token()}}">
+      <div class="cluster workspace-delete-actions">
+        <button class="btn btn-danger" type="submit" name="remove_profile" value="keep">Workspace verwijderen, koppeling behouden</button>
+        {% if is_admin %}<button class="btn btn-danger" type="submit" name="remove_profile" value="delete">Profiel en alle workspaces verwijderen</button>{% endif %}
+        <button class="btn" type="button" data-workspace-delete-close>Annuleren</button>
+      </div>
+    </form>
+  </div>
+</dialog>

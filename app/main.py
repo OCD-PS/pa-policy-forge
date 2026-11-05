@@ -4925,6 +4925,7 @@ def config_workspace_editor(workspace_id):
             migration_staging=str(workspace["source"]) in {"migration-staging", "migration-import", "migration-api"},
             workspace_undo_available=workspace_undo_available,
             workspace_undo_count=workspace_undo_count,
+            workspace_can_delete=workspace_access_allowed(int(workspace["id"]), write=True),
         )
     except Exception as exc:
         flash(f"Workspace niet geopend: {exc}", "error")
@@ -8266,28 +8267,171 @@ def config_workspace_push(workspace_id):
 @app.post("/config-workspaces/<int:workspace_id>/delete")
 @login_required
 def config_workspace_delete(workspace_id):
-    workspace = workspace_row(workspace_id)
-    if not workspace:
-        return "Not found", 404
+    remove_profile = request.form.get("remove_profile", "keep") == "delete"
+    if request.form.get("remove_profile", "keep") not in {"keep", "delete"}:
+        return "Bad request", 400
+    username = str(session.get("username", ""))
+    user_id = session.get("user_id")
+    deleted_files: list[tuple[str, str]] = []
+    deleted_workspace_ids: list[int] = []
+    profile_name = ""
+    profile_id = 0
     try:
         with db() as conn:
-            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
-        was_active = bool(profile and active_config_workspace_id(profile) == workspace_id)
-        workspace_config_path(workspace).unlink(missing_ok=True)
-        with db() as conn:
-            conn.execute("DELETE FROM config_workspaces WHERE id=?", (workspace_id,))
-            baseline_path = str(workspace["baseline_config_path"] or "")
-            if baseline_path and not conn.execute(
-                "SELECT 1 FROM config_workspaces WHERE baseline_config_path=? LIMIT 1", (baseline_path,)
-            ).fetchone():
-                safe_workspace_path(CONFIG_WORKSPACES, baseline_path).unlink(missing_ok=True)
-        if was_active:
-            set_active_config_workspace(workspace["profile_id"], None)
-        audit("config-workspace-deleted", f"workspace={workspace_id} profile={workspace['profile_name']}")
-        flash("Offline configuratieworkspace verwijderd.", "success")
+            conn.execute("BEGIN IMMEDIATE")
+            workspace = conn.execute(
+                "SELECT w.*,p.name profile_name,p.system profile_system,p.settings_json "
+                "FROM config_workspaces w JOIN profiles p ON p.id=w.profile_id WHERE w.id=?",
+                (workspace_id,),
+            ).fetchone()
+            if not workspace or not workspace_allowed(conn, workspace_id, username, write=True):
+                return "Not found", 404
+            profile_id = int(workspace["profile_id"])
+            profile_name = str(workspace["profile_name"])
+            if int(workspace["profile_system"] or 0):
+                raise ValueError("Interne offline targets kunnen niet worden verwijderd")
+            profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+            if remove_profile:
+                user = conn.execute("SELECT is_admin FROM users WHERE id=?", (user_id,)).fetchone()
+                if not user or not bool(user["is_admin"]):
+                    return "Forbidden", 403
+                run_count = int(conn.execute(
+                    "SELECT COUNT(*) FROM runs WHERE profile_id=?", (profile_id,),
+                ).fetchone()[0])
+                if run_count:
+                    raise ValueError(
+                        f"Firewallprofiel niet verwijderd: er zijn nog {run_count} gekoppelde policy run(s)."
+                    )
+                project_count = int(conn.execute(
+                    "SELECT COUNT(*) FROM migration_projects WHERE target_profile_id=?", (profile_id,),
+                ).fetchone()[0])
+                if project_count:
+                    raise ValueError(
+                        f"Firewallprofiel niet verwijderd: er zijn nog {project_count} gekoppelde migratieproject(en)."
+                    )
+                version_rows = conn.execute(
+                    "SELECT id,config_path,baseline_config_path FROM config_workspaces WHERE profile_id=?",
+                    (profile_id,),
+                ).fetchall()
+                deleted_workspace_ids = [int(row["id"]) for row in version_rows]
+            else:
+                root_id = int(workspace["history_root_id"] or workspace["id"])
+                version_rows = conn.execute(
+                    "SELECT id,config_path,baseline_config_path FROM config_workspaces "
+                    "WHERE profile_id=? AND COALESCE(history_root_id,id)=?",
+                    (profile_id, root_id),
+                ).fetchall()
+                deleted_workspace_ids = [int(row["id"]) for row in version_rows]
+                # Fail closed if any snapshot in the history is still used by a migration.
+                if any(
+                    not workspace_allowed(conn, item_id, username, write=True)
+                    for item_id in deleted_workspace_ids
+                ):
+                    return "Not found", 404
+
+            placeholders = ",".join("?" for _ in deleted_workspace_ids)
+            if deleted_workspace_ids:
+                refs = conn.execute(
+                    "SELECT 1 FROM migration_projects WHERE base_workspace_id IN (" + placeholders + ") "
+                    "UNION ALL SELECT 1 FROM migration_sources WHERE staging_workspace_id IN (" + placeholders + ") "
+                    "UNION ALL SELECT 1 FROM migration_outputs WHERE workspace_id IN (" + placeholders + ") LIMIT 1",
+                    (*deleted_workspace_ids, *deleted_workspace_ids, *deleted_workspace_ids),
+                ).fetchone()
+                if refs:
+                    raise ValueError(
+                        "Workspace niet verwijderd: een migratieproject gebruikt deze configuratie nog. "
+                        "Maak het project eerst los van deze workspace."
+                    )
+                pending = conn.execute(
+                    "SELECT 1 FROM config_workspace_commits WHERE workspace_id IN (" + placeholders + ") "
+                    "AND status IN ('SUBMITTING','PEND','ACT') LIMIT 1",
+                    deleted_workspace_ids,
+                ).fetchone()
+                if pending:
+                    raise ValueError(
+                        "Workspace niet verwijderd: er loopt nog een firewallcommit. Wacht tot die klaar is."
+                    )
+            deleted_files = [
+                (str(row["config_path"] or ""), str(row["baseline_config_path"] or ""))
+                for row in version_rows
+            ]
+            if remove_profile:
+                conn.execute(
+                    "DELETE FROM config_workspace_commits WHERE profile_id=?", (profile_id,),
+                )
+                conn.execute("DELETE FROM config_workspace_projects WHERE workspace_id IN (" + placeholders + ")", deleted_workspace_ids)
+                conn.execute("DELETE FROM config_workspaces WHERE profile_id=?", (profile_id,))
+                # Runs and migration projects were checked above; deleting this row
+                # removes the stored firewall connection and its encrypted credentials.
+                conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+            else:
+                settings = profile_settings(profile)
+                if active_config_workspace_id(profile) in deleted_workspace_ids:
+                    settings.pop("config_workspace_id", None)
+                    conn.execute(
+                        "UPDATE profiles SET settings_json=? WHERE id=?",
+                        (json.dumps(settings, sort_keys=True), profile_id),
+                    )
+                conn.execute(
+                    "DELETE FROM config_workspace_commits WHERE workspace_id IN (" + placeholders + ")",
+                    deleted_workspace_ids,
+                )
+                conn.execute(
+                    "DELETE FROM config_workspace_projects WHERE workspace_id IN (" + placeholders + ")",
+                    deleted_workspace_ids,
+                )
+                conn.execute(
+                    "DELETE FROM config_workspaces WHERE id IN (" + placeholders + ")",
+                    deleted_workspace_ids,
+                )
+            audit_action = "profile-deleted-via-workspace" if remove_profile else "config-workspace-deleted"
+            audit_detail = (
+                f"profile={profile_id} name={profile_name} workspaces={len(deleted_workspace_ids)}"
+                if remove_profile
+                else f"workspace={workspace_id} profile={profile_name} versions={len(deleted_workspace_ids)}"
+            )
+            conn.execute(
+                "INSERT INTO audit(created_at,username,action,detail) VALUES(?,?,?,?)",
+                (now(), username, audit_action, audit_detail[:1000]),
+            )
+        for config_path, baseline_path in deleted_files:
+            try:
+                if config_path:
+                    safe_workspace_path(CONFIG_WORKSPACES, config_path).unlink(missing_ok=True)
+                if baseline_path:
+                    with db() as conn:
+                        still_used = conn.execute(
+                            "SELECT 1 FROM config_workspaces WHERE baseline_config_path=? LIMIT 1",
+                            (baseline_path,),
+                        ).fetchone()
+                    if not still_used:
+                        safe_workspace_path(CONFIG_WORKSPACES, baseline_path).unlink(missing_ok=True)
+            except (OSError, ValueError) as cleanup_error:
+                # The database deletion has committed; a cleanup issue only leaves
+                # an inaccessible local snapshot behind and must not misreport it.
+                app.logger.warning(
+                    "Unable to clean deleted workspace snapshot workspace=%s: %s",
+                    workspace_id,
+                    cleanup_error,
+                )
+        if remove_profile:
+            invalidate_profile_caches(profile_id)
+            try:
+                refresh_syslog_source_policy()
+            except Exception:
+                app.logger.exception("Unable to refresh syslog sources after profile deletion profile=%s", profile_id)
+            flash("Firewallprofiel en alle bijbehorende workspaces verwijderd.", "success")
+        else:
+            flash(
+                "Workspace en lokale versies verwijderd. Het firewallprofiel en de koppeling blijven behouden.",
+                "success",
+            )
     except Exception as exc:
-        flash(f"Workspace niet verwijderd: {exc}", "error")
-    return redirect(url_for("index", policy_profile=workspace["profile_id"]) + "#policy-management")
+        flash(str(exc), "error")
+        return redirect(url_for("index", policy_profile=profile_id, policy_source="choose") + "#policy-management")
+    if remove_profile:
+        return redirect(url_for("index") + "#policy-management")
+    return redirect(url_for("index", policy_profile=profile_id, policy_source="choose") + "#policy-management")
 
 
 @app.get("/")
@@ -8410,7 +8554,9 @@ def index():
         if lineage_root in seen_merge_roots:
             continue
         seen_merge_roots.add(lineage_root)
-        vsys_merge_workspaces.append(dict(row))
+        item = dict(row)
+        item["can_delete"] = workspace_access_allowed(int(row["id"]), write=True)
+        vsys_merge_workspaces.append(item)
     policy_profile = None; policies = []; policy_error = ""; policy_objects = []; object_catalog = []; policy_catalog = []; policy_workspaces = []; live_application_state = {}; scm_config_records = []; object_create_template = None
     policy_source = request.args.get("policy_source", "").strip()
     force_live_refresh = request.args.get("refresh") == "1"
@@ -8435,7 +8581,10 @@ def index():
                         "SELECT * FROM config_workspaces WHERE profile_id=? ORDER BY id DESC",
                         (policy_profile["id"],),
                     ).fetchall()
-                policy_workspaces = accessible_workspace_rows(policy_workspaces)
+                policy_workspaces = [
+                    {**dict(item), "can_delete": workspace_access_allowed(int(item["id"]), write=True)}
+                    for item in accessible_workspace_rows(policy_workspaces)
+                ]
                 active_id = active_config_workspace_id(policy_profile)
                 active_workspace = next((item for item in policy_workspaces if item["id"] == active_id), None)
                 if policy_source != "choose" and active_workspace and active_workspace["source"] != "vsys-merge":
