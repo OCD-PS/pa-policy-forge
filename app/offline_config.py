@@ -2531,19 +2531,73 @@ def _panos_scope_path(root: ET.Element, scope: str) -> str:
     return f"/config/devices/entry[@name={device_name}]/vsys/entry[@name={scope}]"
 
 
+def _panos_scope_move_metadata_signature(entry: ET.Element, object_type: str) -> tuple:
+    """Keep non-behavior metadata equal before reusing an existing Shared item."""
+    def node_signature(node: ET.Element) -> tuple:
+        return (
+            node.tag,
+            tuple(sorted(node.attrib.items())),
+            (node.text or "").strip(),
+            tuple(node_signature(child) for child in node),
+        )
+
+    metadata = tuple(
+        node_signature(child)
+        for child in entry
+        if child.tag in {"description", "comments"}
+    )
+    if object_type in {"services", "service-groups"}:
+        # The merge signature intentionally ignores service tags; preserve them
+        # exactly before discarding a local duplicate.
+        tags = tuple(sorted(
+            member.text.strip()
+            for member in entry.findall("./tag/member")
+            if member.text and member.text.strip()
+        ))
+        return (*metadata, ("tag-members", tags))
+    return metadata
+
+
+def _panos_scope_move_can_reuse_shared(
+    item_type: str, source_entry: ET.Element, shared_entry: ET.Element,
+    shared_tag_names: set[str],
+) -> bool:
+    """Reuse only leaf-like objects whose effective definition is provably equal."""
+    # Groups can resolve their member names to different definitions in Shared
+    # and a VSYS. Leave those collisions for an explicit dependency-aware merge.
+    if item_type not in {"addresses", "services", "tags", "applications", "regions", "custom-url-categories"}:
+        return False
+    if _merge_object_signature(source_entry, item_type) != _merge_object_signature(shared_entry, item_type):
+        return False
+    if _panos_scope_move_metadata_signature(source_entry, item_type) != _panos_scope_move_metadata_signature(shared_entry, item_type):
+        return False
+
+    references, unsupported = _panos_move_refs_for_object(source_entry, item_type)
+    if unsupported or any(dependency != "tags" or name not in shared_tag_names for dependency, name in references):
+        return False
+    return True
+
+
 def move_panos_scope_entries(
     xml_bytes: bytes, *, item_kind: str, item_type: str, names: Iterable[str],
     source_scope: str, target_scope: str, predefined_applications: Iterable[str] = (),
     predefined_regions: Iterable[str] = PANOS_GEO_REGION_CODES,
     insertion_position: str = "top",
-) -> tuple[bytes, list[dict], list[dict]]:
+    parsed_config: tuple[ET.Element, ConfigSnapshot] | None = None,
+) -> tuple[bytes, list[dict], list[dict], list[dict]]:
     """Move selected entries between a standalone PAN-OS VSYS and Shared.
 
     The operation is per-item: failures stay at their source and successful
     entries are moved in one normalized snapshot. Panorama and SCM ownership
     models are intentionally excluded.
     """
-    root, snapshot = parse_snapshot(xml_bytes)
+    if parsed_config is None:
+        root, snapshot = parse_snapshot(xml_bytes)
+    else:
+        # cached_workspace_config keeps parsed roots for read-only rendering.
+        # Copy the root before mutation so one scope move cannot poison that cache.
+        cached_root, snapshot = parsed_config
+        root = copy.deepcopy(cached_root)
     if snapshot.kind != "panos":
         raise OfflineConfigError("Scope-verplaatsen is alleen beschikbaar voor standalone PAN-OS")
     if item_kind not in {"policy", "object"}:
@@ -2566,21 +2620,45 @@ def move_panos_scope_entries(
         raise OfflineConfigError("Selecteer één tot 5000 configuratie-items")
 
     candidates: list[tuple[str, ET.Element, ET.Element]] = []
+    reusable: list[tuple[str, ET.Element, ET.Element]] = []
     failures: list[dict] = []
     target_root = _panos_scope_root(root, target_scope)
+    source_root = _panos_scope_root(root, source_scope)
+    source_collection = _panos_scope_collection(source_root, item_kind, item_type) if source_root is not None else None
+    source_entries_by_name: dict[str, list[ET.Element]] = {}
+    if source_collection is not None:
+        for entry in source_collection.findall("./entry"):
+            source_entries_by_name.setdefault(entry.get("name", ""), []).append(entry)
+    target_collection = _panos_scope_collection(target_root, item_kind, item_type) if target_root is not None else None
+    target_entries_by_name: dict[str, list[ET.Element]] = {}
+    if target_collection is not None:
+        for entry in target_collection.findall("./entry"):
+            target_entries_by_name.setdefault(entry.get("name", ""), []).append(entry)
+    shared_tag_names = (
+        _panos_visible_object_names(root, "Shared", ("tags",))
+        if item_kind == "object" and target_scope == "Shared" and item_type in {"addresses", "services"}
+        else set()
+    )
     for name in requested:
-        source_root = _panos_scope_root(root, source_scope)
-        source_collection = _panos_scope_collection(source_root, item_kind, item_type) if source_root is not None else None
-        matches = [entry for entry in source_collection.findall("./entry") if entry.get("name") == name] if source_collection is not None else []
+        matches = source_entries_by_name.get(name, [])
         if len(matches) != 1:
             failures.append({"name": name, "reason": "Niet gevonden of dubbel in de bronscope"})
             continue
         if target_root is None and target_scope != "Shared":
             failures.append({"name": name, "reason": "Doelscope ontbreekt"})
             continue
-        target_collection = _panos_scope_collection(target_root, item_kind, item_type) if target_root is not None else None
-        if target_collection is not None and any(entry.get("name") == name for entry in target_collection.findall("./entry")):
-            failures.append({"name": name, "reason": "In de doelscope bestaat al een item met deze naam"})
+        target_matches = target_entries_by_name.get(name, [])
+        if target_matches:
+            if (
+                item_kind == "object" and target_scope == "Shared" and len(target_matches) == 1
+                and _panos_scope_move_can_reuse_shared(item_type, matches[0], target_matches[0], shared_tag_names)
+            ):
+                reusable.append((name, matches[0], source_collection))
+                continue
+            failures.append({
+                "name": name,
+                "reason": "In de doelscope bestaat al een item met deze naam; inhoud of afhankelijkheden zijn niet veilig gelijk bevonden",
+            })
             continue
         if target_scope != "Shared" and source_scope != "Shared":
             shared_root = _panos_scope_root(root, "Shared")
@@ -2631,20 +2709,8 @@ def move_panos_scope_entries(
                 failures.append({"name": name, "reason": "Wordt nog gebruikt buiten de doelscope"})
                 selected_entries.discard((item_type, name))
                 continue
-        if item_kind == "object" and target_scope == "Shared":
-            collision = False
-            for other_scope in snapshot.vsys:
-                if other_scope == source_scope:
-                    continue
-                other_root = _panos_scope_root(root, other_scope)
-                other_collection = _panos_scope_collection(other_root, "object", item_type) if other_root is not None else None
-                if other_collection is not None and any(item.get("name") == name for item in other_collection.findall("./entry")):
-                    collision = True
-                    break
-            if collision:
-                failures.append({"name": name, "reason": "Een andere VSYS heeft al een lokaal item met deze naam"})
-                selected_entries.discard((item_type, name))
-                continue
+        # PAN-OS permits a same-name local item to shadow a Shared item. The
+        # other VSYS's local definition stays untouched and keeps its behavior.
         accepted.append((name, entry, source_collection))
 
     # A selected group cannot move if another selected dependency failed.
@@ -2686,6 +2752,7 @@ def move_panos_scope_entries(
             final.sort(key=lambda candidate: source_order.get(candidate[0], len(source_order)))
 
     moved = []
+    reused = []
     if final and target_root is None:
         target_root = ET.SubElement(root, "shared")
     for name, entry, source_collection in (reversed(final) if insertion_position == "top" else final):
@@ -2714,7 +2781,13 @@ def move_panos_scope_entries(
         else:
             target_collection.append(entry)
         moved.append({"name": name, "item_kind": item_kind, "item_type": item_type, "source_scope": source_scope, "target_scope": target_scope})
-    return (normalized_config_xml(root), moved, failures) if moved else (xml_bytes, moved, failures)
+    for name, entry, source_collection in reusable:
+        source_collection.remove(entry)
+        reused.append({
+            "name": name, "item_kind": item_kind, "item_type": item_type,
+            "source_scope": source_scope, "target_scope": target_scope,
+        })
+    return (normalized_config_xml(root), moved, reused, failures) if moved or reused else (xml_bytes, moved, reused, failures)
 
 
 def scoped_server_profiles(xml_bytes: bytes, scope: str, parsed=None) -> list[dict]:

@@ -79,6 +79,7 @@ from app.offline_config import (
     panos_ui_decorate_record, scoped_object_names, scoped_object_page, scoped_server_profiles,
     object_reference_index, object_reference_indexes,
     _merge_object_signature, _reference_scope, _resolve_scoped_object_entry,
+    _panos_scope_collection, _panos_scope_root,
     _is_panos_global_address_reference,
     _typed_object_reference_nodes,
     duplicate_object_groups_across_panos_scopes, merge_duplicate_object_groups_to_shared,
@@ -5403,6 +5404,13 @@ def config_workspace_policy_move(workspace_id):
 @login_required
 def config_workspace_scope_move(workspace_id):
     """Move selected PAN-OS entries between VSYS and Shared in an offline workspace."""
+    started = time.perf_counter()
+    phase_started = started
+    timings = {}
+
+    def safe_log_field(value: object) -> str:
+        return "".join(char if char.isprintable() else "?" for char in str(value))[:80]
+
     workspace = workspace_row(workspace_id)
     if not workspace:
         return "Not found", 404
@@ -5420,6 +5428,7 @@ def config_workspace_scope_move(workspace_id):
     }
     try:
         xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
+        timings["workspace_load_ms"] = (time.perf_counter() - phase_started) * 1000
         if snapshot.kind != "panos" or len(snapshot.vsys) < 2:
             raise OfflineConfigError("Verplaatsen tussen Shared en VSYS is alleen beschikbaar voor standalone PAN-OS met meerdere VSYS")
         scopes = ["Shared", *snapshot.vsys]
@@ -5427,36 +5436,49 @@ def config_workspace_scope_move(workspace_id):
             raise OfflineConfigError("Kies een geldige, andere doel-VSYS of Shared")
         if item_kind == "policy" and item_type in POLICY_NODES:
             _, records = scoped_policies(xml_bytes, source_scope, item_type, "standard", parsed=(parsed_root, snapshot))
-            names = request.form.getlist("policy_name")
+            available = {item["name"] for item in records if item.get("editable")}
             move_all = request.form.get("move_all") == "yes"
+            names = [item["name"] for item in records if item.get("editable")] if move_all else list(dict.fromkeys(
+                name for name in request.form.getlist("policy_name") if name
+            ))
         elif item_kind == "object" and item_type in PANOS_SCOPE_MOVE_OBJECT_TYPES:
-            _, records = scoped_objects(xml_bytes, source_scope, item_type, parsed=(parsed_root, snapshot))
-            names = request.form.getlist("object_id")
+            source_root = _panos_scope_root(parsed_root, source_scope)
+            collection = _panos_scope_collection(source_root, "object", item_type) if source_root is not None else None
+            available_names = [
+                entry.get("name", "") for entry in collection.findall("./entry")
+                if entry.get("name")
+            ] if collection is not None else []
+            available = set(available_names)
             move_all = request.form.get("move_all") == "yes"
+            names = available_names if move_all else list(dict.fromkeys(
+                name for name in request.form.getlist("object_id") if name
+            ))
         else:
             raise OfflineConfigError("Dit policy- of objecttype kan niet tussen scopes worden verplaatst")
-        available = {item["name"] for item in records if item.get("editable")}
         if move_all:
             if target_scope != "Shared" or source_scope == "Shared":
                 raise OfflineConfigError("Alles verplaatsen is alleen beschikbaar van een VSYS naar Shared")
-            names = [item["name"] for item in records if item.get("editable")]
-        else:
-            names = list(dict.fromkeys(name for name in names if name))
         if not names:
             raise OfflineConfigError("Geen lokale items geselecteerd om te verplaatsen")
         if not set(names).issubset(available):
             raise OfflineConfigError("Een selectie is intussen gewijzigd of bevat inherited items")
+        timings["selection_ms"] = (time.perf_counter() - started) * 1000 - timings["workspace_load_ms"]
 
-        with db() as conn:
-            move_profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
-        if not move_profile:
-            raise OfflineConfigError("Het gekoppelde firewallprofiel bestaat niet meer")
-        predefined_applications = [
-            item.get("name", "") for item in cached_application_catalog(move_profile).get("items", [])
-            if item.get("name")
-        ]
+        catalog_started = time.perf_counter()
+        predefined_applications = []
+        if item_kind == "policy" or item_type == "application-groups":
+            with db() as conn:
+                move_profile = conn.execute("SELECT * FROM profiles WHERE id=?", (workspace["profile_id"],)).fetchone()
+            if not move_profile:
+                raise OfflineConfigError("Het gekoppelde firewallprofiel bestaat niet meer")
+            predefined_applications = [
+                item.get("name", "") for item in cached_application_catalog(move_profile).get("items", [])
+                if item.get("name")
+            ]
+        timings["catalog_ms"] = (time.perf_counter() - catalog_started) * 1000
 
-        updated_xml, moved, failed = move_panos_scope_entries(
+        move_started = time.perf_counter()
+        updated_xml, moved, reused, failed = move_panos_scope_entries(
             xml_bytes,
             item_kind=item_kind,
             item_type=item_type,
@@ -5465,17 +5487,21 @@ def config_workspace_scope_move(workspace_id):
             target_scope=target_scope,
             predefined_applications=predefined_applications,
             insertion_position=request.form.get("insertion_position", "top"),
+            parsed_config=(parsed_root, snapshot),
         )
+        timings["move_plan_ms"] = (time.perf_counter() - move_started) * 1000
         result_workspace_id = workspace_id
-        if moved:
+        if moved or reused:
+            store_started = time.perf_counter()
             result_workspace_id = store_workspace_edit_version(
-                workspace, updated_xml, f"scope move {len(moved)} items"
+                workspace, updated_xml, f"scope move {len(moved) + len(reused)} items"
             )
+            timings["store_version_ms"] = (time.perf_counter() - store_started) * 1000
             audit(
                 "config-workspace-scope-moved",
-                f"source={workspace_id} workspace={result_workspace_id} kind={item_kind} type={item_type} from={source_scope} to={target_scope} moved={len(moved)} failed={len(failed)}",
+                f"source={workspace_id} workspace={result_workspace_id} kind={item_kind} type={item_type} from={source_scope} to={target_scope} moved={len(moved)} reused={len(reused)} failed={len(failed)}",
             )
-        return render_template(
+        response = render_template(
             "workspace_scope_move_result.html",
             workspace=workspace,
             result_workspace_id=result_workspace_id,
@@ -5484,10 +5510,31 @@ def config_workspace_scope_move(workspace_id):
             item_kind=item_kind,
             item_type=item_type,
             moved=moved,
+            reused=reused,
             failed=failed,
             return_url=url_for("config_workspace_editor", workspace_id=result_workspace_id, **query_args),
         )
+        app.logger.info(
+            "Scope move timing workspace_id=%s target_type=%s item_kind=%s item_type=%s source_scope=%s target_scope=%s "
+            "requested=%s moved=%s reused=%s skipped=%s workspace_load_ms=%.1f selection_ms=%.1f "
+            "catalog_ms=%.1f move_plan_ms=%.1f store_version_ms=%.1f total_ms=%.1f xml_bytes=%s",
+            workspace_id, workspace["target_type"], safe_log_field(item_kind), safe_log_field(item_type),
+            safe_log_field(source_scope), safe_log_field(target_scope),
+            len(names), len(moved), len(reused), len(failed), timings.get("workspace_load_ms", 0.0),
+            timings.get("selection_ms", 0.0), timings.get("catalog_ms", 0.0),
+            timings.get("move_plan_ms", 0.0), timings.get("store_version_ms", 0.0),
+            (time.perf_counter() - started) * 1000, len(xml_bytes),
+        )
+        return response
     except Exception as exc:
+        app.logger.warning(
+            "Scope move failed workspace_id=%s kind=%s type=%s source_scope=%s target_scope=%s "
+            "phase_ms=%.1f total_ms=%.1f error_type=%s",
+            workspace_id, safe_log_field(item_kind), safe_log_field(item_type),
+            safe_log_field(source_scope), safe_log_field(target_scope),
+            (time.perf_counter() - phase_started) * 1000, (time.perf_counter() - started) * 1000,
+            type(exc).__name__,
+        )
         flash(f"Scope-verplaatsing niet uitgevoerd: {exc}", "error")
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, **query_args))
 
@@ -6086,6 +6133,9 @@ def config_workspace_upload(profile_id):
 @app.post("/profiles/<int:profile_id>/config-workspaces/pull")
 @login_required
 def config_workspace_pull(profile_id):
+    pull_started = time.perf_counter()
+    phase_started = pull_started
+    phase = "profile"
     with db() as conn:
         profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
     if not profile or profile["target_type"] not in {"panorama", "panos"}:
@@ -6096,14 +6146,21 @@ def config_workspace_pull(profile_id):
         else url_for("index", policy_profile=profile_id) + "#policy-management"
     )
     try:
+        phase = "api_fetch"
+        phase_started = time.perf_counter()
+        api_started = time.perf_counter()
         _, endpoint, key, ctx = panos_profile_context(profile)
         root = policy_api.require_success(
             panos_api_post(endpoint, {"type": "config", "action": "get", "xpath": "/config", "key": key}, ctx),
             "volledige candidateconfiguratie ophalen",
         )
+        api_fetch_ms = (time.perf_counter() - api_started) * 1000
         config = root.find("./result/config")
         if config is None:
             raise RuntimeError("API-antwoord bevat geen volledige configuratie")
+        phase = "parse"
+        phase_started = time.perf_counter()
+        parse_started = time.perf_counter()
         xml_bytes = normalized_config_xml(config)
         expected_kind = "panorama" if profile["target_type"] == "panorama" else "panos"
         parsed_config = parse_snapshot(xml_bytes, expected_kind=expected_kind)
@@ -6115,6 +6172,10 @@ def config_workspace_pull(profile_id):
             saved_settings = profile_settings(profile)
             if saved_settings.get("vsys_mode") == "multi":
                 expected_vsys_count = int(saved_settings.get("vsys_count") or 0)
+        parse_ms = (time.perf_counter() - parse_started) * 1000
+        phase = "store"
+        phase_started = time.perf_counter()
+        store_started = time.perf_counter()
         workspace_id = store_config_workspace(
             profile,
             request.form.get("name", "").strip() or f"{profile['name']} candidate {now()}",
@@ -6125,6 +6186,14 @@ def config_workspace_pull(profile_id):
             parsed_config=parsed_config,
         )
         set_active_config_workspace(profile_id, workspace_id)
+        store_ms = (time.perf_counter() - store_started) * 1000
+        app.logger.info(
+            "Workspace config pull timing profile_id=%s target_type=%s workspace_id=%s "
+            "api_fetch_ms=%.1f parse_ms=%.1f store_ms=%.1f total_ms=%.1f xml_bytes=%s vsys_count=%s",
+            profile_id, profile["target_type"], workspace_id, api_fetch_ms, parse_ms, store_ms,
+            (time.perf_counter() - pull_started) * 1000, len(xml_bytes),
+            discovered_vsys_count if discovered_vsys_count is not None else "n/a",
+        )
         if discovered_vsys_count is None:
             message = "Volledige candidateconfiguratie via API opgehaald."
         elif expected_vsys_count and expected_vsys_count != discovered_vsys_count:
@@ -6138,6 +6207,12 @@ def config_workspace_pull(profile_id):
         flash(message, "success")
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id))
     except Exception as exc:
+        app.logger.warning(
+            "Workspace config pull failed profile_id=%s target_type=%s phase=%s phase_ms=%.1f total_ms=%.1f error_type=%s",
+            profile_id, profile["target_type"], phase,
+            (time.perf_counter() - phase_started) * 1000, (time.perf_counter() - pull_started) * 1000,
+            type(exc).__name__,
+        )
         flash(f"Volledige configuratie niet opgehaald: {exc}", "error")
         return redirect(error_redirect)
 
