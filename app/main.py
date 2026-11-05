@@ -10,6 +10,7 @@ import hmac
 import io
 import ipaddress
 import json
+import logging
 import math
 import os
 import re
@@ -124,6 +125,9 @@ BLOCKED_PASSWORD_SHA256 = {
 }
 
 app = Flask(__name__)
+# Flask defaults to WARNING, which hides the operation timing records below.
+# Keep production diagnostics at INFO without enabling verbose request logging.
+app.logger.setLevel(logging.INFO)
 
 
 def build_asset_version() -> str:
