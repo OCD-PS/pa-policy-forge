@@ -226,6 +226,28 @@
     });
   }
 
+  function setupWorkspaceDeleteDialog() {
+    var dialog = document.querySelector("[data-workspace-delete-dialog]");
+    if (!dialog) return;
+    var form = dialog.querySelector("[data-workspace-delete-form]");
+    var workspaceName = dialog.querySelector("[data-delete-workspace-name]");
+    var profileName = dialog.querySelector("[data-delete-profile-name]");
+    document.addEventListener("click", function (event) {
+      var trigger = event.target.closest("[data-open-workspace-delete]");
+      if (trigger) {
+        form.action = trigger.dataset.deleteUrl || "";
+        workspaceName.textContent = trigger.dataset.workspaceName || "Workspace";
+        profileName.textContent = trigger.dataset.profileName || "";
+        dialog.showModal();
+        return;
+      }
+      if (event.target.closest("[data-workspace-delete-close]")) dialog.close();
+    });
+    dialog.addEventListener("click", function (event) {
+      if (event.target === dialog) dialog.close();
+    });
+  }
+
   function dismissFlash(flash) {
     if (!flash) return;
     flash.classList.add("is-leaving");
@@ -1495,6 +1517,7 @@
     runSetup("config-tree", setupConfigTree);
     runSetup("passwords", setupPasswords);
     runSetup("confirmations", setupConfirmations);
+    runSetup("workspace-delete-dialog", setupWorkspaceDeleteDialog);
     runSetup("flashes", setupFlashes);
     runSetup("bulk-selection", setupBulkSelection);
     runSetup("filters", setupFilters);
