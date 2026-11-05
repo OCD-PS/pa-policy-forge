@@ -6874,9 +6874,13 @@ def panos_scope_move_plan(
                 ):
                     operation["policy_change_path"] = field_path
                 ops.append(operation)
+            # PAN-OS can report the old reference as live when a rename,
+            # reference repair, and delete share one multi-config request.
+            # Finish the reference repair first, then clean up in a later write.
             ops.append({
                 "action": "delete", "xpath": temporary_xpath, "element": "",
-                "family": removal["family"], "label": label, "name": name,
+                "family": removal["family"], "label": "Shared object merge cleanup", "name": name,
+                "defer_until_after_merge": True,
             })
             if shared is None:
                 # The new Shared entry must exist before the reference fields
@@ -6996,9 +7000,9 @@ def panos_scope_move_plan(
         consumed_deletes.add(id(removal))
         moved_names.add((object_type, name))
 
-    # Apply each same-name Shared merge as one transactional XML API request.
-    # Seed new Shared entries in that same batch so a rejected reference repair
-    # cannot leave an orphaned Shared object in the candidate.
+    # Apply same-name Shared seeds, renames, and reference repairs together.
+    # Clean up renamed entries only after PAN-OS has finished that request;
+    # its reference checks can otherwise still see stale references.
     # Remove proven-unused local shadows before selected changes can introduce
     # references that PAN-OS would otherwise resolve to the local copy.
     write_plan = list(early_deletes)
@@ -7006,9 +7010,9 @@ def panos_scope_move_plan(
         change["policy_change_path"] for change in safe_merge_ops
         if change.get("policy_change_path")
     }
-    seed_operation_count = 0
     if safe_merge_ops:
         transaction = ET.Element("multi-config")
+        merge_cleanup_ops = []
         for target in selected_sets:
             entries = shared_target_seed_entries.get(id(target), {})
             if not entries:
@@ -7016,8 +7020,10 @@ def panos_scope_move_plan(
             action = ET.SubElement(transaction, "set", {"xpath": target["xpath"]})
             for entry in entries.values():
                 action.append(copy.deepcopy(entry))
-            seed_operation_count += 1
         for change in safe_merge_ops:
+            if change.get("defer_until_after_merge"):
+                merge_cleanup_ops.append(change)
+                continue
             attributes = {"xpath": change["xpath"]}
             if change.get("newname"):
                 attributes["newname"] = change["newname"]
@@ -7028,12 +7034,18 @@ def panos_scope_move_plan(
                 except Exception as exc:
                     raise OfflineConfigError("Shared-merge bevat ongeldige XML; niets geschreven") from exc
                 action.extend(copy.deepcopy(list(element)))
-        write_plan.append({
-            "action": "multi-config", "xpath": "/config", "element": ET.tostring(transaction, encoding="unicode"),
-            "family": safe_merge_ops[0]["family"], "label": "Shared object merge",
-            "name": ", ".join(dict.fromkeys(change["name"] for change in safe_merge_ops)),
-            "operation_count": len(safe_merge_ops) + seed_operation_count,
-        })
+        merge_operation_count = len(transaction)
+        if merge_operation_count:
+            write_plan.append({
+                "action": "multi-config", "xpath": "/config", "element": ET.tostring(transaction, encoding="unicode"),
+                "family": safe_merge_ops[0]["family"], "label": "Shared object merge",
+                "name": ", ".join(dict.fromkeys(
+                    change["name"] for change in safe_merge_ops
+                    if not change.get("defer_until_after_merge")
+                )),
+                "operation_count": merge_operation_count,
+            })
+        write_plan.extend(merge_cleanup_ops)
     for change in chosen:
         if change["family"].startswith("policy:") and change["xpath"] in embedded_policy_paths:
             continue

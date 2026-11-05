@@ -219,7 +219,8 @@ class IncrementalPushCommitTests(unittest.TestCase):
                 transaction = main.ET.fromstring(next(change["element"] for change in plan if change["action"] == "multi-config"))
                 repair = next(change for change in transaction.findall("./edit") if change.get("xpath", "").endswith("/service"))
                 self.assertEqual(repair.findtext("./service"), "tcp443")
-                self.assertEqual([change.tag for change in transaction], ["rename", "edit", "delete"])
+                self.assertEqual([change.tag for change in transaction], ["rename", "edit"])
+                self.assertEqual(plan[-1]["action"], "delete")
 
     def test_multi_config_batches_keep_order_and_stop_at_non_batchable_actions(self):
         plan = [
@@ -981,7 +982,6 @@ class IncrementalPushCommitTests(unittest.TestCase):
                         '<response status="success" code="20"><result>'
                         '<response status="success" code="20" id="1"/>'
                         '<response status="success" code="20" id="2"/>'
-                        '<response status="success" code="20" id="3"/>'
                         '</result></response>'
                     )
                 return '<response status="success" code="20"><result/></response>'
@@ -1000,16 +1000,16 @@ class IncrementalPushCommitTests(unittest.TestCase):
 
         self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
         config_calls = [item for item in requests if item["type"] == "config"]
-        self.assertEqual(len(config_calls), 1)
+        self.assertEqual([item["action"] for item in config_calls], ["multi-config", "delete"])
         self.assertEqual(config_calls[0]["action"], "multi-config")
         self.assertEqual(config_calls[0]["strict-transactional"], "no")
         transaction = main.ET.fromstring(config_calls[0]["element"])
-        self.assertEqual([item.tag for item in transaction], ["rename", "edit", "delete"])
+        self.assertEqual([item.tag for item in transaction], ["rename", "edit"])
         self.assertTrue(transaction[0].get("newname").startswith("PF_TMP_"))
         self.assertTrue(transaction[0].get("xpath").endswith("/entry[@name='0_NAC_10_10_130_0_24']"))
         self.assertTrue(transaction[1].get("xpath").endswith("/source"))
         self.assertIn("0_NAC_10_10_130_0_24", main.ET.tostring(transaction[1], encoding="unicode"))
-        self.assertIn("PF_TMP_", transaction[2].get("xpath"))
+        self.assertIn("PF_TMP_", config_calls[1]["xpath"])
 
     def test_same_name_shared_merge_deletes_unused_local_shadow_before_new_policy_reference(self):
         base = main.normalized_config_xml(main.ET.fromstring(
@@ -1262,7 +1262,6 @@ class IncrementalPushCommitTests(unittest.TestCase):
                         '<response status="success" code="20"><result>'
                         '<response status="success" code="20" id="1"/>'
                         '<response status="success" code="20" id="2"/>'
-                        '<response status="success" code="20" id="3"/>'
                         '</result></response>'
                     )
                 return '<response status="success" code="20"><result/></response>'
@@ -1281,9 +1280,9 @@ class IncrementalPushCommitTests(unittest.TestCase):
 
         self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
         config_calls = [item for item in requests if item["type"] == "config"]
-        self.assertEqual([item["action"] for item in config_calls], ["multi-config", "delete"])
+        self.assertEqual([item["action"] for item in config_calls], ["multi-config", "delete", "delete"])
         transaction = main.ET.fromstring(config_calls[0]["element"])
-        self.assertEqual([item.tag for item in transaction], ["rename", "edit", "delete"])
+        self.assertEqual([item.tag for item in transaction], ["rename", "edit"])
         policy_source = transaction[1]
         self.assertTrue(policy_source.get("xpath").endswith("/source"))
         policy_members = [node.text for node in policy_source.findall("./source/member")]
@@ -1343,10 +1342,10 @@ class IncrementalPushCommitTests(unittest.TestCase):
             {node: kind for kind, node in main.OBJECT_NODES.items()},
         )
 
-        self.assertEqual([item["action"] for item in plan], ["multi-config"])
+        self.assertEqual([item["action"] for item in plan], ["multi-config", "delete"])
         self.assertEqual(moved, {("addresses", "same-object")})
         transaction = main.ET.fromstring(plan[0]["element"])
-        self.assertEqual([item.tag for item in transaction], ["rename", "edit", "delete"])
+        self.assertEqual([item.tag for item in transaction], ["rename", "edit"])
         policy_source = transaction[1]
         self.assertTrue(policy_source.get("xpath").endswith("/source"))
         self.assertEqual(
@@ -1356,7 +1355,7 @@ class IncrementalPushCommitTests(unittest.TestCase):
 
     def test_same_name_shared_service_merge_handles_multiple_vsys_deletes(self):
         base = main.normalized_config_xml(main.ET.fromstring(
-            b'<config><shared><service><entry name="RadSec"><protocol><tcp><port>2083</port>'
+            b'<config version="12.1.0"><shared><service><entry name="RadSec"><protocol><tcp><port>2083</port>'
             b'</tcp></protocol></entry></service></shared><devices><entry name="localhost.localdomain">'
             b'<vsys><entry name="vsys1"><service><entry name="RadSec"><protocol><tcp><port>2083</port>'
             b'</tcp></protocol></entry></service><rulebase><security><rules><entry name="rule-vsys1">'
@@ -1386,9 +1385,10 @@ class IncrementalPushCommitTests(unittest.TestCase):
             requests.append(dict(params))
             if params["type"] == "config":
                 if params["action"] == "multi-config":
+                    transaction = main.ET.fromstring(params["element"])
                     nested = "".join(
                         f'<response status="success" code="20" id="{index}"/>'
-                        for index in range(1, 7)
+                        for index in range(1, len(transaction) + 1)
                     )
                     return f'<response status="success" code="20"><result>{nested}</result></response>'
                 return '<response status="success" code="20"><result/></response>'
@@ -1410,16 +1410,20 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
         self.assertFalse(any(item["type"] == "commit" for item in requests))
         config_calls = [item for item in requests if item["type"] == "config"]
-        self.assertEqual(len(config_calls), 1)
+        self.assertEqual([item["action"] for item in config_calls], ["multi-config", "multi-config"])
         self.assertEqual(config_calls[0]["action"], "multi-config")
         transaction = main.ET.fromstring(config_calls[0]["element"])
-        self.assertEqual([item.tag for item in transaction], ["rename", "edit", "delete"] * 2)
+        self.assertEqual([item.tag for item in transaction], ["rename", "edit"] * 2)
         self.assertTrue(all(item.get("newname", "").startswith("PF_TMP_") for item in transaction.findall("rename")))
         self.assertEqual(sum(item.tag == "edit" for item in transaction), 2)
+        cleanup = main.ET.fromstring(config_calls[1]["element"])
+        cleanup_paths = [item.get("xpath", "") for item in cleanup.findall("delete")]
+        self.assertEqual(len(cleanup_paths), 2)
+        self.assertTrue(all("PF_TMP_" in path for path in cleanup_paths))
 
     def test_new_shared_service_merge_handles_multiple_vsys_references(self):
         base_root = main.ET.fromstring(
-            b'<config><devices><entry name="localhost.localdomain"><vsys>'
+            b'<config version="12.1.0"><devices><entry name="localhost.localdomain"><vsys>'
             b'<entry name="vsys1"><service><entry name="RadSec"><protocol><tcp><port>2083</port>'
             b'<override><no /></override></tcp></protocol></entry></service>'
             b'<rulebase><security><rules><entry name="rule-vsys1">'
@@ -1458,9 +1462,10 @@ class IncrementalPushCommitTests(unittest.TestCase):
             requests.append(dict(params))
             if params["type"] == "config":
                 if params["action"] == "multi-config":
+                    transaction = main.ET.fromstring(params["element"])
                     nested = "".join(
                         f'<response status="success" code="20" id="{index}"/>'
-                        for index in range(1, 8)
+                        for index in range(1, len(transaction) + 1)
                     )
                     return f'<response status="success" code="20"><result>{nested}</result></response>'
                 return '<response status="success" code="20"><result/></response>'
@@ -1480,9 +1485,9 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertIn("naar de candidate geschreven en gevalideerd", response.get_data(as_text=True))
         self.assertFalse(any(item["type"] == "commit" for item in requests))
         config_calls = [item for item in requests if item["type"] == "config"]
-        self.assertEqual([item["action"] for item in config_calls], ["multi-config"])
+        self.assertEqual([item["action"] for item in config_calls], ["multi-config", "multi-config"])
         transaction = main.ET.fromstring(config_calls[0]["element"])
-        self.assertEqual([item.tag for item in transaction], ["set"] + ["rename", "edit", "delete"] * 2)
+        self.assertEqual([item.tag for item in transaction], ["set"] + ["rename", "edit"] * 2)
         self.assertTrue(transaction[0].get("xpath", "").endswith("/shared/service"))
         self.assertEqual(transaction[0].find("entry").get("name"), "RadSec")
         edited_paths = [item.get("xpath", "") for item in transaction.findall("edit")]
@@ -1490,6 +1495,8 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertTrue(any("rule-vsys1" in path and path.endswith("/service") for path in edited_paths))
         self.assertTrue(any("rule-vsys2" in path and path.endswith("/service") for path in edited_paths))
         self.assertTrue(all("RadSec" in (item.text or "") for edit in transaction.findall("edit") for item in edit.findall("./member")))
+        cleanup = main.ET.fromstring(config_calls[1]["element"])
+        self.assertEqual([item.tag for item in cleanup], ["delete", "delete"])
 
         incomplete_requests = []
 
@@ -1498,7 +1505,7 @@ class IncrementalPushCommitTests(unittest.TestCase):
             if params["type"] == "config" and params["action"] == "multi-config":
                 nested = "".join(
                     f'<response status="success" code="20" id="{index}"/>'
-                    for index in range(1, 7)
+                    for index in range(1, 5)
                 )
                 return f'<response status="success" code="20"><result>{nested}</result></response>'
             self.fail(f"Unexpected request after incomplete transaction response: {params}")
@@ -1512,7 +1519,7 @@ class IncrementalPushCommitTests(unittest.TestCase):
                 follow_redirects=True,
             )
 
-        self.assertIn("bevestigde 6 van 7 bewerkingen", incomplete.get_data(as_text=True))
+        self.assertIn("bevestigde 4 van 5 bewerkingen", incomplete.get_data(as_text=True))
         self.assertIn("API-uitkomst onzeker", incomplete.get_data(as_text=True))
         self.assertIn("candidate opnieuw op", incomplete.get_data(as_text=True))
         self.assertNotIn("candidate niet gewijzigd", incomplete.get_data(as_text=True))
@@ -1595,9 +1602,10 @@ class IncrementalPushCommitTests(unittest.TestCase):
         def api_response(endpoint, params, ctx):
             requests.append(dict(params))
             if params["type"] == "config" and params["action"] == "multi-config":
+                transaction = main.ET.fromstring(params["element"])
                 nested = "".join(
                     f'<response status="success" code="20" id="{index}"/>'
-                    for index in range(1, 5)
+                    for index in range(1, len(transaction) + 1)
                 )
                 return f'<response status="success" code="20"><result>{nested}</result></response>'
             if params["type"] == "config":
@@ -1619,7 +1627,7 @@ class IncrementalPushCommitTests(unittest.TestCase):
         self.assertFalse(any(item["type"] == "commit" for item in requests))
         config_call = next(item for item in requests if item["type"] == "config")
         transaction = main.ET.fromstring(config_call["element"])
-        self.assertEqual([item.tag for item in transaction], ["rename", "edit", "edit", "delete"])
+        self.assertEqual([item.tag for item in transaction], ["rename", "edit", "edit"])
         edit_paths = [item.get("xpath") for item in transaction.findall("edit")]
         self.assertTrue(any(
             path.endswith("/rulebase/security/rules/entry[@name='allow-google']/destination")
@@ -1683,7 +1691,7 @@ class IncrementalPushCommitTests(unittest.TestCase):
         config_call = next(item for item in requests if item["type"] == "config")
         self.assertEqual(config_call["action"], "multi-config")
         transaction = main.ET.fromstring(config_call["element"])
-        self.assertEqual([item.tag for item in transaction], ["rename", "edit", "edit", "delete"])
+        self.assertEqual([item.tag for item in transaction], ["rename", "edit", "edit"])
         self.assertTrue(any(
             item.get("xpath", "").endswith(
                 "/network/virtual-router/entry[@name='default']/routing-table/ip/"
@@ -2202,9 +2210,18 @@ class IncrementalPushCommitTests(unittest.TestCase):
 
         def api_response(endpoint, params, ctx):
             requests.append(dict(params))
+            if params["type"] == "config" and params["action"] == "multi-config":
+                transaction = main.ET.fromstring(params["element"])
+                nested = "".join(
+                    f'<response status="success" code="20" id="{index}"/>'
+                    for index in range(1, len(transaction) + 1)
+                )
+                return f'<response status="success" code="20"><result>{nested}</result></response>'
+            if params["type"] == "config" and params["action"] == "delete":
+                return '<response status="error" code="10"><msg>Object is still referenced</msg></response>'
             return (
                 '<response status="success" code="20">'
-                '<response status="error" code="10"><msg>Object is still referenced</msg></response>'
+                '<result/>'
                 '</response>'
             )
 
@@ -2220,7 +2237,7 @@ class IncrementalPushCommitTests(unittest.TestCase):
         message = response.get_data(as_text=True)
         self.assertIn("Shared object merge", message)
         self.assertIn("kan dit object niet verwijderen zolang er verwijzingen naar bestaan", message)
-        self.assertEqual([item.get("action") for item in requests], ["multi-config"])
+        self.assertEqual([item.get("action") for item in requests], ["multi-config", "delete"])
         wait_job.assert_not_called()
 
     def test_same_name_shared_merge_supports_panorama_device_group_scope(self):
@@ -2241,7 +2258,7 @@ class IncrementalPushCommitTests(unittest.TestCase):
             base, desired, [deletion], {node: kind for kind, node in main.OBJECT_NODES.items()},
         )
 
-        self.assertEqual([item["action"] for item in plan], ["multi-config"])
+        self.assertEqual([item["action"] for item in plan], ["multi-config", "delete"])
         self.assertEqual(moved, {("addresses", "same-object")})
 
     def test_multiple_shared_merges_parse_each_config_once_per_object_type(self):
@@ -2272,7 +2289,7 @@ class IncrementalPushCommitTests(unittest.TestCase):
                 {node: kind for kind, node in main.OBJECT_NODES.items()},
             )
 
-        self.assertEqual([item["action"] for item in plan], ["multi-config"])
+        self.assertEqual([item["action"] for item in plan], ["multi-config", "delete", "delete"])
         self.assertEqual(moved, {("addresses", "object-a"), ("addresses", "object-b")})
         self.assertEqual(parse_config.call_count, 2)
 
