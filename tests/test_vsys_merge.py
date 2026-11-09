@@ -30,7 +30,7 @@ MULTI_VSYS = b'''<config version="12.1.0">
         </zone>
         <address><entry name="web"><ip-netmask>10.1.0.10/32</ip-netmask></entry></address>
         <address-group><entry name="web-group"><static><member>web</member></static></entry></address-group>
-        <rulebase><security><rules><entry name="servers-to-transit"><from><member>Servers</member></from><to><member>Transit</member></to><source><member>web</member></source><destination><member>any</member></destination><action>allow</action></entry></rules><default-rule><action>deny</action></default-rule></security></rulebase>
+        <rulebase><security><rules><entry name="servers-to-transit"><from><member>Servers</member></from><to><member>Transit</member></to><source><member>web</member></source><destination><member>any</member></destination><action>allow</action></entry></rules></security><default-security-rules><rules><entry name="interzone-default"><action>deny</action></entry></rules></default-security-rules></rulebase>
       </entry>
       <entry name="vsys2"><vsys-id>2</vsys-id>
         <import><network><interface><member>ethernet1/2</member></interface><virtual-router><member>default</member></virtual-router></network></import>
@@ -41,12 +41,12 @@ MULTI_VSYS = b'''<config version="12.1.0">
         <address><entry name="web"><ip-netmask>10.1.0.10/32</ip-netmask></entry></address>
         <address-group><entry name="web-group"><static><member>web</member></static></entry></address-group>
         <service><entry name="tcp-443"><protocol><tcp><port>443</port></tcp></protocol></entry></service>
-        <rulebase><security><rules><entry name="transit-to-internet"><from><member>Transit</member></from><to><member>Internet</member></to><source><member>any</member></source><destination><member>web-group</member></destination><action>allow</action></entry></rules><default-rule><action>drop</action></default-rule></security></rulebase>
+        <rulebase><security><rules><entry name="transit-to-internet"><from><member>Transit</member></from><to><member>Internet</member></to><source><member>any</member></source><destination><member>web-group</member></destination><action>allow</action></entry></rules></security><default-security-rules><rules><entry name="interzone-default"><action>drop</action></entry></rules></default-security-rules></rulebase>
       </entry>
       <entry name="vsys3"><vsys-id>3</vsys-id>
         <zone><entry name="Admin"><network><layer3><member>loopback.1</member></layer3></network></entry></zone>
         <import><network><virtual-router><member>default</member></virtual-router></network></import>
-        <rulebase><security><rules><entry name="admin-to-servers"><from><member>Admin</member></from><to><member>Servers</member></to><source><member>any</member></source><destination><member>web</member></destination><action>allow</action></entry></rules><default-rule><action>drop</action></default-rule></security></rulebase>
+        <rulebase><security><rules><entry name="admin-to-servers"><from><member>Admin</member></from><to><member>Servers</member></to><source><member>any</member></source><destination><member>web</member></destination><action>allow</action></entry></rules></security><default-security-rules><rules><entry name="interzone-default"><action>drop</action></entry></rules></default-security-rules></rulebase>
       </entry>
     </vsys>
   </entry></devices>
@@ -64,6 +64,46 @@ def zone_mappings():
 
 
 class VsysMergeTests(unittest.TestCase):
+    def test_actual_default_security_rules_come_only_from_selected_vsys(self):
+        root = ET.fromstring(MULTI_VSYS)
+        for scope in root.findall('./devices/entry/vsys/entry'):
+            defaults = scope.find('./rulebase/default-security-rules/rules')
+            intrazone = ET.SubElement(defaults, 'entry', {'name': 'intrazone-default'})
+            ET.SubElement(intrazone, 'action').text = 'allow'
+            ET.SubElement(intrazone, 'log-setting').text = scope.get('name') + '-logging'
+        source = ET.tostring(root)
+        for selected in ('vsys1', 'vsys2', 'vsys3'):
+            with self.subTest(selected=selected):
+                merged, plan = merge_panos_vsys_config(
+                    source, target_vsys='vsys1', vsys_order=['vsys3', 'vsys2', 'vsys1'],
+                    default_rule_source=selected, zone_mappings=zone_mappings(),
+                )
+                merged_root = ET.fromstring(merged)
+                defaults = merged_root.find('./devices/entry/vsys/entry/rulebase/default-security-rules')
+                expected = root.find(f'./devices/entry/vsys/entry[@name="{selected}"]/rulebase/default-security-rules')
+                self.assertEqual(
+                    ET.canonicalize(ET.tostring(defaults), strip_text=True),
+                    ET.canonicalize(ET.tostring(expected), strip_text=True),
+                )
+                self.assertEqual(
+                    [node.get('name') for node in defaults.findall('./rules/entry')],
+                    ['interzone-default', 'intrazone-default'],
+                )
+                self.assertEqual(plan['policy_total'], 3)
+                self.assertEqual(plan['renamed_policies'], [])
+                self.assertEqual(analyze_panos_vsys_merge(source)['policy_total'], 3)
+                self.assertEqual(ET.tostring(root), source)
+
+    def test_missing_selected_default_security_rules_fails_closed(self):
+        root = ET.fromstring(MULTI_VSYS)
+        base = root.find('./devices/entry/vsys/entry[@name="vsys1"]/rulebase')
+        base.remove(base.find('./default-security-rules'))
+        with self.assertRaisesRegex(VsysMergeError, 'default-rulebron vsys1'):
+            merge_panos_vsys_config(
+                ET.tostring(root), target_vsys='vsys1', vsys_order=['vsys1', 'vsys2', 'vsys3'],
+                default_rule_source='vsys1', zone_mappings=zone_mappings(),
+            )
+
     def test_analysis_flags_possible_transit_but_does_not_claim_it_as_fact(self):
         report = analyze_panos_vsys_merge(MULTI_VSYS)
         self.assertEqual(report["vsys_count"], 3)
@@ -107,7 +147,7 @@ class VsysMergeTests(unittest.TestCase):
         self.assertEqual(len(root.findall("./shared/address/entry[@name='web']")), 1)
         self.assertEqual(len(root.findall("./shared/address-group/entry[@name='web-group']")), 1)
         self.assertIsNotNone(root.find("./shared/service/entry[@name='tcp-443']"))
-        self.assertEqual(root.findtext("./devices/entry/vsys/entry/rulebase/security/default-rule/action"), "deny")
+        self.assertEqual(root.findtext("./devices/entry/vsys/entry/rulebase/default-security-rules/rules/entry/action"), "deny")
         self.assertIsNotNone(root.find("./devices/entry/network/virtual-router/entry[@name='default']"))
         self.assertEqual(root.findtext("./mgt-config/users/entry[@name='admin']/phash"), "keep-this-hash")
         self.assertEqual(MULTI_VSYS, before)

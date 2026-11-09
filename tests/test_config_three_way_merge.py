@@ -5,6 +5,52 @@ from app.offline_config import merge_config_xml
 
 
 class ConfigThreeWayMergeTests(unittest.TestCase):
+    def test_ordered_member_reorder_is_preserved_across_xml_scopes(self):
+        sequence = (
+            '<authentication-sequence><entry name="Sequence"><authentication-profiles>'
+            '<member>LDAP</member><member>RADIUS</member></authentication-profiles>'
+            '</entry></authentication-sequence>'
+        )
+        scopes = [
+            '<shared>{}</shared>',
+            '<devices><entry name="fw"><vsys><entry name="vsys1">{}</entry></vsys></entry></devices>',
+            '<devices><entry name="fw"><vsys><entry name="vsys2">{}</entry></vsys></entry></devices>',
+            '<devices><entry name="fw"><template><entry name="Template"><config><devices>'
+            '<entry name="fw"><vsys><entry name="vsys1">{}</entry></vsys></entry>'
+            '</devices></config></entry></template></entry></devices>',
+        ]
+        for scope in scopes:
+            with self.subTest(scope=scope):
+                base = ('<config>' + scope.format(sequence) + '</config>').encode()
+                desired = base.replace(
+                    b'<member>LDAP</member><member>RADIUS</member>',
+                    b'<member>RADIUS</member><member>LDAP</member>',
+                )
+                merged, conflicts = merge_config_xml(base, desired, base)
+                self.assertEqual(conflicts, [])
+                self.assertEqual(
+                    [node.text for node in ET.fromstring(merged).findall('.//authentication-profiles/member')],
+                    ['RADIUS', 'LDAP'],
+                )
+
+    def test_competing_ordered_member_changes_fail_closed(self):
+        base = b'<config><authentication-profiles><member>A</member><member>B</member><member>C</member></authentication-profiles></config>'
+        desired = base.replace(b'<member>A</member><member>B</member>', b'<member>B</member><member>A</member>')
+        current = base.replace(b'<member>B</member><member>C</member>', b'<member>C</member><member>B</member>')
+        merged, conflicts = merge_config_xml(base, desired, current)
+        self.assertEqual(merged, b'')
+        self.assertEqual(conflicts, ['/config/authentication-profiles/member-list'])
+
+    def test_unknown_member_schemas_keep_order_and_independent_candidate_changes(self):
+        base = b'<config><unknown-list><member>A</member><member>B</member></unknown-list><description>old</description></config>'
+        desired = base.replace(b'<description>old', b'<description>new')
+        current = base.replace(b'<member>A</member><member>B</member>', b'<member>B</member><member>A</member>')
+        merged, conflicts = merge_config_xml(base, desired, current)
+        self.assertEqual(conflicts, [])
+        root = ET.fromstring(merged)
+        self.assertEqual([node.text for node in root.findall('./unknown-list/member')], ['B', 'A'])
+        self.assertEqual(root.findtext('description'), 'new')
+
     def test_description_edit_keeps_concurrent_policy_member_removal(self):
         base = b"""<config><devices><entry name='fw'><vsys><entry name='vsys2'><rulebase><security><rules>
           <entry name='Allow-app'><description>old</description><source><member>CN</member><member>RU</member></source></entry>
