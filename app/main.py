@@ -4044,6 +4044,8 @@ def config_workspace_undo(workspace_id):
     if not parent or int(parent["profile_id"]) != int(workspace["profile_id"]):
         flash("De vorige configuratieversie is niet meer beschikbaar.", "error")
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, **return_context))
+    restored_id = parent_id
+    restored_config_path = None
     try:
         parent_xml, _, _ = cached_workspace_config(parent["config_path"], parent["sha256"])
         with db() as conn:
@@ -4054,6 +4056,9 @@ def config_workspace_undo(workspace_id):
             )
             if len(current_chain) < 2 or current_chain[:2] != [workspace_id, parent_id]:
                 raise OfflineConfigError("De werkruimte is intussen gewijzigd; ververs de pagina en probeer opnieuw")
+            if not workspace_allowed(conn, workspace_id, str(session.get("username", "")), write=True):
+                raise OfflineConfigError("Geen schrijftoegang tot deze configuratiewerkruimte")
+            parent = conn.execute("SELECT * FROM config_workspaces WHERE id=?", (parent_id,)).fetchone()
             current = conn.execute(
                 "SELECT 1 FROM config_workspaces WHERE id=? AND profile_id=?",
                 (workspace_id, workspace["profile_id"]),
@@ -4071,28 +4076,67 @@ def config_workspace_undo(workspace_id):
             ).fetchone()
             migration_linked = bool(staged or output or migration_base)
             is_active = active_config_workspace_id(profile) == workspace_id
+            is_vsys_merge = str(workspace["source"]) == "vsys-merge"
             if str(workspace["source"]).startswith("migration-") and not migration_linked:
                 raise OfflineConfigError("Deze migratiewerkruimte is verouderd; open de actuele migratieversie opnieuw")
-            if not is_active and not migration_linked:
+            if is_vsys_merge:
+                root_id = int(workspace["history_root_id"] or workspace_id)
+                latest = conn.execute(
+                    "SELECT id FROM config_workspaces WHERE profile_id=? AND source='vsys-merge' "
+                    "AND COALESCE(history_root_id,id)=? ORDER BY id DESC LIMIT 1",
+                    (workspace["profile_id"], root_id),
+                ).fetchone()
+                if not latest or int(latest["id"]) != workspace_id:
+                    raise OfflineConfigError("Deze VSYS-merge is verouderd; open de nieuwste merged workspace opnieuw")
+                # Keep MAX(id) as the merged branch head, while skipping the
+                # undone version in its ancestry. The live source stays active.
+                restored_id = store_config_workspace(
+                    profile, parent["name"], parent["original_name"], parent_xml,
+                    "vsys-merge", baseline_workspace=parent,
+                    history_parent_id=workspace_id, connection=conn, log_creation=False,
+                )
+                restored = conn.execute(
+                    "SELECT config_path,metadata_json FROM config_workspaces WHERE id=?", (restored_id,),
+                ).fetchone()
+                restored_config_path = str(restored["config_path"])
+                metadata = json.loads(restored["metadata_json"] or "{}")
+                access_mode = json.loads(workspace["metadata_json"] or "{}").get("workspace_access_mode")
+                if access_mode:
+                    metadata["workspace_access_mode"] = access_mode
+                conn.execute(
+                    "UPDATE config_workspaces SET history_parent_id=?,metadata_json=? WHERE id=?",
+                    (parent["history_parent_id"], json.dumps(metadata, sort_keys=True), restored_id),
+                )
+            elif not is_active and not migration_linked:
                 raise OfflineConfigError("Deze versie is verouderd; open de actuele configuratiewerkruimte opnieuw")
-            if not advance_migration_staging_workspace(workspace_id, parent_id, connection=conn):
-                advance_migration_output_workspace(workspace_id, parent_id, parent_xml, connection=conn)
+            if not advance_migration_staging_workspace(workspace_id, restored_id, connection=conn):
+                advance_migration_output_workspace(workspace_id, restored_id, parent_xml, connection=conn)
                 conn.execute(
                     "UPDATE migration_projects SET base_workspace_id=?,updated_at=? WHERE base_workspace_id=?",
-                    (parent_id, now(), workspace_id),
+                    (restored_id, now(), workspace_id),
                 )
-                set_active_config_workspace(workspace["profile_id"], parent_id, connection=conn)
+                if not is_vsys_merge:
+                    set_active_config_workspace(workspace["profile_id"], restored_id, connection=conn)
         audit(
             "config-workspace-undone",
-            f"workspace={workspace_id} restored={parent_id} profile={workspace['profile_name']}",
+            f"workspace={workspace_id} restored={restored_id} profile={workspace['profile_name']}",
         )
         try:
-            prune_workspace_history(parent_id)
+            prune_workspace_history(restored_id)
         except Exception:
-            app.logger.exception("Unable to prune workspace history after undo workspace_id=%s", parent_id)
+            app.logger.exception("Unable to prune workspace history after undo workspace_id=%s", restored_id)
         flash("Laatste wijziging ongedaan gemaakt.", "success")
-        return redirect(url_for("config_workspace_editor", workspace_id=parent_id, **return_context))
+        return redirect(url_for("config_workspace_editor", workspace_id=restored_id, **return_context))
     except Exception as exc:
+        if restored_config_path:
+            # If the transaction rolled back, discard only its new XML file.
+            with db() as conn:
+                persisted = conn.execute("SELECT 1 FROM config_workspaces WHERE id=?", (restored_id,)).fetchone()
+            if not persisted:
+                try:
+                    safe_workspace_path(CONFIG_WORKSPACES, restored_config_path).unlink(missing_ok=True)
+                except (OSError, ValueError):
+                    app.logger.exception("Unable to remove uncommitted undo XML for workspace_id=%s", restored_id)
         flash(f"Wijziging niet ongedaan gemaakt: {exc}", "error")
         return redirect(url_for("config_workspace_editor", workspace_id=workspace_id, **return_context))
 

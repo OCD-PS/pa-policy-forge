@@ -26,9 +26,10 @@ def merge_config_xml(
 ) -> tuple[bytes, list[str]]:
     """Merge independent edits from a workspace onto a newer PAN-OS XML candidate.
 
-    XML child collections that represent member lists are treated as unordered
-    multisets. Named ``entry`` collections merge by name; policy ``rules`` order
-    is preserved and concurrent order changes fail closed.
+    Known policy-match and object-group member lists are unordered multisets.
+    Other member lists retain their order, including authentication sequences.
+    Named ``entry`` collections merge by name; policy ``rules`` order is
+    preserved and concurrent order changes fail closed.
     """
     base = SafeET.fromstring(base_xml)
     desired = SafeET.fromstring(desired_xml)
@@ -66,6 +67,23 @@ def merge_config_xml(
             return desired_value
         conflict(path)
         return current_value
+
+    def unordered_members(path, tag):
+        # Order affects execution in other schemas (for example authentication
+        # profiles). Only normalize fields whose membership defines a set.
+        policy_fields = {
+            "from", "to", "source", "destination", "source-user", "destination-user",
+            "source-hip", "destination-hip", "application", "service", "category", "tag",
+        }
+        if tag in policy_fields and ("/rules/entry[" in path or "/rule/" in path):
+            return True
+        return (
+            tag == "static" and "/address-group/entry[" in path
+            or tag == "members" and any(
+                f"/{kind}/entry[" in path for kind in ("service-group", "application-group")
+            )
+            or tag == "tag"
+        )
 
     def merge_node(base_node, desired_node, current_node, path):
         if base_node is None:
@@ -109,6 +127,16 @@ def merge_config_xml(
         ):
             def member_values(children):
                 return [(child.text or "").strip() for child in children]
+
+            if not unordered_members(path, base_node.tag):
+                values = merge_scalar(
+                    member_values(base_children), member_values(desired_children),
+                    member_values(current_children), f"{path}/member-list",
+                )
+                chosen = desired_children if values == member_values(desired_children) else current_children
+                for child in chosen:
+                    merged.append(copy.deepcopy(child))
+                return merged
 
             b_values = Counter(member_values(base_children))
             d_values = Counter(member_values(desired_children))

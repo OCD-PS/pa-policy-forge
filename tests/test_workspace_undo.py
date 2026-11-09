@@ -104,6 +104,113 @@ class WorkspaceUndoTests(unittest.TestCase):
         button = html.split("Ongedaan maken", 1)[0].rsplit("<button", 1)[-1]
         self.assertNotIn("disabled", button)
 
+    def merged_branch(self):
+        merged_id = main.store_config_workspace(
+            self.profile, "Merged", "undo-merged.xml", BASE_XML, "vsys-merge",
+        )
+        with main.db() as conn:
+            metadata = json.loads(conn.execute(
+                "SELECT metadata_json FROM config_workspaces WHERE id=?", (merged_id,),
+            ).fetchone()[0])
+            metadata["workspace_access_mode"] = "shared"
+            conn.execute(
+                "UPDATE config_workspaces SET metadata_json=? WHERE id=?", (json.dumps(metadata), merged_id),
+            )
+        return merged_id
+
+    def test_merged_undo_restores_branch_head_and_allows_further_edits(self):
+        merged_id = self.merged_branch()
+        first_id = self.edit_version(merged_id, "first")
+        second_id = self.edit_version(first_id, "second")
+        with patch.object(main, "fetch_panos_candidate_xml", side_effect=AssertionError("offline only")):
+            for current_id, expected_text, expected_undo_count in [(second_id, "first", 1), (None, "base", 0)]:
+                if current_id is None:
+                    current_id = restored_id
+                response = self.client.post(
+                    f"/config-workspaces/{current_id}/undo", data={"csrf": "undo-csrf"},
+                )
+                self.assertEqual(response.status_code, 302)
+                restored_id = int(response.headers["Location"].split("/config-workspaces/")[1].split("/")[0])
+                self.assertNotEqual(restored_id, current_id)
+                restored = main.workspace_row(restored_id)
+                xml = main.workspace_config_path(restored).read_bytes()
+                self.assertIn(f">{expected_text}</description>".encode(), xml)
+                self.assertEqual(restored["source"], "vsys-merge")
+                self.assertEqual(json.loads(restored["metadata_json"])["workspace_access_mode"], "shared")
+                self.assertEqual(len(main.workspace_history_chain(restored_id)) - 1, expected_undo_count)
+                with main.db() as conn:
+                    profile = conn.execute("SELECT * FROM profiles WHERE id=?", (self.profile_id,)).fetchone()
+                    latest_id = conn.execute(
+                        "SELECT MAX(id) FROM config_workspaces WHERE source='vsys-merge' AND profile_id=?",
+                        (self.profile_id,),
+                    ).fetchone()[0]
+                self.assertEqual(latest_id, restored_id)
+                self.assertEqual(main.active_config_workspace_id(profile), self.base_id)
+            edited_id = self.edit_version(restored_id, "after undo")
+            self.assertIn(b">after undo</description>", main.workspace_config_path(main.workspace_row(edited_id)).read_bytes())
+
+    def test_stale_merged_undo_cannot_replace_newer_branch_head(self):
+        merged_id = self.merged_branch()
+        first_id = self.edit_version(merged_id, "first")
+        second_id = self.edit_version(first_id, "second")
+        response = self.client.post(f"/config-workspaces/{first_id}/undo", data={"csrf": "undo-csrf"})
+        self.assertIn(f"/config-workspaces/{first_id}/edit", response.headers["Location"])
+        with self.client.session_transaction() as session:
+            self.assertTrue(any("verouderd" in message for _, message in session.get("_flashes", [])))
+        with main.db() as conn:
+            latest_id = conn.execute("SELECT MAX(id) FROM config_workspaces").fetchone()[0]
+        self.assertEqual(latest_id, second_id)
+
+    def test_merged_undo_rollback_removes_new_snapshot_and_retains_head(self):
+        merged_id = self.merged_branch()
+        edited_id = self.edit_version(merged_id, "changed")
+        before_files = set(main.CONFIG_WORKSPACES.iterdir())
+        with patch.object(main, "advance_migration_staging_workspace", side_effect=RuntimeError("fixture failure")):
+            response = self.client.post(f"/config-workspaces/{edited_id}/undo", data={"csrf": "undo-csrf"})
+        self.assertIn(f"/config-workspaces/{edited_id}/edit", response.headers["Location"])
+        self.assertEqual(set(main.CONFIG_WORKSPACES.iterdir()), before_files)
+        self.assertEqual(main.workspace_history_chain(edited_id), [edited_id, merged_id])
+        self.edit_version(edited_id, "retry")
+
+    def test_merged_undo_requires_write_access_to_restored_parent(self):
+        merged_id = self.merged_branch()
+        edited_id = self.edit_version(merged_id, "changed")
+        with main.db() as conn:
+            project_id = conn.execute(
+                "INSERT INTO migration_projects(name,target_profile_id,owner,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("Restricted ancestor", self.profile_id, "another-owner", main.now(), main.now()),
+            ).lastrowid
+            main.link_workspace_project(conn, merged_id, project_id)
+        response = self.client.post(f"/config-workspaces/{edited_id}/undo", data={"csrf": "undo-csrf"})
+        self.assertIn(f"/config-workspaces/{edited_id}/edit", response.headers["Location"])
+        with main.app.test_request_context(method="POST"):
+            main.session["username"] = "undo-owner"
+            self.assertEqual(main.workspace_history_chain(edited_id), [edited_id])
+
+    def test_project_viewer_cannot_undo_merged_workspace(self):
+        merged_id = self.merged_branch()
+        with main.db() as conn:
+            project_id = conn.execute(
+                "INSERT INTO migration_projects(name,target_profile_id,owner,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("Private merge", self.profile_id, "undo-owner", main.now(), main.now()),
+            ).lastrowid
+            main.link_workspace_project(conn, merged_id, project_id)
+            viewer_id = conn.execute(
+                "INSERT INTO users(username,password_hash,must_change) VALUES(?,?,0)",
+                ("undo-viewer", "unused-fixture-hash"),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO migration_project_roles(project_id,username,role,created_at) VALUES(?,?,?,?)",
+                (project_id, "undo-viewer", "viewer", main.now()),
+            )
+        edited_id = self.edit_version(merged_id, "private change")
+        with self.client.session_transaction() as session:
+            session.update(user_id=viewer_id, username="undo-viewer")
+        response = self.client.post(f"/config-workspaces/{edited_id}/undo", data={"csrf": "undo-csrf"})
+        self.assertEqual(response.status_code, 404)
+        with main.db() as conn:
+            self.assertEqual(conn.execute("SELECT MAX(id) FROM config_workspaces").fetchone()[0], edited_id)
+
     def test_history_keeps_current_plus_at_most_fifteen_undo_steps(self):
         workspace_id = self.base_id
         for index in range(20):

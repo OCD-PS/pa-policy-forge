@@ -71,11 +71,11 @@ class IncrementalPushCommitTests(unittest.TestCase):
           <entry name="vsys1"><vsys-id>1</vsys-id><zone>
             <entry name="Inside"><network><layer3/></network></entry>
             <entry name="External"><network><external><member>vsys2</member></external></network></entry>
-          </zone><rulebase><security><rules><entry name="inside-out"><from><member>Inside</member></from><to><member>External</member></to><source><member>any</member></source><destination><member>any</member></destination><action>allow</action></entry></rules><default-rule><entry name="interzone-default"><action>deny</action></entry></default-rule></security></rulebase></entry>
+          </zone><rulebase><security><rules><entry name="inside-out"><from><member>Inside</member></from><to><member>External</member></to><source><member>any</member></source><destination><member>any</member></destination><action>allow</action></entry></rules></security><default-security-rules><rules><entry name="interzone-default"><action>deny</action></entry></rules></default-security-rules></rulebase></entry>
           <entry name="vsys2"><vsys-id>2</vsys-id><zone>
             <entry name="Transit"><network><layer3/></network></entry>
             <entry name="Internet"><network><layer3/></network></entry>
-          </zone><rulebase><security><rules><entry name="transit-out"><from><member>Transit</member></from><to><member>Internet</member></to><source><member>any</member></source><destination><member>any</member></destination><action>allow</action></entry></rules><default-rule><entry name="interzone-default"><action>drop</action></entry></default-rule></security></rulebase></entry>
+          </zone><rulebase><security><rules><entry name="transit-out"><from><member>Transit</member></from><to><member>Internet</member></to><source><member>any</member></source><destination><member>any</member></destination><action>allow</action></entry></rules></security><default-security-rules><rules><entry name="interzone-default"><action>drop</action></entry></rules></default-security-rules></rulebase></entry>
         </vsys></entry></devices></config>'''
         workspace_id = main.store_config_workspace(
             self.profile, "VSYS merge source", "source.xml", source_xml, "test",

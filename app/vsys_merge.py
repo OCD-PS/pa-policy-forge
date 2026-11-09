@@ -137,6 +137,8 @@ def _policy_counts(vsys: ET.Element) -> tuple[dict[str, int], int]:
     total = 0
     for rulebase in _RULEBASES:
         for policy_type in vsys.findall(f"./{rulebase}/*"):
+            if policy_type.tag == "default-security-rules":
+                continue
             rules = policy_type.findall("./rules/entry")
             if rules:
                 key = f"{rulebase} · {policy_type.tag}"
@@ -560,6 +562,8 @@ def _policy_name_assignments(
     names_by_scope_category: dict[tuple[str, str], set[str]] = defaultdict(set)
     for scope, source_base in source_bases:
         for category in list(source_base):
+            if category.tag == "default-security-rules":
+                continue
             rules = category.find("./rules")
             if rules is None:
                 continue
@@ -653,6 +657,15 @@ def _merge_rulebases(
 
         for scope, source_base in source_bases:
             for source_category in list(source_base):
+                if source_category.tag == "default-security-rules":
+                    # PAN-OS stores the fixed intrazone/interzone overrides in
+                    # their own category. They must never be renamed or joined
+                    # with another VSYS's defaults like ordinary policies.
+                    key = (source_category.tag, "category")
+                    default_rule_sources[key].add(scope)
+                    if scope == default_rule_source:
+                        selected_default_rules[key] = copy.deepcopy(source_category)
+                    continue
                 category = categories.get(source_category.tag)
                 if category is None:
                     category = ET.Element(source_category.tag, dict(source_category.attrib))
@@ -731,6 +744,15 @@ def _merge_rulebases(
             if category_default is not None:
                 category.append(category_default)
 
+        default_key = ("default-security-rules", "category")
+        if default_rule_sources.get(default_key):
+            defaults = selected_default_rules.get(default_key)
+            if defaults is None:
+                raise VsysMergeError(
+                    f"De gekozen default-rulebron {default_rule_source} heeft geen default rules voor {base_name}; "
+                    "kies een bron die deze rulebase bevat."
+                )
+            merged_base.append(defaults)
         target.insert(min(insert_at, len(list(target))), merged_base)
     return policy_total, renamed_policies
 
