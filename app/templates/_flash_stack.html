@@ -1,0 +1,15 @@
+{% with messages=get_flashed_messages(with_categories=true) %}
+  {% if form_error is defined and form_error %}
+    {% set messages = messages + [('error', form_error)] %}
+  {% endif %}
+  {% if messages %}
+  <div class="flash-stack" aria-label="Meldingen" aria-live="polite">
+    {% for category,message in messages %}
+    <div class="flash flash-{{category}}" role="{{'alert' if category in ['error','danger'] else 'status'}}" aria-atomic="true" data-auto-dismiss="9000">
+      <div class="flash-body">{{message}}</div>
+      <button type="button" class="flash-close" data-flash-close aria-label="Melding sluiten">×</button>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+{% endwith %}

@@ -54,10 +54,7 @@
 </form>
 </header>
 <div class="content">
-{% with messages=get_flashed_messages(with_categories=true) %}{% if messages %}<div class="flash-stack">{% for category,message in messages %}<div class="flash flash-{{category}}" data-auto-dismiss="9000">
-<div class="flash-body">{{message}}</div>
-<button type="button" class="flash-close" data-flash-close>×</button>
-</div>{% endfor %}</div>{% endif %}{% endwith %}
+{% include '_flash_stack.html' %}
 <section id="dashboard" class="page-section" data-title="Dashboard">
 <div class="page-header">
 <div>

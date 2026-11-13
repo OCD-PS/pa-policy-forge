@@ -264,6 +264,121 @@
     });
   }
 
+  function setupFloatingHorizontalScrollbar() {
+    var wrappers = [];
+
+    var floating = document.createElement("div");
+    floating.className = "floating-horizontal-scroll";
+    floating.hidden = true;
+    var track = document.createElement("div");
+    track.className = "floating-horizontal-scroll-track";
+    track.tabIndex = 0;
+    track.setAttribute("role", "region");
+    track.setAttribute("aria-label", "Horizontaal scrollen in tabel");
+    var spacer = document.createElement("div");
+    spacer.className = "floating-horizontal-scroll-spacer";
+    track.appendChild(spacer);
+    floating.appendChild(track);
+    document.body.appendChild(floating);
+
+    var activeWrapper = null;
+    var framePending = false;
+
+    function copyScrollPosition(source, target) {
+      var sourceMax = Math.max(0, source.scrollWidth - source.clientWidth);
+      var targetMax = Math.max(0, target.scrollWidth - target.clientWidth);
+      target.scrollLeft = sourceMax ? source.scrollLeft / sourceMax * targetMax : 0;
+    }
+
+    function updatePosition() {
+      framePending = false;
+      wrappers = all(".table-wrap").filter(function (wrapper) {
+        var dialog = wrapper.closest("dialog");
+        return (!dialog || dialog.open) && wrapper.getClientRects().length > 0
+          && wrapper.scrollWidth > wrapper.clientWidth + 2;
+      });
+      wrappers.forEach(function (wrapper, index) {
+        if (wrapper.__ppfFloatingScrollBound) return;
+        if (!wrapper.id) wrapper.id = "table-scroll-target-" + index;
+        wrapper.__ppfFloatingScrollBound = true;
+        wrapper.addEventListener("scroll", function () {
+          if (activeWrapper === wrapper) copyScrollPosition(wrapper, track);
+        }, { passive: true });
+      });
+      if (!wrappers.length) {
+        floating.hidden = true;
+        activeWrapper = null;
+        return;
+      }
+      var centerY = window.innerHeight * 0.55;
+      var visible = wrappers.map(function (wrapper) {
+        return { wrapper: wrapper, rect: wrapper.getBoundingClientRect() };
+      }).filter(function (item) {
+        return item.rect.bottom > 0 && item.rect.top < window.innerHeight && item.rect.right > 0 && item.rect.left < window.innerWidth;
+      });
+      if (!visible.length) {
+        floating.hidden = true;
+        activeWrapper = null;
+        return;
+      }
+
+      visible.sort(function (left, right) {
+        function distance(item) {
+          if (item.rect.top <= centerY && item.rect.bottom >= centerY) return 0;
+          return Math.min(Math.abs(item.rect.top - centerY), Math.abs(item.rect.bottom - centerY));
+        }
+        return distance(left) - distance(right);
+      });
+      var selected = visible[0];
+      var wrapper = selected.wrapper;
+      var rect = selected.rect;
+      var owningDialog = wrapper.closest("dialog[open]");
+      var targetParent = owningDialog || document.body;
+      if (floating.parentNode !== targetParent) targetParent.appendChild(floating);
+      var actionbar = all(".policy-actionbar,.object-actionbar,.migration-actionbar,.migration-zone-actionbar,.migration-review-bulk-actions").find(function (item) {
+        var actionRect = item.getBoundingClientRect();
+        return actionRect.top < window.innerHeight && actionRect.bottom > window.innerHeight - 80;
+      });
+      var bottomOffset = 12;
+      if (actionbar) {
+        bottomOffset = Math.max(bottomOffset, window.innerHeight - actionbar.getBoundingClientRect().top + 10);
+      }
+      var nativeScrollbarVisible = rect.top >= 0 && rect.bottom <= window.innerHeight - 26 && !actionbar;
+      if (nativeScrollbarVisible) {
+        floating.hidden = true;
+        activeWrapper = wrapper;
+        return;
+      }
+
+      activeWrapper = wrapper;
+      track.setAttribute("aria-controls", wrapper.id);
+      floating.style.left = Math.max(0, rect.left) + "px";
+      floating.style.width = Math.max(80, Math.min(rect.width, window.innerWidth - Math.max(0, rect.left))) + "px";
+      floating.style.bottom = bottomOffset + "px";
+      spacer.style.width = wrapper.scrollWidth + "px";
+      floating.hidden = false;
+      copyScrollPosition(wrapper, track);
+    }
+
+    function scheduleUpdate() {
+      if (framePending) return;
+      framePending = true;
+      window.requestAnimationFrame(updatePosition);
+    }
+
+    track.addEventListener("scroll", function () {
+      if (activeWrapper) copyScrollPosition(track, activeWrapper);
+    }, { passive: true });
+    window.addEventListener("scroll", scheduleUpdate, { passive: true });
+    window.addEventListener("resize", scheduleUpdate, { passive: true });
+    if (window.MutationObserver) {
+      new MutationObserver(scheduleUpdate).observe(document.body, {
+        attributes: true, attributeFilter: ["class", "hidden", "open"], childList: true, subtree: true,
+      });
+    }
+    scheduleUpdate();
+  }
+
   function setupBulkSelection() {
     all("[data-select-all]").forEach(function (master) {
       var selector = master.getAttribute("data-select-all");
@@ -1519,6 +1634,7 @@
     runSetup("confirmations", setupConfirmations);
     runSetup("workspace-delete-dialog", setupWorkspaceDeleteDialog);
     runSetup("flashes", setupFlashes);
+    runSetup("floating-horizontal-scrollbar", setupFloatingHorizontalScrollbar);
     runSetup("bulk-selection", setupBulkSelection);
     runSetup("filters", setupFilters);
     runSetup("migration-review-search", setupMigrationReviewSearch);

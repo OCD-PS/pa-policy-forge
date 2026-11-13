@@ -9,7 +9,7 @@
 <body>
 <main class="content" style="max-width:1200px;margin:32px auto">
 <div class="page-header"><div><p class="eyebrow">PA Policy Forge</p><h1>Admin & bugmeldingen</h1><p class="muted">Alleen beheerders kunnen deze instellingen en meldingen bekijken.</p></div><a class="btn" href="{{url_for('index')}}">Terug naar Policy Forge</a></div>
-{% with messages=get_flashed_messages(with_categories=true) %}{% if messages %}<div class="flash-stack">{% for category,message in messages %}<div class="flash flash-{{category}}"><div class="flash-body">{{message}}</div></div>{% endfor %}</div>{% endif %}{% endwith %}
+{% include '_flash_stack.html' %}
 <section class="card stack">
 <div><h2>Mailrelay</h2><p class="muted">SMTP over TLS of STARTTLS. De relay wachtwoordwaarde wordt versleuteld opgeslagen en nooit terug getoond. De host moet ook op de server zijn toegestaan in <code>PPF_SMTP_ALLOWED_HOSTS</code>; dit beperkt uitgaande verbindingen tot goedgekeurde relays.</p></div>
 <form method="post" action="{{url_for('bug_reports.save_mail_settings')}}" class="stack">

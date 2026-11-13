@@ -5549,10 +5549,16 @@ def config_workspace_scope_move(workspace_id):
                 "config-workspace-scope-moved",
                 f"source={workspace_id} workspace={result_workspace_id} kind={item_kind} type={item_type} from={source_scope} to={target_scope} moved={len(moved)} reused={len(reused)} failed={len(failed)}",
             )
+        flash(
+            f"Scopeverplaatsing verwerkt: {len(moved)} verplaatst, {len(reused)} hergebruikt, {len(failed)} overgeslagen.",
+            "warning" if failed else "success",
+        )
         response = render_template(
-            "workspace_scope_move_result.html",
+            "workspace_operation_result.html",
             workspace=workspace,
+            operation="scope_move",
             result_workspace_id=result_workspace_id,
+            version_created=bool(moved or reused),
             source_scope=source_scope,
             target_scope=target_scope,
             item_kind=item_kind,
@@ -5780,8 +5786,19 @@ def config_workspace_object_merge_shared_preview(workspace_id):
             } for group in duplicate_object_groups_across_panos_scopes(
                 xml_bytes, object_type, parsed=(parsed_root, snapshot),
             ))
+        groups_by_type = {}
+        for group in groups:
+            item_type = group["object_type"]
+            counts = groups_by_type.setdefault(item_type, {"groups": 0, "duplicates": 0})
+            counts["groups"] += 1
+            counts["duplicates"] += len(group["objects"]) - 1
+        merge_type_summary = [{
+            "object_type": item_type,
+            "label": SCM_OBJECT_TYPES.get(item_type, {}).get("label", item_type),
+            **groups_by_type.get(item_type, {"groups": 0, "duplicates": 0}),
+        } for item_type in object_types]
         if not groups:
-            flash("Geen inhoudelijk identieke objecten gevonden tussen Shared en verschillende VSYS.", "info")
+            flash("Geen duplicaten gevonden. Ook adresgroepen en servicegroepen zijn gecontroleerd.", "info")
             return redirect(url_for(
                 "config_workspace_editor", workspace_id=workspace_id, scope=scope,
                 workspace_view="objects", object_type=return_object_type,
@@ -5802,6 +5819,7 @@ def config_workspace_object_merge_shared_preview(workspace_id):
             "workspace_object_merge_preview.html", workspace=workspace,
             draft=draft, draft_id=draft_id,
             object_label="Duplicaten",
+            merge_type_summary=merge_type_summary,
         )
     except Exception as exc:
         flash(f"Duplicaten niet voorbereid: {exc}", "error")
@@ -5882,6 +5900,7 @@ def config_workspace_object_apply(draft_id):
             raise OfflineConfigError("De bronworkspace bestaat niet meer")
         if draft.get("operation") == "merge_to_shared":
             selections = []
+            merge_results = []
             for group in draft.get("groups", []):
                 object_type = group.get("object_type", "")
                 if object_type not in MERGEABLE_OBJECT_TYPES:
@@ -5890,10 +5909,19 @@ def config_workspace_object_apply(draft_id):
                 candidates = [item for item in group.get("objects", []) if item.get("candidate_id") == candidate_id]
                 if len(candidates) != 1:
                     raise OfflineConfigError("Kies precies één Shared-master per duplicaatgroep")
+                master = candidates[0]
+                merge_results.append({
+                    "object_type": object_type,
+                    "object_label": group.get("object_label", SCM_OBJECT_TYPES.get(object_type, {}).get("label", object_type)),
+                    "master_name": master["name"],
+                    "master_source_scope": master["scope"],
+                    "merged_names": [item["name"] for item in group["objects"] if item["candidate_id"] != master["candidate_id"]],
+                    "source_scopes": sorted({item["scope"] for item in group["objects"]}),
+                })
                 selections.append({
                     "object_type": object_type,
                     "objects": group["objects"],
-                    "master": {"scope": candidates[0]["scope"], "name": candidates[0]["name"]},
+                    "master": {"scope": master["scope"], "name": master["name"]},
                 })
             predefined_applications = []
             if any(item["object_type"] == "application-groups" for item in selections):
@@ -5938,6 +5966,23 @@ def config_workspace_object_apply(draft_id):
                 f"{merge_summary['merged']} duplicaatobject(en) naar Shared samengevoegd in "
                 f"{merge_summary['groups']} groep(en); referenties bijgewerkt.",
                 "success",
+            )
+            return render_template(
+                "workspace_operation_result.html",
+                workspace=workspace,
+                operation="merge_to_shared",
+                result_workspace_id=new_id,
+                version_created=True,
+                source_scope=draft["scope"],
+                target_scope="Shared",
+                merge_results=merge_results,
+                merged_count=merge_summary["merged"],
+                group_count=merge_summary["groups"],
+                return_url=url_for(
+                    "config_workspace_editor", workspace_id=new_id, scope=draft["scope"],
+                    workspace_view="objects",
+                    object_type=draft.get("return_object_type", draft["object_type"]),
+                ),
             )
         else:
             flash("Opgeslagen", "success")

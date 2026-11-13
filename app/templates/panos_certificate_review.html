@@ -12,7 +12,7 @@
   <div><p class="eyebrow">{{profile.name}} · {{profile.target_type|upper}}</p><h1>Firewallcertificaat controleren</h1><p class="lede">Endpoint: {{endpoint}}</p></div>
   <a class="btn" href="{{url_for('index',edit_profile=profile.id)}}#profiles">Terug naar profiel</a>
 </div>
-{% with messages=get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="flash flash-{{category}}"><div class="flash-body">{{message}}</div></div>{% endfor %}{% endwith %}
+{% include '_flash_stack.html' %}
 {% if current %}
 <section class="card">
   <h2>Certificaat dat de endpoint presenteert</h2>
@@ -56,5 +56,6 @@
 </section>
 {% endif %}
 </main>
+<script src="{{url_for('static',filename='app.js',v=asset_version)}}"></script>
 </body>
 </html>
