@@ -707,7 +707,7 @@ done'''
         self.assertIn("Push via API naar candidate", run_template)
         self.assertIn("onmiddellijk voor", run_template)
         self.assertNotIn('name="mode" value="push"', app_template)
-        self.assertIn("get_flashed_messages", run_template)
+        self.assertIn("{% include '_flash_stack.html' %}", run_template)
         self.assertIn("Technische details", run_template)
         js = (ROOT / "app/static/app.js").read_text()
         self.assertIn("Uitgeschakeld pushen", js)

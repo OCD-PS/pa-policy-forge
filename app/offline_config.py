@@ -282,7 +282,10 @@ REFERENCE_CHECK_OBJECT_TYPES = UNUSED_OBJECT_TYPES | frozenset({
     "hip-profiles", "dynamic-user-groups",
 })
 
-MERGEABLE_OBJECT_TYPES = REFERENCE_CHECK_OBJECT_TYPES
+# Keep group types explicit: moving a group to Shared must be considered in
+# the same duplicate batch as its members so the dependency checks can verify it.
+PANOS_SCOPE_MERGE_GROUP_TYPES = frozenset({"address-groups", "service-groups"})
+MERGEABLE_OBJECT_TYPES = REFERENCE_CHECK_OBJECT_TYPES | PANOS_SCOPE_MERGE_GROUP_TYPES
 
 
 def object_reference_index(

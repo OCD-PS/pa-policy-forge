@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Wijzigingen verwerkt · PA Policy Forge</title>
+  <link rel="icon" href="{{url_for('static',filename='favicon.svg',v=asset_version)}}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{url_for('static',filename='app.css',v=asset_version)}}">
+</head>
+<body>
+<header class="topbar workspace-topbar">
+  <div class="brand">OCD <span>PA Policy Forge</span></div>
+  <a class="btn btn-primary" href="{{return_url}}">Terug naar workspace</a>
+</header>
+<main class="content">
+  {% include '_flash_stack.html' %}
+  <div class="page-header">
+    <div>
+      <p class="eyebrow">{{workspace.profile_name}} · PAN-OS · {{source_scope}} → {{target_scope}}</p>
+      <h1>{% if operation=='merge_to_shared' %}Duplicaten samengevoegd{% else %}Scope-verplaatsing{% endif %}</h1>
+      <p class="lede">{% if operation=='merge_to_shared' %}De duplicaten per type zijn naar Shared samengevoegd.{% else %}{{item_type|replace('-', ' ')|title}} · {{item_kind}}{% endif %} {% if version_created %}Nieuwe workspaceversie {{result_workspace_id}} aangemaakt.{% else %}Workspaceversie {{result_workspace_id}} bleef ongewijzigd.{% endif %}</p>
+    </div>
+    <a class="btn btn-primary" href="{{return_url}}">Terug naar workspace</a>
+  </div>
+
+  {% if operation=='merge_to_shared' %}
+  <section class="card stack">
+    <div class="callout"><strong>{{merged_count}} duplicaatobject(en) samengevoegd in {{group_count}} groep(en).</strong><br>De gekozen definities staan in Shared en de gevonden referenties zijn bijgewerkt.</div>
+    <div>
+      <h2>Wijzigingen per duplicaatgroep</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Type</th><th>In Shared bewaard</th><th>Samengevoegde definities</th><th>Scopes</th></tr></thead>
+          <tbody>
+          {% for item in merge_results %}
+            <tr>
+              <td>{{item.object_label}}</td>
+              <td><strong>{{item.master_name}}</strong> <span class="badge">gekozen uit {{item.master_source_scope}}</span></td>
+              <td>{{item.merged_names|join(', ')}}</td>
+              <td>{{item.source_scopes|join(', ')}}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="4">Geen detailregels beschikbaar.</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+  {% else %}
+  <section class="card stack">
+    <p>{{moved|length}} verplaatst; {{reused|length}} identieke Shared-objecten hergebruikt; {{failed|length}} overgeslagen.</p>
+    {% if moved %}<details><summary>Verplaatst ({{moved|length}})</summary><ul>{% for item in moved %}<li>{{item.name}}</li>{% endfor %}</ul></details>{% endif %}
+    {% if reused %}<details><summary>Bestaande Shared-objecten hergebruikt ({{reused|length}})</summary><ul>{% for item in reused %}<li>{{item.name}}</li>{% endfor %}</ul></details>{% endif %}
+    {% if not failed %}<p class="callout">{% if moved or reused %}Alle verplaatsbare items zijn verwerkt.{% else %}Er zijn geen items geselecteerd om te verplaatsen.{% endif %}</p>{% endif %}
+  </section>
+  {% if failed %}
+  <dialog open class="bulk-dialog">
+    <div class="push-dialog-brand">OCD</div>
+    <div class="bulk-dialog-body">
+      <div class="card-header"><div><h2>Niet alles kon worden verplaatst</h2><p class="muted">De geslaagde items staan in de nieuwe workspaceversie; de overgeslagen items bleven in de bron staan.</p></div></div>
+      <ul>{% for item in failed %}<li><strong>{{item.name}}</strong>: {{item.reason}}</li>{% endfor %}</ul>
+      <div class="cluster bulk-dialog-actions"><a class="btn btn-primary" href="{{return_url}}">Terug naar workspace</a></div>
+    </div>
+  </dialog>
+  {% endif %}
+  {% endif %}
+  <div class="cluster" style="justify-content:flex-end;margin-top:18px"><a class="btn btn-primary" href="{{return_url}}">Terug naar workspace</a></div>
+</main>
+<script src="{{url_for('static',filename='app.js',v=asset_version)}}"></script>
+</body>
+</html>

@@ -34,7 +34,7 @@
 {% endif %}
 </div>
 </div>
-{% with messages=get_flashed_messages(with_categories=true) %}{% if messages %}<div class="flash-stack">{% for category,message in messages %}<div class="flash flash-{{category}}" data-auto-dismiss="9000"><div class="flash-body">{{message}}</div><button type="button" class="flash-close" data-flash-close>×</button></div>{% endfor %}</div>{% endif %}{% endwith %}
+{% include '_flash_stack.html' %}
 {% if run.status=='running' %}
 <div class="callout" style="margin-top:22px"><strong>Policy-run bezig</strong></div>
 {% elif run.status=='complete' and run.mode=='preview' %}

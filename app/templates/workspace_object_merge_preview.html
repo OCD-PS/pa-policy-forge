@@ -19,8 +19,19 @@
   <div class="card stack">
     <div class="callout">
       <strong>{{draft.groups|length}} duplicaatgroep(en) gevonden</strong><br>
-      De scan vergelijkt definities in Shared en alle VSYS van deze standalone multi-VSYS-firewall. Shared is standaard geselecteerd waar beschikbaar. Lokale objecten met dezelfde naam die niet in de groep zitten, en onveilige verwijzingen, blokkeren de samenvoeging.
+      De scan vergelijkt definities in Shared en alle VSYS van deze standalone multi-VSYS-firewall. Adresgroepen en servicegroepen zijn inbegrepen. Shared is standaard geselecteerd waar beschikbaar. Lokale objecten met dezelfde naam die niet in de groep zitten, en onveilige verwijzingen, blokkeren de samenvoeging.
     </div>
+    <details class="card">
+      <summary>Gecontroleerde typen</summary>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Type</th><th>Duplicaatgroepen</th><th>Definities die samengevoegd worden</th></tr></thead>
+          <tbody>{% for item in merge_type_summary %}
+            <tr><td>{{item.label}}</td><td>{{item.groups}}</td><td>{{item.duplicates}}</td></tr>
+          {% endfor %}</tbody>
+        </table>
+      </div>
+    </details>
     <form method="post" action="{{url_for('config_workspace_object_apply',draft_id=draft_id)}}" class="stack">
       <input type="hidden" name="csrf" value="{{csrf_token()}}">
       {% for group in draft.groups %}
@@ -63,5 +74,6 @@
     </form>
   </div>
 </main>
+<script src="{{url_for('static',filename='app.js',v=asset_version)}}"></script>
 </body>
 </html>

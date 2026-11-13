@@ -1746,7 +1746,8 @@ class TargetAdapterTests(unittest.TestCase):
                 action, data={"csrf": "merge-shared-csrf", f"master_{group_id}": selected_candidate},
                 base_url="https://forge.test",
             )
-            self.assertEqual(applied.status_code, 302)
+            self.assertEqual(applied.status_code, 200)
+            self.assertIn(b"Duplicaten samengevoegd", applied.data)
             with main.db() as conn:
                 latest = conn.execute("SELECT * FROM config_workspaces WHERE profile_id=? ORDER BY id DESC LIMIT 1", (profile_id,)).fetchone()
             merged_xml = main.workspace_config_path(latest).read_bytes()
