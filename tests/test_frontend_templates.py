@@ -123,6 +123,25 @@ class FrontendTemplateTests(unittest.TestCase):
         self.assertNotIn("PAN-OS valideert elke policy tegen de zones", source)
         self.assertIn("Klik op een policy om ze te bewerken. Inherited regels openen in hun owning scope.", source)
 
+    def test_virtual_router_static_routes_have_gui_labels_and_explicit_actions(self):
+        html = self.environment().get_template("workspace_static_routes.html").render(
+            workspace={"id": 12}, scope="vsys1", template="", router_name="default",
+            family="ip", interfaces=["ethernet1/1"], next_vrs=["inside"],
+            routes=[{
+                "name": "Default-Route", "destination": "0.0.0.0/0", "interface": "ethernet1/1",
+                "next_hop_type": "ip-address", "next_hop_value": "192.0.2.1", "admin_distance": "10",
+                "metric": "10", "route_table": "both", "path_monitor": False, "bfd": False,
+                "editable": True, "edit_error": "", "fingerprint": "route-sha",
+            }],
+        )
+        self.assertIn("IPv4", html)
+        self.assertIn("Default-Route", html)
+        self.assertIn("IP Address · 192.0.2.1", html)
+        self.assertIn("Statische route toevoegen", html)
+        self.assertIn("Route opslaan", html)
+        self.assertIn("Route verwijderen", html)
+        self.assertIn("wijzigingen worden alleen in deze workspaceversie opgeslagen", html)
+
     def test_device_workspace_owns_zone_mapping_and_push_flow(self):
         source = self.environment().loader.get_source(self.environment(), "app.html")[0]
         self.assertIn("Firewall toevoegen", source)

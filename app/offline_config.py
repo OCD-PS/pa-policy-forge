@@ -1480,7 +1480,7 @@ PANOS_CONFIG_UI_TABS = {
     "zones": ("General", "Network", "User Identification", "Device Identification", "Other"),
     "vlans": ("General", "Interfaces", "Other"),
     "virtual-wires": ("General", "Interfaces", "Other"),
-    "virtual-routers": ("Router Settings", "Static Routes", "Redistribution", "RIP", "OSPF", "OSPFv3", "BGP", "Multicast", "ECMP", "Other"),
+    "virtual-routers": ("Router Settings", "Redistribution", "RIP", "OSPF", "OSPFv3", "BGP", "Multicast", "ECMP", "Other"),
     "logical-routers": ("General", "Interfaces", "Static Routes", "Routing Profiles", "RIPv2", "OSPF", "OSPFv3", "BGP", "Multicast", "BFD", "Other"),
     "ipsec-tunnels": ("General", "Proxy IDs", "Tunnel Monitor", "Other"),
     "gre-tunnels": ("General", "Tunnel Monitor", "Other"),
@@ -2928,6 +2928,315 @@ def _config_roots(root: ET.Element, snapshot: ConfigSnapshot, scope: str, templa
         return []
     names = [member.text or "" for member in stack.findall("./templates/member")]
     return [(name, templates[name]) for name in names if name in templates]
+
+
+_STATIC_ROUTE_NEXT_HOP_TYPES = {"ip-address", "ipv6-address", "next-vr", "fqdn", "discard", "none"}
+_STATIC_ROUTE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_. -]{0,30}\Z")
+
+
+def _virtual_router_route_owner(root: ET.Element, snapshot: ConfigSnapshot, template: str = "") -> ET.Element:
+    """Return the device configuration that owns virtual routers for this target."""
+    if snapshot.kind == "panorama":
+        template_entry = next((
+            item for item in root.findall("./devices/entry/template/entry")
+            if item.get("name") == template
+        ), None)
+        if template_entry is None:
+            raise OfflineConfigError("Kies een concrete Panorama-template voor routerbeheer")
+        device = template_entry.find("./config/devices/entry")
+    elif snapshot.kind == "panos":
+        device = root.find("./devices/entry")
+    else:
+        raise OfflineConfigError("Virtual-routerbeheer is beschikbaar voor PAN-OS en Panorama")
+    if device is None:
+        raise OfflineConfigError("De configuratie bevat geen device-configuratie")
+    return device
+
+
+def virtual_router_static_route_records(
+    xml_bytes: bytes, router_name: str, template: str = "", parsed=None,
+) -> tuple[ConfigSnapshot, list[dict], list[str], list[str]]:
+    """Return readable IPv4/IPv6 route rows plus valid interface and next-VR choices."""
+    root, snapshot = parsed if parsed is not None else parse_snapshot(xml_bytes)
+    device = _virtual_router_route_owner(root, snapshot, template)
+    routers = [
+        item for item in device.findall("./network/virtual-router/entry")
+        if item.get("name") == router_name
+    ]
+    if len(routers) != 1:
+        raise OfflineConfigError("De gekozen virtual router bestaat niet of is dubbel")
+    router = routers[0]
+    interface_names = sorted({
+        (member.text or "").strip()
+        for member in router.findall("./interface/member")
+        if (member.text or "").strip()
+    })
+    next_vr_names = sorted({
+        item.get("name", "") for item in device.findall("./network/virtual-router/entry")
+        if item.get("name") and item.get("name") != router_name
+    })
+    rows: list[dict] = []
+    for family, title in (("ip", "IPv4"), ("ipv6", "IPv6")):
+        collection = router.find(f"./routing-table/{family}/static-route")
+        for route in collection.findall("./entry") if collection is not None else ():
+            nexthop = route.find("./nexthop")
+            next_nodes = list(nexthop) if nexthop is not None else []
+            next_node = next_nodes[0] if len(next_nodes) == 1 else None
+            next_type = next_node.tag if next_node is not None else "none"
+            next_value = (next_node.text or "").strip() if next_node is not None else ""
+            table_node = route.find("./route-table")
+            table_values = [child.tag for child in list(table_node)] if table_node is not None else []
+            route_table = "both" if "both" in table_values or {"unicast", "multicast"}.issubset(table_values) else (table_values[0] if table_values else "unicast")
+            supported_tables = (
+                {"unicast", "no-install"}
+                if family == "ipv6"
+                else {"unicast", "multicast", "both", "no-install"}
+            )
+            normalized_table_values = set(table_values)
+            if {"unicast", "multicast"}.issubset(normalized_table_values):
+                normalized_table_values -= {"unicast", "multicast"}
+                normalized_table_values.add("both")
+            edit_error = ""
+            if len(next_nodes) > 1:
+                edit_error = "De route bevat meerdere next-hopwaarden; bewerken is uitgeschakeld om verlies te voorkomen."
+            elif next_node is not None and next_node.tag not in _STATIC_ROUTE_NEXT_HOP_TYPES:
+                edit_error = "Dit next-hop-type wordt niet ondersteund; bewerken is uitgeschakeld om verlies te voorkomen."
+            elif len(table_values) != len(set(table_values)):
+                edit_error = "Deze route-table bevat dubbele waarden; bewerken is uitgeschakeld om verlies te voorkomen."
+            elif not normalized_table_values.issubset(supported_tables) or len(normalized_table_values) > 1:
+                edit_error = "Deze route-tableconfiguratie wordt niet ondersteund; bewerken is uitgeschakeld om verlies te voorkomen."
+            bfd_profile = route.findtext("./bfd/profile", "").strip()
+            xml = ET.tostring(route, encoding="unicode")
+            rows.append({
+                "name": route.get("name", ""), "family": family, "family_label": title,
+                "destination": route.findtext("./destination", "").strip(),
+                "interface": route.findtext("./interface", "").strip(),
+                "next_hop_type": next_type, "next_hop_value": next_value,
+                "admin_distance": route.findtext("./admin-dist", "10").strip() or "10",
+                "metric": route.findtext("./metric", "10").strip() or "10",
+                "route_table": route_table,
+                "path_monitor": (route.findtext("./path-monitor/enable", "no").strip().lower() == "yes"),
+                "bfd": bool(bfd_profile and bfd_profile.casefold() != "none"),
+                "editable": not edit_error,
+                "edit_error": edit_error,
+                "fingerprint": hashlib.sha256(xml.encode()).hexdigest(),
+            })
+    rows.sort(key=lambda item: (item["family"], item["destination"], item["name"].casefold()))
+    return snapshot, rows, interface_names, next_vr_names
+
+
+def _static_route_address_object_exists(root: ET.Element, value: str, family: str, host_only: bool = False) -> bool:
+    expected_version = 4 if family == "ip" else 6
+    entries = [
+        entry for collection in (
+            *root.findall("./shared/address"),
+            *root.findall("./devices/entry/template/entry/config/shared/address"),
+        )
+        for entry in collection.findall("./entry")
+        if entry.get("name") == value
+    ]
+    if len(entries) != 1:
+        return False
+    try:
+        network = ipaddress.ip_network(entries[0].findtext("./ip-netmask", "").strip(), strict=False)
+    except ValueError:
+        return False
+    return network.version == expected_version and (not host_only or network.prefixlen == network.max_prefixlen)
+
+
+def _static_route_fqdn_object_exists(root: ET.Element, value: str) -> bool:
+    entries = [
+        entry for collection in (
+            *root.findall("./shared/address"),
+            *root.findall("./devices/entry/template/entry/config/shared/address"),
+        )
+        for entry in collection.findall("./entry")
+        if entry.get("name") == value and entry.findtext("./fqdn", "").strip()
+    ]
+    return len(entries) == 1
+
+
+def _validate_static_route_destination(value: str, family: str, root: ET.Element) -> str:
+    clean = str(value or "").strip()
+    try:
+        network = ipaddress.ip_network(clean, strict=False)
+    except ValueError:
+        if _static_route_address_object_exists(root, clean, family):
+            return clean
+        raise OfflineConfigError("Bestemming moet een geldig netwerk zijn of een unieke Shared-IP-netmask address object")
+    if (family == "ip" and network.version != 4) or (family == "ipv6" and network.version != 6):
+        raise OfflineConfigError("De bestemming hoort niet bij de gekozen adresfamilie")
+    return clean
+
+
+def apply_virtual_router_static_route_change(
+    xml_bytes: bytes, router_name: str, family: str, operation: str,
+    fields: dict | None = None, *, template: str = "", fingerprint: str = "",
+) -> bytes:
+    """Create, update, or delete one PAN-OS static route without replacing unknown XML."""
+    if family not in {"ip", "ipv6"} or operation not in {"create", "update", "delete"}:
+        raise OfflineConfigError("Ongeldige routebewerking")
+    root, snapshot = parse_snapshot(xml_bytes)
+    device = _virtual_router_route_owner(root, snapshot, template)
+    routers = [
+        item for item in device.findall("./network/virtual-router/entry")
+        if item.get("name") == router_name
+    ]
+    if len(routers) != 1:
+        raise OfflineConfigError("De gekozen virtual router bestaat niet of is dubbel")
+    router = routers[0]
+    family_node = router.find(f"./routing-table/{family}")
+    collection = family_node.find("./static-route") if family_node is not None else None
+    if operation == "create":
+        if family_node is None:
+            routing_table = router.find("./routing-table")
+            if routing_table is None:
+                routing_table = ET.SubElement(router, "routing-table")
+            family_node = ET.SubElement(routing_table, family)
+        collection = collection if collection is not None else ET.SubElement(family_node, "static-route")
+        values = dict(fields or {})
+        name = str(values.get("name", "")).strip()
+        if not _STATIC_ROUTE_NAME_PATTERN.fullmatch(name):
+            raise OfflineConfigError("Routenaam moet 1-31 tekens zijn en beginnen met een letter of cijfer")
+        if any(item.get("name") == name for item in collection.findall("./entry")):
+            raise OfflineConfigError("Er bestaat al een route met deze naam in deze adresfamilie")
+        route = ET.Element("entry", {"name": name})
+    else:
+        name = str((fields or {}).get("name", "")).strip()
+        matches = [item for item in (collection.findall("./entry") if collection is not None else ()) if item.get("name") == name]
+        if len(matches) != 1:
+            raise OfflineConfigError("De gekozen route bestaat niet meer")
+        route = matches[0]
+        current_xml = ET.tostring(route, encoding="unicode")
+        if not fingerprint or hashlib.sha256(current_xml.encode()).hexdigest() != fingerprint:
+            raise OfflineConfigError("Deze route is intussen gewijzigd; laad de routerpagina opnieuw")
+        if operation == "delete":
+            collection.remove(route)
+            return normalized_config_xml(root)
+        current_nexthop = route.find("./nexthop")
+        if current_nexthop is not None:
+            current_nodes = list(current_nexthop)
+            if len(current_nodes) > 1:
+                raise OfflineConfigError("Bewerken van de meerdere bestaande next-hopwaarden wordt niet ondersteund; de route bleef ongewijzigd")
+            current_type = current_nodes[0] if current_nodes else None
+            if current_type is not None and current_type.tag not in _STATIC_ROUTE_NEXT_HOP_TYPES:
+                raise OfflineConfigError("Bewerken van het bestaande next-hop-type wordt niet ondersteund; de route bleef ongewijzigd")
+        route_table_node = route.find("./route-table")
+        current_tables = [child.tag for child in list(route_table_node)] if route_table_node is not None else []
+        if len(current_tables) != len(set(current_tables)):
+            raise OfflineConfigError("Bewerken van de dubbele route-tablewaarden wordt niet ondersteund; de route bleef ongewijzigd")
+        normalized_tables = set(current_tables)
+        if {"unicast", "multicast"}.issubset(normalized_tables):
+            normalized_tables -= {"unicast", "multicast"}
+            normalized_tables.add("both")
+        allowed_current_tables = (
+            {"unicast", "no-install"}
+            if family == "ipv6"
+            else {"unicast", "multicast", "both", "no-install"}
+        )
+        if not normalized_tables.issubset(allowed_current_tables) or len(normalized_tables) > 1:
+            raise OfflineConfigError("Bewerken van de bestaande route-tableconfiguratie wordt niet ondersteund; de route bleef ongewijzigd")
+        values = dict(fields or {})
+        new_name = str(values.get("new_name", name)).strip()
+        if not _STATIC_ROUTE_NAME_PATTERN.fullmatch(new_name):
+            raise OfflineConfigError("Routenaam moet 1-31 tekens zijn en beginnen met een letter of cijfer")
+        if any(item is not route and item.get("name") == new_name for item in collection.findall("./entry")):
+            raise OfflineConfigError("Er bestaat al een route met deze naam in deze adresfamilie")
+        route.set("name", new_name)
+
+    destination = _validate_static_route_destination(str(values.get("destination", "")), family, root)
+    next_hop_type = str(values.get("next_hop_type", "none")).strip()
+    if next_hop_type not in _STATIC_ROUTE_NEXT_HOP_TYPES:
+        raise OfflineConfigError("Kies een ondersteund next-hop-type")
+    next_hop_value = str(values.get("next_hop_value", "")).strip()
+    if next_hop_type in {"ip-address", "ipv6-address"}:
+        try:
+            hop = ipaddress.ip_address(next_hop_value)
+        except ValueError:
+            if not _static_route_address_object_exists(root, next_hop_value, family, host_only=True):
+                raise OfflineConfigError("Next hop moet een geldig IP-adres zijn of een unieke Shared-/32- of /128-address object")
+            hop = None
+        expected_version = 4 if family == "ip" else 6
+        if hop is not None and hop.version != expected_version:
+            raise OfflineConfigError("Next hop hoort niet bij de gekozen adresfamilie")
+        next_hop_type = "ip-address" if family == "ip" else "ipv6-address"
+    elif next_hop_type == "next-vr":
+        if next_hop_value not in {
+            item.get("name", "") for item in device.findall("./network/virtual-router/entry")
+            if item is not router
+        }:
+            raise OfflineConfigError("Kies een bestaande andere virtual router als next hop")
+    elif next_hop_type == "fqdn":
+        if (
+            len(next_hop_value) > 253
+            or not re.fullmatch(r"(?i)(?=.{1,253}\.?\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*\.?", next_hop_value)
+        ) and not _static_route_fqdn_object_exists(root, next_hop_value):
+            raise OfflineConfigError("Vul een geldige FQDN of unieke Shared-FQDN address object in als next hop")
+    elif next_hop_type in {"discard", "none"}:
+        next_hop_value = ""
+    elif not next_hop_value:
+        raise OfflineConfigError("Vul de waarde van de gekozen next hop in")
+
+    bfd_profile = route.findtext("./bfd/profile", "").strip()
+    if bfd_profile and bfd_profile.casefold() != "none" and next_hop_type not in {"ip-address", "ipv6-address"}:
+        raise OfflineConfigError("BFD vereist een IP Address next hop; pas BFD eerst aan of behoud het IP-next-hop-type")
+
+    interface = str(values.get("interface", "")).strip()
+    configured_interfaces = {
+        (member.text or "").strip() for member in router.findall("./interface/member")
+        if (member.text or "").strip()
+    }
+    if interface and interface not in configured_interfaces:
+        raise OfflineConfigError("Kies een interface die aan deze virtual router is gekoppeld")
+    path_monitor_enabled = route.findtext("./path-monitor/enable", "no").strip().lower() == "yes"
+    if path_monitor_enabled and not interface:
+        raise OfflineConfigError("Path monitoring vereist een interface; kies een interface of behoud de route ongewijzigd")
+    if path_monitor_enabled and next_hop_type not in {"ip-address", "ipv6-address", "next-vr", "none"}:
+        raise OfflineConfigError("Dit next-hop-type ondersteunt de bestaande path monitoring niet; de route bleef ongewijzigd")
+    try:
+        admin_distance = int(str(values.get("admin_distance", "10")).strip())
+        metric = int(str(values.get("metric", "10")).strip())
+    except ValueError as exc:
+        raise OfflineConfigError("Admin distance en metric moeten gehele getallen zijn") from exc
+    if not 10 <= admin_distance <= 240:
+        raise OfflineConfigError("Admin distance moet tussen 10 en 240 liggen")
+    if not 1 <= metric <= 65535:
+        raise OfflineConfigError("Metric moet tussen 1 en 65535 liggen")
+    route_table = str(values.get("route_table", "unicast")).strip()
+    allowed_tables = {"unicast", "no-install"} if family == "ipv6" else {"unicast", "multicast", "both", "no-install"}
+    if route_table not in allowed_tables:
+        raise OfflineConfigError("Kies een geldige route table voor deze adresfamilie")
+    def set_text(tag: str, value: str) -> None:
+        child = route.find(f"./{tag}")
+        if value:
+            if child is None:
+                child = ET.SubElement(route, tag)
+            child.text = value
+        elif child is not None:
+            route.remove(child)
+
+    set_text("destination", destination)
+    set_text("interface", interface)
+    set_text("admin-dist", str(admin_distance))
+    set_text("metric", str(metric))
+    nexthop = route.find("./nexthop")
+    if nexthop is None:
+        nexthop = ET.SubElement(route, "nexthop")
+    for child in list(nexthop):
+        nexthop.remove(child)
+    next_node = ET.SubElement(nexthop, next_hop_type)
+    if next_hop_value:
+        next_node.text = next_hop_value
+    route_table_node = route.find("./route-table")
+    if route_table_node is None:
+        route_table_node = ET.SubElement(route, "route-table")
+    for child in list(route_table_node):
+        route_table_node.remove(child)
+    ET.SubElement(route_table_node, route_table)
+    if operation == "create":
+        assert collection is not None
+        collection.append(route)
+    return normalized_config_xml(root)
 
 
 def _indexed_element(root: ET.Element, locator: str) -> ET.Element:

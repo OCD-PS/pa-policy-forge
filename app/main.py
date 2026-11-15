@@ -79,6 +79,7 @@ from app.offline_config import (
     policy_fingerprint as offline_policy_fingerprint, render_set_commands,
     panos_ui_decorate_record, scoped_object_names, scoped_object_page, scoped_server_profiles,
     object_reference_index, object_reference_indexes,
+    apply_virtual_router_static_route_change, virtual_router_static_route_records,
     _merge_object_signature, _reference_scope, _resolve_scoped_object_entry,
     _panos_scope_collection, _panos_scope_root,
     _is_panos_global_address_reference,
@@ -4419,18 +4420,127 @@ def validate_incremental_object_deletions(
 
 
 def validate_workspace_configuration_deletions(xml_bytes: bytes, view: str, section: str, records: list[dict]) -> None:
-    """Block certificate removal while its names appear in certificate use sites."""
-    if view != "device" or section != "certificates":
+    """Block deletion of configuration entries with known live dependencies."""
+    names = [str(item.get("name", "")) for item in records if str(item.get("name", ""))]
+    if not names:
         return
-    names = [str(item.get("name", "")) for item in records]
-    try:
-        references = object_reference_index(xml_bytes, "certificates", names)
-    except Exception as exc:
-        raise OfflineConfigError("Certificaatreferentiecontrole is mislukt; niets verwijderd") from exc
-    used = {name: paths for name, paths in references.items() if paths}
+    if view == "device" and section == "certificates":
+        try:
+            references = object_reference_index(xml_bytes, "certificates", names)
+        except Exception as exc:
+            raise OfflineConfigError("Certificaatreferentiecontrole is mislukt; niets verwijderd") from exc
+        used = {name: paths for name, paths in references.items() if paths}
+    elif view == "network" and section in {"interfaces", "zones", "virtual-routers"}:
+        try:
+                used = _network_configuration_references(xml_bytes, section, records)
+        except Exception as exc:
+            raise OfflineConfigError("Referentiecontrole voor netwerkconfiguratie is mislukt; niets verwijderd") from exc
+    else:
+        return
     if used:
         details = "; ".join(f"{name}: {', '.join(paths[:3])}" for name, paths in list(used.items())[:5])
-        raise OfflineConfigError(f"Certificaat in gebruik; niet verwijderd ({details})")
+        label = {"certificates": "Certificaat", "interfaces": "Interface", "zones": "Zone", "virtual-routers": "Virtual router"}.get(section, "Configuratie-item")
+        raise OfflineConfigError(f"{label} nog in gebruik; niet verwijderd ({details})")
+
+
+def _network_configuration_references(xml_bytes: bytes, section: str, records: list[dict]) -> dict[str, list[str]]:
+    """Find the PAN-OS network references that make deleting an entry unsafe."""
+    root, snapshot = parse_snapshot(xml_bytes)
+    owners_by_name: dict[str, set[str]] = defaultdict(set)
+    for record in records:
+        name = str(record.get("name", ""))
+        if name:
+            owners_by_name[name].add(str(record.get("owner", "")))
+    wanted = set(owners_by_name)
+    references = {name: [] for name in wanted}
+    parents = {child: parent for parent in root.iter() for child in parent}
+    paths: dict[ET.Element, str] = {root: "/config"}
+
+    def reference_owner(node: ET.Element) -> str:
+        current = node
+        while current is not None:
+            parent = parents.get(current)
+            if current.tag == "entry" and parent is not None:
+                if snapshot.kind == "panorama" and parent.tag == "template":
+                    return current.get("name", "")
+                if section == "zones" and snapshot.kind != "panorama" and parent.tag == "vsys":
+                    return current.get("name", "")
+            current = parent
+        return ""
+
+    def path_for(node: ET.Element) -> str:
+        pending = []
+        current = node
+        while current not in paths and current in parents:
+            pending.append(current)
+            current = parents[current]
+        path = paths.get(current, "/config")
+        for item in reversed(pending):
+            selector = f"[@name={item.get('name')}]" if item.tag == "entry" and item.get("name") else ""
+            path += f"/{item.tag}{selector}"
+            paths[item] = path
+        return paths.get(node, path)
+
+    for node in root.iter():
+        value = (node.text or "").strip()
+        if not value or value not in wanted:
+            continue
+        parent = parents.get(node)
+        if parent is None:
+            continue
+        ancestor_tags = set()
+        ancestor = parent
+        while ancestor is not None:
+            ancestor_tags.add(ancestor.tag)
+            ancestor = parents.get(ancestor)
+        referenced = False
+        if section == "virtual-routers":
+            referenced = (
+                node.tag == "member" and parent.tag == "virtual-router" and "import" in ancestor_tags
+            ) or node.tag == "next-vr"
+            if node.tag == "next-vr":
+                current = parent
+                while current is not None:
+                    current_parent = parents.get(current)
+                    if current.tag == "entry" and current_parent is not None and current_parent.tag == "virtual-router":
+                        if current.get("name") == value:
+                            referenced = False
+                        break
+                    current = current_parent
+        elif section == "zones":
+            referenced = (
+                node.tag == "member" and parent.tag in {"from", "to"}
+                and bool(ancestor_tags & {"rulebase", "pre-rulebase", "post-rulebase"})
+            )
+        elif section == "interfaces":
+            referenced = (
+                node.tag == "member" and parent.tag in {"layer2", "layer3", "virtual-wire", "tap", "tunnel"}
+                and "zone" in ancestor_tags
+            ) or (
+                node.tag == "member" and parent.tag == "interface" and "virtual-router" in ancestor_tags
+                and "static-route" not in ancestor_tags
+            ) or (
+                node.tag == "interface" and "static-route" in ancestor_tags
+            ) or (
+                node.tag in {"interface1", "interface2"} and "virtual-wire" in ancestor_tags
+            ) or (
+                node.tag == "member" and parent.tag == "interface" and "vlan" in ancestor_tags
+            ) or (
+                node.tag == "interface" and "virtual-interface" in ancestor_tags
+            ) or (
+                node.tag in {"egress-interface", "interface"} and "pbf" in ancestor_tags
+            ) or (
+                node.tag == "interface" and bool(ancestor_tags & {"source-translation", "destination-translation"})
+            )
+        if referenced:
+            owner = reference_owner(node)
+            selected_owners = owners_by_name.get(value, set())
+            if owner and "" not in selected_owners and owner not in selected_owners:
+                continue
+            reference = path_for(node)
+            if reference not in references[value]:
+                references[value].append(reference)
+    return {name: paths for name, paths in references.items() if paths}
 
 
 def scm_fetch_reference_inventory(endpoint: str, token: str, container: dict[str, str], label: str) -> list[dict]:
@@ -6011,6 +6121,92 @@ def _store_workspace_configuration_version(workspace, context: dict, changes: li
     new_id = store_workspace_edit_version(workspace, new_xml, f"{context['view']} edit")
     audit("config-workspace-configuration-edited", f"source={workspace['id']} workspace={new_id} view={context['view']} section={context['section']} operation={context.get('operation','update')}")
     return new_id
+
+
+def _virtual_router_route_redirect(workspace_id: int, scope: str, template: str, router_name: str, family: str):
+    return redirect(url_for(
+        "config_workspace_virtual_router_routes", workspace_id=workspace_id,
+        scope=scope, template=template, virtual_router=router_name, family=family,
+    ))
+
+
+@app.get("/config-workspaces/<int:workspace_id>/network/virtual-router-routes")
+@login_required
+def config_workspace_virtual_router_routes(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    try:
+        if workspace["target_type"] not in {"panos", "panorama"}:
+            raise OfflineConfigError("Statische virtual-router-routes zijn alleen beschikbaar voor PAN-OS en Panorama")
+        xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
+        scope = request.args.get("scope", "").strip()
+        if scope not in available_scopes(snapshot):
+            raise OfflineConfigError("De gekozen scope bestaat niet meer")
+        template = request.args.get("template", "").strip()
+        router_name = request.args.get("virtual_router", "").strip()
+        family = request.args.get("family", "ip").strip()
+        if family not in {"ip", "ipv6"}:
+            family = "ip"
+        _snapshot, routes, interfaces, next_vrs = virtual_router_static_route_records(
+            xml_bytes, router_name, template, parsed=(parsed_root, snapshot),
+        )
+        return render_template(
+            "workspace_static_routes.html", workspace=workspace, scope=scope,
+            template=template, router_name=router_name, family=family,
+            routes=[route for route in routes if route["family"] == family],
+            interfaces=interfaces, next_vrs=next_vrs,
+        )
+    except Exception as exc:
+        flash(f"Virtual router kon niet worden geopend: {exc}", "error")
+        return redirect(url_for(
+            "config_workspace_editor", workspace_id=workspace_id,
+            scope=request.args.get("scope", ""), template=request.args.get("template", ""),
+            workspace_view="network", config_section="virtual-routers",
+        ))
+
+
+@app.post("/config-workspaces/<int:workspace_id>/network/virtual-router-routes")
+@login_required
+def config_workspace_virtual_router_route_save(workspace_id):
+    workspace = workspace_row(workspace_id)
+    if not workspace:
+        return "Not found", 404
+    scope = request.form.get("scope", "").strip()
+    template = request.form.get("template", "").strip()
+    router_name = request.form.get("virtual_router", "").strip()
+    family = request.form.get("family", "ip").strip()
+    operation = request.form.get("operation", "").strip()
+    try:
+        if workspace["target_type"] not in {"panos", "panorama"}:
+            raise OfflineConfigError("Statische virtual-router-routes zijn alleen beschikbaar voor PAN-OS en Panorama")
+        xml_bytes, parsed_root, snapshot = cached_workspace_config(workspace["config_path"], workspace["sha256"])
+        if scope not in available_scopes(snapshot):
+            raise OfflineConfigError("De gekozen scope bestaat niet meer")
+        fields = {
+            "name": request.form.get("name", "").strip(),
+            "new_name": request.form.get("new_name", "").strip(),
+            "destination": request.form.get("destination", "").strip(),
+            "interface": request.form.get("interface", "").strip(),
+            "next_hop_type": request.form.get("next_hop_type", "none").strip(),
+            "next_hop_value": request.form.get("next_hop_value", "").strip(),
+            "admin_distance": request.form.get("admin_distance", "10").strip(),
+            "metric": request.form.get("metric", "10").strip(),
+            "route_table": request.form.get("route_table", "unicast").strip(),
+        }
+        new_xml = apply_virtual_router_static_route_change(
+            xml_bytes, router_name, family, operation, fields, template=template,
+            fingerprint=request.form.get("fingerprint", "").strip(),
+        )
+        if new_xml == normalized_config_xml(parsed_root):
+            raise OfflineConfigError("Er zijn geen routewijzigingen om te bewaren")
+        new_id = store_workspace_edit_version(workspace, new_xml, f"virtual-router {operation}")
+        audit("config-workspace-static-route-edited", f"source={workspace_id} workspace={new_id} operation={operation} family={family}")
+        flash("Statische route opgeslagen in een nieuwe workspaceversie.", "success")
+        return _virtual_router_route_redirect(new_id, scope, template, router_name, family)
+    except Exception as exc:
+        flash(f"Statische route niet opgeslagen: {exc}", "error")
+        return _virtual_router_route_redirect(workspace_id, scope, template, router_name, family)
 
 
 @app.post("/config-workspaces/<int:workspace_id>/configuration/create-basic")
