@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Statische routes · {{router_name}} · Policy Forge</title>
+  <link rel="stylesheet" href="{{url_for('static',filename='app.css',v=asset_version)}}">
+</head>
+<body>
+<main class="page-shell workspace-shell">
+  <div class="cluster" style="justify-content:space-between; margin-bottom:16px">
+    <a class="btn" href="{{url_for('config_workspace_editor',workspace_id=workspace.id,scope=scope,template=template,workspace_view='network',config_section='virtual-routers')}}">Terug naar Virtual Routers</a>
+    <span class="badge">Workspaceversie · {{workspace.id}}</span>
+  </div>
+  <section class="card config-record-list">
+    <div class="card-header">
+      <div>
+        <p class="eyebrow">{{template if template else 'PAN-OS'}}</p>
+        <h1>{{router_name}}</h1>
+        <p class="muted">Statische routes · wijzigingen worden alleen in deze workspaceversie opgeslagen.</p>
+      </div>
+    </div>
+    <nav class="policy-tabs" aria-label="Adresfamilie">
+      <a class="btn btn-small {{'is-active' if family=='ip' else ''}}" href="{{url_for('config_workspace_virtual_router_routes',workspace_id=workspace.id,scope=scope,template=template,virtual_router=router_name,family='ip')}}">IPv4</a>
+      <a class="btn btn-small {{'is-active' if family=='ipv6' else ''}}" href="{{url_for('config_workspace_virtual_router_routes',workspace_id=workspace.id,scope=scope,template=template,virtual_router=router_name,family='ipv6')}}">IPv6</a>
+    </nav>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Naam</th><th>Bestemming</th><th>Interface</th><th>Next hop</th><th>Admin distance</th><th>Metric</th><th>Route table</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+          {% for route in routes %}
+          {% set next_hop_labels = {'ip-address': 'IP Address', 'ipv6-address': 'IPv6 Address', 'next-vr': 'Next VR', 'fqdn': 'FQDN'} %}
+          <tr>
+            <td><strong>{{route.name}}</strong></td>
+            <td>{{route.destination or '—'}}</td>
+            <td>{{route.interface or 'Auto'}}</td>
+            <td>
+              {% if route.next_hop_type in ['discard','none'] %}{{'Discard' if route.next_hop_type=='discard' else 'Geen next hop'}}
+              {% else %}{{next_hop_labels.get(route.next_hop_type, route.next_hop_type|replace('-',' ')|title)}} · {{route.next_hop_value or '—'}}{% endif %}
+            </td>
+            <td>{{route.admin_distance}}</td><td>{{route.metric}}</td>
+            <td>{{route.route_table|replace('-',' ')|title}}</td>
+            <td>{% if route.path_monitor %}<span class="badge">Path monitoring</span>{% endif %}{% if route.bfd %}<span class="badge">BFD</span>{% endif %}{% if not route.path_monitor and not route.bfd %}<span class="muted">—</span>{% endif %}</td>
+            <td>
+              <details class="config-quick-add">
+                <summary class="btn btn-small">{{'Bewerken' if route.editable else 'Acties'}}</summary>
+                {% if route.editable %}
+                <form method="post" action="{{url_for('config_workspace_virtual_router_route_save',workspace_id=workspace.id)}}" class="form-grid">
+                  <input type="hidden" name="csrf" value="{{csrf_token()}}"><input type="hidden" name="scope" value="{{scope}}"><input type="hidden" name="template" value="{{template}}"><input type="hidden" name="virtual_router" value="{{router_name}}"><input type="hidden" name="family" value="{{family}}"><input type="hidden" name="operation" value="update"><input type="hidden" name="name" value="{{route.name}}"><input type="hidden" name="fingerprint" value="{{route.fingerprint}}">
+                  <div class="field"><label>Naam</label><input name="new_name" maxlength="31" required value="{{route.name}}"></div>
+                  <div class="field"><label>Bestemming</label><input name="destination" required value="{{route.destination}}" placeholder="{{'192.0.2.0/24' if family=='ip' else '2001:db8::/32'}}"></div>
+                  <div class="field"><label>Interface</label><select name="interface"><option value="">Auto (geen interface vastgelegd)</option>{% for interface in interfaces %}<option value="{{interface}}" {{'selected' if route.interface==interface else ''}}>{{interface}}</option>{% endfor %}</select></div>
+                  <div class="field"><label>Next-hop-type</label><select name="next_hop_type"><option value="ip-address" {{'selected' if route.next_hop_type in ['ip-address','ipv6-address'] else ''}}>{{'IPv6 Address' if family=='ipv6' else 'IP Address'}}</option><option value="next-vr" {{'selected' if route.next_hop_type=='next-vr' else ''}}>Next VR</option><option value="fqdn" {{'selected' if route.next_hop_type=='fqdn' else ''}}>FQDN</option><option value="discard" {{'selected' if route.next_hop_type=='discard' else ''}}>Discard</option><option value="none" {{'selected' if route.next_hop_type=='none' else ''}}>None</option></select></div>
+                  <div class="field"><label>Next-hop-waarde</label><input name="next_hop_value" list="route-next-vrs-{{loop.index}}" value="{{route.next_hop_value}}" placeholder="IP-adres, FQDN of naam van een andere VR"><datalist id="route-next-vrs-{{loop.index}}">{% for next_vr in next_vrs %}<option value="{{next_vr}}">{% endfor %}</datalist><small class="muted">Kies een router uit de lijst, of vul een IP/FQDN in. Leeg laten bij Discard of None.</small></div>
+                  {% if route.next_hop_type=='next-vr' and route.next_hop_value and route.next_hop_value not in next_vrs %}<div class="field full"><p class="callout">De bestaande next VR is niet meer beschikbaar. Kies een geldige router of wijzig de route.</p></div>{% endif %}
+                  <div class="field"><label>Admin distance (10–240)</label><input type="number" name="admin_distance" min="10" max="240" required value="{{route.admin_distance}}"></div>
+                  <div class="field"><label>Metric (1–65535)</label><input type="number" name="metric" min="1" max="65535" required value="{{route.metric}}"></div>
+                  <div class="field"><label>Route table</label><select name="route_table"><option value="unicast" {{'selected' if route.route_table=='unicast' else ''}}>Unicast</option>{% if family=='ip' %}<option value="multicast" {{'selected' if route.route_table=='multicast' else ''}}>Multicast</option><option value="both" {{'selected' if route.route_table=='both' else ''}}>Both</option>{% endif %}<option value="no-install" {{'selected' if route.route_table=='no-install' else ''}}>No Install</option></select></div>
+                  <div class="cluster full"><button class="btn btn-primary" type="submit">Route opslaan</button></div>
+                </form>
+                {% else %}<p class="callout">{{route.edit_error}} Alleen expliciet verwijderen is beschikbaar.</p>{% endif %}
+                <form method="post" action="{{url_for('config_workspace_virtual_router_route_save',workspace_id=workspace.id)}}" onsubmit="return confirm('Deze route uit de workspace verwijderen?');">
+                  <input type="hidden" name="csrf" value="{{csrf_token()}}"><input type="hidden" name="scope" value="{{scope}}"><input type="hidden" name="template" value="{{template}}"><input type="hidden" name="virtual_router" value="{{router_name}}"><input type="hidden" name="family" value="{{family}}"><input type="hidden" name="operation" value="delete"><input type="hidden" name="name" value="{{route.name}}"><input type="hidden" name="fingerprint" value="{{route.fingerprint}}">
+                  <button class="btn btn-danger" type="submit">Route verwijderen</button>
+                </form>
+              </details>
+            </td>
+          </tr>
+          {% else %}<tr><td colspan="9" class="muted">Geen {{'IPv4' if family=='ip' else 'IPv6'}}-routes in deze router.</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <details class="config-quick-add">
+      <summary class="btn btn-primary">+ Statische route toevoegen</summary>
+      <form method="post" action="{{url_for('config_workspace_virtual_router_route_save',workspace_id=workspace.id)}}" class="form-grid">
+        <input type="hidden" name="csrf" value="{{csrf_token()}}"><input type="hidden" name="scope" value="{{scope}}"><input type="hidden" name="template" value="{{template}}"><input type="hidden" name="virtual_router" value="{{router_name}}"><input type="hidden" name="family" value="{{family}}"><input type="hidden" name="operation" value="create">
+        <div class="field"><label>Naam (max. 31 tekens)</label><input name="name" maxlength="31" required placeholder="Default-Route"></div>
+        <div class="field"><label>Bestemming</label><input name="destination" required placeholder="{{'0.0.0.0/0' if family=='ip' else '::/0'}}"></div>
+        <div class="field"><label>Interface</label><select name="interface"><option value="">Auto (geen interface vastgelegd)</option>{% for interface in interfaces %}<option value="{{interface}}">{{interface}}</option>{% endfor %}</select></div>
+        <div class="field"><label>Next-hop-type</label><select name="next_hop_type"><option value="ip-address">{{'IPv6 Address' if family=='ipv6' else 'IP Address'}}</option><option value="next-vr">Next VR</option><option value="fqdn">FQDN</option><option value="discard">Discard</option><option value="none">None</option></select></div>
+        <div class="field"><label>Next-hop-waarde</label><input name="next_hop_value" list="route-next-vrs-create" placeholder="IP-adres, FQDN of naam van een andere VR"><datalist id="route-next-vrs-create">{% for next_vr in next_vrs %}<option value="{{next_vr}}">{% endfor %}</datalist><small class="muted">Kies een router uit de lijst, of vul een IP/FQDN in. Leeg laten bij Discard of None.</small></div>
+        <div class="field"><label>Admin distance (10–240)</label><input type="number" name="admin_distance" min="10" max="240" required value="10"></div>
+        <div class="field"><label>Metric (1–65535)</label><input type="number" name="metric" min="1" max="65535" required value="10"></div>
+        <div class="field"><label>Route table</label><select name="route_table"><option value="unicast">Unicast</option>{% if family=='ip' %}<option value="multicast">Multicast</option><option value="both">Both</option>{% endif %}<option value="no-install">No Install</option></select></div>
+        <div class="cluster full"><button class="btn btn-primary" type="submit">Statische route toevoegen</button></div>
+      </form>
+    </details>
+    <p class="help">Bestaande path monitoring en BFD blijven behouden wanneer je de route bewerkt. De wijzigingen staan alleen in de workspace en worden pas naar de firewall geschreven via de gewone push.</p>
+  </section>
+</main>
+</body>
+</html>

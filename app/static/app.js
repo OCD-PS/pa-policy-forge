@@ -1512,7 +1512,7 @@
         createTemplates.forEach(function (item, index) { var option = document.createElement("option"); option.value = String(index); option.textContent = item.label || item.kind || item.ui_family; createType.appendChild(option); });
         actionbar.insertBefore(createType, remove);
       }
-      var add = document.createElement("button"); add.type = "button"; add.className = "btn btn-primary"; add.textContent = "+ Add"; add.dataset.configAdd = "";
+      var add = document.createElement("button"); add.type = "button"; add.className = "btn btn-primary"; add.textContent = dialog.dataset.configSection === "virtual-routers" ? "+ Add virtual router" : "+ Add"; add.dataset.configAdd = "";
       add.addEventListener("click", function () {
         if (createTemplates.length) {
           var template = createTemplates[createType ? Number(createType.value) : 0];

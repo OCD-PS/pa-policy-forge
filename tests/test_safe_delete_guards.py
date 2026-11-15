@@ -138,6 +138,23 @@ class SafeDeleteGuardTests(unittest.TestCase):
                 main.validate_live_object_deletions({"target_type": "panos"}, "addresses", ["shared-object"])
         fetch.assert_called_once()
 
+    def test_workspace_delete_blocks_virtual_router_still_imported_by_vsys(self):
+        xml = b'<config><devices><entry name="localhost.localdomain"><network><virtual-router><entry name="default"/></virtual-router></network><vsys><entry name="vsys1"><import><network><virtual-router><member>default</member></virtual-router></network></import></entry></vsys></entry></devices></config>'
+        with self.assertRaisesRegex(main.OfflineConfigError, "Virtual router nog in gebruik"):
+            main.validate_workspace_configuration_deletions(xml, "network", "virtual-routers", [{"name": "default"}])
+
+    def test_workspace_delete_blocks_zone_and_interface_references(self):
+        zone_xml = b'<config><devices><entry><vsys><entry name="vsys1"><zone><entry name="Trust"/></zone><rulebase><security><rules><entry name="r"><from><member>Trust</member></from></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        interface_xml = b'<config><devices><entry><network><interface><ethernet><entry name="ethernet1/1"/></ethernet></interface><virtual-router><entry name="default"><interface><member>ethernet1/1</member></interface></entry></virtual-router></network></entry></devices></config>'
+        with self.assertRaisesRegex(main.OfflineConfigError, "Zone nog in gebruik"):
+            main.validate_workspace_configuration_deletions(zone_xml, "network", "zones", [{"name": "Trust"}])
+        with self.assertRaisesRegex(main.OfflineConfigError, "Interface nog in gebruik"):
+            main.validate_workspace_configuration_deletions(interface_xml, "network", "interfaces", [{"name": "ethernet1/1"}])
+
+    def test_workspace_zone_delete_only_checks_the_selected_vsys(self):
+        xml = b'<config><devices><entry><vsys><entry name="vsys1"><zone><entry name="Trust"/></zone></entry><entry name="vsys2"><zone><entry name="Trust"/></zone><rulebase><security><rules><entry name="r"><from><member>Trust</member></from></entry></rules></security></rulebase></entry></vsys></entry></devices></config>'
+        main.validate_workspace_configuration_deletions(xml, "network", "zones", [{"name": "Trust", "owner": "vsys1"}])
+
 
 if __name__ == "__main__":
     unittest.main()
